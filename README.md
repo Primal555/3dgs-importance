@@ -112,6 +112,60 @@ To prune an already trained 3DGS, specify its checkpoint path in `scripts/run_pr
 bash scripts/run_prune_finetune.sh
 ```
 
+## Vanilla 3D-GS baseline and pruning comparison
+
+`input.ply` is only the COLMAP/Blender initialization point cloud. It is not a
+trained 3D-GS baseline and must not be used as the denominator of a pruning
+ratio. This repository includes a compatible vanilla training entry point:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u train_3dgs.py \
+  -s /path/to/scene \
+  -m /path/to/vanilla_output \
+  --eval \
+  --data_device cpu \
+  --test_iterations 7000 30000 \
+  --checkpoint_iterations 7000 15000 30000
+```
+
+The last iteration always produces both
+`point_cloud/iteration_30000/point_cloud.ply` and `chkpnt30000.pth`. The latter
+uses the original 12-item 3D-GS format expected by `prune_finetune.py`.
+
+Render and evaluate the vanilla and MaskGaussian outputs on the same held-out
+cameras, then calculate the representation-size reduction:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python render.py -m /path/to/vanilla_output --skip_train
+CUDA_VISIBLE_DEVICES=0 python render.py -m /path/to/mask_output --skip_train
+CUDA_VISIBLE_DEVICES=0 python metrics.py -m /path/to/vanilla_output /path/to/mask_output
+
+python compare_models.py \
+  --baseline /path/to/vanilla_output \
+  --mask /path/to/mask_output \
+  --make_visuals
+```
+
+`compare_models.py` writes `comparison_vs_baseline.json` and creates panels
+containing ground truth, vanilla rendering, MaskGaussian rendering, and an
+amplified difference image. Its Gaussian reduction is
+`1 - N_mask / N_vanilla`. Because these are independent from-scratch training
+runs, this is a representation-size reduction, not one-to-one Gaussian deletion
+tracking.
+
+For the complete baseline/render/metric/visual workflow, use:
+
+```bash
+bash scripts/run_baseline_comparison.sh \
+  /path/to/scene \
+  /path/to/vanilla_output \
+  /path/to/mask_output \
+  0
+```
+
+The GPU still performs all training and rendering. `--data_device cpu` only
+keeps source camera images in CPU memory to reduce VRAM use.
+
 ## LICENSE
 
 Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting).
