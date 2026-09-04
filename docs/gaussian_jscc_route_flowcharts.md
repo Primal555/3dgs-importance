@@ -16,67 +16,92 @@
 ## 路线一：MaskGaussian 重要性先验 + 分离式资源分配
 
 ```mermaid
-flowchart TB
-    subgraph OFF[阶段 A：离线获得重要性]
-        A0[原始多视角图像<br/>相机参数与初始点云] --> A1[训练 MaskGaussian]
-        A1 --> A2[紧凑 Gaussian 场景 G]
-        A1 --> A3[存在概率 p_exist]
-        A3 --> A4[冻结重要性<br/>通信训练不更新 p_exist]
+flowchart LR
+    subgraph S1[① 离线重要性学习]
+        direction TB
+        A0[多视角图像<br/>相机参数与初始点云]
+        A1[MaskGaussian 训练]
+        A2[紧凑 Gaussian 场景 G<br/>存在概率 p_exist]
+        A3[[冻结 p_exist<br/>不受后续信道反向影响]]
+        A0 --> A1 --> A2 --> A3
     end
 
-    subgraph RATE[阶段 B：资源档位分配]
-        A4 --> B1{分档方式}
-        B0[SNR γ<br/>总预算 B] --> B1
-        B1 -->|基线版本| B2[按 p_exist 排序<br/>人工阈值/比例分档]
-        B1 -->|增强版本| B3[轻量 Rate Allocator<br/>输入 p_exist, γ, B]
-        B2 --> B4[档位 q_i 与符号数 k_i]
-        B3 --> B4
+    subgraph S2[② 信道感知码率分配]
+        direction TB
+        B0[当前 SNR γ<br/>总资源预算 B]
+        B1[轻量 Rate Allocator]
+        B2[每个 Gaussian 的档位 q_i<br/>0:不传 · 1:低 · 2:中 · 3:高]
+        B3[符号预算 k_i]
+        B0 --> B1 --> B2 --> B3
     end
 
-    subgraph ENC[阶段 C：上下文感知 JSCC 编码]
-        A2 --> C1[q_i=0 的 Gaussian 不发送]
-        B4 --> C1
-        C1 --> C2[Morton/Hilbert 排序<br/>固定数量局部分块]
-        C2 --> C3[局部 Gaussian Transformer<br/>消除空间与属性冗余]
-        C3 --> C4[上下文特征 h_i]
-        C4 --> C5[码率与 SNR 条件化<br/>JSCC Channel Mapper]
-        B4 --> C5
-        B0 --> C5
-        C5 --> C6[k_i 个连续信道符号 z_i<br/>功率归一化]
+    subgraph S3[③ 上下文感知源表征]
+        direction TB
+        C0[q_i=0：删除/不发送<br/>q_i>0：进入编码]
+        C1[Morton/Hilbert 排序<br/>固定数量局部分块]
+        C2[局部 Gaussian Transformer]
+        C3[上下文潜在特征 h_i<br/>消除空间与属性冗余]
+        C0 --> C1 --> C2 --> C3
     end
 
-    subgraph CHANNEL[阶段 D：信道与接收端]
-        C6 --> D1[AWGN / Rayleigh 信道]
-        D1 --> D2[码率与 SNR 条件化<br/>JSCC Decoder]
-        D2 --> D3[局部上下文重建]
-        D3 --> D4[恢复 Gaussian 场景 G_hat]
-        D4 --> D5[3DGS 可微渲染]
-        D5 --> D6[渲染失真 D_render<br/>+ 资源代价 βΣk_i]
+    subgraph S4[④ 可变码率 JSCC]
+        direction TB
+        D0[条件化 JSCC Encoder<br/>输入 h_i, k_i, γ]
+        D1[k_i 个连续信道符号 z_i<br/>功率归一化]
+        D2[[信息表达与抗噪保护<br/>由 JSCC 隐式联合学习]]
+        D0 --> D1 --> D2
     end
 
-    D6 -.训练通信模块.-> C5
-    D6 -.训练上下文表征.-> C3
-    D6 -.仅增强版本可更新.-> B3
-    D6 -.不回传到冻结概率.-> A4
+    subgraph S5[⑤ 信道与接收端]
+        direction TB
+        E0[AWGN / Rayleigh 信道]
+        E1[条件化 JSCC Decoder]
+        E2[局部上下文重建]
+        E3[恢复 Gaussian 场景 G_hat]
+        E0 --> E1 --> E2 --> E3
+    end
 
-    classDef source fill:#E8F1FF,stroke:#3B6FB6,color:#14213D;
-    classDef rate fill:#FFF3D6,stroke:#C58A00,color:#4B3500;
-    classDef model fill:#E8F8EF,stroke:#27864D,color:#123B22;
-    classDef channel fill:#F2EAFE,stroke:#7C4DAD,color:#2D1744;
-    classDef loss fill:#FFE8E8,stroke:#B84242,color:#4A1616;
-    class A0,A1,A2,A3,A4 source;
-    class B0,B1,B2,B3,B4 rate;
-    class C1,C2,C3,C4,C5,C6,D2,D3,D4 model;
-    class D1 channel;
-    class D5,D6 loss;
+    subgraph S6[⑥ 渲染监督]
+        direction TB
+        F0[3DGS 可微渲染]
+        F1[率失真目标<br/>L = D_render + βΣk_i]
+        F0 --> F1
+    end
+
+    A3 --> B1
+    A2 --> C0
+    B2 --> C0
+    B3 --> D0
+    B0 --> D0
+    C3 --> D0
+    D2 --> E0
+    E3 --> F0
+
+    F1 -.反向更新.-> E1
+    F1 -.反向更新.-> D0
+    F1 -.反向更新.-> C2
+    F1 -.反向更新.-> B1
+    F1 -.梯度在此截止.-> A3
+
+    classDef source fill:#EAF2FF,stroke:#3569B7,color:#14213D,stroke-width:1.5px;
+    classDef rate fill:#FFF4D8,stroke:#C68A00,color:#4A3400,stroke-width:1.5px;
+    classDef context fill:#E9F8EF,stroke:#27864D,color:#123B22,stroke-width:1.5px;
+    classDef jscc fill:#EDE9FE,stroke:#7650B5,color:#2D1744,stroke-width:1.5px;
+    classDef channel fill:#E8F7FA,stroke:#258092,color:#12383F,stroke-width:1.5px;
+    classDef loss fill:#FFE9E9,stroke:#B84242,color:#4A1616,stroke-width:1.5px;
+    class A0,A1,A2,A3 source;
+    class B0,B1,B2,B3 rate;
+    class C0,C1,C2,C3 context;
+    class D0,D1,D2 jscc;
+    class E0,E1,E2,E3 channel;
+    class F0,F1 loss;
 ```
 
 ### 路线一的梯度边界
 
 ```text
-固定分档版本：D_render → JSCC/上下文编码器
-轻量分档版本：D_render → JSCC/上下文编码器/Rate Allocator
-两种版本均不更新已经训练完成的 MaskGaussian p_exist
+D_render → JSCC Decoder/Encoder → Gaussian Transformer → Rate Allocator
+梯度在冻结的 p_exist 处截止，不更新已经训练完成的 MaskGaussian
 ```
 
 路线一回答的是：**如何把已有的“存在必要性”转化为通信资源，并在给定资源内完成抗噪传输。**
@@ -172,7 +197,7 @@ flowchart LR
     C1 --> O1[恢复场景与渲染结果]
     C2 --> O2[恢复场景与渲染结果]
 
-    P1[主要变量：<br/>p_exist → q_i 的固定/轻量映射] -.决定.-> R1
+    P1[主要变量：<br/>p_exist, γ, B → Rate Allocator → q_i] -.决定.-> R1
     P2[主要变量：<br/>h_i, γ, B → π_i → q_i] -.决定.-> R2
 
     classDef shared fill:#E8F8EF,stroke:#27864D,color:#123B22;
@@ -190,7 +215,7 @@ flowchart LR
 | 项目 | 路线一 | 路线二 |
 |---|---|---|
 | 重要性来源 | 已训练完成的 MaskGaussian $p_i^{exist}$ | 上下文特征、SNR、预算；可选使用 $p_i^{exist}$ 作为先验 |
-| 档位产生方式 | 人工排序/阈值，或轻量映射网络 | 可微离散策略网络端到端学习 |
+| 档位产生方式 | 轻量 Rate Allocator 根据冻结的 $p_i^{exist}$、SNR 和预算分档 | 可微离散策略网络端到端学习 |
 | 信道是否改变原始重要性 | 不改变 $p_i^{exist}$ | 可以改变最终档位 $q_i$ |
 | 上下文 Transformer 的职责 | 提取待传内容、消除源冗余 | 同时支撑内容编码与档位决策 |
 | JSCC 的职责 | 在既定 $k_i$ 内隐式平衡信息与保护 | 在联合学习的 $k_i$ 内隐式平衡信息与保护 |
