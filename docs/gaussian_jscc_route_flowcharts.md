@@ -17,65 +17,52 @@
 
 ```mermaid
 flowchart LR
-    subgraph S1[① 离线重要性学习]
+    subgraph S1[① 重要性先验与资源决策]
         direction TB
         A0[多视角图像<br/>相机参数与初始点云]
         A1[MaskGaussian 训练]
-        A2[紧凑 Gaussian 场景 G<br/>存在概率 p_exist]
-        A3[[冻结 p_exist<br/>不受后续信道反向影响]]
-        A0 --> A1 --> A2 --> A3
-    end
-
-    subgraph S2[② 信道感知码率分配]
-        direction TB
+        A2[紧凑 Gaussian 场景 G]
+        A3[[冻结存在概率 p_exist]]
         B0[当前 SNR γ<br/>总资源预算 B]
-        B1[轻量 Rate Allocator]
-        B2[每个 Gaussian 的档位 q_i<br/>0:不传 · 1:低 · 2:中 · 3:高]
-        B3[符号预算 k_i]
-        B0 --> B1 --> B2 --> B3
+        B1[信道感知 Rate Allocator<br/>输入 p_exist, γ, B]
+        B2[资源决策<br/>档位 q_i 与符号数 k_i]
+        A0 --> A1
+        A1 --> A2
+        A1 --> A3
+        A3 --> B1
+        B0 --> B1 --> B2
     end
 
-    subgraph S3[③ 上下文感知源表征]
+    subgraph S2[② 上下文表征与 JSCC 编码]
         direction TB
         C0[q_i=0：删除/不发送<br/>q_i>0：进入编码]
         C1[Morton/Hilbert 排序<br/>固定数量局部分块]
         C2[局部 Gaussian Transformer]
         C3[上下文潜在特征 h_i<br/>消除空间与属性冗余]
-        C0 --> C1 --> C2 --> C3
-    end
-
-    subgraph S4[④ 可变码率 JSCC]
-        direction TB
         D0[条件化 JSCC Encoder<br/>输入 h_i, k_i, γ]
         D1[k_i 个连续信道符号 z_i<br/>功率归一化]
         D2[[信息表达与抗噪保护<br/>由 JSCC 隐式联合学习]]
+        C0 --> C1 --> C2 --> C3
         D0 --> D1 --> D2
+        C3 --> D0
     end
 
-    subgraph S5[⑤ 信道与接收端]
+    subgraph S3[③ 信道、恢复与渲染监督]
         direction TB
         E0[AWGN / Rayleigh 信道]
         E1[条件化 JSCC Decoder]
         E2[局部上下文重建]
         E3[恢复 Gaussian 场景 G_hat]
-        E0 --> E1 --> E2 --> E3
-    end
-
-    subgraph S6[⑥ 渲染监督]
-        direction TB
         F0[3DGS 可微渲染]
         F1[率失真目标<br/>L = D_render + βΣk_i]
-        F0 --> F1
+        E0 --> E1 --> E2 --> E3 --> F0 --> F1
     end
 
-    A3 --> B1
     A2 --> C0
     B2 --> C0
-    B3 --> D0
+    B2 --> D0
     B0 --> D0
-    C3 --> D0
     D2 --> E0
-    E3 --> F0
 
     F1 -.反向更新.-> E1
     F1 -.反向更新.-> D0
@@ -90,7 +77,7 @@ flowchart LR
     classDef channel fill:#E8F7FA,stroke:#258092,color:#12383F,stroke-width:1.5px;
     classDef loss fill:#FFE9E9,stroke:#B84242,color:#4A1616,stroke-width:1.5px;
     class A0,A1,A2,A3 source;
-    class B0,B1,B2,B3 rate;
+    class B0,B1,B2 rate;
     class C0,C1,C2,C3 context;
     class D0,D1,D2 jscc;
     class E0,E1,E2,E3 channel;
