@@ -16,59 +16,70 @@
 ## 路线一：MaskGaussian 重要性先验 + 分离式资源分配
 
 ```mermaid
-flowchart LR
-    subgraph S1[① 重要性先验与资源决策]
-        direction TB
-        A0[多视角图像<br/>相机参数与初始点云]
-        A1[MaskGaussian 训练]
-        A2[紧凑 Gaussian 场景 G]
-        A3[[冻结存在概率 p_exist]]
-        B0[当前 SNR γ<br/>总资源预算 B]
-        B1[信道感知 Rate Allocator<br/>输入 p_exist, γ, B]
-        B2[资源决策<br/>档位 q_i 与符号数 k_i]
-        A0 --> A1
-        A1 --> A2
-        A1 --> A3
-        A3 --> B1
-        B0 --> B1 --> B2
+flowchart TB
+    subgraph S1[① 离线获得固定的重要性先验]
+        direction LR
+        A0[多视角图像、相机参数<br/>与初始点云] --> A1[MaskGaussian 场景训练]
+        A1 --> A2[紧凑 Gaussian 场景 G]
+        A1 --> A3[存在概率 p_i^exist]
+        A3 --> A4[[冻结 p_i^exist<br/>通信训练不再更新]]
     end
 
-    subgraph S2[② 上下文表征与 JSCC 编码]
-        direction TB
-        C0[q_i=0：删除/不发送<br/>q_i>0：进入编码]
-        C1[Morton/Hilbert 排序<br/>固定数量局部分块]
-        C2[局部 Gaussian Transformer]
-        C3[上下文潜在特征 h_i<br/>消除空间与属性冗余]
-        D0[条件化 JSCC Encoder<br/>输入 h_i, k_i, γ]
-        D1[k_i 个连续信道符号 z_i<br/>功率归一化]
-        D2[[信息表达与抗噪保护<br/>由 JSCC 隐式联合学习]]
-        C0 --> C1 --> C2 --> C3
-        D0 --> D1 --> D2
-        C3 --> D0
+    subgraph S2[② 信道感知的 Gaussian 级资源分配]
+        direction LR
+        B0[冻结概率 p_i^exist] --> B3[轻量 Rate Allocator]
+        B1[当前 SNR γ] --> B3
+        B2[总资源预算 B] --> B3
+        B3 --> B4[档位概率 ρ_i^0...ρ_i^3]
+        B4 --> B5[训练：可微档位选择<br/>推理：硬档位选择]
+        B5 --> B6[档位 q_i ∈ {0,1,2,3}<br/>符号预算 k_i]
+        B6 --> B7[预算约束/投影<br/>Σ_i k_i ≤ B]
     end
 
-    subgraph S3[③ 信道、恢复与渲染监督]
-        direction TB
-        E0[AWGN / Rayleigh 信道]
-        E1[条件化 JSCC Decoder]
-        E2[局部上下文重建]
-        E3[恢复 Gaussian 场景 G_hat]
-        F0[3DGS 可微渲染]
-        F1[率失真目标<br/>L = D_render + βΣk_i]
-        E0 --> E1 --> E2 --> E3 --> F0 --> F1
+    subgraph S3[③ 上下文感知的源表征与可变码率 JSCC 编码]
+        direction LR
+        C0[Gaussian G_i<br/>及资源档位 q_i] --> C1[q_i=0：不发送<br/>q_i>0：进入编码]
+        C1 --> C2[Morton/Hilbert 排序<br/>固定数量局部分块]
+        C2 --> C3[局部 Gaussian Transformer<br/>建模空间与属性相关性]
+        C3 --> C4[上下文潜在特征 h_i]
+        C4 --> C5[条件化 JSCC Encoder<br/>输入 h_i, k_i, γ]
+        C5 --> C6[k_i 个连续信道符号 z_i<br/>功率归一化]
+        C6 --> C7[[信息表达与抗噪保护<br/>由 JSCC 隐式联合学习]]
     end
 
+    subgraph S4[④ 控制信息、信道与接收端重建]
+        direction LR
+        D0[控制信息<br/>分块索引、档位 q_i、有效长度] --> D3[条件化 JSCC Decoder]
+        D1[连续符号 z_i] --> D2[AWGN / Rayleigh 信道]
+        D2 --> D3
+        D3 --> D4[恢复上下文特征 h_hat_i]
+        D4 --> D5[局部 Context Decoder<br/>重建 Gaussian 属性]
+        D5 --> D6[恢复场景 G_hat<br/>q_i=0 的 Gaussian 保持缺省]
+    end
+
+    subgraph S5[⑤ 渲染监督与通信链路端到端优化]
+        direction LR
+        E0[恢复场景 G_hat] --> E1[3DGS 可微渲染]
+        E1 --> E2[渲染失真 D_render<br/>L1 / SSIM，可选 LPIPS]
+        E2 --> E3[总目标 L<br/>D_render + βΣ_i k_i]
+        E4[功率约束与预算约束] --> E3
+    end
+
+    A4 --> B0
     A2 --> C0
-    B2 --> C0
-    B2 --> D0
-    B0 --> D0
-    D2 --> E0
+    B7 --> C0
+    B6 --> C5
+    B1 --> C5
+    B6 -.可靠控制头或共享规则.-> D0
+    C2 -.分块索引.-> D0
+    C7 --> D1
+    D6 --> E0
 
-    F1 -.反向更新.-> E1
-    F1 -.反向更新.-> D0
-    F1 -.反向更新.-> C2
-    F1 -.反向更新.-> B1
-    F1 -.梯度在此截止.-> A3
+    E3 -.反向更新.-> D3
+    E3 -.反向更新.-> C5
+    E3 -.反向更新.-> C3
+    E3 -.反向更新.-> B3
+    E3 -.梯度截止.-> A4
 
     classDef source fill:#EAF2FF,stroke:#3569B7,color:#14213D,stroke-width:1.5px;
     classDef rate fill:#FFF4D8,stroke:#C68A00,color:#4A3400,stroke-width:1.5px;
@@ -76,12 +87,12 @@ flowchart LR
     classDef jscc fill:#EDE9FE,stroke:#7650B5,color:#2D1744,stroke-width:1.5px;
     classDef channel fill:#E8F7FA,stroke:#258092,color:#12383F,stroke-width:1.5px;
     classDef loss fill:#FFE9E9,stroke:#B84242,color:#4A1616,stroke-width:1.5px;
-    class A0,A1,A2,A3 source;
-    class B0,B1,B2 rate;
-    class C0,C1,C2,C3 context;
-    class D0,D1,D2 jscc;
-    class E0,E1,E2,E3 channel;
-    class F0,F1 loss;
+    class A0,A1,A2,A3,A4 source;
+    class B0,B1,B2,B3,B4,B5,B6,B7 rate;
+    class C0,C1,C2,C3,C4 context;
+    class C5,C6,C7 jscc;
+    class D0,D1,D2,D3,D4,D5,D6 channel;
+    class E0,E1,E2,E3,E4 loss;
 ```
 
 ### 路线一的梯度边界
