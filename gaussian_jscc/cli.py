@@ -3,16 +3,18 @@
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.checkpoint import checkpoint
+from torch.nn.utils.rnn import pad_sequence
 
 from .codec import CodecConfig, GaussianCodec
 from .data import (attribute_loss, load_tiers, prepare, read_ply, to_features,
                    to_raw, write_ply)
 from .transport import load_checkpoint, receive, save_checkpoint, transmit
+from .training import full_scene_step
 
 
 def device_for(name):
@@ -47,6 +49,8 @@ def train(args):
         raise ValueError("attribute-drop must be in [0,1)")
     if args.render_steps and (not args.source or not args.device.startswith("cuda")):
         raise ValueError("render training requires --source and CUDA")
+    if args.blocks_per_batch < 1 or args.profile_every < 0:
+        raise ValueError("blocks-per-batch must be positive; profile-every must be nonnegative")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     device = device_for(args.device)
@@ -73,6 +77,25 @@ def train(args):
     starts = list(range(0, len(raw), model.cfg.block_size))
     if fixed_q is not None:
         starts = [s for s in starts if (fixed_q[s:s + model.cfg.block_size] > 0).any()]
+    # Frozen source attributes/statistics: normalize once, not on every step.
+    # Only source inputs are cached; learned context and decoded xyz are recomputed.
+    cache_device = device if args.training_data_device == "cuda" else torch.device("cpu")
+    feature_blocks, tier_blocks = [], []
+    with torch.no_grad():
+        for start in starts:
+            rb = raw[start:start + model.cfg.block_size].to(device)
+            f, _ = to_features(rb, geometry, model)
+            feature_blocks.append(f.to(cache_device))
+            tier_blocks.append(None if fixed_q is None else
+                               fixed_q[start:start + len(rb)].to(cache_device))
+    # A batch never changes packet boundaries. The short final block is padded
+    # with q0 slots which are excluded from context, power, losses and rendering.
+    render_groups = [pad_sequence(feature_blocks[i:i + args.blocks_per_batch], batch_first=True)
+                     for i in range(0, len(feature_blocks), args.blocks_per_batch)] if args.render_steps else []
+    if args.init:
+        print("Loaded codec weights; Adam state and step schedule start fresh (--init is not exact resume).")
+    print(f"Training cache: {cache_device}; render blocks/batch: {args.blocks_per_batch}; "
+          f"backward: {args.render_backward}")
     cameras = None
     if args.render_steps:
         from .rendering import load_cameras
@@ -83,70 +106,63 @@ def train(args):
     progress = trange(args.steps + args.render_steps, desc="Gaussian JSCC training")
     with (out / "loss.jsonl").open("w", encoding="utf-8") as log:
         for step in progress:
+            step_started = time.perf_counter()
             snr = random.uniform(*args.snr_range)
             optimizer.zero_grad(set_to_none=True)
             is_render = step >= args.steps
             if not is_render:
-                start = random.choice(starts)
-                rb = raw[start:start + model.cfg.block_size].to(device)
-                qb = (fixed_q[start:start + len(rb)].to(device) if fixed_q is not None
-                      else sample_tiers(len(rb), device, drop=args.attribute_drop))
+                index = random.randrange(len(feature_blocks))
+                features = feature_blocks[index].to(device)
+                qb = (tier_blocks[index].to(device) if fixed_q is not None
+                      else sample_tiers(len(features), device, drop=args.attribute_drop))
                 keep = qb > 0
                 if not keep.any():
                     qb[0] = 1
                     keep = qb > 0
-                rb, qb = rb[keep], qb[keep]
-                features, unit = to_features(rb, geometry, model)
+                features, qb = features[keep], qb[keep]
+                unit = features[:, :3]
                 pred, seed = model(features, unit, qb, snr, args.channel, return_seed=True)
                 loss = attribute_loss(pred, features) + args.seed_position_weight * torch.nn.functional.smooth_l1_loss(
                     seed, features[:, :3])
                 image_loss = None
+                render_values = {}
             else:
                 from .rendering import render
                 from utils.loss_utils import ssim
 
-                # Render the COMPLETE received scene. Checkpoint each spatial block
-                # so its context activations are recomputed during backpropagation.
-                rows, aux_losses = [], []
-                total_kept = 0
-                for start in starts:
-                    rb = raw[start:start + model.cfg.block_size].to(device)
-                    qb = (fixed_q[start:start + len(rb)].to(device) if fixed_q is not None
-                          else sample_tiers(len(rb), device))
-                    keep = qb > 0
-                    if not keep.any():
-                        continue
-                    rb, qb = rb[keep], qb[keep]
-                    features, unit = to_features(rb, geometry, model)
-                    # Pass SNR/channel as bound defaults, not loop-captured tensors.
-                    def forward(f, u, q, gamma=snr, kind=args.channel):
-                        return model(f, u, q, gamma, kind, return_seed=True)
-                    pred, seed = checkpoint(forward, features, unit, qb, use_reentrant=False,
-                                            preserve_rng_state=True)
-                    rows.append(to_raw(pred, geometry, model))
-                    block_loss = attribute_loss(pred, features) + args.seed_position_weight * torch.nn.functional.smooth_l1_loss(
-                        seed, features[:, :3])
-                    aux_losses.append(block_loss * len(rb))
-                    total_kept += len(rb)
-                reconstructed = torch.cat(rows)
                 camera = random.choice(cameras)
-                image = render(reconstructed, camera, degree, args.white_background)
                 gt = camera.original_image[:3].to(device)
-                image_loss = .8 * (image - gt).abs().mean() + .2 * (1 - ssim(image, gt))
-                loss = image_loss + args.attr_weight * torch.stack(aux_losses).sum() / total_kept
+                def distortion(scene):
+                    image = render(scene, camera, degree, args.white_background)
+                    return .8 * (image - gt).abs().mean() + .2 * (1 - ssim(image, gt))
+                batches = []
+                for group_index, f in enumerate(render_groups):
+                    begin = group_index * args.blocks_per_batch
+                    qs = [tier_blocks[i] if fixed_q is not None else
+                          sample_tiers(len(feature_blocks[i]), cache_device)
+                          for i in range(begin, min(begin + args.blocks_per_batch, len(feature_blocks)))]
+                    batches.append((f, pad_sequence(qs, batch_first=True)))
+                profiled = bool(args.profile_every and (step - args.steps) % args.profile_every == 0)
+                loss, render_values = full_scene_step(
+                    model, batches, geometry, snr, args.channel, distortion,
+                    args.attr_weight, args.seed_position_weight, args.render_backward, profiled)
+                image_loss = render_values["render_loss"]
             if not torch.isfinite(loss):
                 raise RuntimeError("nonfinite training loss; no checkpoint saved for this step")
-            loss.backward()
+            if not is_render:
+                loss.backward()
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
             optimizer.step()
             values = {"step": step + 1, "phase": "render" if is_render else "attribute",
-                      "loss": float(loss.detach()), "snr": snr, "grad_norm": float(norm)}
+                      "loss": float(loss.detach()), "snr": snr, "grad_norm": float(norm),
+                      "step_seconds": time.perf_counter() - step_started, **render_values}
             if image_loss is not None:
-                values["render_loss"] = float(image_loss.detach())
+                values["render_loss"] = float(image_loss)
             log.write(json.dumps(values) + "\n")
-            if (step + 1) % 10 == 0:
+            if is_render or (step + 1) % 10 == 0:
                 log.flush()
-                progress.set_postfix(loss=f"{values['loss']:.5f}", phase=values["phase"])
+                progress.set_postfix(loss=f"{values['loss']:.5f}", phase=values["phase"],
+                                     sec=f"{values['step_seconds']:.2f}")
             if (step + 1) % args.save_every == 0:
                 save_checkpoint(out / f"codec_{step + 1}.pt", model, step + 1, record)
         save_checkpoint(out / "codec.pt", model, args.steps + args.render_steps, record)
@@ -249,6 +265,14 @@ def main():
     p.add_argument("--init", help="initialize from shared codec; architecture/statistics stay fixed")
     p.add_argument("--steps", type=int, default=20000, help="attribute training steps")
     p.add_argument("--render-steps", type=int, default=0, help="subsequent full-scene rendering steps")
+    p.add_argument("--blocks-per-batch", type=int, default=4,
+                   help="independent spatial blocks processed together during full-scene render training")
+    p.add_argument("--render-backward", choices=["replay", "checkpoint"], default="replay",
+                   help="exact full-scene gradient replay (bounded codec memory) or checkpoint reference")
+    p.add_argument("--training-data-device", choices=["cpu", "cuda"], default="cuda",
+                   help="cache fixed normalized source features; cuda uses the selected --device")
+    p.add_argument("--profile-every", type=int, default=10,
+                   help="synchronize and record render phase timings/peak memory every N steps; 0 disables")
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--attr-weight", type=float, default=.1)

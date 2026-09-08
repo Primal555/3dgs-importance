@@ -2,6 +2,10 @@
 
 ## Gaussian JSCC codec extension
 
+Full-scene codec training now supports vectorized spatial contexts, independent
+block batches, and exact gradient replay. See [training performance and continuation](docs/training_performance.md)
+for `benchmark_training.py`, timing fields, and reuse of existing codec checkpoints.
+
 The local-context Gaussian JSCC implementation, training commands, receiver-only decoding,
 and multi-SNR evaluation guide are documented in [docs/gaussian_jscc.md](docs/gaussian_jscc.md).
 Joint optimization of four-way per-Gaussian masks and the codec is described in

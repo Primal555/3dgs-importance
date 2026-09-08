@@ -123,37 +123,69 @@ class GridContext(nn.Module):
         self.levels = levels
         self.axes = [(0, 1, 2)] + ([(0, 1), (0, 2), (1, 2)] if planes else [])
         self.output_dim = dim * len(levels) * len(self.axes)
+        # Nonpersistent buffers preserve compatibility with existing codec.pt files.
+        for dimensions in (2, 3):
+            self.register_buffer(f"corners_{dimensions}",
+                                 torch.tensor(list(product((0, 1), repeat=dimensions))),
+                                 persistent=False)
 
-    def forward(self, h, xyz, active=None):
-        f = self.project(h)
+    def geometry_plan(self, xyz, active=None):
+        """Reusable encoder interpolation plan; never cache predicted decoder xyz.
+
+        Mask-dependent weights retain their graph for joint four-tier training.
+        Plans are local to a forward call, so changing choices cannot make them stale.
+        """
+        single = xyz.ndim == 2
+        if single:
+            xyz = xyz[None]
+            active = None if active is None else active[None]
         with torch.no_grad():
-            retained = xyz if active is None else xyz[active.detach() > .5]
-            if len(retained) == 0:
-                retained = xyz
-            lower = retained.amin(0)
-            span = (retained.amax(0) - lower).clamp_min(1e-8)
+            if active is None:
+                lower, upper = xyz.amin(1, keepdim=True), xyz.amax(1, keepdim=True)
+            else:
+                retained = active.detach() > .5
+                retained = retained | ~retained.any(1, keepdim=True)
+                lower = xyz.masked_fill(~retained[..., None], float("inf")).amin(1, keepdim=True)
+                upper = xyz.masked_fill(~retained[..., None], -float("inf")).amax(1, keepdim=True)
+            span = (upper - lower).clamp_min(1e-8)
         unit = ((xyz - lower) / span).clamp(0, 1)
-        contexts = []
+        batches = len(xyz)
+        plan = []
         for axes in self.axes:
+            corners = getattr(self, f"corners_{len(axes)}")
             for resolution in self.levels:
-                p = unit[:, list(axes)] * (resolution - 1)
+                p = unit[..., list(axes)] * (resolution - 1)
                 base = p.floor().long().clamp(max=resolution - 2)
                 frac = p - base
-                grid = f.new_zeros((resolution ** len(axes), f.shape[1]))
-                mass = f.new_zeros((len(grid), 1))
-                corners = []
-                for corner in product((0, 1), repeat=len(axes)):
-                    c = torch.tensor(corner, device=h.device)
-                    weight = torch.where(c.bool(), frac, 1 - frac).prod(-1, keepdim=True)
-                    contribution = weight if active is None else weight * active[:, None]
-                    vertex = base + c
-                    index = sum(vertex[:, d] * resolution ** d for d in range(len(axes)))
-                    grid = grid.index_add(0, index, f * contribution)
-                    mass = mass.index_add(0, index, contribution)
-                    corners.append((index, weight))
-                grid = grid / mass.clamp_min(1e-8)
-                contexts.append(sum(grid[index] * weight for index, weight in corners))
-        return torch.cat(contexts, -1)
+                weight = torch.where(corners.bool(), frac[..., None, :],
+                                     1 - frac[..., None, :]).prod(-1)
+                contribution = weight if active is None else weight * active[..., None]
+                vertex = base[..., None, :] + corners
+                index = sum(vertex[..., d] * resolution ** d for d in range(len(axes)))
+                vertices = resolution ** len(axes)
+                index = index + torch.arange(batches, device=xyz.device)[:, None, None] * vertices
+                plan.append((index, weight, contribution, batches * vertices))
+        return plan
+
+    def forward(self, h, xyz, active=None, plan=None):
+        single = h.ndim == 2
+        if plan is None:
+            plan = self.geometry_plan(xyz, active)
+        if single:
+            h = h[None]
+        f = self.project(h)
+        dim = f.shape[-1]
+        contexts = []
+        for index, weight, contribution, cells in plan:
+            # Accumulate features AND mass in one scatter, for all corners/blocks.
+            values = torch.cat((f[..., None, :] * contribution[..., None],
+                                contribution[..., None]), -1)
+            accumulated = f.new_zeros((cells, dim + 1)).index_add(
+                0, index.reshape(-1), values.reshape(-1, dim + 1))
+            grid = accumulated[:, :dim] / accumulated[:, dim:].clamp_min(1e-8)
+            contexts.append((grid[index] * weight[..., None]).sum(-2))
+        result = torch.cat(contexts, -1)
+        return result[0] if single else result
 
 
 class ContextBlock(nn.Module):
@@ -165,9 +197,9 @@ class ContextBlock(nn.Module):
                                   nn.GELU(), nn.Linear(cfg.hidden, cfg.hidden))
         self.gate = nn.Sequential(nn.Linear(cfg.hidden, cfg.hidden), nn.Sigmoid())
 
-    def forward(self, h, xyz, condition, active=None):
+    def forward(self, h, xyz, condition, active=None, plan=None):
         x = self.norm(h)
-        return h + self.gate(condition) * self.fuse(torch.cat((x, self.grid(x, xyz, active)), -1))
+        return h + self.gate(condition) * self.fuse(torch.cat((x, self.grid(x, xyz, active, plan)), -1))
 
 
 class GaussianCodec(nn.Module):
@@ -208,8 +240,9 @@ class GaussianCodec(nn.Module):
             raise ValueError("remove tier-0 Gaussians before building context")
         condition = self.encoder_conditioning(xyz, q, snr)
         h = self.enc_in(features) + condition
+        plan = self.enc_blocks[0].grid.geometry_plan(xyz)
         for block in self.enc_blocks:
-            h = block(h, xyz, condition)
+            h = block(h, xyz, condition, plan=plan)
         return normalize_power(pack(self.enc_out(h), q, self.cfg.rates))
 
     def decode(self, symbols, q, snr, return_seed=False):
@@ -245,21 +278,35 @@ class GaussianCodec(nn.Module):
         """
         if choices.shape != (len(features), 4):
             raise ValueError("choices must have shape [N,4]")
+        return tuple(x[0] for x in self.forward_tier_batches(
+            features[None], xyz[None], choices[None], snr, kind))
+
+    def forward_tier_batches(self, features, xyz, choices, snr, kind="awgn"):
+        """Independent padded blocks [B,N,D]; q0 slots do not enter context/power.
+
+        Each block has its OWN grid bounds and average symbol energy. This is
+        not equivalent to concatenating blocks into a larger codec packet.
+        Choices may be hard one-hots or straight-through Gumbel choices.
+        """
+        if choices.shape != (*features.shape[:2], 4) or features.ndim != 3:
+            raise ValueError("batched choices must have shape [B,N,4]")
         table = prefix_mask(torch.arange(4, device=features.device), self.cfg.rates).to(features.dtype)
         mask = choices @ table
-        active = choices[:, 1:].sum(-1)
+        active = choices[..., 1:].sum(-1)
         embedding = choices @ self.tier_emb.weight
-        snr_col = features.new_full((len(features), 1), float(snr) / 20)
+        snr_col = features.new_full((*features.shape[:2], 1), float(snr) / 20)
         condition = embedding + self.enc_condition(torch.cat((xyz * 2 - 1, snr_col), -1))
         h = self.enc_in(features) + condition
+        plan = self.enc_blocks[0].grid.geometry_plan(xyz, active)
         for block in self.enc_blocks:
-            h = block(h, xyz, condition, active)
+            h = block(h, xyz, condition, active, plan=plan)
         latent = self.enc_out(h)
-        energy = (latent.square() * mask).sum() / (mask.sum() / 2).clamp_min(1.)
+        energy = (latent.square() * mask).sum((1, 2), keepdim=True) / (
+            mask.sum((1, 2), keepdim=True) / 2).clamp_min(1.)
         # All-dropped packets have no transmitted energy. A finite training-only
         # normalization keeps counterfactual ST derivatives from exploding.
-        if not (active.detach() > .5).any():
-            energy = latent.detach().square().sum(-1).mean().clamp_min(1e-4)
+        fallback = latent.detach().square().sum(-1).mean(-1)[:, None, None].clamp_min(1e-4)
+        energy = torch.where((active.detach() > .5).any(-1)[:, None, None], energy, fallback)
         normalized = latent / energy.clamp_min(1e-12).sqrt()
         received = channel(normalized.reshape(-1, 2), snr, kind).reshape_as(latent) * mask
         condition = embedding + self.dec_condition(snr_col)
