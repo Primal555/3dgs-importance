@@ -81,6 +81,16 @@ def evaluate_views(raw, reference, cameras, degree, white_background, directory=
             row[name + "_ssim"] = float(ssim(image, gt))
             if perceptual is not None:
                 row[name + "_lpips"] = float(perceptual(image[None] * 2 - 1, gt[None] * 2 - 1))
+        codec_mse = (received - baseline).square().mean().clamp_min(1e-12)
+        row["received_vs_reference_psnr"] = float(-10 * codec_mse.log10())
+        row["received_vs_reference_ssim"] = float(ssim(received, baseline))
+        row["received_vs_reference_l1"] = float((received - baseline).abs().mean())
+        row["psnr_delta_received_minus_reference"] = row["received_psnr"] - row["reference_psnr"]
+        row["ssim_delta_received_minus_reference"] = row["received_ssim"] - row["reference_ssim"]
+        if perceptual is not None:
+            row["received_vs_reference_lpips"] = float(
+                perceptual(received[None] * 2 - 1, baseline[None] * 2 - 1))
+            row["lpips_delta_received_minus_reference"] = row["received_lpips"] - row["reference_lpips"]
         rows.append(row)
         if directory:
             comparison = torch.cat((gt, baseline, received), dim=2)

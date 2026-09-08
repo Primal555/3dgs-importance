@@ -232,7 +232,14 @@ def plot_evaluation(evaluation_dir, output_dir=None):
         row = {"series": series, "snr_db": snr, "trials": len(group)}
         for key in ("received_psnr", "received_ssim", "received_lpips",
                     "reference_psnr", "reference_ssim", "reference_lpips",
-                    "total_uses_per_source_gaussian", "position_rmse", "attribute_mse"):
+                    "received_vs_reference_psnr", "received_vs_reference_ssim",
+                    "received_vs_reference_lpips", "received_vs_reference_l1",
+                    "psnr_delta_received_minus_reference", "ssim_delta_received_minus_reference",
+                    "lpips_delta_received_minus_reference", "total_uses_per_source_gaussian",
+                    "position_rmse", "attribute_mse", "position_nrmse_bbox_diagonal",
+                    "opacity_alpha_mae", "log_scale_rmse", "rotation_angle_mean_deg",
+                    "rotation_angle_p95_deg", "dc_rmse", "sh_rest_rmse",
+                    "all_parameter_rmse"):
             row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
         for key in ("payload_complex_symbols", "metadata_channel_uses", "total_channel_uses"):
             row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
@@ -279,6 +286,33 @@ def plot_evaluation(evaluation_dir, output_dir=None):
             axis.set_ylabel(label)
             axis.legend()
         charts += _finish(fig, out / "quality_vs_snr")
+
+    direct = (("received_vs_reference_psnr", "Codec render PSNR (dB)"),
+              ("received_vs_reference_ssim", "Codec render SSIM"),
+              ("received_vs_reference_l1", "Codec render L1 (lower is better)"),
+              ("received_vs_reference_lpips", "Codec render LPIPS (lower is better)"))
+    direct = [(key, label) for key, label in direct
+              if any(np.isfinite(row.get(key + "_mean", np.nan)) for row in summary)]
+    if direct:
+        columns = min(2, len(direct))
+        rows_count = int(np.ceil(len(direct) / columns))
+        fig, axes = plt.subplots(rows_count, columns, figsize=(6 * columns, 4 * rows_count),
+                                 squeeze=False)
+        for axis, (key, label) in zip(axes.flat, direct):
+            for index, series in enumerate(series_names):
+                rows = series_rows[series]
+                snrs = np.asarray([row["snr_db"] for row in rows])
+                means = np.asarray([row[key + "_mean"] for row in rows])
+                stds = np.asarray([row[key + "_std"] for row in rows])
+                axis.errorbar(snrs, means, yerr=stds, color=palette[index % len(palette)],
+                              marker=markers[index % len(markers)], capsize=3, label=series)
+            axis.set_title(label.split(" (")[0])
+            axis.set_xlabel("SNR (dB)")
+            axis.set_ylabel(label)
+            axis.legend()
+        for axis in axes.flat[len(direct):]:
+            axis.set_visible(False)
+        charts += _finish(fig, out / "codec_render_fidelity_vs_snr")
 
     if any(np.isfinite(row["total_uses_per_source_gaussian_mean"]) for row in summary):
         fig, axis = plt.subplots(figsize=(8.5, 4.8))
@@ -374,9 +408,39 @@ def plot_evaluation(evaluation_dir, output_dir=None):
                 axis.legend()
         charts += _finish(fig, out / "gaussian_errors_vs_snr")
 
+    parameter_keys = (("position_nrmse_bbox_diagonal", "Position NRMSE / bbox diagonal"),
+                      ("opacity_alpha_mae", "Opacity alpha MAE"),
+                      ("log_scale_rmse", "Log-scale RMSE"),
+                      ("rotation_angle_mean_deg", "Mean rotation error (degrees)"),
+                      ("dc_rmse", "DC coefficient RMSE"),
+                      ("sh_rest_rmse", "Higher-order SH RMSE"))
+    parameter_keys = [(key, label) for key, label in parameter_keys
+                      if any(np.isfinite(row.get(key + "_mean", np.nan)) for row in summary)]
+    if parameter_keys:
+        columns = min(3, len(parameter_keys))
+        rows_count = int(np.ceil(len(parameter_keys) / columns))
+        fig, axes = plt.subplots(rows_count, columns, figsize=(5 * columns, 3.8 * rows_count),
+                                 squeeze=False)
+        for axis, (key, label) in zip(axes.flat, parameter_keys):
+            for index, series in enumerate(series_names):
+                rows = series_rows[series]
+                snrs = np.asarray([row["snr_db"] for row in rows])
+                means = np.asarray([row[key + "_mean"] for row in rows])
+                stds = np.asarray([row[key + "_std"] for row in rows])
+                axis.errorbar(snrs, means, yerr=stds, color=palette[index % len(palette)],
+                              marker=markers[index % len(markers)], capsize=3, label=series)
+            axis.set_title(label)
+            axis.set_xlabel("SNR (dB)")
+            axis.set_ylabel(label)
+        for axis in axes.flat[len(parameter_keys):]:
+            axis.set_visible(False)
+        axes.flat[0].legend(ncol=min(4, len(series_names)))
+        charts += _finish(fig, out / "codec_parameter_errors_vs_snr")
+
     return _manifest(out, "evaluation", evaluation_dir / "results.json", charts,
                      ["Lines show trial means; error bars show sample standard deviation.",
-                      "Rate includes measured JSCC payload and the configured reliable-metadata accounting model."])
+                      "Rate includes measured JSCC payload and the configured reliable-metadata accounting model.",
+                      "received_vs_reference metrics isolate communication reconstruction from source-scene error."])
 
 
 def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 32), snr=None):

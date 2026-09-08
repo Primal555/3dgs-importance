@@ -173,6 +173,26 @@ CUDA_VISIBLE_DEVICES=0 python -u -m gaussian_jscc evaluate \
 
 `results.json` 包含信道开销、位置 RMSE、属性 MSE和渲染指标。视图从左到右为 GT、传输前 PLY 渲染、通信恢复后渲染。若使用真实 q 文件，用 `--rate-map` 替代 `--tiers`。去掉 `--source` 可只测试属性收发，不产生 PSNR / SSIM。
 
+## 独立编解码器损失基准
+
+`benchmark-codec` 固定所有 Gaussian 为同一个正档位，不使用 `route2.pt`、q0 或重要性分配。`none` 信道衡量有限 latent 与编解码器造成的重建损失，`awgn` / `rayleigh` 衡量加入信道后的总损失。两组都按相同档位和 SNR 条件运行，因此可以区分网络瓶颈与信道额外退化。
+
+若要从头训练一个不含随机删点增强的纯 codec，使用普通 `train` 命令并设置 `--attribute-drop 0`；如果只是检查联合模型中的通信部分，也可以直接把 `train-route2` 产生的 `codec.pt` 交给下面的基准命令。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u benchmark_codec.py \
+  --ply "$PLY" --checkpoint "$CODEC" --source "$SCENE" \
+  --tiers 1 2 3 --snrs 0 5 10 15 20 \
+  --channels none awgn --trials 3 --resolution 2 \
+  --save-images --lpips \
+  --out "$PWD/output/truck_codec_benchmark"
+```
+
+先做接口和参数误差检查时可去掉 `--source --save-images --lpips`，并使用 `--device cpu --snrs 10 --trials 1`。基准报告位置的世界坐标 RMSE / 包围盒对角线归一化 RMSE、激活后透明度 MAE、log-scale RMSE、四元数夹角误差、DC / 高阶 SH RMSE、实际复符号数与可靠元数据开销。提供相机时还报告通信恢复渲染相对输入 PLY 渲染的 PSNR、SSIM、L1 和 LPIPS，以及两者各自相对 GT 的质量。
+
+默认完成真实打包和独立接收后删除临时 `received.npy`，防止大场景多档位、多 SNR 测试占用数 GB。使用 `--keep-packets` 才会把每轮包保存在对应目录；`--save-ply` 可保存每轮恢复场景。输出的 `charts/` 会包含 codec 渲染保真度、分属性误差、质量—SNR、信道开销和率失真图。
+`none` 是确定性通路，每个档位 / SNR 只运行一次；`--trials` 只重复带噪信道。
+
 自动测试覆盖前缀长度、功率和 AWGN、网格邻居梯度、初始位置与编解码梯度、激活重计算、PLY 往返、2-bit 档位打包、零档 / 空块、包完整性、独立解码和 CLI 全流程。CUDA 光栅器反传测试只在具有对应环境时运行。通过这些测试不等于已证明论文级视觉性能或 4090 显存目标。
 
 借鉴源与许可证见 `gaussian_jscc/NOTICE.md`。

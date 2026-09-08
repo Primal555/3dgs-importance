@@ -8,6 +8,8 @@ Joint optimization of four-way per-Gaussian masks and the codec is described in
 [docs/route2_joint_jscc.md](docs/route2_joint_jscc.md).
 Training, allocation and multi-SNR evaluation now export reproducible PNG/SVG
 statistical charts and their chart-ready CSV data automatically.
+The dedicated `benchmark_codec.py` entry point measures reconstruction and channel loss
+with all Gaussians retained, independently of the learned tier allocator.
 It adapts ROI-JSCC prefix transport and FCGS-inspired spatial aggregation; upstream
 MaskGaussian training is unchanged.
 

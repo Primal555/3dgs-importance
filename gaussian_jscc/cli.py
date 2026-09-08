@@ -43,6 +43,8 @@ def train(args):
 
     if args.steps < 0 or args.render_steps < 0 or args.steps + args.render_steps == 0:
         raise ValueError("request at least one training step")
+    if not 0 <= args.attribute_drop < 1:
+        raise ValueError("attribute-drop must be in [0,1)")
     if args.render_steps and (not args.source or not args.device.startswith("cuda")):
         raise ValueError("render training requires --source and CUDA")
     out = Path(args.out)
@@ -88,7 +90,7 @@ def train(args):
                 start = random.choice(starts)
                 rb = raw[start:start + model.cfg.block_size].to(device)
                 qb = (fixed_q[start:start + len(rb)].to(device) if fixed_q is not None
-                      else sample_tiers(len(rb), device, drop=.05))
+                      else sample_tiers(len(rb), device, drop=args.attribute_drop))
                 keep = qb > 0
                 if not keep.any():
                     qb[0] = 1
@@ -238,6 +240,8 @@ def main():
     add_parsers(sub)
     from .plots import add_parser as add_plot_parser
     add_plot_parser(sub)
+    from .benchmark import add_parser as add_benchmark_parser
+    add_benchmark_parser(sub)
     p = sub.add_parser("train")
     p.set_defaults(func=train)
     p.add_argument("--ply", required=True)
@@ -260,6 +264,8 @@ def main():
                    help="sender-only spatial sorting precision; coordinates are not metadata")
     p.add_argument("--seed-position-weight", type=float, default=.2,
                    help="auxiliary loss for decoder position bootstrap")
+    p.add_argument("--attribute-drop", type=float, default=.05,
+                   help="random context dropout during attribute warmup; use 0 for strict codec isolation")
     p.add_argument("--rate-map")
     train_parser = p
     p = sub.add_parser("transmit")
