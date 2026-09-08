@@ -1,0 +1,514 @@
+"""Reproducible statistical figures for Gaussian JSCC experiments.
+
+Charts are exported as both PNG (quick inspection/slides) and SVG (papers).
+The plotting dependency is deliberately imported lazily so codec training and
+packet decoding remain usable in minimal receiver environments.
+"""
+
+import csv
+import json
+from pathlib import Path
+
+import numpy as np
+
+
+TIER_NAMES = ("Drop", "Low", "Medium", "High")
+TIER_COLORS = ("#9AA1A8", "#2F6B9A", "#D8A72E", "#D96C2F")
+INK = "#17202A"
+GRID = "#DDE2E6"
+REFERENCE = "#59636E"
+
+
+def _plt():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({
+        "figure.facecolor": "white", "axes.facecolor": "white",
+        "axes.edgecolor": REFERENCE, "axes.labelcolor": INK,
+        "axes.titlecolor": INK, "xtick.color": INK, "ytick.color": INK,
+        "font.family": "DejaVu Sans", "font.size": 10,
+        "axes.grid": True, "grid.color": GRID, "grid.linewidth": .7,
+        "grid.alpha": .75, "axes.axisbelow": True,
+        "legend.frameon": False, "savefig.bbox": "tight",
+    })
+    return plt
+
+
+def _read_jsonl(path):
+    rows = []
+    for line_number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON at {path}:{line_number}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"expected JSON object at {path}:{line_number}")
+        rows.append(row)
+    if not rows:
+        raise ValueError(f"no records in {path}")
+    return rows
+
+
+def _write_csv(path, rows, fields):
+    with Path(path).open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _save(fig, stem):
+    stem = Path(stem)
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    outputs = []
+    for extension in ("png", "svg"):
+        path = stem.with_suffix("." + extension)
+        fig.savefig(path, dpi=180 if extension == "png" else None)
+        outputs.append(str(path))
+    return outputs
+
+
+def _finish(fig, stem):
+    plt = _plt()
+    fig.tight_layout()
+    outputs = _save(fig, stem)
+    plt.close(fig)
+    return outputs
+
+
+def _numeric(rows, key):
+    return np.asarray([np.nan if row.get(key) is None else float(row[key]) for row in rows], dtype=float)
+
+
+def _rolling(values, window):
+    values = np.asarray(values, dtype=float)
+    if window <= 1:
+        return values.copy()
+    valid = np.isfinite(values).astype(float)
+    clean = np.where(np.isfinite(values), values, 0.)
+    kernel = np.ones(window)
+    total = np.convolve(clean, kernel, mode="same")
+    count = np.convolve(valid, kernel, mode="same")
+    return np.divide(total, count, out=np.full_like(total, np.nan), where=count > 0)
+
+
+def _phase_boundary(rows):
+    joint = [float(row["step"]) for row in rows if str(row.get("phase", "")).startswith("joint")]
+    return min(joint) if joint else None
+
+
+def _manifest(out, kind, source, charts, notes):
+    payload = {"kind": kind, "source": str(Path(source).resolve()),
+               "charts": charts, "notes": notes}
+    (Path(out) / "charts_manifest.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return payload
+
+
+def plot_training(training_dir, output_dir=None):
+    """Plot optimization traces from a route2 loss.jsonl file."""
+    training_dir = Path(training_dir)
+    out = Path(output_dir) if output_dir else training_dir / "charts"
+    out.mkdir(parents=True, exist_ok=True)
+    rows = _read_jsonl(training_dir / "loss.jsonl")
+    steps = _numeric(rows, "step")
+    window = max(1, min(101, len(rows) // 40))
+    boundary = _phase_boundary(rows)
+    charts = []
+    plt = _plt()
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    series = (("loss", "Total loss", TIER_COLORS[1]),
+              ("distortion", "Render distortion", TIER_COLORS[3]),
+              ("aux_loss", "Attribute auxiliary", TIER_COLORS[2]))
+    for key, label, color in series:
+        values = _numeric(rows, key)
+        if np.isfinite(values).any():
+            axes[0].plot(steps, values, color=color, alpha=.18, linewidth=.7)
+            axes[0].plot(steps, _rolling(values, window), color=color, linewidth=1.8, label=label)
+    axes[0].set_title("Training objectives")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend(ncol=3, loc="upper right")
+    for key, label, color in (("codec_grad_norm", "Codec", TIER_COLORS[1]),
+                              ("mask_grad_norm", "Tier mask", TIER_COLORS[3])):
+        values = _numeric(rows, key)
+        if np.isfinite(values).any():
+            axes[1].plot(steps, np.maximum(values, 1e-12), color=color, alpha=.18, linewidth=.7)
+            axes[1].plot(steps, np.maximum(_rolling(values, window), 1e-12),
+                         color=color, linewidth=1.8, label=label)
+    axes[1].set_yscale("log")
+    axes[1].set_title("Gradient norms")
+    axes[1].set_ylabel("L2 norm (log scale)")
+    axes[1].set_xlabel("Optimization step")
+    axes[1].legend(loc="upper right")
+    if boundary is not None:
+        for axis in axes:
+            axis.axvline(boundary, color=REFERENCE, linestyle="--", linewidth=1)
+        axes[0].text(boundary, .02, " joint optimization", va="bottom", color=REFERENCE,
+                     transform=axes[0].get_xaxis_transform())
+    charts += _finish(fig, out / "training_objectives")
+
+    joint_rows = [row for row in rows if row.get("sampled_tier_counts") is not None]
+    if joint_rows:
+        joint_steps = _numeric(joint_rows, "step")
+        expected = _numeric(joint_rows, "expected_symbols_per_gaussian")
+        temperatures = _numeric(joint_rows, "temperature")
+        counts = np.asarray([row["sampled_tier_counts"] for row in joint_rows], dtype=float)
+        if counts.ndim != 2 or counts.shape[1] != 4 or (counts < 0).any():
+            raise ValueError("sampled_tier_counts must contain four nonnegative values")
+        denominator = counts.sum(1, keepdims=True)
+        shares = np.divide(counts, denominator, out=np.zeros_like(counts), where=denominator > 0)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+        axes[0].plot(joint_steps, expected, color=TIER_COLORS[1], alpha=.2, linewidth=.7)
+        axes[0].plot(joint_steps, _rolling(expected, max(1, min(101, len(joint_rows) // 40))),
+                     color=TIER_COLORS[1], linewidth=2, label="Expected payload")
+        axes[0].set_title("Expected JSCC payload")
+        axes[0].set_ylabel("Complex symbols / source Gaussian")
+        temp_axis = axes[0].twinx()
+        temp_axis.grid(False)
+        temp_axis.plot(joint_steps, temperatures, color=REFERENCE, linestyle="--", linewidth=1,
+                       label="Gumbel temperature")
+        temp_axis.set_ylabel("Temperature", color=REFERENCE)
+        lines = axes[0].lines[-1:] + temp_axis.lines
+        axes[0].legend(lines, [line.get_label() for line in lines], loc="upper right")
+        axes[1].stackplot(joint_steps, shares.T, labels=TIER_NAMES, colors=TIER_COLORS, alpha=.9)
+        axes[1].set_ylim(0, 1)
+        axes[1].set_title("Sampled tier composition")
+        axes[1].set_ylabel("Share of sampled Gaussians")
+        axes[1].set_xlabel("Optimization step")
+        axes[1].legend(ncol=4, loc="upper center")
+        charts += _finish(fig, out / "training_rate_and_tiers")
+
+    flat = []
+    for row in rows:
+        item = {key: row.get(key) for key in ("step", "phase", "snr", "loss", "distortion",
+                                               "aux_loss", "expected_symbols_per_gaussian",
+                                               "temperature", "codec_grad_norm", "mask_grad_norm")}
+        counts = row.get("sampled_tier_counts")
+        for index, name in enumerate(TIER_NAMES):
+            item[f"tier_{name.lower()}_count"] = counts[index] if counts is not None else None
+        flat.append(item)
+    fields = list(flat[0])
+    _write_csv(out / "training_chart_data.csv", flat, fields)
+    return _manifest(out, "training", training_dir / "loss.jsonl", charts,
+                     [f"Raw traces plus centered rolling mean (window={window}).",
+                      "Tier composition records hard Gumbel samples, not deployment argmax counts."])
+
+
+def _evaluation_series(row):
+    label = str(row.get("label", "allocation"))
+    return label.split("_snr", 1)[0] if "_snr" in label else "allocation"
+
+
+def _group_by_series_snr(rows):
+    groups = {}
+    for row in rows:
+        if row.get("snr_db") is None:
+            raise ValueError("evaluation records must contain snr_db")
+        groups.setdefault((_evaluation_series(row), float(row["snr_db"])), []).append(row)
+    return sorted(groups.items())
+
+
+def _mean_std(group, key):
+    values = np.asarray([float(row[key]) for row in group if row.get(key) is not None], dtype=float)
+    return ((float(values.mean()), float(values.std(ddof=1)) if len(values) > 1 else 0.)
+            if len(values) else (np.nan, np.nan))
+
+
+def plot_evaluation(evaluation_dir, output_dir=None):
+    """Plot multi-SNR quality, rate, allocation and Gaussian error summaries."""
+    evaluation_dir = Path(evaluation_dir)
+    out = Path(output_dir) if output_dir else evaluation_dir / "charts"
+    out.mkdir(parents=True, exist_ok=True)
+    data = json.loads((evaluation_dir / "results.json").read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not data:
+        raise ValueError("results.json must contain a nonempty list")
+    grouped = _group_by_series_snr(data)
+    summary = []
+    for (series, snr), group in grouped:
+        row = {"series": series, "snr_db": snr, "trials": len(group)}
+        for key in ("received_psnr", "received_ssim", "received_lpips",
+                    "reference_psnr", "reference_ssim", "reference_lpips",
+                    "total_uses_per_source_gaussian", "position_rmse", "attribute_mse"):
+            row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
+        for key in ("payload_complex_symbols", "metadata_channel_uses", "total_channel_uses"):
+            row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
+        tier_arrays = [record.get("tier_counts") for record in group if record.get("tier_counts") is not None]
+        if tier_arrays:
+            mean_counts = np.asarray(tier_arrays, dtype=float).mean(0)
+            for index, name in enumerate(TIER_NAMES):
+                row[f"tier_{name.lower()}_count_mean"] = float(mean_counts[index])
+                row[f"tier_{name.lower()}_share"] = float(mean_counts[index] / mean_counts.sum())
+        summary.append(row)
+    fields = sorted({key for row in summary for key in row})
+    _write_csv(out / "evaluation_chart_data.csv", summary, fields)
+    charts = []
+    plt = _plt()
+    series_names = sorted({row["series"] for row in summary})
+    series_rows = {series: sorted((row for row in summary if row["series"] == series),
+                                  key=lambda row: row["snr_db"])
+                   for series in series_names}
+    palette = (TIER_COLORS[1], TIER_COLORS[3], TIER_COLORS[2], "#6F7F3F", "#B55A8A")
+    markers = ("o", "s", "^", "D", "v")
+
+    available = [("psnr", "PSNR (dB)"), ("ssim", "SSIM"), ("lpips", "LPIPS (lower is better)")]
+    available = [(key, label) for key, label in available
+                 if any(np.isfinite(row.get(f"received_{key}_mean", np.nan)) for row in summary)]
+    if available:
+        fig, axes = plt.subplots(1, len(available), figsize=(5 * len(available), 4), squeeze=False)
+        for axis, (key, label) in zip(axes[0], available):
+            for index, series in enumerate(series_names):
+                rows = series_rows[series]
+                snrs = np.asarray([row["snr_db"] for row in rows])
+                received = np.asarray([row[f"received_{key}_mean"] for row in rows])
+                error = np.asarray([row[f"received_{key}_std"] for row in rows])
+                axis.errorbar(snrs, received, yerr=error, color=palette[index % len(palette)],
+                              marker=markers[index % len(markers)], capsize=3, linewidth=1.8,
+                              label="Received" if len(series_names) == 1 else series)
+            rows = series_rows[series_names[0]]
+            snrs = np.asarray([row["snr_db"] for row in rows])
+            reference = np.asarray([row[f"reference_{key}_mean"] for row in rows])
+            if np.isfinite(reference).any():
+                axis.plot(snrs, reference, color=REFERENCE, linestyle="--", marker="s",
+                          fillstyle="none", label="Input PLY reference")
+            axis.set_title(label.split(" (")[0])
+            axis.set_xlabel("SNR (dB)")
+            axis.set_ylabel(label)
+            axis.legend()
+        charts += _finish(fig, out / "quality_vs_snr")
+
+    if any(np.isfinite(row["total_uses_per_source_gaussian_mean"]) for row in summary):
+        fig, axis = plt.subplots(figsize=(8.5, 4.8))
+        for index, series in enumerate(series_names):
+            rows = series_rows[series]
+            snrs = np.asarray([row["snr_db"] for row in rows])
+            total = np.asarray([row["total_uses_per_source_gaussian_mean"] for row in rows])
+            axis.plot(snrs, total, color=palette[index % len(palette)],
+                      marker=markers[index % len(markers)], linewidth=2,
+                      label="Total" if len(series_names) == 1 else series)
+        if len(series_names) == 1:
+            raw_groups = [grouped_item[1] for grouped_item in grouped]
+            source_counts = np.asarray([float(group[0].get("source_gaussians", 1)) for group in raw_groups])
+            payload = np.asarray([row["payload_complex_symbols_mean"] for row in summary]) / source_counts
+            metadata = np.asarray([row["metadata_channel_uses_mean"] for row in summary]) / source_counts
+            axis.plot(snrs, payload, color=TIER_COLORS[1], marker="s", fillstyle="none",
+                      linestyle="--", label="JSCC payload")
+            axis.plot(snrs, metadata, color=TIER_COLORS[2], marker="^", fillstyle="none",
+                      linestyle=":", label="Reliable metadata")
+        axis.set_title("Channel use by SNR")
+        axis.set_xlabel("SNR (dB)")
+        axis.set_ylabel("Complex channel uses / source Gaussian")
+        axis.legend(ncol=3)
+        charts += _finish(fig, out / "channel_uses_vs_snr")
+
+    share_fields = [f"tier_{name.lower()}_share" for name in TIER_NAMES]
+    if all(field in summary[0] for field in share_fields):
+        fig, axes = plt.subplots(len(series_names), 1, figsize=(8.5, 4 * len(series_names)),
+                                 squeeze=False)
+        for series_index, series in enumerate(series_names):
+            axis = axes[series_index, 0]
+            rows = series_rows[series]
+            snrs = np.asarray([row["snr_db"] for row in rows])
+            shares = np.asarray([[row[field] for field in share_fields] for row in rows])
+            bottom = np.zeros(len(snrs))
+            width = .7 * (np.diff(snrs).min() if len(snrs) > 1 else 1.)
+            for index, (name, color) in enumerate(zip(TIER_NAMES, TIER_COLORS)):
+                axis.bar(snrs, shares[:, index], bottom=bottom, width=width, label=name,
+                         color=color, edgecolor="white", linewidth=.6)
+                bottom += shares[:, index]
+            axis.set_ylim(0, 1)
+            axis.set_title("Deployment tier composition by SNR" +
+                           (f" — {series}" if len(series_names) > 1 else ""))
+            axis.set_xlabel("SNR (dB)")
+            axis.set_ylabel("Share of source Gaussians")
+            axis.legend(ncol=4)
+        charts += _finish(fig, out / "tier_mix_vs_snr")
+
+    psnr_rows = [row for row in data if row.get("received_psnr") is not None and
+                 row.get("total_uses_per_source_gaussian") is not None]
+    if psnr_rows:
+        fig, axis = plt.subplots(figsize=(8, 5))
+        if len(series_names) == 1:
+            unique_snrs = sorted({float(row["snr_db"]) for row in psnr_rows})
+            shades = plt.cm.Blues(np.linspace(.45, .9, max(2, len(unique_snrs))))
+            for color, snr in zip(shades, unique_snrs):
+                group = [row for row in psnr_rows if float(row["snr_db"]) == snr]
+                axis.scatter([row["total_uses_per_source_gaussian"] for row in group],
+                             [row["received_psnr"] for row in group], color=color,
+                             edgecolor=INK, linewidth=.35, s=45, label=f"{snr:g} dB")
+        else:
+            for index, series in enumerate(series_names):
+                group = [row for row in psnr_rows if _evaluation_series(row) == series]
+                axis.scatter([row["total_uses_per_source_gaussian"] for row in group],
+                             [row["received_psnr"] for row in group],
+                             color=palette[index % len(palette)], marker=markers[index % len(markers)],
+                             edgecolor=INK, linewidth=.35, s=45, label=series)
+        axis.set_title("Rate-distortion observations")
+        axis.set_xlabel("Total complex channel uses / source Gaussian")
+        axis.set_ylabel("Received PSNR (dB)")
+        axis.legend(title="SNR" if len(series_names) == 1 else "Allocation",
+                    ncol=min(5, len(series_names) if len(series_names) > 1 else len(unique_snrs)))
+        charts += _finish(fig, out / "rate_distortion")
+
+    error_keys = [("position_rmse", "Position RMSE"), ("attribute_mse", "Attribute MSE")]
+    error_keys = [(key, label) for key, label in error_keys
+                  if any(np.isfinite(row.get(key + "_mean", np.nan)) for row in summary)]
+    if error_keys:
+        fig, axes = plt.subplots(1, len(error_keys), figsize=(5 * len(error_keys), 4), squeeze=False)
+        for axis, (key, label) in zip(axes[0], error_keys):
+            for index, series in enumerate(series_names):
+                rows = series_rows[series]
+                snrs = np.asarray([row["snr_db"] for row in rows])
+                means = np.asarray([row[key + "_mean"] for row in rows])
+                stds = np.asarray([row[key + "_std"] for row in rows])
+                axis.errorbar(snrs, means, yerr=stds, color=palette[index % len(palette)],
+                              marker=markers[index % len(markers)], capsize=3,
+                              label=series if len(series_names) > 1 else None)
+            axis.set_title(label)
+            axis.set_xlabel("SNR (dB)")
+            axis.set_ylabel(label)
+            if len(series_names) > 1:
+                axis.legend()
+        charts += _finish(fig, out / "gaussian_errors_vs_snr")
+
+    return _manifest(out, "evaluation", evaluation_dir / "results.json", charts,
+                     ["Lines show trial means; error bars show sample standard deviation.",
+                      "Rate includes measured JSCC payload and the configured reliable-metadata accounting model."])
+
+
+def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 32), snr=None):
+    """Plot hard tier composition, probability distributions and spatial projections."""
+    allocation_dir = Path(allocation_dir)
+    out = Path(output_dir) if output_dir else allocation_dir / "charts"
+    out.mkdir(parents=True, exist_ok=True)
+    probabilities = np.load(allocation_dir / "probabilities.npy", allow_pickle=False)
+    tiers = np.load(allocation_dir / "tiers.npy", allow_pickle=False)
+    if probabilities.ndim != 2 or probabilities.shape[1] != 4 or tiers.shape != (len(probabilities),):
+        raise ValueError("allocation arrays must have shapes [N,4] and [N]")
+    if not np.isfinite(probabilities).all() or (probabilities < 0).any() or (probabilities > 1).any():
+        raise ValueError("allocation probabilities must be finite values in [0,1]")
+    if not np.allclose(probabilities.sum(1), 1., atol=2e-4) or ((tiers < 0) | (tiers > 3)).any():
+        raise ValueError("invalid categorical allocation")
+    rates = np.asarray(rates, dtype=float)
+    if rates.shape != (4,):
+        raise ValueError("rates must contain four values")
+    counts = np.bincount(tiers.astype(np.int64), minlength=4)
+    shares = counts / len(tiers)
+    expected = probabilities @ rates
+    existence = 1 - probabilities[:, 0]
+    charts = []
+    plt = _plt()
+
+    fig, axis = plt.subplots(figsize=(8, 4.8))
+    bars = axis.bar(TIER_NAMES, shares, color=TIER_COLORS, edgecolor="white", linewidth=.8)
+    axis.set_ylim(0, max(1., float(shares.max()) * 1.18))
+    axis.set_title("Hard tier allocation" + (f" at {snr:g} dB" if snr is not None else ""))
+    axis.set_ylabel("Share of source Gaussians")
+    for bar, count, share in zip(bars, counts, shares):
+        axis.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                  f"{share:.1%}\n{count:,}", ha="center", va="bottom", color=INK)
+    charts += _finish(fig, out / "allocation_tier_composition")
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+    axes[0].hist(existence, bins=50, color=TIER_COLORS[1], edgecolor="white", linewidth=.25)
+    axes[0].set_title("Existence probability")
+    axes[0].set_xlabel("1 - P(drop)")
+    axes[0].set_ylabel("Gaussian count")
+    axes[1].hist(expected, bins=50, color=TIER_COLORS[2], edgecolor="white", linewidth=.25)
+    axes[1].set_title("Expected payload allocation")
+    axes[1].set_xlabel("Complex symbols / Gaussian")
+    axes[1].set_ylabel("Gaussian count")
+    charts += _finish(fig, out / "allocation_probability_distributions")
+
+    if xyz is not None:
+        xyz = np.asarray(xyz)
+        if xyz.shape != (len(tiers), 3) or not np.isfinite(xyz).all():
+            raise ValueError("xyz must be a finite [N,3] array matching the allocation")
+        selected = []
+        for tier in range(4):
+            indices = np.flatnonzero(tiers == tier)
+            if len(indices) > 25000:
+                indices = indices[np.linspace(0, len(indices) - 1, 25000).astype(int)]
+            selected.append(indices)
+        selected = np.concatenate(selected) if selected else np.empty(0, dtype=int)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+        for axis, (a, b, labels) in zip(axes, ((0, 1, ("X", "Y")), (0, 2, ("X", "Z")),
+                                                     (1, 2, ("Y", "Z")))):
+            for tier, (name, color) in enumerate(zip(TIER_NAMES, TIER_COLORS)):
+                idx = selected[tiers[selected] == tier]
+                if len(idx):
+                    axis.scatter(xyz[idx, a], xyz[idx, b], s=1.2, alpha=.4, color=color,
+                                 linewidths=0, label=name)
+            axis.set_xlabel(labels[0])
+            axis.set_ylabel(labels[1])
+            axis.set_aspect("equal", adjustable="datalim")
+        axes[0].legend(markerscale=5, ncol=2)
+        fig.suptitle("Spatial distribution of hard tiers (up to 25k points per tier)", color=INK)
+        charts += _finish(fig, out / "allocation_spatial_projections")
+
+    summary = [{"tier": name, "symbol_length": float(rates[index]), "count": int(counts[index]),
+                "share": float(shares[index]), "snr_db": snr}
+               for index, name in enumerate(TIER_NAMES)]
+    _write_csv(out / "allocation_chart_data.csv", summary, list(summary[0]))
+    return _manifest(out, "allocation", allocation_dir, charts,
+                     ["Existence probability is defined as 1 - P(drop).",
+                      "Spatial plots use deterministic per-tier subsampling and do not represent density proportions."])
+
+
+def safe_plot(kind, source, **kwargs):
+    """Best-effort automatic plotting; never invalidate a completed experiment."""
+    try:
+        result = {"training": plot_training, "evaluation": plot_evaluation,
+                  "allocation": plot_allocation}[kind](source, **kwargs)
+        print(f"Saved {kind} charts to {Path(kwargs.get('output_dir') or source) / ('charts' if not kwargs.get('output_dir') else '')}")
+        return result
+    except Exception as exc:  # plotting is a post-processing convenience
+        print(f"WARNING: automatic {kind} charts were not generated: {exc}")
+        return None
+
+
+def plot_command(args):
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=False)
+    made = 0
+    if args.training:
+        plot_training(args.training, out / "training")
+        made += 1
+    if args.evaluation:
+        plot_evaluation(args.evaluation, out / "evaluation")
+        made += 1
+    if args.allocation:
+        xyz = rates = snr = None
+        info_path = Path(args.allocation) / "allocation.json"
+        if info_path.exists():
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            snr = info.get("snr_db")
+            rates = info.get("rates")
+        if args.ply:
+            from .data import read_ply
+            raw, _ = read_ply(args.ply)
+            xyz = raw[:, :3].numpy()
+        if args.checkpoint:
+            import torch
+            from .transport import load_checkpoint
+            rates = load_checkpoint(args.checkpoint, torch.device("cpu")).cfg.rates
+        plot_allocation(args.allocation, out / "allocation", xyz=xyz,
+                        rates=rates or (0, 8, 16, 32), snr=snr)
+        made += 1
+    if not made:
+        raise ValueError("provide at least one of --training, --evaluation or --allocation")
+    print(f"Saved statistical charts to {out}")
+
+
+def add_parser(sub):
+    parser = sub.add_parser("plot-stats", help="render route2 statistical charts from saved outputs")
+    parser.set_defaults(func=plot_command)
+    parser.add_argument("--training", help="directory containing loss.jsonl")
+    parser.add_argument("--evaluation", help="directory containing results.json")
+    parser.add_argument("--allocation", help="directory containing probabilities.npy and tiers.npy")
+    parser.add_argument("--ply", help="matching PLY for allocation spatial projections")
+    parser.add_argument("--checkpoint", help="matching codec.pt for the allocation rate table")
+    parser.add_argument("--out", required=True, help="new chart output directory")

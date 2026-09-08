@@ -1,0 +1,5 @@
+torch>=2.0
+numpy
+plyfile
+tqdm
+matplotlib>=3.7

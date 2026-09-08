@@ -1,5 +1,16 @@
 # MaskGaussian: Adaptive 3D Gaussian Representation from Probabilistic Masks [CVPR 2025]
 
+## Gaussian JSCC codec extension
+
+The local-context Gaussian JSCC implementation, training commands, receiver-only decoding,
+and multi-SNR evaluation guide are documented in [docs/gaussian_jscc.md](docs/gaussian_jscc.md).
+Joint optimization of four-way per-Gaussian masks and the codec is described in
+[docs/route2_joint_jscc.md](docs/route2_joint_jscc.md).
+Training, allocation and multi-SNR evaluation now export reproducible PNG/SVG
+statistical charts and their chart-ready CSV data automatically.
+It adapts ROI-JSCC prefix transport and FCGS-inspired spatial aggregation; upstream
+MaskGaussian training is unchanged.
+
 <div id="top" align="center">
  
 <a href="https://arxiv.org/abs/2412.20522"><img src="https://img.shields.io/badge/Read-Paper-B31B1B.svg" height="23"></a>

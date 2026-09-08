@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="2400" viewBox="0 0 1800 2400" role="img" aria-labelledby="title desc">
+  <title id="title">路线一：MaskGaussian 固定重要性先验驱动的端到端 JSCC</title>
+  <desc id="desc">自上而下的详细流程图，包含离线重要性、可微资源分配、上下文编码、可变码率 JSCC、控制信息、信道、接收端重建与渲染监督。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FAFCFF"/>
+      <stop offset="1" stop-color="#EEF3F9"/>
+    </linearGradient>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="122%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#1E293B" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#405066"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#2563EB"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#D64F4F"/>
+    </marker>
+    <style>
+      .title { font: 700 42px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #14213D; }
+      .subtitle { font: 400 20px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #59677D; }
+      .stage { font: 700 27px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #172033; }
+      .tag { font: 700 16px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #FFFFFF; letter-spacing: 1px; }
+      .main { font: 700 20px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #172033; }
+      .body { font: 400 16px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #536178; }
+      .small { font: 500 15px "Microsoft YaHei", "Noto Sans SC", sans-serif; fill: #3B495E; }
+      .formula { font: italic 500 18px Georgia, "Times New Roman", serif; fill: #334155; }
+      .panel { stroke-width: 1.6; filter: url(#shadow); }
+      .card { fill: #FFFFFF; stroke-width: 1.4; }
+      .arrow { fill: none; stroke: #405066; stroke-width: 3; marker-end: url(#arrow); }
+      .thin { fill: none; stroke: #6D7C90; stroke-width: 2.2; marker-end: url(#arrow); }
+      .side { fill: none; stroke: #7193C3; stroke-width: 2.5; stroke-dasharray: 9 7; marker-end: url(#arrowBlue); }
+      .grad { fill: none; stroke: #2563EB; stroke-width: 3.2; stroke-dasharray: 11 8; marker-end: url(#arrowBlue); }
+      .stop { fill: none; stroke: #D64F4F; stroke-width: 3; stroke-dasharray: 9 7; marker-end: url(#arrowRed); }
+    </style>
+  </defs>
+
+  <rect width="1800" height="2400" fill="url(#bg)"/>
+  <text x="75" y="70" class="title">路线一｜固定 MaskGaussian 重要性先验驱动的端到端 JSCC</text>
+  <text x="77" y="112" class="subtitle">自上而下的数据流：存在必要性 → 信道资源档位 → 上下文表征 → 连续信道符号 → Gaussian 恢复 → 渲染率失真优化</text>
+
+  <!-- Stage 1 -->
+  <rect x="60" y="155" width="1680" height="330" rx="26" fill="#EDF4FF" stroke="#89B2EB" class="panel"/>
+  <rect x="86" y="180" width="142" height="32" rx="16" fill="#3976C7"/>
+  <text x="157" y="197" text-anchor="middle" dominant-baseline="middle" class="tag">OFFLINE PRIOR</text>
+  <text x="900" y="225" text-anchor="middle" class="stage">① 离线获得固定的重要性先验</text>
+
+  <rect x="105" y="270" width="300" height="112" rx="15" stroke="#75A3E0" class="card"/>
+  <text x="255" y="308" text-anchor="middle" class="main">原始场景数据</text>
+  <text x="255" y="339" text-anchor="middle" class="body">多视角图像 · 相机内外参</text>
+  <text x="255" y="365" text-anchor="middle" class="body">初始稀疏点云</text>
+
+  <path d="M405 326 L475 326" class="arrow"/>
+  <rect x="485" y="270" width="300" height="112" rx="15" stroke="#75A3E0" class="card"/>
+  <text x="635" y="310" text-anchor="middle" class="main">MaskGaussian 场景训练</text>
+  <text x="635" y="341" text-anchor="middle" class="body">联合优化 Gaussian 属性与 mask</text>
+  <text x="635" y="367" text-anchor="middle" class="body">学习每个椭球的存在概率</text>
+
+  <path d="M785 326 L855 326" class="arrow"/>
+  <rect x="865" y="270" width="310" height="112" rx="15" stroke="#75A3E0" class="card"/>
+  <text x="1020" y="309" text-anchor="middle" class="main">紧凑 Gaussian 场景</text>
+  <text x="1020" y="344" text-anchor="middle" class="formula">G = {G_i}</text>
+  <text x="1020" y="370" text-anchor="middle" class="body">位置 · 尺度 · 旋转 · opacity · SH</text>
+
+  <path d="M1175 326 L1245 326" class="arrow"/>
+  <rect x="1255" y="270" width="380" height="112" rx="15" fill="#DDEBFF" stroke="#3976C7" stroke-width="1.5"/>
+  <text x="1445" y="306" text-anchor="middle" class="main">固定存在重要性</text>
+  <text x="1445" y="339" text-anchor="middle" class="formula">p_i^exist ∈ [0,1]</text>
+  <text x="1445" y="369" text-anchor="middle" class="body">冻结参数，后续信道训练不改变该概率</text>
+
+  <!-- Stage 2 -->
+  <rect x="60" y="535" width="1680" height="405" rx="26" fill="#FFF7E4" stroke="#E0B35A" class="panel"/>
+  <rect x="86" y="560" width="158" height="32" rx="16" fill="#C78A12"/>
+  <text x="165" y="577" text-anchor="middle" dominant-baseline="middle" class="tag">RATE CONTROL</text>
+  <text x="900" y="605" text-anchor="middle" class="stage">② 信道感知的 Gaussian 级资源分配</text>
+
+  <rect x="110" y="655" width="260" height="88" rx="14" fill="#FFEDBB" stroke="#D4A13C" stroke-width="1.3"/>
+  <text x="240" y="687" text-anchor="middle" class="main">冻结的重要性</text>
+  <text x="240" y="721" text-anchor="middle" class="formula">p_i^exist</text>
+
+  <rect x="405" y="655" width="230" height="88" rx="14" stroke="#D4A13C" class="card"/>
+  <text x="520" y="687" text-anchor="middle" class="main">当前信道状态</text>
+  <text x="520" y="721" text-anchor="middle" class="formula">SNR γ</text>
+
+  <rect x="670" y="655" width="230" height="88" rx="14" stroke="#D4A13C" class="card"/>
+  <text x="785" y="687" text-anchor="middle" class="main">总资源预算</text>
+  <text x="785" y="721" text-anchor="middle" class="formula">B</text>
+
+  <path d="M240 743 L240 782 L520 782 L520 804" class="thin"/>
+  <path d="M520 743 L520 804" class="thin"/>
+  <path d="M785 743 L785 782 L520 782" fill="none" stroke="#6D7C90" stroke-width="2.2"/>
+
+  <rect x="345" y="812" width="350" height="92" rx="15" fill="#FFFFFF" stroke="#D4A13C" stroke-width="1.6"/>
+  <text x="520" y="848" text-anchor="middle" class="main">轻量 Rate Allocator</text>
+  <text x="520" y="880" text-anchor="middle" class="body">只把固定重要性映射为通信资源需求</text>
+
+  <path d="M695 858 L760 858" class="arrow"/>
+  <rect x="770" y="812" width="285" height="92" rx="15" stroke="#D4A13C" class="card"/>
+  <text x="912" y="845" text-anchor="middle" class="main">档位概率</text>
+  <text x="912" y="879" text-anchor="middle" class="formula">ρ_i = [ρ_i^0,...,ρ_i^3]</text>
+
+  <path d="M1055 858 L1120 858" class="arrow"/>
+  <rect x="1130" y="785" width="245" height="119" rx="15" stroke="#D4A13C" class="card"/>
+  <text x="1252" y="817" text-anchor="middle" class="main">档位选择</text>
+  <text x="1252" y="848" text-anchor="middle" class="body">训练：可微 soft/hard gate</text>
+  <text x="1252" y="875" text-anchor="middle" class="body">推理：确定性硬档位</text>
+
+  <path d="M1375 844 L1430 844" class="arrow"/>
+  <rect x="1440" y="772" width="240" height="132" rx="15" fill="#FFEDBB" stroke="#D4A13C" stroke-width="1.6"/>
+  <text x="1560" y="806" text-anchor="middle" class="main">最终资源决策</text>
+  <text x="1560" y="839" text-anchor="middle" class="formula">q_i ∈ {0,1,2,3}</text>
+  <text x="1560" y="869" text-anchor="middle" class="formula">q_i → k_i</text>
+  <text x="1560" y="893" text-anchor="middle" class="body">约束 Σ_i k_i ≤ B</text>
+
+  <!-- Stage 3 -->
+  <rect x="60" y="990" width="1680" height="510" rx="26" fill="#ECF9F1" stroke="#7DBD94" class="panel"/>
+  <rect x="86" y="1015" width="210" height="32" rx="16" fill="#328557"/>
+  <text x="191" y="1032" text-anchor="middle" dominant-baseline="middle" class="tag">CONTEXT + JSCC TX</text>
+  <text x="900" y="1060" text-anchor="middle" class="stage">③ 上下文感知的源表征与可变码率 JSCC 编码</text>
+
+  <rect x="105" y="1110" width="260" height="105" rx="15" stroke="#68AB81" class="card"/>
+  <text x="235" y="1145" text-anchor="middle" class="main">Gaussian 与档位</text>
+  <text x="235" y="1178" text-anchor="middle" class="formula">G_i · q_i · k_i</text>
+  <text x="235" y="1203" text-anchor="middle" class="body">q_i=0 不发送</text>
+
+  <path d="M365 1162 L420 1162" class="arrow"/>
+  <rect x="430" y="1110" width="280" height="105" rx="15" stroke="#68AB81" class="card"/>
+  <text x="570" y="1143" text-anchor="middle" class="main">空间序列化与分块</text>
+  <text x="570" y="1175" text-anchor="middle" class="body">Morton / Hilbert 排序</text>
+  <text x="570" y="1202" text-anchor="middle" class="body">固定数量的局部窗口</text>
+
+  <path d="M710 1162 L765 1162" class="arrow"/>
+  <rect x="775" y="1095" width="350" height="135" rx="15" fill="#FFFFFF" stroke="#68AB81" stroke-width="1.6"/>
+  <text x="950" y="1132" text-anchor="middle" class="main">局部 Gaussian Transformer</text>
+  <text x="950" y="1164" text-anchor="middle" class="body">利用邻域空间与属性相关性</text>
+  <text x="950" y="1192" text-anchor="middle" class="body">提取不可由邻居替代的信息</text>
+  <text x="950" y="1218" text-anchor="middle" class="formula">输出上下文特征 h_i</text>
+
+  <path d="M1125 1162 L1180 1162" class="arrow"/>
+  <rect x="1190" y="1095" width="300" height="135" rx="15" fill="#F1EDFF" stroke="#9277CF" stroke-width="1.6"/>
+  <text x="1340" y="1132" text-anchor="middle" class="main">条件化 JSCC Encoder</text>
+  <text x="1340" y="1164" text-anchor="middle" class="formula">f_enc(h_i, k_i, γ)</text>
+  <text x="1340" y="1193" text-anchor="middle" class="body">共享主干 + 档位掩码/投影头</text>
+  <text x="1340" y="1219" text-anchor="middle" class="body">控制实际输出符号数</text>
+
+  <path d="M1490 1162 L1540 1162" class="arrow"/>
+  <rect x="1550" y="1095" width="145" height="135" rx="15" fill="#E2D9FC" stroke="#9277CF" stroke-width="1.6"/>
+  <text x="1622" y="1132" text-anchor="middle" class="main">符号</text>
+  <text x="1622" y="1164" text-anchor="middle" class="formula">z_i ∈ C^k_i</text>
+  <text x="1622" y="1193" text-anchor="middle" class="body">功率归一化</text>
+  <text x="1622" y="1219" text-anchor="middle" class="body">长度由 k_i 决定</text>
+
+  <rect x="180" y="1286" width="1440" height="156" rx="19" fill="#FFFFFF" stroke="#8F9DB0" stroke-width="1.3"/>
+  <text x="900" y="1324" text-anchor="middle" class="main">JSCC 在给定 k_i 个信道符号内进行联合表征</text>
+  <rect x="250" y="1350" width="365" height="58" rx="29" fill="#DDF2E5"/>
+  <text x="432" y="1385" text-anchor="middle" class="body">去除 Gaussian 间的源端冗余</text>
+  <text x="675" y="1385" text-anchor="middle" class="main">+</text>
+  <rect x="735" y="1350" width="365" height="58" rx="29" fill="#E7DFFC"/>
+  <text x="917" y="1385" text-anchor="middle" class="body">表达与渲染相关的有效信息</text>
+  <text x="1160" y="1385" text-anchor="middle" class="main">+</text>
+  <rect x="1220" y="1350" width="330" height="58" rx="29" fill="#DDEEF8"/>
+  <text x="1385" y="1385" text-anchor="middle" class="body">形成对信道噪声的鲁棒性</text>
+
+  <!-- Stage 4 -->
+  <rect x="60" y="1550" width="1680" height="390" rx="26" fill="#EAF8FB" stroke="#76B8C6" class="panel"/>
+  <rect x="86" y="1575" width="186" height="32" rx="16" fill="#2C8395"/>
+  <text x="179" y="1592" text-anchor="middle" dominant-baseline="middle" class="tag">CHANNEL + RX</text>
+  <text x="900" y="1620" text-anchor="middle" class="stage">④ 控制信息、信道与接收端 Gaussian 重建</text>
+
+  <rect x="105" y="1672" width="315" height="112" rx="15" fill="#FFFFFF" stroke="#5EA7B7" stroke-width="1.4"/>
+  <text x="262" y="1707" text-anchor="middle" class="main">可靠控制信息</text>
+  <text x="262" y="1738" text-anchor="middle" class="body">分块索引 · 档位 q_i</text>
+  <text x="262" y="1765" text-anchor="middle" class="body">有效符号长度 k_i / 共享规则</text>
+
+  <rect x="475" y="1672" width="260" height="112" rx="50" fill="#D8F0F5" stroke="#5EA7B7" stroke-width="1.5"/>
+  <text x="605" y="1710" text-anchor="middle" class="main">无线信道</text>
+  <text x="605" y="1741" text-anchor="middle" class="body">AWGN / Rayleigh</text>
+  <text x="605" y="1768" text-anchor="middle" class="formula">z_tilde = H z + n</text>
+
+  <path d="M735 1728 L800 1728" class="arrow"/>
+  <rect x="810" y="1660" width="300" height="136" rx="15" stroke="#5EA7B7" class="card"/>
+  <text x="960" y="1697" text-anchor="middle" class="main">条件化 JSCC Decoder</text>
+  <text x="960" y="1729" text-anchor="middle" class="formula">g_dec(z_tilde, k_i, γ)</text>
+  <text x="960" y="1760" text-anchor="middle" class="body">恢复上下文潜在特征</text>
+  <text x="960" y="1786" text-anchor="middle" class="formula">h_hat_i</text>
+
+  <path d="M420 1728 L800 1728" class="side"/>
+  <path d="M1110 1728 L1170 1728" class="arrow"/>
+  <rect x="1180" y="1660" width="300" height="136" rx="15" stroke="#5EA7B7" class="card"/>
+  <text x="1330" y="1697" text-anchor="middle" class="main">局部 Context Decoder</text>
+  <text x="1330" y="1729" text-anchor="middle" class="body">结合分块上下文重建</text>
+  <text x="1330" y="1758" text-anchor="middle" class="body">位置、形状、opacity 与 SH</text>
+  <text x="1330" y="1785" text-anchor="middle" class="formula">G_hat_i</text>
+
+  <path d="M1480 1728 L1535 1728" class="arrow"/>
+  <rect x="1545" y="1660" width="150" height="136" rx="15" fill="#D8F0F5" stroke="#5EA7B7" stroke-width="1.5"/>
+  <text x="1620" y="1699" text-anchor="middle" class="main">恢复场景</text>
+  <text x="1620" y="1733" text-anchor="middle" class="formula">G_hat</text>
+  <text x="1620" y="1763" text-anchor="middle" class="body">q_i=0</text>
+  <text x="1620" y="1785" text-anchor="middle" class="body">保持缺省</text>
+
+  <rect x="225" y="1840" width="1350" height="62" rx="31" fill="#DDF2F6"/>
+  <text x="900" y="1878" text-anchor="middle" class="body">控制头必须让接收端知道“哪些 Gaussian 被发送、每个 Gaussian 使用多少符号”；它可以可靠传输，也可以由双方共享确定性规则生成。</text>
+
+  <!-- Stage 5 -->
+  <rect x="60" y="1990" width="1680" height="265" rx="26" fill="#FFF0F0" stroke="#E09696" class="panel"/>
+  <rect x="86" y="2015" width="190" height="32" rx="16" fill="#C75353"/>
+  <text x="181" y="2032" text-anchor="middle" dominant-baseline="middle" class="tag">RENDERING LOSS</text>
+  <text x="900" y="2060" text-anchor="middle" class="stage">⑤ 渲染监督与通信链路端到端优化</text>
+
+  <rect x="120" y="2110" width="255" height="92" rx="15" stroke="#D27A7A" class="card"/>
+  <text x="247" y="2145" text-anchor="middle" class="main">恢复场景 G_hat</text>
+  <text x="247" y="2176" text-anchor="middle" class="body">接收端 Gaussian 表示</text>
+
+  <path d="M375 2156 L445 2156" class="arrow"/>
+  <rect x="455" y="2110" width="255" height="92" rx="15" stroke="#D27A7A" class="card"/>
+  <text x="582" y="2145" text-anchor="middle" class="main">3DGS 可微渲染</text>
+  <text x="582" y="2176" text-anchor="middle" class="body">生成训练相机视角</text>
+
+  <path d="M710 2156 L780 2156" class="arrow"/>
+  <rect x="790" y="2110" width="300" height="92" rx="15" stroke="#D27A7A" class="card"/>
+  <text x="940" y="2145" text-anchor="middle" class="main">渲染失真 D_render</text>
+  <text x="940" y="2176" text-anchor="middle" class="body">L1 + SSIM；可选 LPIPS</text>
+
+  <path d="M1090 2156 L1160 2156" class="arrow"/>
+  <rect x="1170" y="2095" width="500" height="122" rx="16" fill="#FFE0E0" stroke="#C75353" stroke-width="1.6"/>
+  <text x="1420" y="2132" text-anchor="middle" class="main">率失真联合目标</text>
+  <text x="1420" y="2167" text-anchor="middle" class="formula">L = D_render + β Σ_i k_i</text>
+  <text x="1420" y="2197" text-anchor="middle" class="body">同时满足总预算与平均发送功率约束</text>
+
+  <!-- Inter-stage arrows -->
+  <path d="M1445 382 L1445 510 L900 510 L900 535" class="arrow"/>
+  <path d="M1560 904 L1560 962 L900 962 L900 990" class="arrow"/>
+  <path d="M1622 1230 L1622 1520 L900 1520 L900 1550" class="arrow"/>
+  <path d="M1620 1796 L1620 1960 L900 1960 L900 1990" class="arrow"/>
+
+  <!-- Source Gaussian bypass and control path -->
+  <path d="M1020 382 L1020 470 L1715 470 L1715 1080 L235 1080 L235 1110" class="side"/>
+  <text x="1510" y="457" class="small" fill="#3769A5">Gaussian G_i 数据路径</text>
+  <path d="M1560 904 L1715 904 L1715 1640 L262 1640 L262 1672" class="side"/>
+  <text x="1450" y="1630" class="small" fill="#3769A5">q_i / k_i 与分块控制信息</text>
+
+  <!-- Training loop -->
+  <rect x="60" y="2292" width="1680" height="74" rx="22" fill="#FFFFFF" stroke="#CCD6E4" stroke-width="1.4"/>
+  <text x="90" y="2322" class="main">梯度边界</text>
+  <path d="M1585 2330 L480 2330 L480 905" class="grad"/>
+  <text x="1040" y="2353" text-anchor="middle" class="small">更新：Rate Allocator、Gaussian Transformer、JSCC Encoder/Decoder 与 Context Decoder</text>
+  <path d="M480 2348 L240 2348 L240 743" class="stop"/>
+  <line x1="220" y1="755" x2="260" y2="755" stroke="#D64F4F" stroke-width="7"/>
+  <text x="205" y="2386" class="small" fill="#B54141">在冻结的 p_i^exist 处停止；MaskGaussian 不参与通信阶段更新</text>
+</svg>

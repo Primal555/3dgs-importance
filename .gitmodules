@@ -13,3 +13,9 @@
 [submodule "external/NTSCC_JSAC22"]
 	path = external/NTSCC_JSAC22
 	url = https://github.com/wsxtyrdd/NTSCC_JSAC22.git
+[submodule "external/FCGS"]
+	path = external/FCGS
+	url = https://github.com/YihangChen-ee/FCGS.git
+[submodule "external/ROI-JSCC"]
+	path = external/ROI-JSCC
+	url = https://github.com/hansung-choi/ROI-JSCC.git
