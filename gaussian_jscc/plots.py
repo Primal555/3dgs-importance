@@ -241,6 +241,11 @@ def plot_evaluation(evaluation_dir, output_dir=None):
                     "rotation_angle_p95_deg", "dc_rmse", "sh_rest_rmse",
                     "all_parameter_rmse"):
             row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
+        for variant in ("position_error_only", "attribute_error_only"):
+            for metric in ("psnr", "ssim", "lpips", "vs_reference_psnr",
+                           "vs_reference_ssim", "vs_reference_lpips", "vs_reference_l1"):
+                key = f"{variant}_{metric}"
+                row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
         for key in ("payload_complex_symbols", "metadata_channel_uses", "total_channel_uses"):
             row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
         tier_arrays = [record.get("tier_counts") for record in group if record.get("tier_counts") is not None]
@@ -286,6 +291,36 @@ def plot_evaluation(evaluation_dir, output_dir=None):
             axis.set_ylabel(label)
             axis.legend()
         charts += _finish(fig, out / "quality_vs_snr")
+
+    hybrid_variants = (("position_error_only", "Decoded XYZ + source attributes"),
+                       ("attribute_error_only", "Source XYZ + decoded attributes"),
+                       ("received", "Fully decoded"))
+    if any(np.isfinite(row.get("position_error_only_psnr_mean", np.nan)) for row in summary):
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8), squeeze=False)
+        for column, (variant, title) in enumerate(hybrid_variants):
+            for row_index, (metric, label) in enumerate((("psnr", "PSNR (dB)"),
+                                                          ("ssim", "SSIM"))):
+                axis = axes[row_index, column]
+                for index, series in enumerate(series_names):
+                    rows = series_rows[series]
+                    snrs = np.asarray([row["snr_db"] for row in rows])
+                    means = np.asarray([row[f"{variant}_{metric}_mean"] for row in rows])
+                    stds = np.asarray([row[f"{variant}_{metric}_std"] for row in rows])
+                    axis.errorbar(snrs, means, yerr=stds,
+                                  color=palette[index % len(palette)],
+                                  marker=markers[index % len(markers)], capsize=3,
+                                  linewidth=1.8, label=series)
+                rows = series_rows[series_names[0]]
+                axis.plot([row["snr_db"] for row in rows],
+                          [row[f"reference_{metric}_mean"] for row in rows],
+                          color=REFERENCE, linestyle="--", marker="s", fillstyle="none",
+                          label="Input PLY reference")
+                axis.set_title(title)
+                axis.set_xlabel("SNR (dB)")
+                axis.set_ylabel(label)
+                if row_index == 0 and column == 0:
+                    axis.legend()
+        charts += _finish(fig, out / "hybrid_ablation_quality_vs_snr")
 
     direct = (("received_vs_reference_psnr", "Codec render PSNR (dB)"),
               ("received_vs_reference_ssim", "Codec render SSIM"),
@@ -440,7 +475,8 @@ def plot_evaluation(evaluation_dir, output_dir=None):
     return _manifest(out, "evaluation", evaluation_dir / "results.json", charts,
                      ["Lines show trial means; error bars show sample standard deviation.",
                       "Rate includes measured JSCC payload and the configured reliable-metadata accounting model.",
-                      "received_vs_reference metrics isolate communication reconstruction from source-scene error."])
+                      "received_vs_reference metrics isolate communication reconstruction from source-scene error.",
+                      "Hybrid ablation, when present, mixes only row-aligned XYZ versus non-position attributes."])
 
 
 def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 32), snr=None):

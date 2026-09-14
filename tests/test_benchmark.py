@@ -13,11 +13,25 @@ import torch
 
 from gaussian_jscc.benchmark import parameter_metrics
 from gaussian_jscc.data import write_ply
+from gaussian_jscc.rendering import hybrid_parameter_scenes
 from gaussian_jscc.transport import save_checkpoint
 from test_gaussian_jscc import fixture
 
 
 class CodecBenchmarkTests(unittest.TestCase):
+    def test_hybrid_scenes_isolate_position_and_attributes(self):
+        reference, _ = fixture(n=12)
+        received = reference + torch.arange(reference.shape[1], dtype=reference.dtype)[None]
+        scenes = hybrid_parameter_scenes(received, reference)
+        self.assertEqual(list(scenes), ["reference", "position_error_only",
+                                       "attribute_error_only", "received"])
+        torch.testing.assert_close(scenes["position_error_only"][:, :3], received[:, :3])
+        torch.testing.assert_close(scenes["position_error_only"][:, 3:], reference[:, 3:])
+        torch.testing.assert_close(scenes["attribute_error_only"][:, :3], reference[:, :3])
+        torch.testing.assert_close(scenes["attribute_error_only"][:, 3:], received[:, 3:])
+        with self.assertRaises(ValueError):
+            hybrid_parameter_scenes(received[:-1], reference)
+
     def test_group_metrics_are_zero_for_identical_gaussians(self):
         raw, _ = fixture(n=12)
         metrics = parameter_metrics(raw, raw.clone())

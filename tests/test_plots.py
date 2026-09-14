@@ -51,11 +51,16 @@ class PlotTests(unittest.TestCase):
                                     "received_ssim": .7 + snr / 100,
                                     "received_lpips": .3 - snr / 100,
                                     "reference_psnr": 31., "reference_ssim": .93,
-                                    "reference_lpips": .08})
+                                    "reference_lpips": .08,
+                                    "position_error_only_psnr": 21 + snr / 2 + trial / 10,
+                                    "position_error_only_ssim": .72 + snr / 100,
+                                    "attribute_error_only_psnr": 28 + snr / 4 + trial / 10,
+                                    "attribute_error_only_ssim": .86 + snr / 200})
             (evaluation / "results.json").write_text(json.dumps(results), encoding="utf-8")
             plot_evaluation(evaluation)
             for name in ("quality_vs_snr", "channel_uses_vs_snr", "tier_mix_vs_snr",
-                         "rate_distortion", "gaussian_errors_vs_snr"):
+                         "rate_distortion", "gaussian_errors_vs_snr",
+                         "hybrid_ablation_quality_vs_snr"):
                 self.assertTrue((evaluation / "charts" / f"{name}.png").is_file(), name)
 
             allocation = root / "allocation"

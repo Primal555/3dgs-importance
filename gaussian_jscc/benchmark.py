@@ -51,6 +51,8 @@ def benchmark_codec(args):
         raise ValueError("render benchmark requires CUDA; omit --source for parameter-only testing")
     if (args.save_images or args.lpips) and not args.source:
         raise ValueError("--save-images/--lpips require --source")
+    if args.hybrid_ablation and not args.source:
+        raise ValueError("--hybrid-ablation requires --source")
     if len(set(args.channels)) != len(args.channels):
         raise ValueError("channels must be unique")
     if any(tier not in (1, 2, 3) for tier in args.tiers):
@@ -72,7 +74,9 @@ def benchmark_codec(args):
     if args.source:
         from .rendering import load_cameras
         cameras = load_cameras(args.source, args.resolution, args.white_background, args.images, "test")
-        reference = raw.to(device)
+        # Rendering is order invariant, but hybrid rows must match the Morton-
+        # ordered decoder output exactly.
+        reference = ordered.to(device)
 
     results = []
     total = sum((1 if kind == "none" else args.trials) * len(args.tiers) * len(args.snrs)
@@ -117,9 +121,13 @@ def benchmark_codec(args):
                         metrics = evaluate_views(recovered.to(device), reference, cameras, degree,
                                                  args.white_background,
                                                  run / "views" if args.save_images else None,
-                                                 args.lpips)
+                                                 args.lpips,
+                                                 hybrid_ablation=args.hybrid_ablation)
                         (run / "metrics.json").write_text(
                             json.dumps(metrics, indent=2), encoding="utf-8")
+                        if args.hybrid_ablation:
+                            (run / "hybrid_ablation.json").write_text(
+                                json.dumps(metrics, indent=2), encoding="utf-8")
                         stats.update(metrics["mean"])
                     (run / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
                     results.append(stats)
@@ -150,6 +158,8 @@ def add_parser(sub):
     parser.add_argument("--white-background", action="store_true")
     parser.add_argument("--lpips", action="store_true")
     parser.add_argument("--save-images", action="store_true")
+    parser.add_argument("--hybrid-ablation", action="store_true",
+                        help="render decoded-XYZ/source-attribute and source-XYZ/decoded-attribute hybrids")
     parser.add_argument("--save-ply", action="store_true")
     parser.add_argument("--keep-packets", action="store_true",
                         help="retain metadata.bin/received.npy for every run (large)")

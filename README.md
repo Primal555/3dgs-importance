@@ -13,7 +13,11 @@ Joint optimization of four-way per-Gaussian masks and the codec is described in
 Training, allocation and multi-SNR evaluation now export reproducible PNG/SVG
 statistical charts and their chart-ready CSV data automatically.
 The dedicated `benchmark_codec.py` entry point measures reconstruction and channel loss
-with all Gaussians retained, independently of the learned tier allocator.
+with all Gaussians retained, independently of the learned tier allocator. Its optional
+`--hybrid-ablation` mode isolates render degradation from decoded positions versus
+decoded non-position attributes without running another channel transmission.
+See [the hybrid codec ablation guide](docs/hybrid_codec_ablation.md) for the
+four scene variants, output metrics, charts, and server command.
 It adapts ROI-JSCC prefix transport and FCGS-inspired spatial aggregation; upstream
 MaskGaussian training is unchanged.
 

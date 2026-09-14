@@ -7,6 +7,26 @@ import math
 import torch
 
 
+HYBRID_VARIANT_DEFINITIONS = {
+    "reference": "source xyz and source non-position attributes",
+    "position_error_only": "decoded xyz and source non-position attributes",
+    "attribute_error_only": "source xyz and decoded non-position attributes",
+    "received": "decoded xyz and decoded non-position attributes",
+}
+
+
+def hybrid_parameter_scenes(received, reference):
+    """Build row-aligned scenes that isolate position and attribute errors."""
+    if received.shape != reference.shape or received.ndim != 2 or received.shape[1] < 4:
+        raise ValueError("received and reference must be matching [N,D] Gaussian tensors")
+    return {
+        "reference": reference,
+        "position_error_only": torch.cat((received[:, :3], reference[:, 3:]), -1),
+        "attribute_error_only": torch.cat((reference[:, :3], received[:, 3:]), -1),
+        "received": received,
+    }
+
+
 def load_cameras(source, resolution=2, white_background=False, images="images", split="test"):
     from scene.dataset_readers import sceneLoadTypeCallbacks
     from utils.camera_utils import cameraList_from_camInfos
@@ -58,7 +78,14 @@ def render(raw, camera, degree, white_background=False, existence=None):
 
 
 @torch.no_grad()
-def evaluate_views(raw, reference, cameras, degree, white_background, directory=None, lpips=False):
+def evaluate_views(raw, reference, cameras, degree, white_background, directory=None, lpips=False,
+                   hybrid_ablation=False):
+    """Evaluate decoded Gaussians and optionally isolate position/attribute errors.
+
+    Hybrid construction assumes ``raw`` and ``reference`` contain the same rows in
+    the same order. Rendering itself is permutation invariant, but mixing columns
+    from unmatched rows is not.
+    """
     from utils.loss_utils import ssim
     from PIL import Image
     import numpy as np
@@ -69,33 +96,50 @@ def evaluate_views(raw, reference, cameras, degree, white_background, directory=
     if lpips:
         from lpipsPyTorch.modules.lpips import LPIPS
         perceptual = LPIPS(net_type="vgg").to(raw.device).eval()
+    scenes = (hybrid_parameter_scenes(raw, reference) if hybrid_ablation else
+              {"received": raw, "reference": reference})
     rows = []
     for index, camera in enumerate(cameras):
-        received = render(raw, camera, degree, white_background).clamp(0, 1)
-        baseline = render(reference, camera, degree, white_background).clamp(0, 1)
+        images = {name: render(scene, camera, degree, white_background).clamp(0, 1)
+                  for name, scene in scenes.items()}
+        baseline = images["reference"]
         gt = camera.original_image[:3].to(raw.device)
         row = {"view": camera.image_name}
-        for name, image in (("received", received), ("reference", baseline)):
+        for name, image in images.items():
             mse = (image - gt).square().mean().clamp_min(1e-12)
             row[name + "_psnr"] = float(-10 * mse.log10())
             row[name + "_ssim"] = float(ssim(image, gt))
             if perceptual is not None:
                 row[name + "_lpips"] = float(perceptual(image[None] * 2 - 1, gt[None] * 2 - 1))
-        codec_mse = (received - baseline).square().mean().clamp_min(1e-12)
-        row["received_vs_reference_psnr"] = float(-10 * codec_mse.log10())
-        row["received_vs_reference_ssim"] = float(ssim(received, baseline))
-        row["received_vs_reference_l1"] = float((received - baseline).abs().mean())
-        row["psnr_delta_received_minus_reference"] = row["received_psnr"] - row["reference_psnr"]
-        row["ssim_delta_received_minus_reference"] = row["received_ssim"] - row["reference_ssim"]
-        if perceptual is not None:
-            row["received_vs_reference_lpips"] = float(
-                perceptual(received[None] * 2 - 1, baseline[None] * 2 - 1))
-            row["lpips_delta_received_minus_reference"] = row["received_lpips"] - row["reference_lpips"]
+        for name, image in images.items():
+            if name == "reference":
+                continue
+            prefix = name + "_vs_reference"
+            codec_mse = (image - baseline).square().mean().clamp_min(1e-12)
+            row[prefix + "_psnr"] = float(-10 * codec_mse.log10())
+            row[prefix + "_ssim"] = float(ssim(image, baseline))
+            row[prefix + "_l1"] = float((image - baseline).abs().mean())
+            row[f"psnr_delta_{name}_minus_reference"] = row[name + "_psnr"] - row["reference_psnr"]
+            row[f"ssim_delta_{name}_minus_reference"] = row[name + "_ssim"] - row["reference_ssim"]
+            if perceptual is not None:
+                row[prefix + "_lpips"] = float(
+                    perceptual(image[None] * 2 - 1, baseline[None] * 2 - 1))
+                row[f"lpips_delta_{name}_minus_reference"] = (
+                    row[name + "_lpips"] - row["reference_lpips"])
         rows.append(row)
         if directory:
-            comparison = torch.cat((gt, baseline, received), dim=2)
+            panel_names = (["ground_truth", "reference", "position_error_only",
+                            "attribute_error_only", "received"] if hybrid_ablation else
+                           ["ground_truth", "reference", "received"])
+            panel_images = {"ground_truth": gt, **images}
+            comparison = torch.cat([panel_images[name] for name in panel_names], dim=2)
             pixels = (comparison.permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)
             Image.fromarray(pixels).save(Path(directory) / f"{index:05d}.png")
     keys = [k for k in rows[0] if k != "view"]
-    return {"mean": {k: sum(r[k] for r in rows) / len(rows) for k in keys}, "views": rows,
-            "lpips_input_range": "[-1,1]" if lpips else None}
+    result = {"mean": {k: sum(r[k] for r in rows) / len(rows) for k in keys}, "views": rows,
+              "lpips_input_range": "[-1,1]" if lpips else None}
+    if hybrid_ablation:
+        result.update(variant_definitions=HYBRID_VARIANT_DEFINITIONS,
+                      panel_order=["ground_truth", "reference", "position_error_only",
+                                   "attribute_error_only", "received"])
+    return result
