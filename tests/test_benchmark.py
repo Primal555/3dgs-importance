@@ -11,7 +11,7 @@ import unittest
 
 import torch
 
-from gaussian_jscc.benchmark import parameter_metrics
+from gaussian_jscc.benchmark import parameter_metrics, position_metrics
 from gaussian_jscc.data import write_ply
 from gaussian_jscc.rendering import hybrid_parameter_scenes
 from gaussian_jscc.transport import save_checkpoint
@@ -29,8 +29,22 @@ class CodecBenchmarkTests(unittest.TestCase):
         torch.testing.assert_close(scenes["position_error_only"][:, 3:], reference[:, 3:])
         torch.testing.assert_close(scenes["attribute_error_only"][:, :3], reference[:, :3])
         torch.testing.assert_close(scenes["attribute_error_only"][:, 3:], received[:, 3:])
+        seed = reference[:, :3] + .25
+        seeded = hybrid_parameter_scenes(received, reference, seed)
+        self.assertEqual(list(seeded), ["reference", "seed_position_error_only",
+                                       "position_error_only", "attribute_error_only", "received"])
+        torch.testing.assert_close(seeded["seed_position_error_only"][:, :3], seed)
+        torch.testing.assert_close(seeded["seed_position_error_only"][:, 3:], reference[:, 3:])
         with self.assertRaises(ValueError):
             hybrid_parameter_scenes(received[:-1], reference)
+        with self.assertRaises(ValueError):
+            hybrid_parameter_scenes(received, reference, seed[:-1])
+
+    def test_position_metrics_report_world_and_normalized_errors(self):
+        source = torch.tensor([[0., 0., 0.], [2., 3., 6.]])
+        metrics = position_metrics(source, source + 1.)
+        self.assertAlmostEqual(metrics["position_rmse"], 1.)
+        self.assertAlmostEqual(metrics["position_nrmse_bbox_diagonal"], 1 / 7)
 
     def test_group_metrics_are_zero_for_identical_gaussians(self):
         raw, _ = fixture(n=12)

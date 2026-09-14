@@ -52,6 +52,11 @@ class PlotTests(unittest.TestCase):
                                     "received_lpips": .3 - snr / 100,
                                     "reference_psnr": 31., "reference_ssim": .93,
                                     "reference_lpips": .08,
+                                    "position_seed_rmse": .08 / (snr + 1),
+                                    "position_seed_nrmse_bbox_diagonal": .008 / (snr + 1),
+                                    "position_nrmse_bbox_diagonal": .01 / (snr + 1),
+                                    "seed_position_error_only_psnr": 22 + snr / 2 + trial / 10,
+                                    "seed_position_error_only_ssim": .74 + snr / 100,
                                     "position_error_only_psnr": 21 + snr / 2 + trial / 10,
                                     "position_error_only_ssim": .72 + snr / 100,
                                     "attribute_error_only_psnr": 28 + snr / 4 + trial / 10,
@@ -60,7 +65,7 @@ class PlotTests(unittest.TestCase):
             plot_evaluation(evaluation)
             for name in ("quality_vs_snr", "channel_uses_vs_snr", "tier_mix_vs_snr",
                          "rate_distortion", "gaussian_errors_vs_snr",
-                         "hybrid_ablation_quality_vs_snr"):
+                         "hybrid_ablation_quality_vs_snr", "position_seed_vs_final"):
                 self.assertTrue((evaluation / "charts" / f"{name}.png").is_file(), name)
 
             allocation = root / "allocation"

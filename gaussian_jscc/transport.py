@@ -152,7 +152,12 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
 
 
 @torch.no_grad()
-def receive(model, packet):
+def receive(model, packet, return_position_seed=False):
+    """Decode a packet, optionally exposing the decoder bootstrap XYZ.
+
+    The optional seed is a diagnostic derived from the same received symbols;
+    it is neither added to the packet nor used by normal deployment decoding.
+    """
     packet = Path(packet)
     header, q = decode_metadata((packet / "metadata.bin").read_bytes())
     if header["version"] != 2 or header["model_id"] != model_id(model):
@@ -167,7 +172,7 @@ def receive(model, packet):
     if geometry.bits != model.cfg.morton_bits:
         raise ValueError("geometry/checkpoint Morton quantization mismatch")
     device = next(model.parameters()).device
-    rows = []
+    rows, position_seeds = [], []
     i = j = 0
     model.eval()
     for start in range(0, len(q), model.cfg.block_size):
@@ -178,8 +183,18 @@ def receive(model, packet):
             continue
         length = int(torch.as_tensor(model.cfg.rates, device=device)[qb].sum())
         symbols = torch.from_numpy(z[j:j + length].copy()).to(device)
-        pred = model.decode(symbols, qb, header["snr_db"])
+        decoded = model.decode(symbols, qb, header["snr_db"],
+                               return_seed=return_position_seed)
+        if return_position_seed:
+            pred, seed = decoded
+            position_seeds.append(geometry.denormalize(seed).cpu())
+        else:
+            pred = decoded
         rows.append(to_raw(pred, geometry, model).cpu())
         i += count
         j += length
-    return torch.cat(rows) if rows else torch.empty((0, 3 + model.cfg.attr_dim))
+    recovered = torch.cat(rows) if rows else torch.empty((0, 3 + model.cfg.attr_dim))
+    if return_position_seed:
+        seeds = torch.cat(position_seeds) if position_seeds else torch.empty((0, 3))
+        return recovered, seeds
+    return recovered

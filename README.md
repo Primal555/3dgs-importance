@@ -16,6 +16,8 @@ The dedicated `benchmark_codec.py` entry point measures reconstruction and chann
 with all Gaussians retained, independently of the learned tier allocator. Its optional
 `--hybrid-ablation` mode isolates render degradation from decoded positions versus
 decoded non-position attributes without running another channel transmission.
+`--position-seed-ablation` additionally compares the decoder's bootstrap XYZ with
+the final XYZ produced after spatial context updates.
 See [the hybrid codec ablation guide](docs/hybrid_codec_ablation.md) for the
 four scene variants, output metrics, charts, and server command.
 It adapts ROI-JSCC prefix transport and FCGS-inspired spatial aggregation; upstream

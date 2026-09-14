@@ -9,22 +9,28 @@ import torch
 
 HYBRID_VARIANT_DEFINITIONS = {
     "reference": "source xyz and source non-position attributes",
+    "seed_position_error_only": "decoder position-seed xyz and source non-position attributes",
     "position_error_only": "decoded xyz and source non-position attributes",
     "attribute_error_only": "source xyz and decoded non-position attributes",
     "received": "decoded xyz and decoded non-position attributes",
 }
 
 
-def hybrid_parameter_scenes(received, reference):
+def hybrid_parameter_scenes(received, reference, position_seed=None):
     """Build row-aligned scenes that isolate position and attribute errors."""
     if received.shape != reference.shape or received.ndim != 2 or received.shape[1] < 4:
         raise ValueError("received and reference must be matching [N,D] Gaussian tensors")
-    return {
-        "reference": reference,
+    if position_seed is not None and position_seed.shape != (len(reference), 3):
+        raise ValueError("position_seed must be a matching [N,3] tensor")
+    scenes = {"reference": reference}
+    if position_seed is not None:
+        scenes["seed_position_error_only"] = torch.cat((position_seed, reference[:, 3:]), -1)
+    scenes.update({
         "position_error_only": torch.cat((received[:, :3], reference[:, 3:]), -1),
         "attribute_error_only": torch.cat((reference[:, :3], received[:, 3:]), -1),
         "received": received,
-    }
+    })
+    return scenes
 
 
 def load_cameras(source, resolution=2, white_background=False, images="images", split="test"):
@@ -79,7 +85,7 @@ def render(raw, camera, degree, white_background=False, existence=None):
 
 @torch.no_grad()
 def evaluate_views(raw, reference, cameras, degree, white_background, directory=None, lpips=False,
-                   hybrid_ablation=False):
+                   hybrid_ablation=False, position_seed=None):
     """Evaluate decoded Gaussians and optionally isolate position/attribute errors.
 
     Hybrid construction assumes ``raw`` and ``reference`` contain the same rows in
@@ -96,7 +102,9 @@ def evaluate_views(raw, reference, cameras, degree, white_background, directory=
     if lpips:
         from lpipsPyTorch.modules.lpips import LPIPS
         perceptual = LPIPS(net_type="vgg").to(raw.device).eval()
-    scenes = (hybrid_parameter_scenes(raw, reference) if hybrid_ablation else
+    if position_seed is not None:
+        hybrid_ablation = True
+    scenes = (hybrid_parameter_scenes(raw, reference, position_seed) if hybrid_ablation else
               {"received": raw, "reference": reference})
     rows = []
     for index, camera in enumerate(cameras):
@@ -128,9 +136,7 @@ def evaluate_views(raw, reference, cameras, degree, white_background, directory=
                     row[name + "_lpips"] - row["reference_lpips"])
         rows.append(row)
         if directory:
-            panel_names = (["ground_truth", "reference", "position_error_only",
-                            "attribute_error_only", "received"] if hybrid_ablation else
-                           ["ground_truth", "reference", "received"])
+            panel_names = ["ground_truth", *scenes]
             panel_images = {"ground_truth": gt, **images}
             comparison = torch.cat([panel_images[name] for name in panel_names], dim=2)
             pixels = (comparison.permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)
@@ -139,7 +145,7 @@ def evaluate_views(raw, reference, cameras, degree, white_background, directory=
     result = {"mean": {k: sum(r[k] for r in rows) / len(rows) for k in keys}, "views": rows,
               "lpips_input_range": "[-1,1]" if lpips else None}
     if hybrid_ablation:
-        result.update(variant_definitions=HYBRID_VARIANT_DEFINITIONS,
-                      panel_order=["ground_truth", "reference", "position_error_only",
-                                   "attribute_error_only", "received"])
+        result.update(variant_definitions={name: HYBRID_VARIANT_DEFINITIONS[name]
+                                           for name in scenes},
+                      panel_order=["ground_truth", *scenes])
     return result

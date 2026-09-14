@@ -184,6 +184,11 @@ class CodecTests(unittest.TestCase):
             # New decoder instance; it receives neither clean attributes nor original PLY.
             receiver = load_checkpoint(directory / "codec.pt", "cpu")
             reconstructed = receive(receiver, directory / "packet")
+            reconstructed_with_seed, position_seed = receive(
+                receiver, directory / "packet", return_position_seed=True)
+            torch.testing.assert_close(reconstructed_with_seed, reconstructed)
+            self.assertEqual(position_seed.shape, (stats["retained_gaussians"], 3))
+            self.assertTrue(torch.isfinite(position_seed).all())
             ordered, geom, oq = prepare(raw, 16, q)
             expected = []
             for start in range(0, len(raw), model.cfg.block_size):

@@ -12,20 +12,26 @@ from .data import prepare, read_ply, write_ply
 from .transport import load_checkpoint, receive, transmit
 
 
+def position_metrics(source_xyz, recovered_xyz):
+    """World-coordinate position errors normalized by the source bounding box."""
+    if source_xyz.shape != recovered_xyz.shape or source_xyz.ndim != 2 or source_xyz.shape[1] != 3:
+        raise ValueError("source_xyz and recovered_xyz must be matching [N,3] tensors")
+    span = source_xyz.amax(0) - source_xyz.amin(0)
+    diagonal = float(span.square().sum().sqrt().clamp_min(1e-12))
+    rmse = float((recovered_xyz - source_xyz).square().mean().sqrt())
+    return {"position_rmse": rmse, "position_nrmse_bbox_diagonal": rmse / diagonal}
+
+
 def parameter_metrics(source, recovered):
     """Group-aware errors for matched, identically ordered Gaussian rows."""
     if source.shape != recovered.shape or source.ndim != 2 or source.shape[1] < 14:
         raise ValueError("source and recovered Gaussians must have the same trained PLY layout")
     difference = recovered - source
-    span = source[:, :3].amax(0) - source[:, :3].amin(0)
-    diagonal = float(span.square().sum().sqrt().clamp_min(1e-12))
     source_q = F.normalize(source[:, 7:11], dim=-1)
     recovered_q = F.normalize(recovered[:, 7:11], dim=-1)
     cosine = (source_q * recovered_q).sum(-1).abs().clamp(0, 1)
     angles = 2 * cosine.acos() * (180 / math.pi)
     result = {
-        "position_rmse": float(difference[:, :3].square().mean().sqrt()),
-        "position_nrmse_bbox_diagonal": float(difference[:, :3].square().mean().sqrt()) / diagonal,
         "opacity_alpha_mae": float((source[:, 3].sigmoid() - recovered[:, 3].sigmoid()).abs().mean()),
         "log_scale_rmse": float(difference[:, 4:7].square().mean().sqrt()),
         "rotation_angle_mean_deg": float(angles.mean()),
@@ -33,6 +39,7 @@ def parameter_metrics(source, recovered):
         "dc_rmse": float(difference[:, 11:14].square().mean().sqrt()),
         "all_parameter_rmse": float(difference.square().mean().sqrt()),
     }
+    result.update(position_metrics(source[:, :3], recovered[:, :3]))
     result["sh_rest_rmse"] = (float(difference[:, 14:].square().mean().sqrt())
                                if source.shape[1] > 14 else None)
     return result
@@ -51,8 +58,8 @@ def benchmark_codec(args):
         raise ValueError("render benchmark requires CUDA; omit --source for parameter-only testing")
     if (args.save_images or args.lpips) and not args.source:
         raise ValueError("--save-images/--lpips require --source")
-    if args.hybrid_ablation and not args.source:
-        raise ValueError("--hybrid-ablation requires --source")
+    if (args.hybrid_ablation or args.position_seed_ablation) and not args.source:
+        raise ValueError("hybrid/position-seed ablation requires --source")
     if len(set(args.channels)) != len(args.channels):
         raise ValueError("channels must be unique")
     if any(tier not in (1, 2, 3) for tier in args.tiers):
@@ -98,17 +105,28 @@ def benchmark_codec(args):
                     else:
                         temporary = TemporaryDirectory(prefix="packet_", dir=out)
                         packet = Path(temporary.name) / "packet"
+                    position_seed = None
                     try:
                         stats = transmit(model, raw, q, snr, channel_kind, args.seed + trial,
                                          packet, args.metadata_code_rate,
                                          args.metadata_modulation_bits)
-                        recovered = receive(model, packet)
+                        decoded = receive(model, packet,
+                                          return_position_seed=args.position_seed_ablation)
+                        if args.position_seed_ablation:
+                            recovered, position_seed = decoded
+                        else:
+                            recovered = decoded
                     finally:
                         if temporary is not None:
                             temporary.cleanup()
                     if len(recovered) != len(ordered) or not torch.isfinite(recovered).all():
                         raise RuntimeError("codec benchmark recovered an invalid Gaussian set")
                     stats.update(parameter_metrics(ordered, recovered))
+                    if position_seed is not None:
+                        seed_metrics = position_metrics(ordered[:, :3], position_seed)
+                        stats.update(position_seed_rmse=seed_metrics["position_rmse"],
+                                     position_seed_nrmse_bbox_diagonal=
+                                     seed_metrics["position_nrmse_bbox_diagonal"])
                     stats.update(label=label, benchmark_series=f"{channel_kind}_tier{tier}",
                                  tier=tier, trial=trial,
                                  expected_payload_complex_symbols=len(raw) * model.cfg.rates[tier])
@@ -118,22 +136,27 @@ def benchmark_codec(args):
                         write_ply(run / "point_cloud.ply", recovered, degree)
                     if cameras:
                         from .rendering import evaluate_views
+                        hybrid = args.hybrid_ablation or args.position_seed_ablation
                         metrics = evaluate_views(recovered.to(device), reference, cameras, degree,
                                                  args.white_background,
                                                  run / "views" if args.save_images else None,
                                                  args.lpips,
-                                                 hybrid_ablation=args.hybrid_ablation)
+                                                 hybrid_ablation=hybrid,
+                                                 position_seed=(None if position_seed is None else
+                                                                position_seed.to(device)))
                         (run / "metrics.json").write_text(
                             json.dumps(metrics, indent=2), encoding="utf-8")
-                        if args.hybrid_ablation:
+                        if hybrid:
                             (run / "hybrid_ablation.json").write_text(
                                 json.dumps(metrics, indent=2), encoding="utf-8")
                         stats.update(metrics["mean"])
                     (run / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
                     results.append(stats)
                     (out / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+                    seed_text = (f", seed_nrmse={stats['position_seed_nrmse_bbox_diagonal']:.6g}"
+                                 if position_seed is not None else "")
                     print(f"[{current}/{total}] {label}: position_nrmse="
-                          f"{stats['position_nrmse_bbox_diagonal']:.6g}, "
+                          f"{stats['position_nrmse_bbox_diagonal']:.6g}{seed_text}, "
                           f"symbols/G={stats['total_uses_per_source_gaussian']:.4g}", flush=True)
     safe_plot("evaluation", out)
     print(f"Saved isolated codec benchmark to {out}")
@@ -160,6 +183,8 @@ def add_parser(sub):
     parser.add_argument("--save-images", action="store_true")
     parser.add_argument("--hybrid-ablation", action="store_true",
                         help="render decoded-XYZ/source-attribute and source-XYZ/decoded-attribute hybrids")
+    parser.add_argument("--position-seed-ablation", action="store_true",
+                        help="extend hybrid ablation with decoder seed XYZ before context updates")
     parser.add_argument("--save-ply", action="store_true")
     parser.add_argument("--keep-packets", action="store_true",
                         help="retain metadata.bin/received.npy for every run (large)")

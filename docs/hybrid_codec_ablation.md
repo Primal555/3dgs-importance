@@ -6,6 +6,7 @@ row-aligned parameter combinations:
 | Name | XYZ | Non-position attributes | Interpretation |
 |---|---|---|---|
 | `reference` | source | source | input PLY upper reference |
+| `seed_position_error_only` | decoder seed | source | geometry before decoder context updates |
 | `position_error_only` | decoded | source | degradation caused by decoded positions |
 | `attribute_error_only` | source | decoded | degradation caused by decoded opacity, scale, rotation and SH |
 | `received` | decoded | decoded | complete codec result |
@@ -38,6 +39,7 @@ CUDA_VISIBLE_DEVICES=0 python -u benchmark_codec.py \
   --resolution 2 \
   --device cuda \
   --hybrid-ablation \
+  --position-seed-ablation \
   --save-images
 ```
 
@@ -54,13 +56,19 @@ Each condition directory contains:
 - `hybrid_ablation.json`: mean and per-view metrics plus exact variant definitions;
 - `metrics.json`: the same render metrics consumed by the general benchmark;
 - `views/*.png` when `--save-images` is enabled. Panels are ordered as ground truth,
-  input PLY, position-error-only, attribute-error-only, and fully decoded;
+  input PLY, seed-position-error-only, final-position-error-only,
+  attribute-error-only, and fully decoded;
 - `stats.json`: flattened mean metrics together with channel use and parameter errors.
 
 The benchmark root contains `results.json` and automatically generates
 `charts/hybrid_ablation_quality_vs_snr.{png,svg}`. The chart has one column for each
 error isolation and rows for PSNR and SSIM. `evaluation_chart_data.csv` contains the
 same aggregated values for later plotting.
+
+With `--position-seed-ablation`, the root also contains
+`charts/position_seed_vs_final.{png,svg}`. It compares seed and final position NRMSE,
+position-only PSNR, and position-only SSIM. The diagnostic seed comes from the same
+received channel symbols and does not add packet metadata or channel uses.
 
 Hybrid mode performs the channel transmission and decoding only once per condition.
 It renders four Gaussian variants instead of the usual two, so its rendering portion

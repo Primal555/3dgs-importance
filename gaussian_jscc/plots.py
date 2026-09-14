@@ -237,11 +237,13 @@ def plot_evaluation(evaluation_dir, output_dir=None):
                     "psnr_delta_received_minus_reference", "ssim_delta_received_minus_reference",
                     "lpips_delta_received_minus_reference", "total_uses_per_source_gaussian",
                     "position_rmse", "attribute_mse", "position_nrmse_bbox_diagonal",
+                    "position_seed_rmse", "position_seed_nrmse_bbox_diagonal",
                     "opacity_alpha_mae", "log_scale_rmse", "rotation_angle_mean_deg",
                     "rotation_angle_p95_deg", "dc_rmse", "sh_rest_rmse",
                     "all_parameter_rmse"):
             row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
-        for variant in ("position_error_only", "attribute_error_only"):
+        for variant in ("seed_position_error_only", "position_error_only",
+                        "attribute_error_only"):
             for metric in ("psnr", "ssim", "lpips", "vs_reference_psnr",
                            "vs_reference_ssim", "vs_reference_lpips", "vs_reference_l1"):
                 key = f"{variant}_{metric}"
@@ -321,6 +323,34 @@ def plot_evaluation(evaluation_dir, output_dir=None):
                 if row_index == 0 and column == 0:
                     axis.legend()
         charts += _finish(fig, out / "hybrid_ablation_quality_vs_snr")
+
+    if any(np.isfinite(row.get("seed_position_error_only_psnr_mean", np.nan))
+           for row in summary):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), squeeze=False)
+        comparisons = (("position_nrmse_bbox_diagonal", "position_seed_nrmse_bbox_diagonal",
+                        "Position NRMSE / bbox diagonal"),
+                       ("position_error_only_psnr", "seed_position_error_only_psnr",
+                        "Position-only render PSNR (dB)"),
+                       ("position_error_only_ssim", "seed_position_error_only_ssim",
+                        "Position-only render SSIM"))
+        for axis, (final_key, seed_key, label) in zip(axes[0], comparisons):
+            for index, series in enumerate(series_names):
+                rows = series_rows[series]
+                snrs = np.asarray([row["snr_db"] for row in rows])
+                color = palette[index % len(palette)]
+                axis.errorbar(snrs, [row[seed_key + "_mean"] for row in rows],
+                              yerr=[row[seed_key + "_std"] for row in rows],
+                              color=color, linestyle="--", marker="x", capsize=3,
+                              label=f"{series} seed")
+                axis.errorbar(snrs, [row[final_key + "_mean"] for row in rows],
+                              yerr=[row[final_key + "_std"] for row in rows],
+                              color=color, linestyle="-", marker="o", capsize=3,
+                              label=f"{series} final")
+            axis.set_title(label)
+            axis.set_xlabel("SNR (dB)")
+            axis.set_ylabel(label)
+        axes[0, 0].legend(ncol=2, fontsize=8)
+        charts += _finish(fig, out / "position_seed_vs_final")
 
     direct = (("received_vs_reference_psnr", "Codec render PSNR (dB)"),
               ("received_vs_reference_ssim", "Codec render SSIM"),
