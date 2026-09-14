@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--source", required=True)
     parser.add_argument("--out", required=True, help="new timing output directory")
-    parser.add_argument("--blocks-per-batch", type=int, nargs="+", default=[4])
+    parser.add_argument("--blocks-per-batch", type=int, nargs="+", default=[32])
     parser.add_argument("--backward", nargs="+", choices=["replay", "checkpoint"], default=["replay"])
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
@@ -34,13 +34,14 @@ def main():
     parser.add_argument("--training-data-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--render-target", choices=["source", "images"], default="source")
     args = parser.parse_args()
     if min(args.blocks_per_batch) < 1 or args.iterations < 1 or args.warmup < 0:
         parser.error("positive batch sizes/iterations and nonnegative warmup required")
     device = device_for(args.device)
     if device.type != "cuda":
         parser.error("full-scene render timing requires CUDA; CPU unit tests only validate gradients")
-    from gaussian_jscc.rendering import load_cameras, render
+    from gaussian_jscc.rendering import load_cameras, render, RenderReference
     from utils.loss_utils import ssim
 
     seed_all(args.seed)
@@ -54,13 +55,15 @@ def main():
         blocks = [to_features(rb.to(device), geometry, model)[0].to(storage)
                   for rb in raw.split(model.cfg.block_size)]
     cameras = load_cameras(args.source, args.resolution, args.white_background, args.images, "train")
+    reference = RenderReference(raw, degree, args.white_background, args.render_target)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     config = vars(args).copy()
     config.update({"torch_version": str(torch.__version__),
                    "gpu": torch.cuda.get_device_name(device), "gaussians": len(raw),
                    "codec_block_size": model.cfg.block_size,
-                   "note": "No optimizer step. Both modes use optimized grid; not a pre-change baseline."})
+                   "codec_config": model.cfg.to_dict(),
+                   "note": "No optimizer step. Teacher-cache generation excluded from step timing; not a pre-change baseline."})
     (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
     results, summaries = [], []
     with (out / "timings.jsonl").open("w", encoding="utf-8") as log:
@@ -77,7 +80,7 @@ def main():
                     qs = [sample_tiers(len(b), torch.device("cpu")).to(storage) for b in blocks]
                     batches = [(f, pad_sequence(qs[i * size:(i + 1) * size], batch_first=True))
                                for i, f in enumerate(groups)]
-                    gt = camera.original_image[:3].to(device)
+                    gt = reference.get(camera, device)
 
                     def distortion(scene):
                         image = render(scene, camera, degree, args.white_background)

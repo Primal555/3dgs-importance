@@ -30,15 +30,19 @@ def model_id(model):
 
 
 def save_checkpoint(path, model, step, training=None):
-    torch.save({"version": 2, "config": model.cfg.to_dict(), "state_dict": model.state_dict(),
+    torch.save({"version": 3 if model.cfg.architecture == "geometry_first" else 2,
+                "config": model.cfg.to_dict(), "state_dict": model.state_dict(),
                 "step": step, "training": training or {}}, path)
 
 
 def load_checkpoint(path, device):
     saved = torch.load(path, map_location="cpu", weights_only=True)
-    if saved.get("version") != 2:
+    if saved.get("version") not in (2, 3):
         raise ValueError("unsupported codec checkpoint version")
-    model = GaussianCodec(CodecConfig(**saved["config"]))
+    cfg = CodecConfig.from_dict(saved["config"])
+    if (saved["version"] == 3) != (cfg.architecture == "geometry_first"):
+        raise ValueError("checkpoint version/architecture mismatch")
+    model = GaussianCodec(cfg)
     model.load_state_dict(saved["state_dict"], strict=True)
     return model.to(device).eval()
 
@@ -147,6 +151,13 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
              "model_weights": "shared in advance; excluded from channel uses",
              "shared_model_tensor_bytes": sum(t.numel() * t.element_size() for t in model.state_dict().values()),
              "disk_payload_bytes": (output / "received.npy").stat().st_size}
+    stats["architecture"] = model.cfg.architecture
+    stats["position_seed_is_final"] = model.cfg.architecture == "geometry_first"
+    if model.cfg.architecture == "geometry_first":
+        geometry_symbols = int(torch.as_tensor(model.cfg.geometry_rates)[q].sum())
+        stats.update(geometry_complex_symbols=geometry_symbols,
+                     attribute_complex_symbols=len(received) - geometry_symbols,
+                     geometry_rates=list(model.cfg.geometry_rates))
     (output / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
 
@@ -162,7 +173,7 @@ def receive(model, packet, return_position_seed=False):
     header, q = decode_metadata((packet / "metadata.bin").read_bytes())
     if header["version"] != 2 or header["model_id"] != model_id(model):
         raise ValueError("packet and shared codec checkpoint do not match")
-    if CodecConfig(**header["config"]) != model.cfg:
+    if CodecConfig.from_dict(header["config"]) != model.cfg:
         raise ValueError("codec configuration mismatch")
     z = np.load(packet / "received.npy", mmap_mode="r", allow_pickle=False)
     expected = int(torch.as_tensor(model.cfg.rates)[q].sum())

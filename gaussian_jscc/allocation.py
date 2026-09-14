@@ -57,6 +57,7 @@ def expected_rate(probabilities, rates):
 
 
 def reconstruction_auxiliary(pred, seed, target, active, seed_weight=.2):
+    """Historical group-average objective; new training uses losses.reconstruction_loss."""
     # No incentive to drop a point just to suppress its auxiliary penalty.
     # Render loss, channel masks and expected rate provide allocation gradients.
     groups = ((0, 3), (3, 4), (4, 7), (7, 11), (11, 14), (14, target.shape[1]))

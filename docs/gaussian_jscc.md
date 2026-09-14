@@ -1,5 +1,9 @@
 # 面向 3DGS 的局部上下文 JSCC 编解码器
 
+> 架构更新：新训练默认使用 [Geometry-first 编解码器](geometry_first_jscc.md)。
+> 本页后文的 seed→Context→更新位置、组间平均 loss 和旧 checkpoint 续训说明属于历史架构；
+> 当前结构、物理损失、符号分路和运行命令以升级说明为准。旧模型仍可独立评估。
+
 实现位于 `gaussian_jscc/`。它借鉴 ROI-JSCC 的变长 latent 前缀选择、打包和补零机制，并以 PyTorch 重新实现 FCGS 式多尺度空间网格聚合。它不是 ROI-JSCC 或 FCGS 的直接复现，不能加载它们的预训练权重；原始 MaskGaussian 训练流程没有被修改。
 
 ## 当前技术路线

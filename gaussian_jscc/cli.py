@@ -11,10 +11,11 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from .codec import CodecConfig, GaussianCodec
-from .data import (attribute_loss, load_tiers, prepare, read_ply, to_features,
+from .data import (load_tiers, prepare, read_ply, to_features,
                    to_raw, write_ply)
 from .transport import load_checkpoint, receive, save_checkpoint, transmit
 from .training import full_scene_step
+from .losses import add_arguments, config_options, configure_training, reconstruction_loss
 
 
 def device_for(name):
@@ -67,10 +68,11 @@ def train(args):
         cfg = CodecConfig(sh_degree=degree, hidden=args.hidden, grid_dim=args.grid_dim,
                           depth=args.depth, planes=not args.no_planes, levels=tuple(args.levels),
                           rates=tuple(args.rates), block_size=args.block_size,
-                          morton_bits=args.morton_bits)
+                          morton_bits=args.morton_bits, **config_options(args))
         model = GaussianCodec(cfg).to(device)
         model.attr_mean.copy_(raw[:, 3:].mean(0).to(device))
         model.attr_std.copy_(raw[:, 3:].std(0, unbiased=False).clamp_min(.01).to(device))
+    configure_training(model, args)
     raw, geometry, fixed_q = prepare(raw, model.cfg.morton_bits, fixed_q)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     model.train()
@@ -97,11 +99,16 @@ def train(args):
     print(f"Training cache: {cache_device}; render blocks/batch: {args.blocks_per_batch}; "
           f"backward: {args.render_backward}")
     cameras = None
+    reference = None
     if args.render_steps:
         from .rendering import load_cameras
         cameras = load_cameras(args.source, args.resolution, args.white_background, args.images, "train")
+        from .rendering import RenderReference
+        reference = RenderReference(raw, degree, args.white_background, args.render_target)
     record = vars(args).copy()
     record.pop("func", None)
+    record["codec_config"] = model.cfg.to_dict()
+    record["seed_position_weight_effective"] = 0  # no seed stage in geometry-first
     (out / "training.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     progress = trange(args.steps + args.render_steps, desc="Gaussian JSCC training")
     with (out / "loss.jsonl").open("w", encoding="utf-8") as log:
@@ -122,16 +129,15 @@ def train(args):
                 features, qb = features[keep], qb[keep]
                 unit = features[:, :3]
                 pred, seed = model(features, unit, qb, snr, args.channel, return_seed=True)
-                loss = attribute_loss(pred, features) + args.seed_position_weight * torch.nn.functional.smooth_l1_loss(
-                    seed, features[:, :3])
+                loss, terms = reconstruction_loss(pred, features, geometry, model, return_terms=True)
                 image_loss = None
-                render_values = {}
+                render_values = {f"{key}_loss": float(value.detach().mean()) for key, value in terms.items()}
             else:
                 from .rendering import render
                 from utils.loss_utils import ssim
 
                 camera = random.choice(cameras)
-                gt = camera.original_image[:3].to(device)
+                gt = reference.get(camera, device)
                 def distortion(scene):
                     image = render(scene, camera, degree, args.white_background)
                     return .8 * (image - gt).abs().mean() + .2 * (1 - ssim(image, gt))
@@ -166,6 +172,8 @@ def train(args):
             if (step + 1) % args.save_every == 0:
                 save_checkpoint(out / f"codec_{step + 1}.pt", model, step + 1, record)
         save_checkpoint(out / "codec.pt", model, args.steps + args.render_steps, record)
+    from .plots import safe_plot
+    safe_plot("training", out)
     print(f"Saved shared codec: {out / 'codec.pt'}")
 
 
@@ -265,7 +273,7 @@ def main():
     p.add_argument("--init", help="initialize from shared codec; architecture/statistics stay fixed")
     p.add_argument("--steps", type=int, default=20000, help="attribute training steps")
     p.add_argument("--render-steps", type=int, default=0, help="subsequent full-scene rendering steps")
-    p.add_argument("--blocks-per-batch", type=int, default=4,
+    p.add_argument("--blocks-per-batch", type=int, default=32,
                    help="independent spatial blocks processed together during full-scene render training")
     p.add_argument("--render-backward", choices=["replay", "checkpoint"], default="replay",
                    help="exact full-scene gradient replay (bounded codec memory) or checkpoint reference")
@@ -287,7 +295,8 @@ def main():
     p.add_argument("--morton-bits", type=int, default=16,
                    help="sender-only spatial sorting precision; coordinates are not metadata")
     p.add_argument("--seed-position-weight", type=float, default=.2,
-                   help="auxiliary loss for decoder position bootstrap")
+                   help="legacy compatibility only; ignored by geometry-first (no seed stage)")
+    add_arguments(p)
     p.add_argument("--attribute-drop", type=float, default=.05,
                    help="random context dropout during attribute warmup; use 0 for strict codec isolation")
     p.add_argument("--rate-map")

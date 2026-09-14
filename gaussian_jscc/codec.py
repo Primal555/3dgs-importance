@@ -26,6 +26,14 @@ class CodecConfig:
     rates: tuple = (0, 8, 16, 32)
     block_size: int = 4096
     morton_bits: int = 16
+    architecture: str = "geometry_first"
+    geometry_rates: tuple = ()
+    geometry_weight: float = 1.0
+    shape_weight: float = .1
+    opacity_weight: float = .1
+    dc_weight: float = .1
+    sh_weight: float = .05
+    geometry_floor: float = 1e-4
 
     def __post_init__(self):
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
@@ -41,13 +49,43 @@ class CodecConfig:
             raise ValueError("grid levels must be integers in 2..64")
         if min(self.hidden, self.grid_dim, self.depth) < 1:
             raise ValueError("hidden, grid_dim and depth must be positive")
+        if self.architecture not in ("legacy", "geometry_first"):
+            raise ValueError("unknown codec architecture")
+        self.geometry_rates = tuple(self.geometry_rates)
+        if self.architecture == "geometry_first":
+            # A configurable engineering starting point, NOT a measured optimum.
+            if not self.geometry_rates:
+                self.geometry_rates = tuple(r // 2 for r in self.rates)
+            g = self.geometry_rates
+            if len(g) != 4 or g[0] != 0 or any(int(x) != x for x in g):
+                raise ValueError("geometry-rates must contain four integer lengths starting at zero")
+            a = tuple(r - x for r, x in zip(self.rates, g))
+            if any(x <= 0 for x in g[1:] + a[1:]) or any(
+                x > y for seq in (g, a) for x, y in zip(seq, seq[1:])
+            ):
+                raise ValueError("geometry and attribute lengths must be positive and nondecreasing at q1..q3")
+        for name in ("geometry_weight", "shape_weight", "opacity_weight", "dc_weight", "sh_weight"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not math.isfinite(self.geometry_floor) or self.geometry_floor <= 0:
+            raise ValueError("geometry_floor must be finite and positive")
 
     @property
     def attr_dim(self):
         return 8 + 3 * (self.sh_degree + 1) ** 2
 
     def to_dict(self):
-        return asdict(self)
+        result = asdict(self)
+        if self.architecture == "legacy":
+            # Preserve historical checkpoint/packet hashes exactly.
+            for name in ("architecture", "geometry_rates", "geometry_weight", "shape_weight",
+                         "opacity_weight", "dc_weight", "sh_weight", "geometry_floor"):
+                result.pop(name)
+        return result
+
+    @classmethod
+    def from_dict(cls, values):
+        return cls(**{**values, "architecture": values.get("architecture", "legacy")})
 
 
 def validate_tiers(q, n):
@@ -215,16 +253,63 @@ class GaussianCodec(nn.Module):
                                            nn.Linear(cfg.hidden, cfg.hidden))
         self.enc_in = nn.Linear(3 + cfg.attr_dim, cfg.hidden)
         self.enc_blocks = nn.ModuleList([ContextBlock(cfg) for _ in range(cfg.depth)])
-        self.enc_out = nn.Linear(cfg.hidden, 2 * cfg.rates[-1])
-        self.dec_in = nn.Linear(4 * cfg.rates[-1], cfg.hidden)
         self.dec_blocks = nn.ModuleList([ContextBlock(cfg) for _ in range(cfg.depth)])
         self.position_seed = nn.Linear(cfg.hidden, 3)
-        self.position_updates = nn.ModuleList([nn.Linear(cfg.hidden, 3)
-                                               for _ in range(cfg.depth)])
+        if cfg.architecture == "legacy":
+            self.enc_out = nn.Linear(cfg.hidden, 2 * cfg.rates[-1])
+            self.dec_in = nn.Linear(4 * cfg.rates[-1], cfg.hidden)
+            self.position_updates = nn.ModuleList([nn.Linear(cfg.hidden, 3)
+                                                   for _ in range(cfg.depth)])
+        else:
+            # Interleave incremental branch segments so every tier is still a
+            # prefix of EXACTLY k(q) complex symbols. No additional row metadata.
+            geo, attr = [], []
+            for i in range(1, 4):
+                begin, end = cfg.rates[i - 1], cfg.rates[i]
+                middle = begin + cfg.geometry_rates[i] - cfg.geometry_rates[i - 1]
+                geo.extend(range(2 * begin, 2 * middle))
+                attr.extend(range(2 * middle, 2 * end))
+            self.register_buffer("geometry_slots", torch.tensor(geo), persistent=False)
+            self.register_buffer("attribute_slots", torch.tensor(attr), persistent=False)
+            self.enc_geometry = nn.Sequential(nn.Linear(cfg.hidden + 3, cfg.hidden), nn.GELU(),
+                                               nn.Linear(cfg.hidden, len(geo)))
+            self.enc_out = nn.Linear(cfg.hidden, len(attr))
+            self.geo_dec = nn.Sequential(nn.Linear(2 * len(geo), cfg.hidden), nn.GELU(),
+                                         nn.Linear(cfg.hidden, cfg.hidden))
+            self.dec_in = nn.Linear(2 * len(attr), cfg.hidden)
         sizes = {"opacity": 1, "scale": 3, "rotation": 4, "dc": 3}
         if cfg.sh_degree:
             sizes["sh"] = cfg.attr_dim - 11
         self.heads = nn.ModuleDict({k: nn.Linear(cfg.hidden, v) for k, v in sizes.items()})
+
+    def encode_latent(self, h, xyz):
+        if self.cfg.architecture == "legacy":
+            return self.enc_out(h)
+        latent = h.new_zeros((*h.shape[:-1], 2 * self.cfg.rates[-1]))
+        latent = latent.index_copy(-1, self.geometry_slots,
+                                   self.enc_geometry(torch.cat((h, xyz * 2 - 1), -1)))
+        return latent.index_copy(-1, self.attribute_slots, self.enc_out(h))
+
+    def decode_latent(self, received, mask, condition, active=None):
+        if self.cfg.architecture == "legacy":
+            h = self.dec_in(torch.cat((received, mask), -1)) + condition
+            seed = self.position_seed(h).sigmoid()
+            xyz = seed
+            for block, update in zip(self.dec_blocks, self.position_updates):
+                h = block(h, xyz, condition, active)
+                xyz = update(h).sigmoid()
+        else:
+            g, a = self.geometry_slots, self.attribute_slots
+            gh = self.geo_dec(torch.cat((received[..., g], mask[..., g]), -1)) + condition
+            xyz = self.position_seed(gh).sigmoid()
+            # Compatibility diagnostic: there is no intermediate position seed
+            # in this architecture; the returned position is already final.
+            seed = xyz
+            h = self.dec_in(torch.cat((received[..., a], mask[..., a]), -1)) + condition
+            plan = self.dec_blocks[0].grid.geometry_plan(xyz, active)
+            for block in self.dec_blocks:
+                h = block(h, xyz, condition, active, plan=plan)
+        return torch.cat((xyz, *(head(h) for head in self.heads.values())), -1), seed
 
     def encoder_conditioning(self, xyz, q, snr):
         snr_col = xyz.new_full((len(xyz), 1), float(snr) / 20)
@@ -243,7 +328,7 @@ class GaussianCodec(nn.Module):
         plan = self.enc_blocks[0].grid.geometry_plan(xyz)
         for block in self.enc_blocks:
             h = block(h, xyz, condition, plan=plan)
-        return normalize_power(pack(self.enc_out(h), q, self.cfg.rates))
+        return normalize_power(pack(self.encode_latent(h, xyz), q, self.cfg.rates))
 
     def decode(self, symbols, q, snr, return_seed=False):
         validate_tiers(q, len(q))
@@ -255,14 +340,7 @@ class GaussianCodec(nn.Module):
         padded = unpack(symbols, q, self.cfg.rates)
         mask = prefix_mask(q, self.cfg.rates).to(padded.dtype)
         condition = self.decoder_conditioning(symbols, q, snr)
-        h = self.dec_in(torch.cat((padded, mask), -1)) + condition
-        seed = self.position_seed(h).sigmoid()
-        xyz = seed
-        for block, update in zip(self.dec_blocks, self.position_updates):
-            h = block(h, xyz, condition)
-            xyz = update(h).sigmoid()
-        outputs = [head(h) for head in self.heads.values()]
-        result = torch.cat((xyz, *outputs), -1)
+        result, seed = self.decode_latent(padded, mask, condition)
         return (result, seed) if return_seed else result
 
     def forward(self, features, xyz, q, snr, kind="awgn", return_seed=False):
@@ -300,7 +378,7 @@ class GaussianCodec(nn.Module):
         plan = self.enc_blocks[0].grid.geometry_plan(xyz, active)
         for block in self.enc_blocks:
             h = block(h, xyz, condition, active, plan=plan)
-        latent = self.enc_out(h)
+        latent = self.encode_latent(h, xyz)
         energy = (latent.square() * mask).sum((1, 2), keepdim=True) / (
             mask.sum((1, 2), keepdim=True) / 2).clamp_min(1.)
         # All-dropped packets have no transmitted energy. A finite training-only
@@ -310,11 +388,5 @@ class GaussianCodec(nn.Module):
         normalized = latent / energy.clamp_min(1e-12).sqrt()
         received = channel(normalized.reshape(-1, 2), snr, kind).reshape_as(latent) * mask
         condition = embedding + self.dec_condition(snr_col)
-        h = self.dec_in(torch.cat((received, mask), -1)) + condition
-        seed = self.position_seed(h).sigmoid()
-        position = seed
-        for block, update in zip(self.dec_blocks, self.position_updates):
-            h = block(h, position, condition, active)
-            position = update(h).sigmoid()
-        result = torch.cat((position, *(head(h) for head in self.heads.values())), -1)
+        result, seed = self.decode_latent(received, mask, condition, active)
         return result, seed, active

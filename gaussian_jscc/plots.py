@@ -122,6 +122,7 @@ def plot_training(training_dir, output_dir=None):
     fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     series = (("loss", "Total loss", TIER_COLORS[1]),
               ("distortion", "Render distortion", TIER_COLORS[3]),
+              ("render_loss", "Render loss", TIER_COLORS[3]),
               ("aux_loss", "Attribute auxiliary", TIER_COLORS[2]))
     for key, label, color in series:
         values = _numeric(rows, key)
@@ -132,6 +133,7 @@ def plot_training(training_dir, output_dir=None):
     axes[0].set_ylabel("Loss")
     axes[0].legend(ncol=3, loc="upper right")
     for key, label, color in (("codec_grad_norm", "Codec", TIER_COLORS[1]),
+                              ("grad_norm", "Codec", TIER_COLORS[1]),
                               ("mask_grad_norm", "Tier mask", TIER_COLORS[3])):
         values = _numeric(rows, key)
         if np.isfinite(values).any():
@@ -149,6 +151,19 @@ def plot_training(training_dir, output_dir=None):
         axes[0].text(boundary, .02, " joint optimization", va="bottom", color=REFERENCE,
                      transform=axes[0].get_xaxis_transform())
     charts += _finish(fig, out / "training_objectives")
+
+    physical_keys = ("geometry_loss", "shape_loss", "opacity_loss", "dc_loss", "sh_loss")
+    if any(np.isfinite(_numeric(rows, key)).any() for key in physical_keys):
+        fig, axis = plt.subplots(figsize=(10, 4))
+        for key in physical_keys:
+            values = _numeric(rows, key)
+            if np.isfinite(values).any():
+                axis.plot(steps, _rolling(values, window), label=key.removesuffix("_loss"))
+        axis.set_yscale("symlog", linthresh=1e-5)
+        axis.set(xlabel="Optimization step", ylabel="Unweighted physical loss",
+                 title="Geometry-first reconstruction components (different scales)")
+        axis.legend()
+        charts += _finish(fig, out / "training_physical_losses")
 
     joint_rows = [row for row in rows if row.get("sampled_tier_counts") is not None]
     if joint_rows:

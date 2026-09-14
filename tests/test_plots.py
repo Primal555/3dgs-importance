@@ -13,6 +13,18 @@ from gaussian_jscc.plots import plot_allocation, plot_evaluation, plot_training
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "requires matplotlib")
 class PlotTests(unittest.TestCase):
+    def test_geometry_first_components_and_codec_gradient_chart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [{"step": step, "phase": "attribute", "loss": 1 / step,
+                     "geometry_loss": .8 / step, "shape_loss": .1 / step,
+                     "opacity_loss": .01 / step, "dc_loss": .02 / step,
+                     "sh_loss": .03 / step, "grad_norm": .5 / step} for step in range(1, 6)]
+            (root / "loss.jsonl").write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            plot_training(root)
+            self.assertTrue((root / "charts" / "training_physical_losses.png").is_file())
+            self.assertTrue((root / "charts" / "training_objectives.png").is_file())
+
     def test_all_statistical_chart_families(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

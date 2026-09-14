@@ -1,5 +1,9 @@
 # 路线二：四档概率与 Gaussian JSCC 联合训练
 
+> 新训练已升级为 [Geometry-first JSCC](geometry_first_jscc.md)：四档语义不变，
+> 几何/属性分路、物理辅助损失、源 PLY 渲染目标，以及默认 32 blocks 的联合 replay。
+> 下文原 seed 更新示意和逐块 checkpoint 流程仅用于理解旧模型，不是当前训练路径。
+
 本实现保留重要性建模作为方法的一部分。每个输入 Gaussian 拥有可学习四维 logits，经过 softmax 得到“不传、低、中、高”四档概率。它们由最终恢复质量和通信资源成本共同更新，不由注意力权重替代。
 
 ## 训练链路

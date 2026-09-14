@@ -1,5 +1,9 @@
 # Gaussian-JSCC 训练性能优化
 
+> [Geometry-first 升级](geometry_first_jscc.md)已将 batched replay 同时用于 codec 和四档联合训练。
+> 新模型必须重新训练，旧 checkpoint 仅可用于旧模型评估/耗时检查；不能用旧权重初始化新架构。
+> 新的物理损失和源渲染缓存会改变耗时，历史 benchmark 数字不代表升级后的速度。
+
 本次优化针对 `python -m gaussian_jscc train` 的完整场景渲染阶段。
 保留所有待传 Gaussian、原始 Morton 分块、三种正档位、逐块功率归一化以及原有渲染/属性损失。
 未引入可见性剪枝、局部渲染近似、混合精度或额外的预测分支。

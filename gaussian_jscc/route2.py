@@ -3,18 +3,22 @@
 import json
 import math
 import random
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+from torch.nn.utils.rnn import pad_sequence
 
-from .allocation import (GaussianTierMask, expected_rate, reconstruction_auxiliary,
+from .allocation import (GaussianTierMask, expected_rate,
                          scene_fingerprint)
 from .codec import CodecConfig, GaussianCodec
-from .data import attribute_loss, prepare, read_ply, to_features, to_raw
+from .data import prepare, read_ply, to_features
 from .transport import load_checkpoint, model_id, save_checkpoint
+from .losses import add_arguments, config_options, configure_training, reconstruction_loss
+from .training import joint_scene_step
 
 
 def save_joint(out, suffix, model, mask, fingerprint, step, record):
@@ -80,6 +84,8 @@ def train_joint(args):
 
     if args.joint_steps < 1 or args.warmup_steps < 0 or args.save_every < 1:
         raise ValueError("joint-steps/save-every must be positive; warmup-steps nonnegative")
+    if args.blocks_per_batch < 1 or args.profile_every < 0:
+        raise ValueError("blocks-per-batch must be positive; profile-every must be nonnegative")
     for name in ("beta", "attr_weight", "seed_position_weight"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
@@ -100,10 +106,11 @@ def train_joint(args):
     else:
         cfg = CodecConfig(sh_degree=degree, hidden=args.hidden, grid_dim=args.grid_dim,
                           depth=args.depth, levels=tuple(args.levels), rates=tuple(args.rates),
-                          block_size=args.block_size)
+                          block_size=args.block_size, **config_options(args))
         model = GaussianCodec(cfg).to(device)
         model.attr_mean.copy_(raw[:, 3:].mean(0).to(device))
         model.attr_std.copy_(raw[:, 3:].std(0, unbiased=False).clamp_min(.01).to(device))
+    configure_training(model, args)
     prior = np.load(args.existence_prior, allow_pickle=False) if args.existence_prior else None
     mask = GaussianTierMask(len(raw), prior, args.condition_snr).to(device)
     raw, geometry, order = prepare(raw, model.cfg.morton_bits, torch.arange(len(raw)))
@@ -112,15 +119,32 @@ def train_joint(args):
     optimizer = torch.optim.Adam([{"params": model.parameters(), "lr": args.lr},
                                   {"params": mask.parameters(), "lr": args.mask_lr}])
     cameras = None
+    reference = None
     if not args.attribute_only:
         # Fail early if the differentiable inactive-mask kernel is unavailable.
         import mask_diff_gaussian_rasterization  # noqa: F401
         from .rendering import load_cameras
         cameras = load_cameras(args.source, args.resolution, args.white_background, args.images, "train")
+        from .rendering import RenderReference
+        reference = RenderReference(raw, degree, args.white_background, args.render_target)
+    render_batches = []
+    if not args.attribute_only:
+        storage = device if args.training_data_device == "cuda" else torch.device("cpu")
+        with torch.no_grad():
+            feature_blocks = [to_features(rb.to(device), geometry, model)[0].to(storage)
+                              for rb in raw.split(model.cfg.block_size)]
+        id_blocks = list(order.to(storage).split(model.cfg.block_size))
+        for begin in range(0, len(feature_blocks), args.blocks_per_batch):
+            end = begin + args.blocks_per_batch
+            render_batches.append((pad_sequence(feature_blocks[begin:end], batch_first=True),
+                                   pad_sequence(id_blocks[begin:end], batch_first=True, padding_value=-1)))
+        del feature_blocks, id_blocks
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     record = vars(args).copy()
     record.pop("func", None)
+    record["codec_config"] = model.cfg.to_dict()
+    record["seed_position_weight_effective"] = 0
     record["rate_objective"] = "expected payload symbols per source Gaussian / maximum tier length"
     record["metadata_objective"] = "2-bit full tier map assumed fixed; actual zlib bytes measured only on transmit"
     record["gradient_estimator"] = "hard Gumbel forward, biased straight-through backward"
@@ -131,6 +155,8 @@ def train_joint(args):
     progress = trange(total_steps, desc="Route2 joint training")
     with (out / "loss.jsonl").open("w", encoding="utf-8") as log:
         for step in progress:
+            step_started = time.perf_counter()
+            backward_done = False
             snr = random.uniform(*args.snr_range)
             optimizer.zero_grad(set_to_none=True)
             tau = args.tau_start * (args.tau_end / args.tau_start) ** (
@@ -141,13 +167,29 @@ def train_joint(args):
                 f, xyz = to_features(rb, geometry, model)
                 q = sample_tiers(len(rb), device)
                 pred, seed = model(f, xyz, q, snr, args.channel, return_seed=True)
-                loss = attribute_loss(pred, f) + args.seed_position_weight * F.smooth_l1_loss(seed, xyz)
-                values = {"phase": "codec_warmup"}
+                loss, terms = reconstruction_loss(pred, f, geometry, model, return_terms=True)
+                values = {"phase": "codec_warmup",
+                          **{f"{key}_loss": float(value.detach().mean()) for key, value in terms.items()}}
+            elif not args.attribute_only:
+                from .rendering import render
+                from utils.loss_utils import ssim
+                camera = random.choice(cameras)
+                gt = reference.get(camera, device)
+
+                def distortion(scene, existence):
+                    image = render(scene, camera, degree, args.white_background, existence)
+                    return .8 * (image - gt).abs().mean() + .2 * (1 - ssim(image, gt))
+
+                profiled = bool(args.profile_every and (step - args.warmup_steps) % args.profile_every == 0)
+                loss, values = joint_scene_step(
+                    model, mask, render_batches, geometry, snr, args.channel, distortion,
+                    tau, args.beta, args.attr_weight, args.render_backward, profiled)
+                values.update(phase="joint_render", distortion=values["render_loss"])
+                backward_done = True
             else:
-                rows, gates, auxiliary, expected, hard_counts = [], [], [], [], []
-                # Diagnostic mode trains one local block; render mode includes
-                # ALL source rows in the rasterizer, gated by 1 - choice[0].
-                selected = [random.choice(starts)] if args.attribute_only else starts
+                auxiliary, expected, hard_counts = [], [], []
+                # Explicit CPU diagnostic proxy, never used in render training.
+                selected = [random.choice(starts)]
                 diagnostic = []
                 for start in selected:
                     rb = raw[start:start + model.cfg.block_size].to(device)
@@ -165,41 +207,29 @@ def train_joint(args):
                     probs = scores.softmax(-1)
                     expected.append(expected_rate(probs, model.cfg.rates).sum())
                     hard_counts.append(choices.detach().sum(0))
-                    auxiliary.append(reconstruction_auxiliary(pred, seed, f, active, args.seed_position_weight))
-                    if args.attribute_only:
-                        # A differentiable proxy for automated CPU checks only;
-                        # it cannot establish rendering importance or quality.
-                        diagnostic.append(F.smooth_l1_loss(pred * active[:, None], f, reduction="sum") / f.shape[1])
-                    else:
-                        rows.append(to_raw(pred, geometry, model))
-                        gates.append(active)
+                    auxiliary.append(reconstruction_loss(pred, f, geometry, model, active=active, reduction="sum"))
+                    diagnostic.append(F.smooth_l1_loss(pred * active[:, None], f, reduction="sum") / f.shape[1])
                 count = sum(int(c.sum()) for c in hard_counts)
                 payload_mean = torch.stack(expected).sum() / count
                 rate_loss = payload_mean / model.cfg.rates[-1]
                 aux_loss = torch.stack(auxiliary).sum() / count
-                if args.attribute_only:
-                    distortion = torch.stack(diagnostic).sum() / count
-                else:
-                    from .rendering import render
-                    from utils.loss_utils import ssim
-                    camera = random.choice(cameras)
-                    image = render(torch.cat(rows), camera, degree, args.white_background, torch.cat(gates))
-                    gt = camera.original_image[:3].to(device)
-                    distortion = .8 * (image - gt).abs().mean() + .2 * (1 - ssim(image, gt))
+                distortion = torch.stack(diagnostic).sum() / count
                 loss = distortion + args.attr_weight * aux_loss + args.beta * rate_loss
                 counts = torch.stack(hard_counts).sum(0)
-                values = {"phase": "joint_attribute_diagnostic" if args.attribute_only else "joint_render",
+                values = {"phase": "joint_attribute_diagnostic",
                           "distortion": float(distortion.detach()), "aux_loss": float(aux_loss.detach()),
                           "expected_symbols_per_gaussian": float(payload_mean.detach()),
                           "sampled_tier_counts": counts.cpu().tolist(), "temperature": tau}
             if not torch.isfinite(loss):
                 raise RuntimeError("nonfinite route2 loss")
-            loss.backward()
+            if not backward_done:
+                loss.backward()
             codec_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
             mask_norm = torch.nn.utils.clip_grad_norm_(mask.parameters(), 1., error_if_nonfinite=True)
             optimizer.step()
             values.update(step=step + 1, snr=snr, loss=float(loss.detach()),
-                          codec_grad_norm=float(codec_norm), mask_grad_norm=float(mask_norm))
+                          codec_grad_norm=float(codec_norm), mask_grad_norm=float(mask_norm),
+                          step_seconds=time.perf_counter() - step_started)
             log.write(json.dumps(values) + "\n")
             log.flush()
             progress.set_postfix(loss=f"{values['loss']:.5f}", phase=values["phase"])
@@ -229,6 +259,7 @@ def add_parsers(sub):
     p.add_argument("--tau-end", type=float, default=.3)
     p.add_argument("--attr-weight", type=float, default=.1)
     p.add_argument("--seed-position-weight", type=float, default=.2)
+    add_arguments(p)
     p.add_argument("--snr-range", type=float, nargs=2, default=[0., 20.])
     p.add_argument("--rates", type=int, nargs=4, default=[0, 8, 16, 32])
     p.add_argument("--hidden", type=int, default=96)
@@ -236,6 +267,10 @@ def add_parsers(sub):
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--levels", type=int, nargs="+", default=[4, 8, 16])
     p.add_argument("--block-size", type=int, default=4096)
+    p.add_argument("--blocks-per-batch", type=int, default=32)
+    p.add_argument("--render-backward", choices=["replay", "checkpoint"], default="replay")
+    p.add_argument("--training-data-device", choices=["cpu", "cuda"], default="cuda")
+    p.add_argument("--profile-every", type=int, default=10)
     p.add_argument("--device", default="cuda")
     p.add_argument("--source")
     p.add_argument("--resolution", type=int, default=2)

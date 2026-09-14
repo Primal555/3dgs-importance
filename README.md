@@ -2,6 +2,13 @@
 
 ## Gaussian JSCC codec extension
 
+New training uses **geometry-first JSCC**: separate geometry/attribute symbol
+paths within the same tier budget, direct XYZ decoding, physical reconstruction
+losses, and frozen source-PLY rendering targets. Both codec-only and joint-mask
+render training support batched replay (default 32 blocks).
+See [the architecture upgrade and server commands](docs/geometry_first_jscc.md).
+Legacy checkpoints remain evaluable but cannot initialize this new architecture.
+
 Full-scene codec training now supports vectorized spatial contexts, independent
 block batches, and exact gradient replay. See [training performance and continuation](docs/training_performance.md)
 for `benchmark_training.py`, timing fields, and reuse of existing codec checkpoints.
@@ -16,8 +23,8 @@ The dedicated `benchmark_codec.py` entry point measures reconstruction and chann
 with all Gaussians retained, independently of the learned tier allocator. Its optional
 `--hybrid-ablation` mode isolates render degradation from decoded positions versus
 decoded non-position attributes without running another channel transmission.
-`--position-seed-ablation` additionally compares the decoder's bootstrap XYZ with
-the final XYZ produced after spatial context updates.
+For legacy checkpoints, `--position-seed-ablation` compares bootstrap XYZ with
+post-context XYZ. Geometry-first has no separate seed; that diagnostic equals final XYZ.
 See [the hybrid codec ablation guide](docs/hybrid_codec_ablation.md) for the
 four scene variants, output metrics, charts, and server command.
 It adapts ROI-JSCC prefix transport and FCGS-inspired spatial aggregation; upstream

@@ -7,6 +7,31 @@ import math
 import torch
 
 
+class RenderReference:
+    """Frozen source-PLY teacher, lazily rendered once per camera on the CPU cache.
+
+    Never sent to the receiver. Retains no source render autograd graph and no
+    permanently resident full-scene CUDA copy. Images mode is explicit opt-in.
+    """
+
+    def __init__(self, raw, degree, white_background=False, target="source"):
+        if target not in ("source", "images"):
+            raise ValueError("unknown rendering target")
+        self.raw = raw.detach().cpu()
+        self.degree, self.white_background, self.target = degree, white_background, target
+        self.cache = {}
+
+    @torch.no_grad()
+    def get(self, camera, device):
+        if self.target == "images":
+            return camera.original_image[:3].detach().to(device)
+        key = id(camera)
+        if key not in self.cache:
+            self.cache[key] = render(self.raw.to(device), camera, self.degree,
+                                     self.white_background).detach().cpu()
+        return self.cache[key].to(device)
+
+
 HYBRID_VARIANT_DEFINITIONS = {
     "reference": "source xyz and source non-position attributes",
     "seed_position_error_only": "decoder position-seed xyz and source non-position attributes",

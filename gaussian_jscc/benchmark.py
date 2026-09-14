@@ -51,6 +51,8 @@ def benchmark_codec(args):
 
     device = device_for(args.device)
     model = load_checkpoint(args.checkpoint, device)
+    if model.cfg.architecture == "geometry_first" and args.position_seed_ablation:
+        print("Geometry-first has no intermediate position seed: seed diagnostics equal final XYZ.")
     raw, degree = read_ply(args.ply)
     if degree != model.cfg.sh_degree:
         raise ValueError("checkpoint SH degree mismatch")
