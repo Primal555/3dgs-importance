@@ -17,7 +17,9 @@ from .allocation import (GaussianTierMask, expected_rate,
 from .codec import CodecConfig, GaussianCodec
 from .data import prepare, read_ply, to_features
 from .transport import load_checkpoint, model_id, save_checkpoint
-from .losses import add_arguments, config_options, configure_training, reconstruction_loss, objective_stats
+from .losses import (add_arguments, config_options, configure_training, reconstruction_loss,
+                     objective_stats, initialize_position_head)
+from .optimization import clip_codec_gradients
 from .training import joint_scene_step
 
 
@@ -114,6 +116,7 @@ def train_joint(args):
     prior = np.load(args.existence_prior, allow_pickle=False) if args.existence_prior else None
     mask = GaussianTierMask(len(raw), prior, args.condition_snr).to(device)
     raw, geometry, order = prepare(raw, model.cfg.morton_bits, torch.arange(len(raw)))
+    initialize_position_head(model, raw, geometry)
     order = order.to(device)
     starts = list(range(0, len(raw), model.cfg.block_size))
     optimizer = torch.optim.Adam([{"params": model.parameters(), "lr": args.lr},
@@ -224,13 +227,14 @@ def train_joint(args):
                 raise RuntimeError("nonfinite route2 loss")
             if not backward_done:
                 loss.backward()
-            codec_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+            codec_norm,clip_stats = clip_codec_gradients(model,args.clip_norm,args.clip_mode)
             mask_norm = torch.nn.utils.clip_grad_norm_(mask.parameters(), 1., error_if_nonfinite=True)
             optimizer.step()
             values.update(step=step + 1, snr=snr, loss=float(loss.detach()),
                           codec_grad_norm=float(codec_norm), mask_grad_norm=float(mask_norm),
                           step_seconds=time.perf_counter() - step_started)
             values.update(objective_stats(values, model, 1. if step < args.warmup_steps else args.attr_weight))
+            values.update(clip_stats)
             log.write(json.dumps(values) + "\n")
             log.flush()
             progress.set_postfix(loss=f"{values['loss']:.5f}", phase=values["phase"])

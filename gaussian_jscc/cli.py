@@ -16,7 +16,9 @@ from .data import (load_tiers, prepare, read_ply, to_features,
                    to_raw, write_ply)
 from .transport import load_checkpoint, receive, save_checkpoint, transmit
 from .training import full_scene_step
-from .losses import add_arguments, config_options, configure_training, reconstruction_loss, objective_stats
+from .losses import (add_arguments, config_options, configure_training, reconstruction_loss,
+                     objective_stats, initialize_position_head)
+from .optimization import all_tier_attribute_step, clip_codec_gradients, preserved_rng
 
 
 def device_for(name):
@@ -53,6 +55,12 @@ def train(args):
         raise ValueError("render training requires --source and CUDA")
     if args.blocks_per_batch < 1 or args.profile_every < 0:
         raise ValueError("blocks-per-batch must be positive; profile-every must be nonnegative")
+    if args.tier_training == "all" and (args.rate_map or args.attribute_drop):
+        raise ValueError("all-tier training requires --attribute-drop 0 and no --rate-map")
+    if args.position_eval_every < 0 or args.position_eval_blocks < 1:
+        raise ValueError("invalid fixed position evaluation settings")
+    if not all(math.isfinite(v) for v in args.position_eval_snrs):
+        raise ValueError("position-eval-snrs must be finite")
     if args.render_lr is None:
         args.render_lr = args.lr * .25
     if not all(math.isfinite(x) and x > 0 for x in (args.lr, args.render_lr)):
@@ -81,6 +89,7 @@ def train(args):
         model.attr_std.copy_(raw[:, 3:].std(0, unbiased=False).clamp_min(.01).to(device))
     configure_training(model, args)
     raw, geometry, fixed_q = prepare(raw, model.cfg.morton_bits, fixed_q)
+    initialize_position_head(model, raw, geometry)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     model.train()
     starts = list(range(0, len(raw), model.cfg.block_size))
@@ -117,12 +126,32 @@ def train(args):
     record["codec_config"] = model.cfg.to_dict()
     record["seed_position_weight_effective"] = 0  # no seed stage in geometry-first
     (out / "training.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+    fixed_evaluations = []
+    def fixed_position_evaluation(step):
+        if args.position_eval_every:
+            from types import SimpleNamespace
+            from .gradient_diagnostics import evaluate_blocks
+            options=SimpleNamespace(eval_blocks=args.position_eval_blocks,eval_snrs=args.position_eval_snrs,seed=args.seed)
+            was_training=model.training
+            try:
+                model.eval()
+                with preserved_rng(device):
+                    rows=evaluate_blocks(model,feature_blocks,geometry,options,step)
+            finally:
+                model.train(was_training)
+            fixed_evaluations.extend(rows)
+            (out / "position_evaluation.json").write_text(json.dumps(fixed_evaluations,indent=2),encoding="utf-8")
+            print(f"[Fixed position evaluation {step}] " + "; ".join(
+                f"q{r['tier']} RMSE={r['position_rmse']:.5g}, P95={r['distance_p95']:.5g}"
+                for r in rows if r['channel']=='none'),flush=True)
+    fixed_position_evaluation(0)
     progress = trange(args.steps + args.render_steps, desc="Gaussian JSCC training")
     with (out / "loss.jsonl").open("w", encoding="utf-8") as log:
         for step in progress:
             step_started = time.perf_counter()
             snr = random.uniform(*args.snr_range)
             optimizer.zero_grad(set_to_none=True)
+            backward_done = False
             is_render = step >= args.steps
             if step == args.steps:
                 for group in optimizer.param_groups:
@@ -130,18 +159,22 @@ def train(args):
             if not is_render:
                 index = random.randrange(len(feature_blocks))
                 features = feature_blocks[index].to(device)
-                qb = (tier_blocks[index].to(device) if fixed_q is not None
-                      else sample_tiers(len(features), device, drop=args.attribute_drop))
-                keep = qb > 0
-                if not keep.any():
-                    qb[0] = 1
+                if args.tier_training == "all":
+                    loss,render_values=all_tier_attribute_step(model,features,geometry,snr,args.channel)
+                    backward_done=True
+                else:
+                    qb = (tier_blocks[index].to(device) if fixed_q is not None
+                          else sample_tiers(len(features), device, drop=args.attribute_drop))
                     keep = qb > 0
-                features, qb = features[keep], qb[keep]
-                unit = features[:, :3]
-                pred, seed = model(features, unit, qb, snr, args.channel, return_seed=True)
-                loss, terms = reconstruction_loss(pred, features, geometry, model, return_terms=True)
+                    if not keep.any():
+                        qb[0] = 1
+                        keep = qb > 0
+                    features, qb = features[keep], qb[keep]
+                    unit = features[:, :3]
+                    pred, seed = model(features, unit, qb, snr, args.channel, return_seed=True)
+                    loss, terms = reconstruction_loss(pred, features, geometry, model, return_terms=True)
+                    render_values = {f"{key}_loss": float(value.detach().mean()) for key, value in terms.items()}
                 image_loss = None
-                render_values = {f"{key}_loss": float(value.detach().mean()) for key, value in terms.items()}
             else:
                 from .rendering import render
                 from utils.loss_utils import ssim
@@ -165,16 +198,26 @@ def train(args):
                 image_loss = render_values["render_loss"]
             if not torch.isfinite(loss):
                 raise RuntimeError("nonfinite training loss; no checkpoint saved for this step")
-            if not is_render:
+            if not is_render and not backward_done:
                 loss.backward()
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+            if args.profile_every and (step+1)%args.profile_every==0:
+                from .gradient_diagnostics import update_stats, largest_gradients
+                before={n:p.detach().clone() for n,p in model.named_parameters()}
+                render_values['largest_parameter_gradients']=largest_gradients(model)
+            else:
+                before=None
+            norm,clip_stats = clip_codec_gradients(model,args.clip_norm,args.clip_mode)
             optimizer.step()
+            if before is not None:
+                render_values['updates']=update_stats(model,before)
+                del before
             values = {"step": step + 1, "phase": "render" if is_render else "attribute",
                       "loss": float(loss.detach()), "snr": snr, "grad_norm": float(norm),
                       "step_seconds": time.perf_counter() - step_started, **render_values}
             if image_loss is not None:
                 values["render_loss"] = float(image_loss)
             values.update(objective_stats(values, model, args.attr_weight if is_render else 1.))
+            values.update(clip_stats)
             values["learning_rate"] = optimizer.param_groups[0]["lr"]
             log.write(json.dumps(values) + "\n")
             if is_render or (step + 1) % 10 == 0:
@@ -183,6 +226,8 @@ def train(args):
                                      sec=f"{values['step_seconds']:.2f}")
             if (step + 1) % args.save_every == 0:
                 save_checkpoint(out / f"codec_{step + 1}.pt", model, step + 1, record)
+            if args.position_eval_every and ((step+1)%args.position_eval_every==0 or step+1 in (args.steps,args.steps+args.render_steps)):
+                fixed_position_evaluation(step+1)
         save_checkpoint(out / "codec.pt", model, args.steps + args.render_steps, record)
     from .plots import safe_plot
     safe_plot("training", out)
@@ -282,7 +327,7 @@ def main():
     p.set_defaults(func=train)
     p.add_argument("--ply", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--init", help="initialize from shared codec; architecture/statistics stay fixed")
+    p.add_argument("--init", help="initialize shared codec weights/statistics; head changes require --upgrade-position-head")
     p.add_argument("--steps", type=int, default=20000, help="attribute training steps")
     p.add_argument("--render-steps", type=int, default=0, help="subsequent full-scene rendering steps")
     p.add_argument("--blocks-per-batch", type=int, default=32,
@@ -314,6 +359,11 @@ def main():
     add_arguments(p)
     p.add_argument("--attribute-drop", type=float, default=.05,
                    help="random context dropout during attribute warmup; use 0 for strict codec isolation")
+    p.add_argument("--tier-training",choices=("sample","all"),default="sample",
+                   help="all: same block/SNR at q1/q2/q3, average gradients then one optimizer step")
+    p.add_argument("--position-eval-every",type=int,default=0,help="0 disables fixed-block per-tier position evaluation")
+    p.add_argument("--position-eval-blocks",type=int,default=8)
+    p.add_argument("--position-eval-snrs",type=float,nargs='+',default=[0.,10.,20.])
     p.add_argument("--rate-map")
     train_parser = p
     p = sub.add_parser("transmit")

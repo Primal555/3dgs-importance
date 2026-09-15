@@ -44,6 +44,7 @@ def load_checkpoint(path, device):
         raise ValueError("checkpoint version/architecture mismatch")
     model = GaussianCodec(cfg)
     model.load_state_dict(saved["state_dict"], strict=True)
+    model.position_head_needs_initialization = False
     return model.to(device).eval()
 
 

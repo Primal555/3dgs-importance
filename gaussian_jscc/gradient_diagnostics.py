@@ -22,21 +22,7 @@ from .data import prepare, read_ply, to_features, to_raw
 from .losses import reconstruction_loss, objective_stats
 from .training import full_scene_step
 from .transport import load_checkpoint, save_checkpoint
-
-
-def parameter_group(name):
-    prefix = name.split('.')[0]
-    if prefix in ('geo_dec', 'position_seed'):
-        return 'geometry_decoder'
-    if prefix == 'enc_geometry':
-        return 'geometry_encoder'
-    if prefix in ('dec_in', 'dec_blocks', 'heads'):
-        return 'attribute_decoder'
-    if prefix == 'enc_out':
-        return 'attribute_encoder'
-    if prefix in ('enc_in', 'enc_blocks'):
-        return 'shared_encoder'
-    return 'conditioning'
+from .optimization import parameter_group
 
 
 class GradientProbe:
@@ -127,12 +113,16 @@ def evaluate_blocks(model, blocks, geometry, args, step):
     for kind, snr in conditions:
         for tier in (1, 2, 3):
             squared, distances, objectives, counts = [], [], [], []
+            raw_squared, outside = [], []
             for index in indices:
                 seed_all(args.seed + 100000 + index)
                 f = blocks[index].to(device)
                 q = torch.full((len(f),), tier, device=device, dtype=torch.long)
                 pred = model(f, f[:, :3], q, snr, kind)
-                delta = (pred[:, :3]-f[:, :3]) * geometry.span.to(device)
+                # Match the actual receiver/render path, which clips bbox units.
+                delta = (pred[:, :3].clamp(0,1)-f[:, :3]) * geometry.span.to(device)
+                raw_squared.append(((pred[:, :3]-f[:, :3])*geometry.span.to(device)).square().sum())
+                outside.append(((pred[:, :3]<0)|(pred[:, :3]>1)).sum())
                 squared.append(delta.square().sum())
                 distances.append(delta.norm(dim=-1))
                 objectives.append(reconstruction_loss(pred, f, geometry, model)*len(f))
@@ -144,6 +134,8 @@ def evaluate_blocks(model, blocks, geometry, args, step):
                          'position_rmse':float(rmse), 'position_nrmse':float(rmse/geometry.span.norm().to(device)),
                          'distance_p50':float(distances.median()),
                          'distance_p95':float(torch.quantile(distances, .95)),
+                         'unclipped_position_rmse':float(torch.sqrt(sum(raw_squared)/(3*n))),
+                         'out_of_bounds_fraction':float(sum(outside)/(3*n)),
                          'reconstruction_loss':float(sum(objectives)/n)})
     return rows
 

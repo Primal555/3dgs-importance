@@ -16,7 +16,38 @@ PROFILES = {
                         dc_weight=.1, sh_weight=.05, scale_weight=0., geometry_floor=1e-4),
     "balanced_v2": dict(geometry_weight=1., shape_weight=.25, opacity_weight=1.,
                         dc_weight=1., sh_weight=.25, scale_weight=1., geometry_floor=1e-4),
+    "position_v3": dict(geometry_weight=10., shape_weight=.25, opacity_weight=1.,
+                        dc_weight=1., sh_weight=.25, scale_weight=1., geometry_floor=1e-4,
+                        position_beta=.001, position_tail_margin=.01, position_tail_weight=2.),
 }
+
+
+def position_v3_terms(pred, target, cfg):
+    """Unclipped bbox-unit correction with a bounded derivative for every row.
+
+    Base SmoothL1 has non-vanishing constant slope for large errors. A second
+    smooth tail penalty beyond a fixed margin adds pressure on bad coordinates.
+    No scene-span / tiny Gaussian scale multiplier in this gradient path. The
+    reference frame is still per-axis global bbox, not a local-coordinate codec.
+    """
+    delta = pred[:, :3] - target[:, :3].detach()
+    base = F.smooth_l1_loss(delta, torch.zeros_like(delta), beta=cfg.position_beta,
+                           reduction="none").mean(-1)
+    excess = (delta.abs() - cfg.position_tail_margin).clamp_min(0.)
+    tail = F.smooth_l1_loss(excess, torch.zeros_like(excess), beta=cfg.position_beta,
+                           reduction="none").mean(-1)
+    return base, tail
+
+
+@torch.no_grad()
+def initialize_position_head(model, raw, geometry):
+    """Source median only initializes a trainable bias; no new decoder input."""
+    if model.position_head_needs_initialization:
+        center = geometry.normalize(raw[:, :3]).median(0).values.to(model.position_seed.bias)
+        model.position_seed.bias.copy_((center-.5)/.25)
+        model.position_head_needs_initialization = False
+        print("Initialized NEW normalized affine XYZ head near source median; "
+              "all other codec weights retained. Position recovery must be retrained.")
 
 
 def rotation_matrix(q):
@@ -87,11 +118,15 @@ def physical_terms(pred, target, geometry, model):
     decoded = to_raw(pred, geometry, model)
     ref_rotation = rotation_matrix(source[:, 7:11])
     rotation = rotation_matrix(decoded[:, 7:11])
-    floor = (geometry.span.to(pred).norm() * model.cfg.geometry_floor).clamp_min(1e-12)
-    ref_scale = (source[:, 4:7].exp().square() + floor.square()).sqrt()
-    delta = decoded[:, :3] - source[:, :3]
-    local_delta = torch.bmm(ref_rotation.transpose(1, 2), delta[..., None]).squeeze(-1)
-    position = torch.log1p((local_delta / ref_scale).square().sum(-1))
+    if model.cfg.loss_profile == "position_v3":
+        base, tail = position_v3_terms(pred, target, model.cfg)
+        position = base + model.cfg.position_tail_weight * tail
+    else:
+        floor = (geometry.span.to(pred).norm() * model.cfg.geometry_floor).clamp_min(1e-12)
+        ref_scale = (source[:, 4:7].exp().square() + floor.square()).sqrt()
+        delta = decoded[:, :3] - source[:, :3]
+        local_delta = torch.bmm(ref_rotation.transpose(1, 2), delta[..., None]).squeeze(-1)
+        position = torch.log1p((local_delta / ref_scale).square().sum(-1))
 
     # Use UNCLIPPED network outputs for scale/logit guards. to_raw clamps for
     # safe rendering; using its clamped values here would create dead gradients.
@@ -167,6 +202,15 @@ def add_arguments(parser):
                         help="training objective; old checkpoints are explicitly migrated for fine-tuning")
     parser.add_argument("--geometry-rates", type=int, nargs=4,
                         help="geometry complex symbols per tier; default floor(total/2), not a measured optimum")
+    parser.add_argument("--position-head", choices=("sigmoid", "normalized_affine_v3"),
+                        help="position_v3 selects normalized_affine_v3 unless explicitly overridden")
+    parser.add_argument("--upgrade-position-head", action="store_true",
+                        help="explicitly reset ONLY the position head when changing an initializer's parameterization")
+    parser.add_argument("--position-beta", type=float, help="SmoothL1 transition in per-axis bbox units")
+    parser.add_argument("--position-tail-margin", type=float, help="large-error margin in per-axis bbox units")
+    parser.add_argument("--position-tail-weight", type=float, help="additional bounded-slope tail penalty")
+    parser.add_argument("--clip-mode", choices=("global", "branch"), default="global")
+    parser.add_argument("--clip-norm", type=float, default=1.)
     for name in ("geometry", "shape", "scale", "opacity", "dc", "sh"):
         parser.add_argument(f"--{name}-weight", type=float,
                             help="override profile weight; retain checkpoint value when profile is unchanged")
@@ -181,6 +225,7 @@ def config_options(args):
     defaults = PROFILES[profile]
     return {"geometry_rates": tuple(args.geometry_rates or ()),
             "loss_profile": profile,
+            "position_head": args.position_head or ("normalized_affine_v3" if profile == "position_v3" else "sigmoid"),
             **{name: default if getattr(args, name) is None else getattr(args, name)
                for name, default in defaults.items()}}
 
@@ -191,6 +236,17 @@ def configure_training(model, args):
                          "to train the upgraded architecture; old checkpoints remain evaluable.")
     if args.geometry_rates is not None and tuple(args.geometry_rates) != model.cfg.geometry_rates:
         raise ValueError("geometry-rates cannot change when initializing a checkpoint")
+    requested_head = args.position_head or ("normalized_affine_v3" if args.loss_profile == "position_v3" else model.cfg.position_head)
+    if model.cfg.position_head != requested_head:
+        if not args.upgrade_position_head:
+            raise ValueError("Position head change requires --upgrade-position-head; "
+                             "the old XYZ head cannot be silently reused. Other weights will be retained.")
+        if requested_head != "normalized_affine_v3":
+            raise ValueError("Only an explicit upgrade to normalized_affine_v3 is supported")
+        model.cfg.position_head = requested_head
+        model.reset_position_head()
+    if not torch.isfinite(torch.tensor(args.clip_norm)) or args.clip_norm <= 0:
+        raise ValueError("clip-norm must be positive and finite")
     if model.cfg.loss_profile != args.loss_profile:
         print(f"Loss profile: {model.cfg.loss_profile} -> {args.loss_profile}; "
               "resetting objective weights to the selected profile, keeping codec weights and rate layout.")
@@ -199,6 +255,6 @@ def configure_training(model, args):
             setattr(model.cfg, name, value)
     # Loss weights can change for fine-tuning; architecture/rate table cannot.
     for name, value in config_options(args).items():
-        if name not in ("geometry_rates", "loss_profile") and getattr(args, name) is not None:
+        if name not in ("geometry_rates", "loss_profile", "position_head") and getattr(args, name) is not None:
             setattr(model.cfg, name, value)
     model.cfg.__post_init__()

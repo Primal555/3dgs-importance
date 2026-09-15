@@ -36,6 +36,10 @@ class CodecConfig:
     geometry_floor: float = 1e-4
     loss_profile: str = "balanced_v2"
     scale_weight: float = 1.
+    position_head: str = "sigmoid"
+    position_beta: float = .001
+    position_tail_margin: float = .01
+    position_tail_weight: float = 2.
 
     def __post_init__(self):
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
@@ -66,8 +70,18 @@ class CodecConfig:
                 x > y for seq in (g, a) for x, y in zip(seq, seq[1:])
             ):
                 raise ValueError("geometry and attribute lengths must be positive and nondecreasing at q1..q3")
-        if self.loss_profile not in ("physical_v1", "balanced_v2"):
+        if self.loss_profile not in ("physical_v1", "balanced_v2", "position_v3"):
             raise ValueError("unknown reconstruction loss profile")
+        if self.position_head not in ("sigmoid", "normalized_affine_v3"):
+            raise ValueError("unknown position head")
+        if self.architecture == "legacy" and self.position_head != "sigmoid":
+            raise ValueError("legacy architecture requires sigmoid positions")
+        if not math.isfinite(self.position_beta) or self.position_beta <= 0:
+            raise ValueError("position-beta must be positive and finite")
+        if not math.isfinite(self.position_tail_margin) or self.position_tail_margin < 0:
+            raise ValueError("position-tail-margin must be nonnegative and finite")
+        if not math.isfinite(self.position_tail_weight) or self.position_tail_weight < 0:
+            raise ValueError("position-tail-weight must be nonnegative and finite")
         for name in ("geometry_weight", "shape_weight", "opacity_weight", "dc_weight", "sh_weight", "scale_weight"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
@@ -80,6 +94,13 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        # Preserve every historical model/packet hash when the new options are
+        # inactive; new readers still load those files without changing outputs.
+        if self.position_head == "sigmoid":
+            result.pop("position_head")
+        if self.loss_profile != "position_v3":
+            for name in ("position_beta", "position_tail_margin", "position_tail_weight"):
+                result.pop(name)
         if self.architecture == "legacy" or self.loss_profile == "physical_v1":
             # Old geometry-first packets also hash the config. Do not silently
             # change their identity just by loading with newer software.
@@ -268,6 +289,9 @@ class GaussianCodec(nn.Module):
         self.enc_blocks = nn.ModuleList([ContextBlock(cfg) for _ in range(cfg.depth)])
         self.dec_blocks = nn.ModuleList([ContextBlock(cfg) for _ in range(cfg.depth)])
         self.position_seed = nn.Linear(cfg.hidden, 3)
+        self.position_head_needs_initialization = cfg.position_head == "normalized_affine_v3"
+        if self.position_head_needs_initialization:
+            self.reset_position_head()
         if cfg.architecture == "legacy":
             self.enc_out = nn.Linear(cfg.hidden, 2 * cfg.rates[-1])
             self.dec_in = nn.Linear(4 * cfg.rates[-1], cfg.hidden)
@@ -303,6 +327,20 @@ class GaussianCodec(nn.Module):
                                    self.enc_geometry(torch.cat((h, xyz * 2 - 1), -1)))
         return latent.index_copy(-1, self.attribute_slots, self.enc_out(h))
 
+    def reset_position_head(self):
+        """Explicit new-head initialization, NOT a function-preserving migration."""
+        nn.init.normal_(self.position_seed.weight, std=.001)
+        nn.init.zeros_(self.position_seed.bias)
+        self.position_head_needs_initialization = True
+
+    def predict_position(self, hidden):
+        if self.cfg.position_head == "sigmoid":
+            return self.position_seed(hidden).sigmoid()
+        # No trainable LN gain that could re-amplify the head's input norm.
+        # Targets remain existing per-axis bbox units; no new geometry metadata.
+        normalized = F.layer_norm(hidden, (self.cfg.hidden,), eps=1e-5)
+        return .5 + .25 * self.position_seed(normalized)
+
     def decode_latent(self, received, mask, condition, active=None):
         if self.cfg.architecture == "legacy":
             h = self.dec_in(torch.cat((received, mask), -1)) + condition
@@ -314,7 +352,7 @@ class GaussianCodec(nn.Module):
         else:
             g, a = self.geometry_slots, self.attribute_slots
             gh = self.geo_dec(torch.cat((received[..., g], mask[..., g]), -1)) + condition
-            xyz = self.position_seed(gh).sigmoid()
+            xyz = self.predict_position(gh)
             # Compatibility diagnostic: there is no intermediate position seed
             # in this architecture; the returned position is already final.
             seed = xyz

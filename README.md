@@ -13,6 +13,13 @@ attribute constraints during rendering, and separates training phases in charts.
 Existing geometry-first checkpoints can be fine-tuned without changing payloads:
 [correction details and continuation script](docs/codec_loss_correction.md).
 
+An explicit [position-v3 upgrade](docs/position_v3.md) adds a normalized affine
+XYZ head, bounded-slope position supervision, branch clipping, same-block
+q1/q2/q3 coverage and fixed per-tier position diagnostics. Use
+`scripts/train_codec_position_v3.sh` to select it; old checkpoints retain their
+original decoding behavior. Upgrading an old head resets that head and requires
+retraining, without adding coordinate metadata or changing symbol budgets.
+
 For a controlled short test of attribute-context gradients into XYZ, use
 [the paired gradient diagnostic](docs/context_xyz_gradient_test.md). It compares
 attached/detached context coordinates with identical sampling, records component

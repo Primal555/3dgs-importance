@@ -191,6 +191,45 @@ def plot_training(training_dir, output_dir=None):
                 axis.legend(ncol=2, fontsize=8)
         charts += _finish(fig, out / "training_weighted_contributions")
 
+    gradient_rows = [r for r in rows if r.get("gradient_groups")]
+    if gradient_rows:
+        groups = sorted({g for r in gradient_rows for g in r["gradient_groups"]})
+        fig, axes = plt.subplots(2, len(groups), figsize=(3.5*len(groups), 6), squeeze=False)
+        fig.suptitle("Disjoint parameter groups: clipping and actual updates\nBranch caps do not impose the same global cap")
+        for col, group in enumerate(groups):
+            selected = [r for r in gradient_rows if group in r["gradient_groups"]]
+            for key, style in (("before", "-"), ("after", "--")):
+                axes[0,col].plot([r['step'] for r in selected],
+                                 [r['gradient_groups'][group][key] for r in selected],
+                                 style, label=key, linewidth=.8)
+            axes[0,col].set(title=group, yscale='symlog', ylabel='Gradient L2 norm')
+            axes[0,col].legend()
+            selected = [r for r in selected if group in r.get('updates', {})]
+            if selected:
+                axes[1,col].plot([r['step'] for r in selected],
+                                 [r['updates'][group]['relative_update'] for r in selected], linewidth=.8)
+            axes[1,col].set(xlabel='Step', ylabel='Relative parameter update', yscale='symlog')
+        charts += _finish(fig, out / 'training_gradient_groups')
+
+    position_path = training_dir / 'position_evaluation.json'
+    if position_path.exists():
+        evaluations = json.loads(position_path.read_text(encoding='utf-8'))
+        conditions = sorted({(r['channel'],r['snr']) for r in evaluations})
+        if conditions:
+            fig, axes = plt.subplots(2,len(conditions),figsize=(4*len(conditions),6),squeeze=False)
+            fig.suptitle('Fixed-block position recovery by tier\nSame source blocks and noise seeds; not held-out-scene performance')
+            for col,(channel,snr) in enumerate(conditions):
+                for tier in (1,2,3):
+                    selected=[r for r in evaluations if (r['channel'],r['snr'],r['tier'])==(channel,snr,tier)]
+                    for axis,key in zip(axes[:,col],('position_rmse','distance_p95')):
+                        axis.plot([r['step'] for r in selected],[r[key] for r in selected],
+                                  marker='.',label=f'q{tier}',color=TIER_COLORS[tier])
+                axes[0,col].set(title=f'{channel}, conditioning SNR {snr:g} dB',ylabel='XYZ RMSE (scene units)')
+                axes[1,col].set(xlabel='Step',ylabel='Euclidean distance P95 (scene units)')
+                axes[0,col].legend()
+            charts += _finish(fig,out / 'training_fixed_positions')
+            _write_csv(out / 'position_evaluation.csv',evaluations,list(evaluations[0]))
+
     joint_rows = [row for row in rows if row.get("sampled_tier_counts") is not None]
     if joint_rows:
         joint_steps = _numeric(joint_rows, "step")
