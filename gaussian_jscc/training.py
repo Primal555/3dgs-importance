@@ -48,16 +48,22 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
 
 def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
                     attr_weight=.1, seed_weight=.2, mode="replay", profile=False,
-                    batch_forward=None):
+                    batch_forward=None, gradient_observer=None):
     """Compute AND backpropagate one loss; caller clips/steps the optimizer.
 
     batches is a nonempty list of (padded_features, int64_tiers), each containing
     independent spatial blocks. CPU-resident batches are transferred on demand.
     q0 is permitted for padding/fixed drop maps, not as a learned mask here.
     distortion_fn receives the COMPLETE decoded scene in retained source order.
+    An optional replay-only observer receives weighted component objectives on
+    each recomputed batch. It may use autograd.grad(retain_graph=True), but must
+    not mutate .grad, parameters, or RNG. Summed observations are full-scene
+    parameter gradients (the render objective here is its exact VJP surrogate).
     """
     if mode not in ("replay", "checkpoint"):
         raise ValueError("render backward must be replay or checkpoint")
+    if gradient_observer is not None and mode != "replay":
+        raise ValueError("gradient observer requires replay")
     device = next(model.parameters()).device
     timer = PhaseTimer(device, profile)
     if profile and device.type == "cuda":
@@ -118,10 +124,17 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
                     torch.cuda.set_rng_state(state, device)
                 else:
                     torch.set_rng_state(state)
-                raw, aux, _ = forward(features.to(device), q.to(device))
+                raw, aux, metrics = forward(features.to(device), q.to(device))
                 # VJP through the codec, plus the original weighted auxiliary.
-                objective = (raw * upstream[offset:offset + count]).sum()
-                objective = objective + attr_weight * aux * count / total_count
+                render_objective = (raw * upstream[offset:offset + count]).sum()
+                weighted_aux = attr_weight * aux * count / total_count
+                if gradient_observer is not None:
+                    weighted_geometry = (metrics["geometry"] * model.cfg.geometry_weight
+                                         * attr_weight * count / total_count)
+                    gradient_observer({"geometry": weighted_geometry,
+                                       "attributes": weighted_aux - weighted_geometry,
+                                       "render": render_objective})
+                objective = render_objective + weighted_aux
                 objective.backward()
                 offset += count
         timer.mark("codec_replay_backward_seconds")

@@ -13,6 +13,12 @@ attribute constraints during rendering, and separates training phases in charts.
 Existing geometry-first checkpoints can be fine-tuned without changing payloads:
 [correction details and continuation script](docs/codec_loss_correction.md).
 
+For a controlled short test of attribute-context gradients into XYZ, use
+[the paired gradient diagnostic](docs/context_xyz_gradient_test.md). It compares
+attached/detached context coordinates with identical sampling, records component
+gradients and actual Adam updates, and evaluates fixed position/render quality.
+Normal training behavior and checkpoint/packet formats are unchanged.
+
 Full-scene codec training now supports vectorized spatial contexts, independent
 block batches, and exact gradient replay. See [training performance and continuation](docs/training_performance.md)
 for `benchmark_training.py`, timing fields, and reuse of existing codec checkpoints.

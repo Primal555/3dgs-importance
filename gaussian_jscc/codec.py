@@ -254,6 +254,9 @@ class GaussianCodec(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        # Diagnostic-only backward switch. Forward values, state_dict and wire
+        # format are unchanged; callers must record this in training metadata.
+        self.detach_attribute_context_xyz = False
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
         self.tier_emb = nn.Embedding(4, cfg.hidden)
@@ -316,9 +319,10 @@ class GaussianCodec(nn.Module):
             # in this architecture; the returned position is already final.
             seed = xyz
             h = self.dec_in(torch.cat((received[..., a], mask[..., a]), -1)) + condition
-            plan = self.dec_blocks[0].grid.geometry_plan(xyz, active)
+            context_xyz = xyz.detach() if self.detach_attribute_context_xyz else xyz
+            plan = self.dec_blocks[0].grid.geometry_plan(context_xyz, active)
             for block in self.dec_blocks:
-                h = block(h, xyz, condition, active, plan=plan)
+                h = block(h, context_xyz, condition, active, plan=plan)
         return torch.cat((xyz, *(head(h) for head in self.heads.values())), -1), seed
 
     def encoder_conditioning(self, xyz, q, snr):
