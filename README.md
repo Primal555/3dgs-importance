@@ -8,6 +8,10 @@ losses, and frozen source-PLY rendering targets. Both codec-only and joint-mask
 render training support batched replay (default 32 blocks).
 See [the architecture upgrade and server commands](docs/geometry_first_jscc.md).
 Legacy checkpoints remain evaluable but cannot initialize this new architecture.
+The current `balanced_v2` loss corrects the scale-collapse penalty, retains
+attribute constraints during rendering, and separates training phases in charts.
+Existing geometry-first checkpoints can be fine-tuned without changing payloads:
+[correction details and continuation script](docs/codec_loss_correction.md).
 
 Full-scene codec training now supports vectorized spatial contexts, independent
 block batches, and exact gradient replay. See [training performance and continuation](docs/training_performance.md)

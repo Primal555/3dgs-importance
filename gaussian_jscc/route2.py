@@ -17,7 +17,7 @@ from .allocation import (GaussianTierMask, expected_rate,
 from .codec import CodecConfig, GaussianCodec
 from .data import prepare, read_ply, to_features
 from .transport import load_checkpoint, model_id, save_checkpoint
-from .losses import add_arguments, config_options, configure_training, reconstruction_loss
+from .losses import add_arguments, config_options, configure_training, reconstruction_loss, objective_stats
 from .training import joint_scene_step
 
 
@@ -230,6 +230,7 @@ def train_joint(args):
             values.update(step=step + 1, snr=snr, loss=float(loss.detach()),
                           codec_grad_norm=float(codec_norm), mask_grad_norm=float(mask_norm),
                           step_seconds=time.perf_counter() - step_started)
+            values.update(objective_stats(values, model, 1. if step < args.warmup_steps else args.attr_weight))
             log.write(json.dumps(values) + "\n")
             log.flush()
             progress.set_postfix(loss=f"{values['loss']:.5f}", phase=values["phase"])
@@ -257,7 +258,7 @@ def add_parsers(sub):
     p.add_argument("--beta", type=float, default=.01)
     p.add_argument("--tau-start", type=float, default=1.)
     p.add_argument("--tau-end", type=float, default=.3)
-    p.add_argument("--attr-weight", type=float, default=.1)
+    p.add_argument("--attr-weight", type=float, default=1.)
     p.add_argument("--seed-position-weight", type=float, default=.2)
     add_arguments(p)
     p.add_argument("--snr-range", type=float, nargs=2, default=[0., 20.])

@@ -84,6 +84,7 @@ def _numeric(rows, key):
 
 def _rolling(values, window):
     values = np.asarray(values, dtype=float)
+    window = min(window, len(values))
     if window <= 1:
         return values.copy()
     valid = np.isfinite(values).astype(float)
@@ -94,9 +95,27 @@ def _rolling(values, window):
     return np.divide(total, count, out=np.full_like(total, np.nan), where=count > 0)
 
 
-def _phase_boundary(rows):
-    joint = [float(row["step"]) for row in rows if str(row.get("phase", "")).startswith("joint")]
-    return min(joint) if joint else None
+def _phase_segments(rows):
+    """Never join/smooth across either an objective or sampling-phase change."""
+    segments = []
+    for row in rows:
+        key = (row.get("phase", "unknown"), row.get("loss_profile", "unrecorded"))
+        if not segments or segments[-1][0] != key:
+            segments.append((key, []))
+        segments[-1][1].append(row)
+    return segments
+
+
+def _trace(axis, rows, key, label, color, style="-", raw=True):
+    values = _numeric(rows, key)
+    if not np.isfinite(values).any():
+        return
+    x = _numeric(rows, "step")
+    window = max(1, min(101, len(rows) // 40))
+    if raw:
+        axis.plot(x, values, color=color, alpha=.16, linewidth=.6)
+    axis.plot(x, _rolling(values, window), color=color, linestyle=style,
+              linewidth=1.6, label=label, marker="o" if len(rows) == 1 else None)
 
 
 def _manifest(out, kind, source, charts, notes):
@@ -108,62 +127,69 @@ def _manifest(out, kind, source, charts, notes):
 
 
 def plot_training(training_dir, output_dir=None):
-    """Plot optimization traces from a route2 loss.jsonl file."""
+    """Plot codec/route2 traces without connecting unlike training objectives."""
     training_dir = Path(training_dir)
     out = Path(output_dir) if output_dir else training_dir / "charts"
     out.mkdir(parents=True, exist_ok=True)
     rows = _read_jsonl(training_dir / "loss.jsonl")
-    steps = _numeric(rows, "step")
-    window = max(1, min(101, len(rows) // 40))
-    boundary = _phase_boundary(rows)
     charts = []
     plt = _plt()
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-    series = (("loss", "Total loss", TIER_COLORS[1]),
-              ("distortion", "Render distortion", TIER_COLORS[3]),
-              ("render_loss", "Render loss", TIER_COLORS[3]),
-              ("aux_loss", "Attribute auxiliary", TIER_COLORS[2]))
-    for key, label, color in series:
-        values = _numeric(rows, key)
-        if np.isfinite(values).any():
-            axes[0].plot(steps, values, color=color, alpha=.18, linewidth=.7)
-            axes[0].plot(steps, _rolling(values, window), color=color, linewidth=1.8, label=label)
-    axes[0].set_title("Training objectives")
-    axes[0].set_ylabel("Loss")
-    axes[0].legend(ncol=3, loc="upper right")
-    for key, label, color in (("codec_grad_norm", "Codec", TIER_COLORS[1]),
-                              ("grad_norm", "Codec", TIER_COLORS[1]),
-                              ("mask_grad_norm", "Tier mask", TIER_COLORS[3])):
-        values = _numeric(rows, key)
-        if np.isfinite(values).any():
-            axes[1].plot(steps, np.maximum(values, 1e-12), color=color, alpha=.18, linewidth=.7)
-            axes[1].plot(steps, np.maximum(_rolling(values, window), 1e-12),
-                         color=color, linewidth=1.8, label=label)
-    axes[1].set_yscale("log")
-    axes[1].set_title("Gradient norms")
-    axes[1].set_ylabel("L2 norm (log scale)")
-    axes[1].set_xlabel("Optimization step")
-    axes[1].legend(loc="upper right")
-    if boundary is not None:
-        for axis in axes:
-            axis.axvline(boundary, color=REFERENCE, linestyle="--", linewidth=1)
-        axes[0].text(boundary, .02, " joint optimization", va="bottom", color=REFERENCE,
-                     transform=axes[0].get_xaxis_transform())
+    segments = _phase_segments(rows)
+    fig, axes = plt.subplots(2, len(segments), figsize=(6 * len(segments), 7), squeeze=False)
+    fig.suptitle("Training objectives by phase\nIndependent axes; smoothing stays within each phase", fontsize=12)
+    for col, ((phase, profile), group) in enumerate(segments):
+        top, bottom = axes[:, col]
+        _trace(top, group, "loss", "Total objective", TIER_COLORS[1])
+        render_key = "render_loss" if any("render_loss" in r for r in group) else "distortion"
+        _trace(top, group, render_key, "Render / task term", TIER_COLORS[3], "--")
+        aux_key = "aux_contribution" if any("aux_contribution" in r for r in group) else "aux_loss"
+        _trace(top, group, aux_key,
+               "Weighted reconstruction" if aux_key == "aux_contribution" else "Raw auxiliary (weight not shown)",
+               REFERENCE, ":")
+        _trace(top, group, "rate_loss", "Weighted rate term", TIER_COLORS[2], "-.")
+        top.set(title=f"{phase} | {profile}", ylabel="Objective value", xlabel="Optimization step")
+        top.margins(y=.25)
+        top.legend(fontsize=8)
+        for key, label, color in (("codec_grad_norm", "Codec", TIER_COLORS[1]),
+                                  ("grad_norm", "Codec", TIER_COLORS[1]),
+                                  ("mask_grad_norm", "Tier mask", TIER_COLORS[3])):
+            _trace(bottom, group, key, label, color)
+        bottom.set_yscale("symlog", linthresh=1e-5)
+        bottom.set(title="Gradient norms before clipping", ylabel="L2 norm (symlog)", xlabel="Optimization step")
+        if bottom.lines:
+            bottom.legend()
     charts += _finish(fig, out / "training_objectives")
 
-    physical_keys = ("geometry_loss", "shape_loss", "opacity_loss", "dc_loss", "sh_loss")
+    physical_keys = ("geometry_loss", "shape_loss", "scale_loss", "opacity_loss", "dc_loss", "sh_loss")
     if any(np.isfinite(_numeric(rows, key)).any() for key in physical_keys):
-        fig, axis = plt.subplots(figsize=(10, 4))
-        for key in physical_keys:
-            values = _numeric(rows, key)
-            if np.isfinite(values).any():
-                axis.plot(steps, _rolling(values, window), label=key.removesuffix("_loss"))
-        axis.set_yscale("symlog", linthresh=1e-5)
-        axis.set(xlabel="Optimization step", ylabel="Unweighted physical loss",
-                 title="Geometry-first reconstruction components (different scales)")
-        axis.legend()
+        fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+        fig.suptitle("Unweighted reconstruction components\nSeparate units/scales; local-block and full-scene sampling differ")
+        for axis, key in zip(axes.flat, physical_keys):
+            for index, ((phase, profile), group) in enumerate(segments):
+                _trace(axis, group, key, f"{phase} | {profile}",
+                       (TIER_COLORS[1], TIER_COLORS[3], REFERENCE)[index % 3],
+                       ("-", "--", ":")[index % 3], raw=False)
+            axis.set(title=key.removesuffix("_loss"), xlabel="Optimization step", ylabel="Unweighted term")
+            if axis.lines:
+                axis.legend(fontsize=7)
+            else:
+                axis.text(.5, .5, "Not recorded", ha="center", transform=axis.transAxes)
         charts += _finish(fig, out / "training_physical_losses")
+
+    if any("geometry_contribution" in r for r in rows):
+        fig, axes = plt.subplots(1, len(segments), figsize=(6 * len(segments), 4.5), squeeze=False)
+        fig.suptitle("Weighted reconstruction contributions\nScalar objective contributions, not gradient magnitudes")
+        colors = (TIER_COLORS[1], TIER_COLORS[3], TIER_COLORS[2], REFERENCE, "#687F45", "#AD668B")
+        for axis, ((phase, _), group) in zip(axes.flat, segments):
+            for i, (key, color) in enumerate(zip(physical_keys, colors)):
+                name = key.removesuffix("_loss")
+                _trace(axis, group, name + "_contribution", name, color,
+                       ("-", "--", ":")[i % 3], raw=False)
+            axis.set(title=phase, xlabel="Optimization step", ylabel="Weighted term")
+            if axis.lines:
+                axis.legend(ncol=2, fontsize=8)
+        charts += _finish(fig, out / "training_weighted_contributions")
 
     joint_rows = [row for row in rows if row.get("sampled_tier_counts") is not None]
     if joint_rows:
@@ -199,17 +225,17 @@ def plot_training(training_dir, output_dir=None):
 
     flat = []
     for row in rows:
-        item = {key: row.get(key) for key in ("step", "phase", "snr", "loss", "distortion",
-                                               "aux_loss", "expected_symbols_per_gaussian",
-                                               "temperature", "codec_grad_norm", "mask_grad_norm")}
+        item = {key: value for key, value in row.items() if not isinstance(value, (list, dict))}
         counts = row.get("sampled_tier_counts")
         for index, name in enumerate(TIER_NAMES):
             item[f"tier_{name.lower()}_count"] = counts[index] if counts is not None else None
         flat.append(item)
-    fields = list(flat[0])
+    fields = list(dict.fromkeys(key for item in flat for key in item))
     _write_csv(out / "training_chart_data.csv", flat, fields)
     return _manifest(out, "training", training_dir / "loss.jsonl", charts,
-                     [f"Raw traces plus centered rolling mean (window={window}).",
+                     ["Smoothing is per contiguous phase/profile, window=min(101, max(1, phase_rows//40)).",
+                      "Objective panels have independent axes; losses are not comparable across changed objectives.",
+                      "Missing historical weighted contributions are not inferred; raw terms use different units.",
                       "Tier composition records hard Gumbel samples, not deployment argmax counts."])
 
 
@@ -254,6 +280,7 @@ def plot_evaluation(evaluation_dir, output_dir=None):
                     "position_rmse", "attribute_mse", "position_nrmse_bbox_diagonal",
                     "position_seed_rmse", "position_seed_nrmse_bbox_diagonal",
                     "opacity_alpha_mae", "log_scale_rmse", "rotation_angle_mean_deg",
+                    "sorted_log_scale_rmse", "log_covariance_rmse", "log_volume_bias",
                     "rotation_angle_p95_deg", "dc_rmse", "sh_rest_rmse",
                     "all_parameter_rmse"):
             row[key + "_mean"], row[key + "_std"] = _mean_std(group, key)
@@ -493,7 +520,10 @@ def plot_evaluation(evaluation_dir, output_dir=None):
                       ("log_scale_rmse", "Log-scale RMSE"),
                       ("rotation_angle_mean_deg", "Mean rotation error (degrees)"),
                       ("dc_rmse", "DC coefficient RMSE"),
-                      ("sh_rest_rmse", "Higher-order SH RMSE"))
+                      ("sh_rest_rmse", "Higher-order SH RMSE"),
+                      ("sorted_log_scale_rmse", "Sorted log-scale RMSE"),
+                      ("log_covariance_rmse", "Log-covariance RMSE"),
+                      ("log_volume_bias", "Mean log-volume ratio (negative = shrink)"))
     parameter_keys = [(key, label) for key, label in parameter_keys
                       if any(np.isfinite(row.get(key + "_mean", np.nan)) for row in summary)]
     if parameter_keys:

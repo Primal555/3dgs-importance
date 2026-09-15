@@ -31,9 +31,19 @@ def parameter_metrics(source, recovered):
     recovered_q = F.normalize(recovered[:, 7:11], dim=-1)
     cosine = (source_q * recovered_q).sum(-1).abs().clamp(0, 1)
     angles = 2 * cosine.acos() * (180 / math.pi)
+    from .losses import rotation_matrix
+    ref_rotation, rotation = rotation_matrix(source_q), rotation_matrix(recovered_q)
+    ref_log_cov = (ref_rotation * (2 * source[:, 4:7])[:, None, :]) @ ref_rotation.transpose(1, 2)
+    log_cov = (rotation * (2 * recovered[:, 4:7])[:, None, :]) @ rotation.transpose(1, 2)
     result = {
         "opacity_alpha_mae": float((source[:, 3].sigmoid() - recovered[:, 3].sigmoid()).abs().mean()),
         "log_scale_rmse": float(difference[:, 4:7].square().mean().sqrt()),
+        "sorted_log_scale_rmse": float((recovered[:, 4:7].sort(-1).values -
+                                         source[:, 4:7].sort(-1).values).square().mean().sqrt()),
+        "log_covariance_rmse": float((log_cov - ref_log_cov).square().mean().sqrt()),
+        # Equal-volume constants cancel. Negative means net shrinkage, positive
+        # means expansion; unlike RMSE this does not discard the direction.
+        "log_volume_bias": float(difference[:, 4:7].sum(-1).mean()),
         "rotation_angle_mean_deg": float(angles.mean()),
         "rotation_angle_p95_deg": float(torch.quantile(angles, .95)),
         "dc_rmse": float(difference[:, 11:14].square().mean().sqrt()),

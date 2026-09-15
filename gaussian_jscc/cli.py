@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -15,7 +16,7 @@ from .data import (load_tiers, prepare, read_ply, to_features,
                    to_raw, write_ply)
 from .transport import load_checkpoint, receive, save_checkpoint, transmit
 from .training import full_scene_step
-from .losses import add_arguments, config_options, configure_training, reconstruction_loss
+from .losses import add_arguments, config_options, configure_training, reconstruction_loss, objective_stats
 
 
 def device_for(name):
@@ -52,6 +53,12 @@ def train(args):
         raise ValueError("render training requires --source and CUDA")
     if args.blocks_per_batch < 1 or args.profile_every < 0:
         raise ValueError("blocks-per-batch must be positive; profile-every must be nonnegative")
+    if args.render_lr is None:
+        args.render_lr = args.lr * .25
+    if not all(math.isfinite(x) and x > 0 for x in (args.lr, args.render_lr)):
+        raise ValueError("lr and render-lr must be finite and positive")
+    if not math.isfinite(args.attr_weight) or args.attr_weight < 0:
+        raise ValueError("attr-weight must be finite and nonnegative")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     device = device_for(args.device)
@@ -117,6 +124,9 @@ def train(args):
             snr = random.uniform(*args.snr_range)
             optimizer.zero_grad(set_to_none=True)
             is_render = step >= args.steps
+            if step == args.steps:
+                for group in optimizer.param_groups:
+                    group["lr"] = args.render_lr
             if not is_render:
                 index = random.randrange(len(feature_blocks))
                 features = feature_blocks[index].to(device)
@@ -164,6 +174,8 @@ def train(args):
                       "step_seconds": time.perf_counter() - step_started, **render_values}
             if image_loss is not None:
                 values["render_loss"] = float(image_loss)
+            values.update(objective_stats(values, model, args.attr_weight if is_render else 1.))
+            values["learning_rate"] = optimizer.param_groups[0]["lr"]
             log.write(json.dumps(values) + "\n")
             if is_render or (step + 1) % 10 == 0:
                 log.flush()
@@ -283,7 +295,10 @@ def main():
                    help="synchronize and record render phase timings/peak memory every N steps; 0 disables")
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--attr-weight", type=float, default=.1)
+    p.add_argument("--render-lr", type=float,
+                   help="render fine-tuning LR; default 0.25 * lr, without resetting Adam state")
+    p.add_argument("--attr-weight", type=float, default=1.,
+                   help="render-stage reconstruction multiplier; default keeps the auxiliary active at weight 1")
     p.add_argument("--snr-range", type=float, nargs=2, default=[0., 20.])
     p.add_argument("--rates", type=int, nargs=4, default=[0, 8, 16, 32])
     p.add_argument("--hidden", type=int, default=96)

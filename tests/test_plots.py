@@ -1,18 +1,49 @@
 """Static chart generation from saved training, evaluation and allocation data."""
 
 import importlib.util
+import csv
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from gaussian_jscc.plots import plot_allocation, plot_evaluation, plot_training
+from gaussian_jscc.plots import plot_allocation, plot_evaluation, plot_training, _finish
 
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "requires matplotlib")
 class PlotTests(unittest.TestCase):
+    def test_phase_panels_and_weighted_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = []
+            for step in range(1, 81):
+                row = dict(step=step, phase="attribute" if step <= 40 else "render",
+                           loss_profile="balanced_v2", geometry_loss=1 / step, geometry_contribution=1 / step,
+                           scale_loss=.2, scale_contribution=.2, grad_norm=.5)
+                row["loss"] = row["geometry_contribution"] + row["scale_contribution"]
+                if step > 40:
+                    row.update(aux_loss=row["loss"], aux_contribution=row["loss"], render_loss=.1)
+                    row["loss"] += .1
+                rows.append(row)
+            (root / "loss.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+            with patch("gaussian_jscc.plots._finish", wraps=_finish) as finish:
+                plot_training(root)
+            objective_fig = finish.call_args_list[0].args[0]
+            self.assertEqual(len(objective_fig.axes), 4)
+            for axis in objective_fig.axes:
+                for line in axis.lines:
+                    x = line.get_xdata()
+                    self.assertFalse(min(x) <= 40 < max(x))
+            self.assertTrue((root / "charts" / "training_weighted_contributions.png").exists())
+            with (root / "charts" / "training_chart_data.csv").open() as stream:
+                saved = list(csv.DictReader(stream))
+            self.assertEqual(len(saved), 80)
+            self.assertAlmostEqual(float(saved[-1]["scale_contribution"]), .2)
+            self.assertEqual(saved[-1]["loss_profile"], "balanced_v2")
+
     def test_geometry_first_components_and_codec_gradient_chart(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

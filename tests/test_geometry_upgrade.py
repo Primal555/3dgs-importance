@@ -120,7 +120,7 @@ class GeometryUpgradeTests(unittest.TestCase):
         raw, new = fixture(n=8)
         config = new.cfg.to_dict()
         for key in ("architecture", "geometry_rates", "geometry_weight", "shape_weight",
-                    "opacity_weight", "dc_weight", "sh_weight", "geometry_floor"):
+                    "opacity_weight", "dc_weight", "sh_weight", "geometry_floor", "loss_profile", "scale_weight"):
             config.pop(key)
         legacy = GaussianCodec(CodecConfig.from_dict(config))
         self.assertEqual(legacy.cfg.architecture, "legacy")

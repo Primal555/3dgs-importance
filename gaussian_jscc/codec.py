@@ -29,11 +29,13 @@ class CodecConfig:
     architecture: str = "geometry_first"
     geometry_rates: tuple = ()
     geometry_weight: float = 1.0
-    shape_weight: float = .1
-    opacity_weight: float = .1
-    dc_weight: float = .1
-    sh_weight: float = .05
+    shape_weight: float = .25
+    opacity_weight: float = 1.
+    dc_weight: float = 1.
+    sh_weight: float = .25
     geometry_floor: float = 1e-4
+    loss_profile: str = "balanced_v2"
+    scale_weight: float = 1.
 
     def __post_init__(self):
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
@@ -64,7 +66,9 @@ class CodecConfig:
                 x > y for seq in (g, a) for x, y in zip(seq, seq[1:])
             ):
                 raise ValueError("geometry and attribute lengths must be positive and nondecreasing at q1..q3")
-        for name in ("geometry_weight", "shape_weight", "opacity_weight", "dc_weight", "sh_weight"):
+        if self.loss_profile not in ("physical_v1", "balanced_v2"):
+            raise ValueError("unknown reconstruction loss profile")
+        for name in ("geometry_weight", "shape_weight", "opacity_weight", "dc_weight", "sh_weight", "scale_weight"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
         if not math.isfinite(self.geometry_floor) or self.geometry_floor <= 0:
@@ -76,6 +80,11 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.architecture == "legacy" or self.loss_profile == "physical_v1":
+            # Old geometry-first packets also hash the config. Do not silently
+            # change their identity just by loading with newer software.
+            result.pop("loss_profile")
+            result.pop("scale_weight")
         if self.architecture == "legacy":
             # Preserve historical checkpoint/packet hashes exactly.
             for name in ("architecture", "geometry_rates", "geometry_weight", "shape_weight",
@@ -85,7 +94,8 @@ class CodecConfig:
 
     @classmethod
     def from_dict(cls, values):
-        return cls(**{**values, "architecture": values.get("architecture", "legacy")})
+        return cls(**{**values, "architecture": values.get("architecture", "legacy"),
+                      "loss_profile": values.get("loss_profile", "physical_v1")})
 
 
 def validate_tiers(q, n):

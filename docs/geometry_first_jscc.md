@@ -56,31 +56,38 @@ XYZ 对属性损失仍可微：前向依赖是单向的，不代表属性损失�
 
 ## 新损失
 
-实现见 `gaussian_jscc/losses.py`。六组参数平均 Smooth L1 不再用于新架构训练。
+实现见 `gaussian_jscc/losses.py`。当前默认 `--loss-profile balanced_v2`；
+修正原因、继续训练命令见 [损失修正说明](codec_loss_correction.md)。
 
 辅助目标为：
 
 ```text
-L_aux = w_geo D_geo + w_shape D_shape + w_opacity D_opacity
+L_aux = w_geo D_geo + w_shape D_shape + w_scale D_scale + w_opacity D_opacity
         + w_dc D_dc + w_sh D_sh
 ```
 
 - `D_geo`：位置误差先投影到源 Gaussian 的旋转坐标系，再除以局部轴尺度，
   使用 `log1p(Mahalanobis距离平方)`。最小轴尺度通过各轴方差加 `(bbox_diagonal × floor)^2` 限制。
-- `D_shape`：恢复协方差在源协方差白化坐标系内与单位矩阵比较，
-  对均方差取 `log1p`；量纲与场景缩放无关，四元数正负号不影响结果。
-  对预测和源协方差使用相同的轴尺度下限，准确恢复时误差为零。
-  实现用旋转/尺度因子计算，不需要逐点特征分解或矩阵求逆。
-- `D_opacity`：激活后 alpha 的 Smooth L1。
+- `D_shape`：对数协方差差的 Frobenius 范数平方除以 9。
+  `log(Σ)=R diag(2 log(s)) Rᵀ` 直接计算，不需要矩阵求逆或特征分解；
+  同时旋转坐标系、四元数变号和等价主轴交换均不影响该损失。
+- `D_scale`：排序后的物理对数轴尺度的 Smooth L1；放大与缩小同等倍数具有相同惩罚。
+- `D_opacity`：激活后 alpha 的 Smooth L1，加 `0.1 ×` 未激活 opacity logit 的 Smooth L1。
+  尺度/logit 约束读取安全渲染截断之前的预测，避免越界时辅助梯度为零。
 - `D_dc`、`D_sh`：使用冻结的 codec 属性统计归一化后分别计算 Smooth L1。
 
-默认权重为 `1 / 0.1 / 0.1 / 0.1 / 0.05`，`geometry_floor=1e-4`。
+默认权重按 geometry / shape / scale / opacity / DC / SH 顺序为
+`1 / 0.25 / 1 / 1 / 1 / 0.25`，`geometry_floor=1e-4`。
 这是明确记录的辅助约束配置，不是论文保证的最优系数，也不是可自由降低的可学习 loss 权重。
-各项可通过 `--geometry-weight`、`--shape-weight` 等参数调整；未指定时保留初始化 checkpoint 的配置。
+各项可通过 `--geometry-weight`、`--shape-weight` 等参数调整。
+同一 loss profile 下未指定的项保留 checkpoint 配置；切换 profile 时重置到该 profile 默认值，
+再应用显式覆盖，并打印迁移提示。旧 `physical_v1` 的计算保持可复现。
 修改几何符号划分则需要新架构实例，不能在加载权重时偷偷更改。
 
 codec 预训练：`L = L_aux`。
 codec 渲染训练：`L = D_render + attr_weight × L_aux`。
+`attr_weight` 现在默认 1，而非 0.1；`train` 渲染阶段学习率默认为 `0.25 × lr`，
+可通过 `--render-lr` 设置。同一次训练切换学习率不清空 Adam 状态。
 四档联合训练：再加入 `beta × E[k(q)] / k_max`，仍是软率惩罚，不保证硬预算上限。
 辅助损失使用 detached 的存在门权重、按源点数归一化，避免通过门的直接导数奖励删除点；
 码流路径的 ST 梯度仍然存在。决定删除代价的完整渲染目标保留所有候选点，q0 通过 mask 光栅器处理。
@@ -97,8 +104,9 @@ codec 渲染训练：`L = D_render + attr_weight × L_aux`。
 - 联合 replay 的分界张量同时包含恢复参数和四档选择，因此能保留 inactive-mask 对 q0 的梯度。
 - 同次 replay 复用 Gumbel 与信道 RNG，不重新抽取另一组档位/噪声。
 - 新 checkpoint 为 version 3、`architecture=geometry_first`；旧 version 2 的结构和模型哈希保持兼容。
-- 旧 checkpoint 仍可 transmit/decode/evaluate/benchmark，但不能用作新训练的 `--init` / `--codec-init`。
-  旧预训练 20000 步的权重不是新架构已经完成的预训练，不能直接续接。
+- legacy/version 2 checkpoint 仍可评估，但不能初始化 geometry-first。
+  已经完成的 geometry-first/version 3 checkpoint 可以通过 `--init` / `--codec-init`
+  继续优化，不需要重新训练网络结构。旧模型仅加载评估时保留原配置和模型哈希。
 - `--seed-position-weight` 仅保留参数兼容，在新架构中不生效。
   `return_seed` 返回的是最终 XYZ；旧 seed 消融对新架构没有独立含义。
 - 归一化统计仍从训练源场景获得。此升级不等于完成了跨场景泛化训练。
