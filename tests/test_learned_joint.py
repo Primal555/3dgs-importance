@@ -262,7 +262,7 @@ class LearnedTests(unittest.TestCase):
             write_ply(root/'input.ply',raw,0)
             argv=['gaussian_jscc','train-learned','--ply',str(root/'input.ply'),'--out',str(root/'run'),
                   '--device','cuda','--source','mock','--steps','1','--render-steps','2','--joint-steps','2',
-                  '--render-ramp','2','--block-size','8','--hidden','16','--decoder-window','4',
+                  '--views-per-step','1','--validation-trials','1','--block-size','8','--hidden','16','--decoder-window','4',
                   '--depth','1','--grid-dim','4','--levels','2','--blocks-per-batch','2',
                   '--validation-blocks','1','--validation-views','1','--validate-every','1','--save-every','1']
             with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
@@ -270,8 +270,10 @@ class LearnedTests(unittest.TestCase):
                  patch('gaussian_jscc.rendering.render',side_effect=renderer),patch('gaussian_jscc.plots.safe_plot'):
                 main()
             rows=[json.loads(x) for x in (root/'run'/'loss.jsonl').read_text().splitlines()]
-            self.assertEqual([r['phase'] for r in rows],['attribute','render','render','joint','joint'])
-            self.assertEqual([r['render_ramp'] for r in rows],[0.,.5,1.,1.,1.])
+            self.assertEqual([r['phase'] for r in rows],['bootstrap','render','render','joint','joint'])
+            self.assertTrue(all(r['aux_loss']==0 for r in rows[1:]))
+            self.assertTrue(all('projection_loss' not in r for r in rows))
+            self.assertAlmostEqual(rows[1]['loss'],rows[1]['image_mse'],places=7)
             self.assertTrue((root/'run'/'route2.pt').exists())
             self.assertTrue(list((root/'run'/'validation_images').rglob('*.png')))
             from gaussian_jscc.route2 import load_mask

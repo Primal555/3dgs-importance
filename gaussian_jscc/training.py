@@ -33,7 +33,8 @@ class PhaseTimer:
         self.last = current
 
 
-def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_metrics=False):
+def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_metrics=False,
+                compute_auxiliary=True):
     choices = F.one_hot(q, 4).to(features.dtype)
     pred, seed, _ = model.forward_tier_batches(features, features[..., :3], choices, snr, kind)
     keep = q > 0
@@ -41,7 +42,12 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
     if len(pred) == 0:
         result = (to_raw(pred, geometry, model), pred.sum())
         return (*result, {'geometry': pred.sum()}) if return_metrics else result
-    auxiliary, terms = reconstruction_loss(pred, target, geometry, model, seed, seed_weight, return_terms=True)
+    if compute_auxiliary:
+        auxiliary, terms = reconstruction_loss(pred, target, geometry, model, seed, seed_weight, return_terms=True)
+    else:
+        # Render-only training must not even evaluate the historical parameter
+        # objective (zero times an invalid auxiliary could still produce NaN).
+        auxiliary, terms = pred.sum() * 0, {}
     result = (to_raw(pred, geometry, model), auxiliary)
     return (*result, {key: value.mean() for key, value in terms.items()}) if return_metrics else result
 
@@ -74,7 +80,8 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
     def forward(f, q):
         if batch_forward is not None:
             return batch_forward(f, q)
-        return codec_batch(model, f, q, snr, kind, geometry, seed_weight, return_metrics=True)
+        return codec_batch(model, f, q, snr, kind, geometry, seed_weight, return_metrics=True,
+                           compute_auxiliary=attr_weight != 0 or gradient_observer is not None)
 
     for features, q in batches:
         features, q = features.to(device), q.to(device)
@@ -100,7 +107,10 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
         scene.requires_grad_(True)
     aux_loss = torch.stack(auxiliary).sum() / total_count
     timer.mark("codec_forward_seconds")
-    distortion = distortion_fn(scene)
+    streamed = mode == 'replay' and hasattr(distortion_fn, 'backward_scene')
+    # A multiview task can accumulate dL/d(scene) one camera at a time, freeing
+    # each rasterizer graph before the next camera. The codec is replayed once.
+    distortion = distortion_fn.backward_scene(scene) if streamed else distortion_fn(scene)
     loss = distortion + attr_weight * aux_loss
     if not torch.isfinite(loss):
         raise RuntimeError("nonfinite render loss")
@@ -110,8 +120,11 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
         loss.backward()
         timer.mark("combined_backward_seconds")
     else:
-        distortion.backward()
+        if not streamed:
+            distortion.backward()
         upstream = scene.grad.detach()
+        if not torch.isfinite(upstream).all():
+            raise RuntimeError('nonfinite rendered-scene gradient; no optimizer step performed')
         timer.mark("render_backward_seconds")
         # Restore the caller's RNG after replay: recomputation must not consume
         # another set of channel draws or change subsequent tier sampling.
@@ -140,6 +153,9 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
         timer.mark("codec_replay_backward_seconds")
     values = {"render_loss": float(distortion.detach()), "aux_loss": float(aux_loss.detach()),
               "retained_gaussians": total_count, "codec_batches": len(batches), **timer.values}
+    if mode == 'replay':
+        values['scene_gradient_norms'] = {'xyz': float(upstream[:, :3].norm()),
+                                         'attributes': float(upstream[:, 3:].norm())}
     values.update({f"{key}_loss": float(value / total_count) for key, value in metric_sums.items()})
     if profile and device.type == "cuda":
         values["peak_allocated_mib"] = torch.cuda.max_memory_allocated(device) / 2 ** 20

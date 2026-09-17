@@ -18,7 +18,7 @@ def policy_objective(log_probabilities, costs):
 
 
 def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr, kind,
-                        distortion_fn, beta=.01, auxiliary_weight=1., samples=2, mode='replay'):
+                        distortion_fn, beta=.001, auxiliary_weight=0., samples=2, mode='replay'):
     """Codec gets conditional backprop; categorical masks get REINFORCE.
 
     distortion_fn(decoded_rows, retained_original_ids) returns a render task
@@ -57,6 +57,12 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
         if len(ids):
             def distortion(scene):
                 return distortion_fn(scene, ids)/samples
+            if hasattr(distortion_fn, 'backward_scene'):
+                def backward_scene(scene):
+                    cost = distortion_fn.backward_scene(scene)
+                    scene.grad.div_(samples)
+                    return cost/samples
+                distortion.backward_scene = backward_scene
             _, stats = full_scene_step(model, batches, geometry, snr, kind, distortion,
                                        attr_weight=auxiliary_weight/samples, mode=mode)
             cost = next(model.parameters()).new_tensor(stats['render_loss']*samples)
@@ -81,6 +87,7 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
         'rate_loss': float(rate_loss.detach()), 'mask_samples': samples,
         'retained_counts': [v['retained_gaussians'] for v in all_stats],
         'sampled_tier_counts': torch.stack(compositions).mean(0).cpu().tolist(),
+        'scene_gradient_norms_by_sample': [v.get('scene_gradient_norms') for v in all_stats],
         'render_loss': float(torch.stack(costs).mean()),
         'aux_loss': mean_aux}
 
@@ -88,7 +95,8 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
 @torch.no_grad()
 def decode_batches(model, feature_batches, q_batches, snr, kind, geometry):
     device = next(model.parameters()).device
-    return torch.cat([codec_batch(model, f.to(device), q.to(device), snr, kind, geometry, 0)[0]
+    return torch.cat([codec_batch(model, f.to(device), q.to(device), snr, kind, geometry, 0,
+                                 compute_auxiliary=False)[0]
                       for f, q in zip(feature_batches, q_batches)])
 
 

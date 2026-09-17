@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from gaussian_jscc.codec import CodecConfig, GaussianCodec
 from gaussian_jscc.data import read_ply, prepare, to_features, to_raw
-from gaussian_jscc.losses import reconstruction_loss
+from gaussian_jscc.render_objective import bootstrap_loss
 from gaussian_jscc.optimization import clip_codec_gradients, preserved_rng
 from gaussian_jscc.transport import save_checkpoint, load_checkpoint, model_id
 from gaussian_jscc.benchmark import parameter_metrics
@@ -52,7 +52,7 @@ def main():
                     pred,_,_=model.forward_tier_batches(f,f[...,:3],torch.nn.functional.one_hot(q,4).float(),10,'awgn')
                     decoded=to_raw(pred.flatten(0,1),geometry,model)
                     metrics=parameter_metrics(source[ids].flatten(0,1),decoded)
-                    metrics['auxiliary']=float(reconstruction_loss(pred.flatten(0,1),f.flatten(0,1),geometry,model))
+                    metrics['bootstrap_loss']=float(bootstrap_loss(pred.flatten(0,1),f.flatten(0,1)))
                     metrics['complex_symbols_per_gaussian']=cfg.rates[tier]
                     metrics['mean_transmitted_complex_energy']=float(model.encode(f[0],f[0,:,:3],q[0],10).square().sum(-1).mean())
                     result[f'{name}_q{tier}']=metrics
@@ -62,20 +62,22 @@ def main():
     initial=evaluate()
     started=time.perf_counter()
     for step in range(1,args.steps+1):
+        step_started=time.perf_counter()
         selected=train_ids[torch.randint(len(train_ids),(4,))]
         f=features[selected]
         q=torch.randint(0,4,f.shape[:2]) if step%4==0 else torch.full(f.shape[:2],1+(step%3),dtype=torch.long)
         optimizer.zero_grad(set_to_none=True)
         pred,_,_=model.forward_tier_batches(f,f[...,:3],torch.nn.functional.one_hot(q,4).float(),10,'awgn')
-        loss,terms=reconstruction_loss(pred[q>0],f[q>0],geometry,model,return_terms=True)
+        loss=bootstrap_loss(pred[q>0],f[q>0])
         loss.backward()
         norm,stats=clip_codec_gradients(model,10.,'none')
         before=[p.detach().clone() for p in model.parameters()]
         optimizer.step()
         update=float(torch.stack([(p.detach()-old).norm() for p,old in zip(model.parameters(),before)]).norm())
-        row={'step':step,'phase':'attribute','loss_profile':'learned_v1','snr':10,
+        row={'step':step,'phase':'bootstrap','objective':'render_mse_v1','snr':10,
              'loss':float(loss.detach()),'grad_norm':float(norm),'update_norm':update,
-             **{k+'_loss':float(v.detach().mean()) for k,v in terms.items()},**stats}
+             'step_seconds':time.perf_counter()-step_started,
+             **stats}
         with (out/'loss.jsonl').open('a',encoding='utf-8') as handle:
             handle.write(json.dumps(row)+'\n')
         if step==1 or step%50==0:
