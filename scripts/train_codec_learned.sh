@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render-first mainline. No checkpoint is silently selected.
+# Render-first mainline: random weights and no bootstrap by default.
 set -euo pipefail
 PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT"
@@ -13,18 +13,28 @@ SCENE="${SCENE:-$PROJECT/data/tandt_db/tandt/truck}"
 command -v "$PYTHON_BIN" >/dev/null || { echo 'Activate maskgs or set PYTHON_BIN to its absolute python path.' >&2; exit 1; }
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 EXTRA=()
-if [[ -n "${INIT:-}" ]]; then
-  [[ -f "$INIT" ]] || { echo "Missing initializer: $INIT" >&2; exit 1; }
-  EXTRA+=(--init "$INIT")
-  DEFAULT_BOOTSTRAP=0
-else
-  DEFAULT_BOOTSTRAP=500
+INITIALIZATION="${INITIALIZATION:-random}"
+case "$INITIALIZATION" in
+  random)
+    if [[ -n "${INIT:-}" ]]; then
+      echo 'Random initialization: ignoring inherited INIT; no checkpoint will be loaded.'
+    fi
+    ;;
+  checkpoint)
+    [[ -n "${INIT:-}" && -f "$INIT" ]] || { echo 'checkpoint mode requires an existing INIT file.' >&2; exit 1; }
+    EXTRA+=(--init "$INIT")
+    ;;
+  *) echo 'INITIALIZATION must be random or checkpoint.' >&2; exit 1 ;;
+esac
+if [[ -n "${STEPS:-}" ]]; then
+  echo 'Legacy STEPS is ignored; set BOOTSTRAP_STEPS explicitly if initialization training is intended.'
 fi
-printf 'Architecture: learned_joint\nGPU: %s\nOutput: %s\n' "$CUDA_VISIBLE_DEVICES" "$OUT"
+printf 'Architecture: learned_joint\nInitialization: %s\nBootstrap steps: %s\nGPU: %s\nOutput: %s\n' \
+  "$INITIALIZATION" "${BOOTSTRAP_STEPS:-0}" "$CUDA_VISIBLE_DEVICES" "$OUT"
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --ply "$PLY" --source "$SCENE" --out "$OUT" "${EXTRA[@]}" \
   --device cuda --snr 10 --channel awgn \
-  --bootstrap-steps "${BOOTSTRAP_STEPS:-${STEPS:-$DEFAULT_BOOTSTRAP}}" --render-steps "${RENDER_STEPS:-1000}" --joint-steps "${JOINT_STEPS:-0}" \
+  --bootstrap-steps "${BOOTSTRAP_STEPS:-0}" --render-steps "${RENDER_STEPS:-1000}" --joint-steps "${JOINT_STEPS:-0}" \
   --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" \
   --rates 0 8 16 32 --lr "${LR:-0.0001}" --render-lr "${RENDER_LR:-0.00001}" \
   --clip-mode "${CLIP_MODE:-none}" --clip-norm "${CLIP_NORM:-10}" \

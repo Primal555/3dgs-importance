@@ -12,6 +12,8 @@ Use `python -m gaussian_jscc train-learned` (`train` is the same entry point)
 or `bash scripts/train_codec_learned.sh`.
 Training now uses **multiview source-render RGB MSE**, not a weighted sum of
 per-Gaussian attribute errors. Optional feature bootstrap is initialization only.
+Launch scripts default to random weights and zero bootstrap steps; inherited
+`INIT` is ignored unless `INITIALIZATION=checkpoint` is explicitly selected.
 For a full-scene, reduced-view/step observation run, use
 `bash scripts/test_render_first.sh`; see [render-first protocol and outputs](docs/render_first_training.md).
 See [architecture, objectives and server commands](docs/learned_joint_jscc.md),

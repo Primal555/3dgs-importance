@@ -155,6 +155,10 @@ def train(args):
     out.mkdir(parents=True,exist_ok=False)
     record = {k:v for k,v in vars(args).items() if k != 'func'}
     record.update(objective='render_mse_v1',codec_config=model.cfg.to_dict(),fixed_snr=True,
+                  initialization={'mode':'checkpoint' if args.init else 'random',
+                                  'checkpoint':str(Path(args.init).resolve()) if args.init else None,
+                                  'seed':args.seed,'bootstrap_steps':args.bootstrap_steps,
+                                  'feature_statistics':'checkpoint' if args.init else 'computed from input PLY'},
                   source_gaussians=len(raw),train_view_indices=train_indices,validation_view_indices=view_indices,
                   train_view_names=[str(getattr(c,'image_name',i)) for i,c in enumerate(cameras or [])],
                   validation_view_names=[str(getattr(c,'image_name',i)) for i,c in enumerate(val_cameras or [])],

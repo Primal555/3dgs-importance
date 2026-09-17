@@ -68,7 +68,8 @@ render and mask-joint training. The architecture and v4 wire identity are unchan
 See [complete objective, stages, validation and server commands](render_first_training.md).
 Use `scripts/test_render_first.sh` for a full-scene, reduced-view/step observation
 run. `scripts/train_codec_learned.sh` runs the longer schedule. Both accept an
-explicit learned_joint `INIT`; neither silently selects an old checkpoint.
+explicit learned_joint `INIT` only with `INITIALIZATION=checkpoint`. The default
+is random weights with zero bootstrap steps, even if an old `INIT` remains in the shell.
 
 Joint mask training uses image MSE plus an expected normalized payload penalty;
 see [four-way allocation](route2_joint_jscc.md). Reliable header delivery remains

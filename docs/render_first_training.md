@@ -45,8 +45,10 @@ MSE 对应 PSNR 的平方误差口径，利于首先验证端到端图像恢复�
 bootstrap 数字和渲染 MSE 数字。bootstrap 仍是工程初始化，有标准化和维数偏好，
 不是一个没有假设或经理论证明的损失。
 
-有 learned_joint 检查点时，脚本默认 bootstrap=0；无检查点时，脚本默认500步
-初始化（CLI本身默认0，可显式选择）。这些步数是迭代预算，不是收敛保证。
+脚本与 CLI 默认都从随机网络权重开始，bootstrap=0，直接使用渲染目标训练。
+不依赖过去失败实验的检查点。随机初始化是网络的标准初始化，不是随意随机生成
+输入场景；属性标准化统计量仍从待传 PLY 计算，全局 bbox 归一化约定不变。
+仅显式设置 `BOOTSTRAP_STEPS` 为正数时才执行预热。这些步数是迭代预算，不是收敛保证。
 `--steps` 仍作为 `--bootstrap-steps` 的别名，含义已更新。旧的辅助权重、投影
 权重、render-ramp 参数不再接受，避免旧命令静默执行不同目标。
 
@@ -83,16 +85,20 @@ cd /data/home/zhangyueheng/projects/3dgs-importance || exit 1
 conda activate maskgs
 export PYTHON_BIN="$(command -v python)"
 export CUDA_VISIBLE_DEVICES=2
-export INIT="$PWD/output/truck_learned_short_gpu2_20260917_112724/codec_2000.pt"
+export INITIALIZATION=random
+export BOOTSTRAP_STEPS=0
+unset INIT STEPS
 OUT="$PWD/output/truck_render_first_short_$(date +%Y%m%d_%H%M%S)"
 nohup bash scripts/test_render_first.sh "$OUT" > "${OUT}.log" 2>&1 &
 echo $! > "${OUT}.pid"
 tail -f "${OUT}.log"
 ```
 
-这里显式选择此前参数训练结束的2000步权重，不默认选其后已经退化的最终权重。
-若服务器没有这个文件，先定位文件再设置 `INIT`；脚本会拒绝不存在的文件。
-`unset INIT` 可从随机权重开始，并自动使用500步 bootstrap。
+这条命令从随机权重直接进行300步渲染训练，没有旧权重，也没有隐式参数预热。
+默认 random 模式会忽略终端残留的 `INIT` 并打印提示；旧 `STEPS` 环境变量也
+不再触发预热。初始化模式、seed、预热步数均写入 `training.json`。
+将来如需明确的检查点对照，必须同时设置 `INITIALIZATION=checkpoint` 和 `INIT`；
+这是可选功能，不是本次训练的默认前提。直接调用 CLI 时，`--init` 仍是显式加载选项。
 `RENDER_STEPS=600 RENDER_LR=0.00002` 等环境变量可修改短实验预算与学习率。
 `tail -f` 的 Ctrl+C 只停止查看日志，不停止 nohup 训练。
 

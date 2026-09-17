@@ -135,6 +135,29 @@ class RenderFirstTests(unittest.TestCase):
             loaded=load_checkpoint(root/'run'/'codec.pt','cpu')
             self.assertEqual(loaded.cfg.rates,model.cfg.rates)
 
+    def test_random_render_training_never_loads_checkpoint(self):
+        from gaussian_jscc.cli import main
+        from gaussian_jscc.data import write_ply
+        raw,_,_,_=setup(16)
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            write_ply(root/'input.ply',raw,0)
+            argv=['gaussian_jscc','train-learned','--ply',str(root/'input.ply'),'--out',str(root/'run'),
+                  '--source','mock','--device','cuda','--render-steps','2','--validation-views','1',
+                  '--validation-trials','1','--validate-every','1','--hidden','16','--depth','1',
+                  '--grid-dim','4','--levels','2','--block-size','8','--decoder-window','4']
+            with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
+                 patch('gaussian_jscc.rendering.load_cameras',return_value=self.cameras()+self.cameras()), \
+                 patch('gaussian_jscc.rendering.render',side_effect=synthetic_render),patch('gaussian_jscc.plots.safe_plot'), \
+                 patch('gaussian_jscc.learned_train.load_checkpoint',side_effect=AssertionError('random must not load')):
+                main()
+            record=json.loads((root/'run'/'training.json').read_text())
+            self.assertEqual(record['initialization'],{'mode':'random','checkpoint':None,'seed':42,
+                                                      'bootstrap_steps':0,'feature_statistics':'computed from input PLY'})
+            rows=[json.loads(line) for line in (root/'run'/'loss.jsonl').read_text().splitlines()]
+            self.assertEqual([r['phase'] for r in rows],['render','render'])
+            self.assertTrue(all(r['aux_loss']==0 for r in rows))
+
 
 if __name__=='__main__':
     unittest.main()
