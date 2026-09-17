@@ -110,7 +110,7 @@ def to_features(raw, geometry, model):
 
 def to_raw(features, geometry, model):
     unit = features[:, :3]
-    xyz = geometry.denormalize(unit if model.cfg.architecture == 'learned_joint' else unit.clamp(0, 1))
+    xyz = geometry.denormalize(unit)
     attrs = features[:, 3:] * model.attr_std + model.attr_mean
     rotation = attrs[:, 4:8]
     identity = torch.zeros_like(rotation)

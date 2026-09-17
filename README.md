@@ -2,63 +2,29 @@
 
 ## Gaussian JSCC codec extension
 
-The current mainline is **fully learned joint JSCC** (`train-learned`): XYZ and
-attributes share a learned variable-length payload, and the receiver jointly
-decodes local noisy features without source/predicted-coordinate grids. Each
-Gaussian retains its own q0/q1/q2/q3 decision. No handcrafted coordinate
-reference, repetition, or reserved geometry sub-budget is used.
-Start with `bash scripts/train_codec_learned.sh`; see the
-[architecture, training, validation and limitations](docs/learned_joint_jscc.md).
-Old weights remain evaluable but cannot initialize this new mainline.
+The maintained codec is **fully learned joint JSCC**: XYZ and attributes share
+a learned variable-length payload; the receiver jointly decodes local noisy
+features without source/predicted-coordinate grids. Each Gaussian has its own
+q0/q1/q2/q3 decision. There is no handcrafted coordinate reference, repetition,
+or reserved geometry sub-budget.
 
-The following paragraphs describe **historical implementations**, not the
-recommended new training entry point. The old `train` and `train-route2`
-commands are retained for reproduction; do not confuse them with `train-learned`.
+Use `python -m gaussian_jscc train-learned` (`train` is the same entry point)
+or `bash scripts/train_codec_learned.sh`.
+See [architecture, objectives and server commands](docs/learned_joint_jscc.md),
+[mask joint training](docs/route2_joint_jscc.md),
+[training performance](docs/training_performance.md) and
+[position/attribute ablation](docs/hybrid_codec_ablation.md).
 
-Historical **geometry-first JSCC** used separate geometry/attribute symbol
-paths within the same tier budget, direct XYZ decoding, physical reconstruction
-losses, and frozen source-PLY rendering targets. Both codec-only and joint-mask
-render training support batched replay (default 32 blocks).
-See [the architecture upgrade and server commands](docs/geometry_first_jscc.md).
-Legacy checkpoints remain evaluable but cannot initialize this new architecture.
-The current `balanced_v2` loss corrects the scale-collapse penalty, retains
-attribute constraints during rendering, and separates training phases in charts.
-Existing geometry-first checkpoints can be fine-tuned without changing payloads:
-[correction details and continuation script](docs/codec_loss_correction.md).
+The independent `benchmark_codec.py` and packet-only receiver remain available.
+Training and evaluation export PNG/SVG charts, machine-readable logs and CSV data.
+The implementation adapts ROI-JSCC prefix transport and FCGS-inspired sender
+aggregation; upstream MaskGaussian scene training is unchanged.
 
-An explicit [position-v3 upgrade](docs/position_v3.md) adds a normalized affine
-XYZ head, bounded-slope position supervision, branch clipping, same-block
-q1/q2/q3 coverage and fixed per-tier position diagnostics. Use
-`scripts/train_codec_position_v3.sh` to select it; old checkpoints retain their
-original decoding behavior. Upgrading an old head resets that head and requires
-retraining, without adding coordinate metadata or changing symbol budgets.
-
-For a controlled short test of attribute-context gradients into XYZ, use
-[the paired gradient diagnostic](docs/context_xyz_gradient_test.md). It compares
-attached/detached context coordinates with identical sampling, records component
-gradients and actual Adam updates, and evaluates fixed position/render quality.
-Normal training behavior and checkpoint/packet formats are unchanged.
-
-Full-scene codec training now supports vectorized spatial contexts, independent
-block batches, and exact gradient replay. See [training performance and continuation](docs/training_performance.md)
-for `benchmark_training.py`, timing fields, and reuse of existing codec checkpoints.
-
-The local-context Gaussian JSCC implementation, training commands, receiver-only decoding,
-and multi-SNR evaluation guide are documented in [docs/gaussian_jscc.md](docs/gaussian_jscc.md).
-Joint optimization of four-way per-Gaussian masks and the codec is described in
-[docs/route2_joint_jscc.md](docs/route2_joint_jscc.md).
-Training, allocation and multi-SNR evaluation now export reproducible PNG/SVG
-statistical charts and their chart-ready CSV data automatically.
-The dedicated `benchmark_codec.py` entry point measures reconstruction and channel loss
-with all Gaussians retained, independently of the learned tier allocator. Its optional
-`--hybrid-ablation` mode isolates render degradation from decoded positions versus
-decoded non-position attributes without running another channel transmission.
-For legacy checkpoints, `--position-seed-ablation` compares bootstrap XYZ with
-post-context XYZ. Geometry-first has no separate seed; that diagnostic equals final XYZ.
-See [the hybrid codec ablation guide](docs/hybrid_codec_ablation.md) for the
-four scene variants, output metrics, charts, and server command.
-It adapts ROI-JSCC prefix transport and FCGS-inspired spatial aggregation; upstream
-MaskGaussian training is unchanged.
+Historical codec implementations, training scripts and migration branches have
+been removed from the mainline. They remain recoverable from Git history
+(snapshot `a545aa5`). Old checkpoints require their historical code revision;
+only learned_joint v4 is loaded by this mainline. Existing experiment output
+files are not deleted. Current learned-v4 weight and packet identities are preserved.
 
 <div id="top" align="center">
  

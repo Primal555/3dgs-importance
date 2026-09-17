@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .data import to_raw
-from .losses import reconstruction_loss, position_training_inputs
+from .losses import reconstruction_loss
 
 
 class PhaseTimer:
@@ -37,12 +37,11 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
     choices = F.one_hot(q, 4).to(features.dtype)
     pred, seed, _ = model.forward_tier_batches(features, features[..., :3], choices, snr, kind)
     keep = q > 0
-    position={k:v[keep] for k,v in position_training_inputs(model,features,q,snr).items()}
     pred, seed, target = pred[keep], seed[keep], features[keep]
     if len(pred) == 0:
         result = (to_raw(pred, geometry, model), pred.sum())
         return (*result, {'geometry': pred.sum()}) if return_metrics else result
-    auxiliary, terms = reconstruction_loss(pred, target, geometry, model, seed, seed_weight, return_terms=True,**position)
+    auxiliary, terms = reconstruction_loss(pred, target, geometry, model, seed, seed_weight, return_terms=True)
     result = (to_raw(pred, geometry, model), auxiliary)
     return (*result, {key: value.mean() for key, value in terms.items()}) if return_metrics else result
 
@@ -69,8 +68,7 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
     timer = PhaseTimer(device, profile)
     if profile and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    rows, auxiliary, geometry_losses, states, counts = [], [], [], [], []
-    v6=model.cfg.position_head=='reference_v6'
+    rows, auxiliary, states, counts = [], [], [], []
     metric_sums = {}
 
     def forward(f, q):
@@ -91,7 +89,6 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
         rows.append(raw)
         counts.append(len(raw))
         auxiliary.append(aux * len(raw))
-        if v6: geometry_losses.append(metrics['geometry']*model.cfg.geometry_weight*len(raw))
         for key, value in metrics.items():
             metric_sums[key] = metric_sums.get(key, 0) + value.detach() * len(raw)
     total_count = sum(counts)
@@ -105,9 +102,6 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
     timer.mark("codec_forward_seconds")
     distortion = distortion_fn(scene)
     loss = distortion + attr_weight * aux_loss
-    if v6:
-        geometry_loss=torch.stack(geometry_losses).sum()/total_count
-        loss=loss+(1-attr_weight)*geometry_loss
     if not torch.isfinite(loss):
         raise RuntimeError("nonfinite render loss")
     timer.mark("render_forward_seconds")
@@ -134,11 +128,9 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
                 # VJP through the codec, plus the original weighted auxiliary.
                 render_objective = (raw * upstream[offset:offset + count]).sum()
                 weighted_aux = attr_weight * aux * count / total_count
-                if v6:
-                    weighted_aux=weighted_aux+(1-attr_weight)*model.cfg.geometry_weight*metrics['geometry']*count/total_count
                 if gradient_observer is not None:
                     weighted_geometry = (metrics["geometry"] * model.cfg.geometry_weight
-                                         * (1. if v6 else attr_weight) * count / total_count)
+                                         * attr_weight * count / total_count)
                     gradient_observer({"geometry": weighted_geometry,
                                        "attributes": weighted_aux - weighted_geometry,
                                        "render": render_objective})
@@ -153,62 +145,3 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
         values["peak_allocated_mib"] = torch.cuda.max_memory_allocated(device) / 2 ** 20
         values["peak_reserved_mib"] = torch.cuda.max_memory_reserved(device) / 2 ** 20
     return loss.detach(), values
-
-
-def joint_scene_step(model, mask, batches, geometry, snr, kind, distortion_fn,
-                     temperature=1., beta=.01, attr_weight=.1, mode="replay", profile=False):
-    """Batched hard-Gumbel codec+mask backward with bounded activation memory.
-
-    batches contain padded (features, ORIGINAL row ids); padding id is -1.
-    The replay boundary includes both raw Gaussian parameters and four choices,
-    so the renderer's inactive-mask gradient reaches dropped-row logits too.
-    RNG snapshots cover BOTH Gumbel selection and channel noise.
-    """
-    device = next(model.parameters()).device
-
-    def forward(features, ids):
-        valid = ids >= 0
-        scores = mask.scores(ids.clamp_min(0), snr)
-        choices = F.gumbel_softmax(scores, tau=temperature, hard=True, dim=-1)
-        padding = torch.zeros_like(choices)
-        padding[..., 0] = 1
-        choices = torch.where(valid[..., None], choices, padding)
-        pred, _, active = model.forward_tier_batches(features, features[..., :3], choices, snr, kind)
-        position={k:v[valid] for k,v in position_training_inputs(model,features,choices,snr).items()}
-        pred, target, active = pred[valid], features[valid], active[valid]
-        aux, terms = reconstruction_loss(pred, target, geometry, model, active=active, return_terms=True,**position)
-        return (torch.cat((to_raw(pred, geometry, model), choices[valid]), -1), aux,
-                {key: value.mean() for key, value in terms.items()})
-
-    counts = None
-
-    def distortion(scene):
-        nonlocal counts
-        counts = scene[:, -4:].detach().sum(0)
-        return distortion_fn(scene[:, :-4], scene[:, -3:].sum(-1))
-
-    loss, values = full_scene_step(model, batches, geometry, snr, kind, distortion,
-                                   attr_weight=attr_weight, mode=mode, profile=profile,
-                                   batch_forward=forward)
-    rate_timer = PhaseTimer(device, profile)
-    # Separate inexpensive graph: expectation over all source rows, never over
-    # a learned retained count. No second codec forward is needed for rate.
-    total = sum(int((ids >= 0).sum()) for _, ids in batches)
-    rates = next(model.parameters()).new_tensor(model.cfg.rates)
-    expectation = []
-    for _, ids in batches:
-        ids = ids.to(device)
-        expectation.append((mask.scores(ids[ids >= 0], snr).softmax(-1) * rates).sum())
-    mean_rate = torch.stack(expectation).sum() / total
-    rate_penalty = beta * mean_rate / model.cfg.rates[-1]
-    rate_penalty.backward()
-    rate_timer.mark("rate_backward_seconds")
-    values.update(source_gaussians=total, retained_gaussians=int(counts[1:].sum()),
-                  sampled_tier_counts=counts.cpu().tolist(),
-                  expected_symbols_per_gaussian=float(mean_rate.detach()),
-                  rate_loss=float(rate_penalty.detach()), temperature=temperature,
-                  **rate_timer.values)
-    if profile and device.type == "cuda":
-        values["peak_allocated_mib"] = torch.cuda.max_memory_allocated(device) / 2 ** 20
-        values["peak_reserved_mib"] = torch.cuda.max_memory_reserved(device) / 2 ** 20
-    return loss + rate_penalty.detach(), values

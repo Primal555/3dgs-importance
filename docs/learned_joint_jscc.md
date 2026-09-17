@@ -2,7 +2,8 @@
 
 This replaces the handcrafted geometric transport direction. It is an implemented
 architecture, not a claim that the position-recovery problem has already been solved.
-Use `train-learned`, not the historical `train` / route2 training entry points.
+Use `train-learned` or its alias `train`. The historical training implementations
+and `train-route2` entry point have been removed; joint training uses `--joint-steps`.
 
 ## Architecture and wire contract
 
@@ -127,7 +128,10 @@ is reported by transmission tools but is not optimized by this rate penalty.
 
 ## Training on the server
 
-Old reference_v6 / geometry_first weights cannot initialize this architecture.
+Old reference_v6 / geometry_first weights cannot be loaded by this mainline.
+Use the corresponding historical Git revision to evaluate those experiments;
+the pre-cleanup implementation snapshot is `a545aa5`. Existing learned-v4
+weights and packet hashes remain supported without preserving old networks.
 Start fresh; reusing the old point-cloud PLY is correct.
 
 ```bash
@@ -202,9 +206,12 @@ The test suite covers packed/batched equivalence, exact symbol counts, q0 holes,
 empty windows, independent receivers, source-input leakage, learned XYZ gradients,
 unclipped coordinate gradients, replay/checkpoint equivalence, exact categorical
 gradient expectation, and complete three-stage orchestration with a **mock**
-renderer. Historical checkpoint tests remain in the regression suite.
-The final local regression run collected 113 tests: 109 passed and four
-CUDA-dependent tests were skipped. The launch script also passed `bash -n`.
+renderer. Old architecture-specific tests were removed with their implementations;
+generic transport, replay, rendering, statistics and allocation tests were adapted
+to the maintained codec. Unsupported old checkpoints are explicitly rejected.
+After cleanup, 45 tests were collected: 42 passed and three CUDA-dependent tests
+were skipped. Current learned-v4 checkpoint/packet identity preservation is tested.
+The launch script passed `bash -n`; Python compilation and Git whitespace checks passed.
 
 `scripts/test_learned_codec_local.py` performs real truck-PLY CPU training from
 scratch on 32 spatial blocks and evaluates eight held-out blocks at fixed AWGN10.

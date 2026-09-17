@@ -95,7 +95,7 @@ class TrainingPerformanceTests(unittest.TestCase):
                 pred, _, _ = model.forward_tier_batches(f, f[..., :3], F.one_hot(q, 4).float(), 10., "none")
                 result = pred[q > 0]
             else:
-                result = torch.cat([model(a[t > 0], a[t > 0, :3], t[t > 0], 10., "none")
+                result = torch.cat([model(a, a[:, :3], t, 10., "none")[t > 0]
                                     for a, t in zip(blocks, tiers)])
             result.square().mean().backward()
             results.append(result)
@@ -156,39 +156,6 @@ class TrainingPerformanceTests(unittest.TestCase):
         for a, b in zip(results[0][1], results[1][1]):
             if a is not None:
                 torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-4)
-
-    def test_render_cli_init_profiles_and_saves_with_mock_renderer(self):
-        # Exercise actual CLI render control flow on CPU, substituting ONLY the
-        # CUDA camera/rasterizer boundary. This does not validate CUDA timings.
-        from gaussian_jscc.cli import main
-        raw, model = fixture(n=19, degree=0)
-        camera = SimpleNamespace(original_image=torch.full((3, 8, 8), .5))
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_ply(root / "source.ply", raw, 0)
-            save_checkpoint(root / "old.pt", model, 20000)
-            argv = ["gaussian_jscc", "train", "--ply", str(root / "source.ply"),
-                    "--init", str(root / "old.pt"), "--out", str(root / "run"),
-                    "--source", "mock-scene", "--device", "cuda", "--training-data-device", "cpu",
-                    "--steps", "0", "--render-steps", "2", "--blocks-per-batch", "2",
-                    "--save-every", "1", "--profile-every", "1"]
-            def render(scene, *args):
-                return scene[:, :3].mean(0).sigmoid()[:, None, None].expand(3, 8, 8)
-            with patch.object(sys, "argv", argv), \
-                    patch("gaussian_jscc.cli.device_for", return_value=torch.device("cpu")), \
-                    patch("gaussian_jscc.rendering.load_cameras", return_value=[camera]), \
-                    patch("gaussian_jscc.rendering.render", side_effect=render):
-                main()
-            rows = [json.loads(line) for line in (root / "run" / "loss.jsonl").read_text().splitlines()]
-            self.assertEqual(len(rows), 2)
-            self.assertTrue((root / "run" / "codec.pt").exists())
-            self.assertTrue((root / "run" / "codec_2.pt").exists())
-            for row in rows:
-                self.assertEqual(row["phase"], "render")
-                self.assertEqual(row["retained_gaussians"], 19)
-                self.assertEqual(row["codec_batches"], 2)
-                self.assertGreater(row["codec_replay_backward_seconds"], 0.)
-                self.assertGreater(row["step_seconds"], 0.)
 
 
 if __name__ == "__main__":

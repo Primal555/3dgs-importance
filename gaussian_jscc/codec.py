@@ -1,15 +1,7 @@
-"""ROI-JSCC prefix transport with independently built spatial grid contexts.
-
-The prefix mask/pack/scatter mechanism is adapted from ROI-JSCC (MIT; see
-NOTICE.md). Grid splat/query is a PyTorch implementation inspired by FCGS;
-no FCGS arithmetic codec, checkpoints or custom CUDA operators are required.
-Lengths below always count COMPLEX channel symbols.
-"""
-
+"""Fully learned Gaussian JSCC configuration, spatial aggregation and transport."""
 from dataclasses import asdict, dataclass
 from itertools import product
 import math
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -20,145 +12,74 @@ class CodecConfig:
     sh_degree: int = 3
     hidden: int = 96
     grid_dim: int = 16
-    levels: tuple = (4, 8, 16)
-    planes: bool = True
+    levels: tuple = (4, 8)
+    planes: bool = False
     depth: int = 2
     rates: tuple = (0, 8, 16, 32)
-    block_size: int = 4096
+    block_size: int = 256
     morton_bits: int = 16
-    architecture: str = "geometry_first"
-    geometry_rates: tuple = ()
-    geometry_weight: float = 1.0
-    shape_weight: float = .25
-    opacity_weight: float = 1.
-    dc_weight: float = 1.
-    sh_weight: float = .25
-    geometry_floor: float = 1e-4
-    loss_profile: str = "balanced_v2"
-    scale_weight: float = 1.
-    position_head: str = "sigmoid"
-    geometry_group_size: int = 256
-    geometry_clean_weight: float = 1.
-    reference_bounded: bool = True
-    individual_tiers: bool = False
-    position_beta: float = .001
-    position_tail_margin: float = .01
-    position_tail_weight: float = 2.
+    architecture: str = "learned_joint"
+    loss_profile: str = "learned_v1"
+    position_head: str = "learned_affine"
+    individual_tiers: bool = True
     decoder_window: int = 32
     attention_heads: int = 4
     power_floor: float = .01
     xyz_loss_scale: float = .05
+    geometry_weight: float = 1.
+    shape_weight: float = .25
+    scale_weight: float = 1.
+    opacity_weight: float = 1.
+    dc_weight: float = 1.
+    sh_weight: float = .25
+    # Reserved v4 metadata values: no runtime branch or geometry budget.
+    # Keeping these two constants preserves existing learned-v4 packet hashes.
+    geometry_rates: tuple = ()
+    geometry_floor: float = 1e-4
 
     def __post_init__(self):
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
-        if len(self.rates) != 4 or self.rates[0] != 0 or any(
-            a >= b for a, b in zip(self.rates, self.rates[1:])
-        ) or any(int(r) != r for r in self.rates):
-            raise ValueError("rates must be four increasing integer complex lengths, starting at 0")
-        if not 0 <= self.sh_degree <= 3:
-            raise ValueError("supported SH degrees: 0..3")
-        if not 1 <= self.morton_bits <= 16 or self.block_size < 1:
-            raise ValueError("morton_bits must be 1..16; block_size must be positive")
-        if not self.levels or any(int(r) != r or not 2 <= r <= 64 for r in self.levels):
-            raise ValueError("grid levels must be integers in 2..64")
-        if min(self.hidden, self.grid_dim, self.depth) < 1:
-            raise ValueError("hidden, grid_dim and depth must be positive")
-        if self.architecture not in ("legacy", "geometry_first", "learned_joint"):
-            raise ValueError("unknown codec architecture")
-        if self.architecture == 'learned_joint':
-            if self.geometry_rates or self.position_head not in ('sigmoid', 'learned_affine'):
-                raise ValueError('learned_joint has no geometry sub-budget or historical position head')
-            self.position_head = 'learned_affine'
-            self.loss_profile = 'learned_v1'
-            self.individual_tiers = True
-            if self.decoder_window < 2 or self.attention_heads < 1 or self.hidden % self.attention_heads:
-                raise ValueError('invalid local attention window/head dimensions')
-            if not math.isfinite(self.power_floor) or self.power_floor <= 0:
-                raise ValueError('power_floor must be finite and positive')
-            if not math.isfinite(self.xyz_loss_scale) or self.xyz_loss_scale <= 0:
-                raise ValueError('xyz_loss_scale must be finite and positive')
         self.geometry_rates = tuple(self.geometry_rates)
-        if self.architecture == "geometry_first":
-            # A configurable engineering starting point, NOT a measured optimum.
-            if not self.geometry_rates:
-                self.geometry_rates = tuple(r // 2 for r in self.rates)
-            g = self.geometry_rates
-            if len(g) != 4 or g[0] != 0 or any(int(x) != x for x in g):
-                raise ValueError("geometry-rates must contain four integer lengths starting at zero")
-            a = tuple(r - x for r, x in zip(self.rates, g))
-            if any(x <= 0 for x in g[1:] + a[1:]) or any(
-                x > y for seq in (g, a) for x, y in zip(seq, seq[1:])
-            ):
-                raise ValueError("geometry and attribute lengths must be positive and nondecreasing at q1..q3")
-        if self.loss_profile not in ("physical_v1", "balanced_v2", "position_v3", "robust_v4", "learned_v1"):
-            raise ValueError("unknown reconstruction loss profile")
-        if self.position_head not in ("sigmoid", "normalized_affine_v3", "block_relative_v4", "block_pilot_v5", "reference_v6", "learned_affine"):
-            raise ValueError("unknown position head")
-        if self.position_head == 'learned_affine' and self.architecture != 'learned_joint':
-            raise ValueError('learned_affine requires learned_joint architecture')
-        if self.individual_tiers and self.position_head != 'reference_v6' and self.architecture != 'learned_joint':
-            raise ValueError('individual_tiers requires reference_v6')
-        if self.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6") and min(self.geometry_rates[1:] or (0,)) < 4:
-            raise ValueError("block_relative_v4 requires at least 4 complex geometry symbols")
-        if not isinstance(self.geometry_group_size, int) or self.geometry_group_size < 1:
-            raise ValueError("geometry_group_size must be a positive integer")
-        if not math.isfinite(self.geometry_clean_weight) or self.geometry_clean_weight < 0:
-            raise ValueError("geometry_clean_weight must be finite and nonnegative")
-        if self.architecture == "legacy" and self.position_head != "sigmoid":
-            raise ValueError("legacy architecture requires sigmoid positions")
-        if not math.isfinite(self.position_beta) or self.position_beta <= 0:
-            raise ValueError("position-beta must be positive and finite")
-        if not math.isfinite(self.position_tail_margin) or self.position_tail_margin < 0:
-            raise ValueError("position-tail-margin must be nonnegative and finite")
-        if not math.isfinite(self.position_tail_weight) or self.position_tail_weight < 0:
-            raise ValueError("position-tail-weight must be nonnegative and finite")
-        for name in ("geometry_weight", "shape_weight", "opacity_weight", "dc_weight", "sh_weight", "scale_weight"):
-            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
-                raise ValueError(f"{name} must be finite and nonnegative")
-        if not math.isfinite(self.geometry_floor) or self.geometry_floor <= 0:
-            raise ValueError("geometry_floor must be finite and positive")
+        if self.architecture != 'learned_joint':
+            raise ValueError('Only learned_joint is supported; use the historical Git revision for old codecs')
+        if self.loss_profile != 'learned_v1' or self.position_head != 'learned_affine':
+            raise ValueError('learned_joint requires learned_v1 and learned_affine')
+        if not self.individual_tiers or self.geometry_rates or self.geometry_floor != 1e-4:
+            raise ValueError('learned_joint requires individual tiers and no geometry sub-budget')
+        if len(self.rates) != 4 or self.rates[0] != 0 or any(
+            a >= b for a,b in zip(self.rates,self.rates[1:])
+        ) or any(int(r) != r for r in self.rates):
+            raise ValueError('rates must be four increasing integer complex lengths starting at zero')
+        if not 0 <= self.sh_degree <= 3:
+            raise ValueError('supported SH degrees: 0..3')
+        if not 1 <= self.morton_bits <= 16 or self.block_size < 1:
+            raise ValueError('morton_bits must be 1..16; block_size must be positive')
+        if not self.levels or any(int(r) != r or not 2 <= r <= 64 for r in self.levels):
+            raise ValueError('grid levels must be integers in 2..64')
+        if min(self.hidden,self.grid_dim,self.depth) < 1:
+            raise ValueError('hidden, grid_dim and depth must be positive')
+        if self.decoder_window < 2 or self.attention_heads < 1 or self.hidden % self.attention_heads:
+            raise ValueError('invalid local attention window/head dimensions')
+        for name in ('power_floor','xyz_loss_scale'):
+            if not math.isfinite(getattr(self,name)) or getattr(self,name) <= 0:
+                raise ValueError(f'{name} must be positive and finite')
+        for name in ('geometry','shape','scale','opacity','dc','sh'):
+            value=getattr(self,name+'_weight')
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'{name}_weight must be finite and nonnegative')
 
     @property
     def attr_dim(self):
         return 8 + 3 * (self.sh_degree + 1) ** 2
 
     def to_dict(self):
-        result = asdict(self)
-        if self.architecture != 'learned_joint':
-            for key in ('decoder_window', 'attention_heads', 'power_floor', 'xyz_loss_scale'):
-                result.pop(key)
-        if not self.individual_tiers:
-            result.pop('individual_tiers')
-        if self.position_head not in ("block_pilot_v5", "reference_v6"):
-            result.pop("geometry_group_size")
-        if self.position_head != "reference_v6":
-            result.pop("geometry_clean_weight")
-        if self.position_head != 'reference_v6' or not self.reference_bounded:
-            result.pop('reference_bounded')
-        # Preserve every historical model/packet hash when the new options are
-        # inactive; new readers still load those files without changing outputs.
-        if self.position_head == "sigmoid":
-            result.pop("position_head")
-        if self.loss_profile != "position_v3":
-            for name in ("position_beta", "position_tail_margin", "position_tail_weight"):
-                result.pop(name)
-        if self.architecture == "legacy" or self.loss_profile == "physical_v1":
-            # Old geometry-first packets also hash the config. Do not silently
-            # change their identity just by loading with newer software.
-            result.pop("loss_profile")
-            result.pop("scale_weight")
-        if self.architecture == "legacy":
-            # Preserve historical checkpoint/packet hashes exactly.
-            for name in ("architecture", "geometry_rates", "geometry_weight", "shape_weight",
-                         "opacity_weight", "dc_weight", "sh_weight", "geometry_floor"):
-                result.pop(name)
-        return result
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, values):
-        return cls(**{**values, "architecture": values.get("architecture", "legacy"),
-                      'reference_bounded':values.get('reference_bounded',values.get('position_head')!='reference_v6'),
-                      "loss_profile": values.get("loss_profile", "physical_v1")})
+        if values.get('architecture') != 'learned_joint':
+            raise ValueError('Only learned_joint checkpoints are supported; use historical Git for old codecs')
+        return cls(**values)
 
 
 def validate_tiers(q, n):
@@ -224,7 +145,7 @@ class GridContext(nn.Module):
 
     Bounded local dense grids (not a scene-wide dense volume). Both splatting
     and querying include self; the feature gradients flow through index_add.
-    Encoder coordinates come from the source; decoder coordinates are predicted.
+    Coordinates come from source points at the sender only.
     Only grid bounds/indices are discrete; interpolation weights carry gradients.
     """
 
@@ -241,7 +162,7 @@ class GridContext(nn.Module):
                                  persistent=False)
 
     def geometry_plan(self, xyz, active=None):
-        """Reusable encoder interpolation plan; never cache predicted decoder xyz.
+        """Reusable sender interpolation plan.
 
         Mask-dependent weights retain their graph for joint four-tier training.
         Plans are local to a forward call, so changing choices cannot make them stale.
@@ -314,279 +235,43 @@ class ContextBlock(nn.Module):
 
 
 class GaussianCodec(nn.Module):
+    """One learned architecture. Historical implementations live in Git history."""
     def __init__(self, cfg):
         super().__init__()
+        from .learned_codec import LearnedCore
         self.cfg = cfg
-        # Diagnostic-only backward switch. Forward values, state_dict and wire
-        # format are unchanged; callers must record this in training metadata.
-        self.detach_attribute_context_xyz = False
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
-        if cfg.architecture == 'learned_joint':
-            from .learned_codec import LearnedCore
-            self.learned = LearnedCore(cfg)
-            self.position_head_needs_initialization = False
-            return
-        self.tier_emb = nn.Embedding(4, cfg.hidden)
-        self.enc_condition = nn.Sequential(nn.Linear(4, cfg.hidden), nn.GELU(),
-                                           nn.Linear(cfg.hidden, cfg.hidden))
-        self.dec_condition = nn.Sequential(nn.Linear(1, cfg.hidden), nn.GELU(),
-                                           nn.Linear(cfg.hidden, cfg.hidden))
-        self.enc_in = nn.Linear(3 + cfg.attr_dim, cfg.hidden)
-        self.enc_blocks = nn.ModuleList([ContextBlock(cfg) for _ in range(cfg.depth)])
-        self.dec_blocks = nn.ModuleList([ContextBlock(cfg) for _ in range(cfg.depth)])
-        self.position_seed = nn.Linear(cfg.hidden, 3)
-        self.position_head_needs_initialization = cfg.position_head == "normalized_affine_v3"
-        if self.position_head_needs_initialization:
-            self.reset_position_head()
-        if cfg.architecture == "legacy":
-            self.enc_out = nn.Linear(cfg.hidden, 2 * cfg.rates[-1])
-            self.dec_in = nn.Linear(4 * cfg.rates[-1], cfg.hidden)
-            self.position_updates = nn.ModuleList([nn.Linear(cfg.hidden, 3)
-                                                   for _ in range(cfg.depth)])
-        else:
-            # Interleave incremental branch segments so every tier is still a
-            # prefix of EXACTLY k(q) complex symbols. No additional row metadata.
-            geo, attr = [], []
-            for i in range(1, 4):
-                begin, end = cfg.rates[i - 1], cfg.rates[i]
-                middle = begin + cfg.geometry_rates[i] - cfg.geometry_rates[i - 1]
-                geo.extend(range(2 * begin, 2 * middle))
-                attr.extend(range(2 * middle, 2 * end))
-            self.register_buffer("geometry_slots", torch.tensor(geo), persistent=False)
-            self.register_buffer("attribute_slots", torch.tensor(attr), persistent=False)
-            self.enc_geometry = nn.Sequential(nn.Linear(cfg.hidden + 3, cfg.hidden), nn.GELU(),
-                                               nn.Linear(cfg.hidden, len(geo)))
-            self.enc_out = nn.Linear(cfg.hidden, len(attr))
-            self.geo_dec = nn.Sequential(nn.Linear(2 * len(geo), cfg.hidden), nn.GELU(),
-                                         nn.Linear(cfg.hidden, cfg.hidden))
-            self.dec_in = nn.Linear(2 * len(attr), cfg.hidden)
-        sizes = {"opacity": 1, "scale": 3, "rotation": 4, "dc": 3}
-        if cfg.sh_degree:
-            sizes["sh"] = cfg.attr_dim - 11
-        self.heads = nn.ModuleDict({k: nn.Linear(cfg.hidden, v) for k, v in sizes.items()})
-        if cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
-            self.enable_block_geometry(cfg.position_head)
-
-    def enable_block_geometry(self, version="block_relative_v4"):
-        from .block_geometry import BlockGeometry, PilotBlockGeometry
-        if version not in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
-            raise ValueError("unknown block geometry version")
-        changed = self.cfg.position_head != version
-        self.cfg.position_head = version
-        self.cfg.__post_init__()
-        if changed or not hasattr(self, "block_geometry"):
-            # Migration explicitly resets geometry residuals: learned v4 values
-            # are not calibrated to v5 amplitude/reference statistics.
-            from .reference_geometry import ReferenceGeometry
-            self.block_geometry = (ReferenceGeometry(self.cfg.geometry_rates,self.cfg.hidden,self.cfg.geometry_group_size,
-                                                     self.cfg.reference_bounded,self.cfg.individual_tiers)
-                                   if version == 'reference_v6' else
-                                   PilotBlockGeometry(self.cfg.geometry_rates, self.cfg.hidden,
-                                                      self.cfg.geometry_group_size)
-                                   if version == "block_pilot_v5" else
-                                   BlockGeometry(self.cfg.geometry_rates, self.cfg.hidden)).to(self.attr_mean)
-        self.position_head_needs_initialization = False
-
-    def tiers_from_mask(self, mask):
-        lengths = mask.sum(-1).detach()
-        table = lengths.new_tensor(self.cfg.rates) * 2
-        return (lengths[..., None] - table).abs().argmin(-1)
-
-    def block_payload(self, h, xyz, mask, snr, choices=None):
-        """Independent geometry/attribute power, with no extra amplitude metadata.
-
-        Geometry has unit mean complex energy (v4 per row; v5 per group). Attribute
-        energy is normalized per packet, independently of geometry. Their union
-        has unit average energy, except for the degenerate zero-attribute signal.
-        """
-        q = self.tiers_from_mask(mask)
-        geo = (self.block_geometry.encode_choices(xyz,choices,snr)
-               if self.cfg.position_head == 'reference_v6' and choices is not None else
-               self.block_geometry.encode(xyz, q, snr))
-        a_mask = mask[..., self.attribute_slots]
-        raw_attr = self.enc_out(h)
-        attr = raw_attr * a_mask
-        if self.cfg.individual_tiers:
-            # Per-Gaussian companding + bounded RMS gain. A tier change cannot
-            # rescale another row, nor can a near-zero/all-dropped row amplify
-            # its ST gradients by 1e6. Most rows retain unit complex energy;
-            # rows below the .1 energy floor deliberately use less power.
-            attr = raw_attr.tanh() * a_mask
-            energy=attr.square().sum(-1,keepdim=True)/(a_mask.sum(-1,keepdim=True)/2).clamp_min(1)
-            attr=attr/energy.clamp_min(.1).sqrt()
-        else:
-            energy = attr.square().sum((-2, -1), keepdim=True) / (a_mask.sum((-2, -1), keepdim=True) / 2).clamp_min(1)
-            attr = attr / energy.clamp_min(1e-12).sqrt()
-        latent = h.new_zeros(mask.shape)
-        return latent.index_copy(-1, self.geometry_slots, geo).index_copy(-1, self.attribute_slots, attr)
-
-    def geometry_forward(self, xyz, q, snr, kind="awgn"):
-        """Geometry-only training; same geometric payload/power as transport."""
-        z = self.block_geometry.encode(xyz, q, snr)
-        received = channel(z.reshape(-1, 2), snr, kind).reshape_as(z)
-        return self.block_geometry.decode(received, q, snr)
-
-    def encode_latent(self, h, xyz):
-        if self.cfg.architecture == "legacy":
-            return self.enc_out(h)
-        latent = h.new_zeros((*h.shape[:-1], 2 * self.cfg.rates[-1]))
-        latent = latent.index_copy(-1, self.geometry_slots,
-                                   self.enc_geometry(torch.cat((h, xyz * 2 - 1), -1)))
-        return latent.index_copy(-1, self.attribute_slots, self.enc_out(h))
-
-    def reset_position_head(self):
-        """Explicit new-head initialization, NOT a function-preserving migration."""
-        nn.init.normal_(self.position_seed.weight, std=.001)
-        nn.init.zeros_(self.position_seed.bias)
-        self.position_head_needs_initialization = True
-
-    def predict_position(self, hidden):
-        if self.cfg.position_head == "sigmoid":
-            return self.position_seed(hidden).sigmoid()
-        # No trainable LN gain that could re-amplify the head's input norm.
-        # Targets remain existing per-axis bbox units; no new geometry metadata.
-        normalized = F.layer_norm(hidden, (self.cfg.hidden,), eps=1e-5)
-        return .5 + .25 * self.position_seed(normalized)
-
-    def decode_latent(self, received, mask, condition, active=None, snr=None):
-        if self.cfg.architecture == "legacy":
-            h = self.dec_in(torch.cat((received, mask), -1)) + condition
-            seed = self.position_seed(h).sigmoid()
-            xyz = seed
-            for block, update in zip(self.dec_blocks, self.position_updates):
-                h = block(h, xyz, condition, active)
-                xyz = update(h).sigmoid()
-        else:
-            g, a = self.geometry_slots, self.attribute_slots
-            if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
-                if snr is None:
-                    raise ValueError("block geometry decoding requires the receiver SNR condition")
-                xyz = self.block_geometry.decode(received[..., g], self.tiers_from_mask(mask), snr)
-            else:
-                gh = self.geo_dec(torch.cat((received[..., g], mask[..., g]), -1)) + condition
-                xyz = self.predict_position(gh)
-            # Compatibility diagnostic: there is no intermediate position seed
-            # in this architecture; the returned position is already final.
-            seed = xyz
-            h = self.dec_in(torch.cat((received[..., a], mask[..., a]), -1)) + condition
-            context_xyz = xyz.detach() if self.detach_attribute_context_xyz else xyz
-            plan = self.dec_blocks[0].grid.geometry_plan(context_xyz, active)
-            for block in self.dec_blocks:
-                h = block(h, context_xyz, condition, active, plan=plan)
-        return torch.cat((xyz, *(head(h) for head in self.heads.values())), -1), seed
-
-    def encoder_conditioning(self, xyz, q, snr):
-        snr_col = xyz.new_full((len(xyz), 1), float(snr) / 20)
-        return self.tier_emb(q) + self.enc_condition(torch.cat((xyz * 2 - 1, snr_col), -1))
-
-    def decoder_conditioning(self, symbols, q, snr):
-        snr_col = symbols.new_full((len(q), 1), float(snr) / 20)
-        return self.tier_emb(q) + self.dec_condition(snr_col)
+        self.learned = LearnedCore(cfg)
 
     def encode(self, features, xyz, q, snr):
         validate_tiers(q, len(features))
-        if self.cfg.architecture == 'learned_joint':
-            return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
-        if (q == 0).any() and not self.cfg.individual_tiers:
-            raise ValueError("remove tier-0 Gaussians before building context")
-        condition = self.encoder_conditioning(xyz, q, snr)
-        h = self.enc_in(features) + condition
-        active = (q > 0).to(features) if self.cfg.individual_tiers else None
-        plan = self.enc_blocks[0].grid.geometry_plan(xyz, active)
-        for block in self.enc_blocks:
-            h = block(h, xyz, condition, active, plan=plan)
-        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
-            return pack(self.block_payload(h, xyz, prefix_mask(q, self.cfg.rates).to(h), snr), q, self.cfg.rates)
-        return normalize_power(pack(self.encode_latent(h, xyz), q, self.cfg.rates))
+        return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
 
     def decode(self, symbols, q, snr, return_seed=False):
         validate_tiers(q, len(q))
-        if self.cfg.architecture == 'learned_joint':
-            result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr)[0]
-            return (result, result[:, :3]) if return_seed else result
-        if (q == 0).any() and not self.cfg.individual_tiers:
-            raise ValueError("decoder metadata must contain only retained Gaussians")
-        if len(q) == 0:
-            empty = symbols.new_empty((0, 3 + self.cfg.attr_dim))
-            return (empty, symbols.new_empty((0, 3))) if return_seed else empty
-        padded = unpack(symbols, q, self.cfg.rates)
-        mask = prefix_mask(q, self.cfg.rates).to(padded.dtype)
-        condition = self.decoder_conditioning(symbols, q, snr)
-        active = (q > 0).to(padded) if self.cfg.individual_tiers else None
-        result, seed = self.decode_latent(padded, mask, condition, active=active, snr=snr)
-        return (result, seed) if return_seed else result
+        result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr)[0]
+        # Optional benchmark diagnostic is final XYZ, not a bootstrap decoder.
+        return (result, result[:, :3]) if return_seed else result
 
     def forward(self, features, xyz, q, snr, kind="awgn", return_seed=False):
-        symbols = channel(self.encode(features, xyz, q, snr), snr, kind)
-        return self.decode(symbols, q, snr, return_seed)
+        return self.decode(channel(self.encode(features, xyz, q, snr), snr, kind), q, snr, return_seed)
 
     def forward_tiers(self, features, xyz, choices, snr, kind="awgn"):
-        """Hard one-hot forward, straight-through gradients to all four logits.
-
-        Dense latent slots exist only as a training tensor. At hard choices the
-        retained outputs equal the packed codec (noiseless / same active noise).
-        Dropped nodes contribute neither power, grid features nor rendered alpha.
-        """
         if choices.shape != (len(features), 4):
             raise ValueError("choices must have shape [N,4]")
         return tuple(x[0] for x in self.forward_tier_batches(
             features[None], xyz[None], choices[None], snr, kind))
 
     def forward_tier_batches(self, features, xyz, choices, snr, kind="awgn"):
-        """Independent padded blocks [B,N,D]; q0 slots do not enter context/power.
-
-        Each block has its OWN grid bounds and average symbol energy. This is
-        not equivalent to concatenating blocks into a larger codec packet.
-        Choices may be hard one-hots or straight-through Gumbel choices.
-        """
         if choices.shape != (*features.shape[:2], 4) or features.ndim != 3:
             raise ValueError("batched choices must have shape [B,N,4]")
-        if self.cfg.architecture == 'learned_joint':
-            if choices.requires_grad or not torch.equal(choices, F.one_hot(choices.argmax(-1), 4).to(choices)):
-                raise ValueError('learned_joint uses hard actions and score-function mask gradients, not ST choices')
-            q = choices.argmax(-1)
-            latent = self.learned.encode(features, xyz, q, snr)
-            mask = prefix_mask(q.flatten(), self.cfg.rates).reshape_as(latent)
-            # Sample only transmitted symbols, identical to the packed path.
-            noisy = channel(latent[mask].reshape(-1, 2), snr, kind)
-            received = latent.new_zeros(latent.shape).masked_scatter(mask, noisy.flatten())
-            result = self.learned.decode(received, q, snr)
-            return result, result[..., :3], (q > 0).to(features)
-        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5") and choices.requires_grad:
-            raise ValueError("block_relative_v4 currently supports fixed hard tiers, not joint mask optimization")
-        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5") and not torch.equal(
-            choices, F.one_hot(choices.argmax(-1), 4).to(choices)
-        ):
-            raise ValueError("block_relative_v4 requires one-hot hard tiers")
-        if self.cfg.position_head == 'reference_v6' and not torch.equal(
-            choices.detach(),F.one_hot(choices.detach().argmax(-1),4).to(choices)):
-            raise ValueError('reference_v6 requires hard or straight-through one-hot choices')
-        table = prefix_mask(torch.arange(4, device=features.device), self.cfg.rates).to(features.dtype)
-        mask = choices @ table
-        active = choices[..., 1:].sum(-1)
-        embedding = choices @ self.tier_emb.weight
-        snr_col = features.new_full((*features.shape[:2], 1), float(snr) / 20)
-        condition = embedding + self.enc_condition(torch.cat((xyz * 2 - 1, snr_col), -1))
-        h = self.enc_in(features) + condition
-        plan = self.enc_blocks[0].grid.geometry_plan(xyz, active)
-        for block in self.enc_blocks:
-            h = block(h, xyz, condition, active, plan=plan)
-        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
-            normalized = self.block_payload(h, xyz, mask, snr, choices)
-            received = channel(normalized.reshape(-1, 2), snr, kind).reshape_as(normalized) * mask
-            condition = embedding + self.dec_condition(snr_col)
-            result, seed = self.decode_latent(received, mask, condition, active, snr=snr)
-            return result, seed, active
-        latent = self.encode_latent(h, xyz)
-        energy = (latent.square() * mask).sum((1, 2), keepdim=True) / (
-            mask.sum((1, 2), keepdim=True) / 2).clamp_min(1.)
-        # All-dropped packets have no transmitted energy. A finite training-only
-        # normalization keeps counterfactual ST derivatives from exploding.
-        fallback = latent.detach().square().sum(-1).mean(-1)[:, None, None].clamp_min(1e-4)
-        energy = torch.where((active.detach() > .5).any(-1)[:, None, None], energy, fallback)
-        normalized = latent / energy.clamp_min(1e-12).sqrt()
-        received = channel(normalized.reshape(-1, 2), snr, kind).reshape_as(latent) * mask
-        condition = embedding + self.dec_condition(snr_col)
-        result, seed = self.decode_latent(received, mask, condition, active)
-        return result, seed, active
+        if choices.requires_grad or not torch.equal(choices, F.one_hot(choices.argmax(-1), 4).to(choices)):
+            raise ValueError('Use hard actions and score-function mask gradients, not ST choices')
+        q = choices.argmax(-1)
+        latent = self.learned.encode(features, xyz, q, snr)
+        mask = prefix_mask(q.flatten(), self.cfg.rates).reshape_as(latent)
+        noisy = channel(latent[mask].reshape(-1, 2), snr, kind)
+        received = latent.new_zeros(latent.shape).masked_scatter(mask, noisy.flatten())
+        result = self.learned.decode(received, q, snr)
+        return result, result[..., :3], (q > 0).to(features)

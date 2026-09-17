@@ -61,8 +61,6 @@ def benchmark_codec(args):
 
     device = device_for(args.device)
     model = load_checkpoint(args.checkpoint, device)
-    if model.cfg.architecture == "geometry_first" and args.position_seed_ablation:
-        print("Geometry-first has no intermediate position seed: seed diagnostics equal final XYZ.")
     raw, degree = read_ply(args.ply)
     if degree != model.cfg.sh_degree:
         raise ValueError("checkpoint SH degree mismatch")
@@ -70,8 +68,8 @@ def benchmark_codec(args):
         raise ValueError("render benchmark requires CUDA; omit --source for parameter-only testing")
     if (args.save_images or args.lpips) and not args.source:
         raise ValueError("--save-images/--lpips require --source")
-    if (args.hybrid_ablation or args.position_seed_ablation) and not args.source:
-        raise ValueError("hybrid/position-seed ablation requires --source")
+    if args.hybrid_ablation and not args.source:
+        raise ValueError("hybrid ablation requires --source")
     if len(set(args.channels)) != len(args.channels):
         raise ValueError("channels must be unique")
     if any(tier not in (1, 2, 3) for tier in args.tiers):
@@ -117,28 +115,17 @@ def benchmark_codec(args):
                     else:
                         temporary = TemporaryDirectory(prefix="packet_", dir=out)
                         packet = Path(temporary.name) / "packet"
-                    position_seed = None
                     try:
                         stats = transmit(model, raw, q, snr, channel_kind, args.seed + trial,
                                          packet, args.metadata_code_rate,
                                          args.metadata_modulation_bits)
-                        decoded = receive(model, packet,
-                                          return_position_seed=args.position_seed_ablation)
-                        if args.position_seed_ablation:
-                            recovered, position_seed = decoded
-                        else:
-                            recovered = decoded
+                        recovered = receive(model, packet)
                     finally:
                         if temporary is not None:
                             temporary.cleanup()
                     if len(recovered) != len(ordered) or not torch.isfinite(recovered).all():
                         raise RuntimeError("codec benchmark recovered an invalid Gaussian set")
                     stats.update(parameter_metrics(ordered, recovered))
-                    if position_seed is not None:
-                        seed_metrics = position_metrics(ordered[:, :3], position_seed)
-                        stats.update(position_seed_rmse=seed_metrics["position_rmse"],
-                                     position_seed_nrmse_bbox_diagonal=
-                                     seed_metrics["position_nrmse_bbox_diagonal"])
                     stats.update(label=label, benchmark_series=f"{channel_kind}_tier{tier}",
                                  tier=tier, trial=trial,
                                  expected_payload_complex_symbols=len(raw) * model.cfg.rates[tier])
@@ -148,14 +135,12 @@ def benchmark_codec(args):
                         write_ply(run / "point_cloud.ply", recovered, degree)
                     if cameras:
                         from .rendering import evaluate_views
-                        hybrid = args.hybrid_ablation or args.position_seed_ablation
+                        hybrid = args.hybrid_ablation
                         metrics = evaluate_views(recovered.to(device), reference, cameras, degree,
                                                  args.white_background,
                                                  run / "views" if args.save_images else None,
                                                  args.lpips,
-                                                 hybrid_ablation=hybrid,
-                                                 position_seed=(None if position_seed is None else
-                                                                position_seed.to(device)))
+                                                 hybrid_ablation=hybrid)
                         (run / "metrics.json").write_text(
                             json.dumps(metrics, indent=2), encoding="utf-8")
                         if hybrid:
@@ -165,10 +150,8 @@ def benchmark_codec(args):
                     (run / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
                     results.append(stats)
                     (out / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-                    seed_text = (f", seed_nrmse={stats['position_seed_nrmse_bbox_diagonal']:.6g}"
-                                 if position_seed is not None else "")
                     print(f"[{current}/{total}] {label}: position_nrmse="
-                          f"{stats['position_nrmse_bbox_diagonal']:.6g}{seed_text}, "
+                          f"{stats['position_nrmse_bbox_diagonal']:.6g}, "
                           f"symbols/G={stats['total_uses_per_source_gaussian']:.4g}", flush=True)
     safe_plot("evaluation", out)
     print(f"Saved isolated codec benchmark to {out}")
@@ -195,8 +178,6 @@ def add_parser(sub):
     parser.add_argument("--save-images", action="store_true")
     parser.add_argument("--hybrid-ablation", action="store_true",
                         help="render decoded-XYZ/source-attribute and source-XYZ/decoded-attribute hybrids")
-    parser.add_argument("--position-seed-ablation", action="store_true",
-                        help="extend hybrid ablation with decoder seed XYZ before context updates")
     parser.add_argument("--save-ply", action="store_true")
     parser.add_argument("--keep-packets", action="store_true",
                         help="retain metadata.bin/received.npy for every run (large)")

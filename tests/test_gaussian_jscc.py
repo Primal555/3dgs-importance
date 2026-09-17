@@ -77,13 +77,13 @@ class CodecTests(unittest.TestCase):
         q = torch.arange(len(raw)) % 3 + 1
         output = model(features, xyz, q, 7.)
         attribute_loss(output, features).backward()
-        for blocks in (model.enc_blocks, model.dec_blocks):
-            grad = blocks[0].grid.project.weight.grad
+        for parameter in (model.learned.enc_blocks[0].grid.project.weight,
+                          model.learned.dec_blocks[0].attention.in_proj_weight):
+            grad = parameter.grad
             self.assertTrue(torch.isfinite(grad).all())
             self.assertGreater(float(grad.abs().sum()), 0.)
         self.assertEqual(output.shape, features.shape)
-        with self.assertRaises(ValueError):
-            model(features, xyz, q * 0, 7.)
+        self.assertEqual(float(model(features, xyz, q * 0, 7.).detach().abs().sum()), 0.)
 
     def test_noiseless_optimization_reduces_loss(self):
         raw, model = fixture(n=8, degree=0)
@@ -194,11 +194,11 @@ class CodecTests(unittest.TestCase):
             for start in range(0, len(raw), model.cfg.block_size):
                 qb = oq[start:start + model.cfg.block_size]
                 keep = qb > 0
-                rb = ordered[start:start + len(qb)][keep]
-                if not len(rb):
+                rb = ordered[start:start + len(qb)]
+                if not keep.any():
                     continue
                 f, xyz = to_features(rb, geom, model)
-                expected.append(to_raw(model(f, xyz, qb[keep], 10., "none"), geom, model))
+                expected.append(to_raw(model(f, xyz, qb, 10., "none")[keep], geom, model))
             torch.testing.assert_close(reconstructed, torch.cat(expected))
             self.assertEqual(stats["payload_complex_symbols"], int(torch.tensor(model.cfg.rates)[q].sum()))
             self.assertEqual(stats["retained_gaussians"], int((q > 0).sum()))
@@ -247,7 +247,7 @@ class CodecTests(unittest.TestCase):
             training = root / "training"
             run("train", "--ply", source, "--out", training, "--device", "cpu", "--steps", 3,
                 "--hidden", 16, "--grid-dim", 4, "--depth", 1, "--levels", 2, 3,
-                "--rates", 0, 2, 4, 6, "--block-size", 8)
+                "--rates", 0, 2, 4, 6, "--block-size", 8, "--render-steps", 0, "--blocks-per-batch", 2)
             weights = training / "codec.pt"
             run("transmit", "--ply", source, "--checkpoint", weights, "--out", root / "packet",
                 "--device", "cpu", "--uniform-tier", 2)

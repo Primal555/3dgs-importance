@@ -14,6 +14,8 @@ from gaussian_jscc.cli import device_for, sample_tiers, seed_all
 from gaussian_jscc.data import prepare, read_ply, to_features
 from gaussian_jscc.training import full_scene_step
 from gaussian_jscc.transport import load_checkpoint
+from gaussian_jscc.optimization import clip_codec_gradients
+from gaussian_jscc.learned_objective import projection_loss
 
 
 def main():
@@ -35,6 +37,10 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render-target", choices=["source", "images"], default="source")
+    parser.add_argument('--attr-weight', type=float, default=1.)
+    parser.add_argument('--projection-weight', type=float, default=.05)
+    parser.add_argument('--clip-mode', choices=['none','global','branch'], default='none')
+    parser.add_argument('--clip-norm', type=float, default=10.)
     args = parser.parse_args()
     if min(args.blocks_per_batch) < 1 or args.iterations < 1 or args.warmup < 0:
         parser.error("positive batch sizes/iterations and nonnegative warmup required")
@@ -50,6 +56,7 @@ def main():
     if degree != model.cfg.sh_degree:
         raise ValueError("checkpoint SH degree mismatch")
     raw, geometry, _ = prepare(raw, model.cfg.morton_bits)
+    source_parameters = raw.to(device)
     storage = device if args.training_data_device == "cuda" else torch.device("cpu")
     with torch.no_grad():
         blocks = [to_features(rb.to(device), geometry, model)[0].to(storage)
@@ -84,14 +91,15 @@ def main():
 
                     def distortion(scene):
                         image = render(scene, camera, degree, args.white_background)
-                        return .8 * (image - gt).abs().mean() + .2 * (1 - ssim(image, gt))
+                        return (.8 * (image - gt).abs().mean() + .2 * (1 - ssim(image, gt))
+                                + args.projection_weight * projection_loss(scene, source_parameters, camera))
 
                     model.zero_grad(set_to_none=True)
                     torch.cuda.synchronize(device)
                     started = time.perf_counter()
                     loss, stats = full_scene_step(model, batches, geometry, args.snr, args.channel,
-                                                  distortion, mode=mode, profile=True)
-                    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+                                                  distortion, attr_weight=args.attr_weight, mode=mode, profile=True)
+                    norm, _ = clip_codec_gradients(model, args.clip_norm, args.clip_mode)
                     torch.cuda.synchronize(device)
                     row = {"backward": mode, "blocks_per_batch": size, "iteration": iteration,
                            "warmup": iteration < args.warmup, "camera": camera.image_name,

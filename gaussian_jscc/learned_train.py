@@ -17,7 +17,7 @@ from .transport import load_checkpoint, save_checkpoint
 
 
 def add_parser(sub):
-    p = sub.add_parser('train-learned', description=__doc__)
+    p = sub.add_parser('train-learned', aliases=['train'], description=__doc__)
     p.set_defaults(func=train)
     for key in ('ply', 'out'):
         p.add_argument('--'+key, required=True)
@@ -296,7 +296,7 @@ def train(args):
                 stats['mask_grad_norm'] = float(mask_norm)
                 mask_optimizer.step()
             optimizer.step()
-            from .gradient_diagnostics import update_stats
+            from .optimization import update_stats
             updates = update_stats(model, before)
             update_norm = math.sqrt(sum(v['update_norm']**2 for v in updates.values()))
             stats['updates'] = updates

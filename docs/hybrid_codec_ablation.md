@@ -1,75 +1,31 @@
-# Gaussian JSCC hybrid parameter ablation
+# 位置与非位置属性的渲染消融
 
-`benchmark_codec.py --hybrid-ablation` reuses each decoded Gaussian scene to render four
-row-aligned parameter combinations:
-
-| Name | XYZ | Non-position attributes | Interpretation |
-|---|---|---|---|
-| `reference` | source | source | input PLY upper reference |
-| `seed_position_error_only` | decoder seed | source | geometry before decoder context updates |
-| `position_error_only` | decoded | source | degradation caused by decoded positions |
-| `attribute_error_only` | source | decoded | degradation caused by decoded opacity, scale, rotation and SH |
-| `received` | decoded | decoded | complete codec result |
-
-All source rows are Morton-ordered before columns are mixed with decoder rows. This is
-essential: rendering is permutation invariant, but a hybrid Gaussian row is not.
-The ablation retains every Gaussian and does not invoke the learned four-tier allocator.
-
-## Server command
-
-Use a new output directory. A compact noiseless diagnosis is usually the most useful
-starting point because it isolates the codec bottleneck from channel noise:
+当前 codec 的 XYZ 与属性来自同一个学习式 payload。以下评估用于区分两类恢复误差，不改变训练结构，也不额外传输信息。
 
 ```bash
-PROJECT=/data/home/zhangyueheng/projects/3dgs-importance
-PLY="$PROJECT/output/truck_mask_0005/point_cloud/iteration_30000/point_cloud.ply"
-SCENE="$PROJECT/data/tandt_db/tandt/truck"
-INIT="$PROJECT/output/truck_codec_attr_retrain/codec.pt"
-OUT="$PROJECT/output/truck_codec_hybrid_none_$(date +%Y%m%d_%H%M%S)"
-
-CUDA_VISIBLE_DEVICES=0 python -u benchmark_codec.py \
-  --ply "$PLY" \
-  --checkpoint "$INIT" \
-  --source "$SCENE" \
-  --out "$OUT" \
-  --tiers 1 2 3 \
-  --snrs 10 \
-  --channels none \
-  --trials 1 \
-  --resolution 2 \
-  --device cuda \
-  --hybrid-ablation \
-  --position-seed-ablation \
-  --save-images
+python benchmark_codec.py \
+  --ply /path/to/point_cloud.ply --checkpoint /path/to/learned_codec.pt \
+  --source /path/to/scene --out /path/to/new_evaluation \
+  --device cuda --channels none awgn --snrs 10 --tiers 1 2 3 \
+  --resolution 2 --save-images --hybrid-ablation
 ```
 
-For a multi-SNR AWGN curve, replace the condition arguments with:
+所有 Gaussian 保留，评估四种参数组合：
 
-```bash
---snrs 0 5 10 15 20 --channels awgn --trials 1
-```
+| 组合 | XYZ | 其余属性 |
+| --- | --- | --- |
+| 输入 PLY 参照 | 原始 | 原始 |
+| 仅位置恢复误差 | 解码 | 原始 |
+| 仅属性恢复误差 | 原始 | 解码 |
+| 完全解码 | 解码 | 解码 |
 
-## Outputs
+对照图从左到右为原始照片、输入 PLY 渲染、仅位置误差、仅属性误差、完全解码。
+混合参数使用同一次传输结果，且按同一个 Morton 排序对齐行，不能直接混合排序不同的 PLY。
 
-Each condition directory contains:
+`none` 表示不加信道噪声，不代表无损；仍有神经编码瓶颈。
+照片参照的 PSNR 与输入 PLY 参照的 codec PSNR 是两种指标，不能混为一谈。
 
-- `hybrid_ablation.json`: mean and per-view metrics plus exact variant definitions;
-- `metrics.json`: the same render metrics consumed by the general benchmark;
-- `views/*.png` when `--save-images` is enabled. Panels are ordered as ground truth,
-  input PLY, seed-position-error-only, final-position-error-only,
-  attribute-error-only, and fully decoded;
-- `stats.json`: flattened mean metrics together with channel use and parameter errors.
+新架构没有中间位置 seed，旧 `--position-seed-ablation` 入口已移除。
+已有历史结果仍可用绘图工具查看。
 
-The benchmark root contains `results.json` and automatically generates
-`charts/hybrid_ablation_quality_vs_snr.{png,svg}`. The chart has one column for each
-error isolation and rows for PSNR and SSIM. `evaluation_chart_data.csv` contains the
-same aggregated values for later plotting.
-
-With `--position-seed-ablation`, the root also contains
-`charts/position_seed_vs_final.{png,svg}`. It compares seed and final position NRMSE,
-position-only PSNR, and position-only SSIM. The diagnostic seed comes from the same
-received channel symbols and does not add packet metadata or channel uses.
-
-Hybrid mode performs the channel transmission and decoding only once per condition.
-It renders four Gaussian variants instead of the usual two, so its rendering portion
-takes approximately twice as long. LPIPS remains optional and is enabled by `--lpips`.
+更多说明见 [learned_joint_jscc.md](learned_joint_jscc.md)。

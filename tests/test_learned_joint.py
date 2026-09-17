@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import itertools
 import json
 from pathlib import Path
@@ -97,6 +98,28 @@ class LearnedTests(unittest.TestCase):
             self.assertEqual(len(b),int((q>0).sum()))
             self.assertEqual(stats['handcrafted_coordinate_symbols'],0)
             self.assertEqual(stats['payload_complex_symbols'],int(torch.tensor(m.cfg.rates)[q].sum()))
+
+    def test_v4_packet_identity_survives_cleanup(self):
+        _,_,_,m = setup(8)
+        # Explicit pre-cleanup learned-v4 schema, not reconstructed from today's
+        # serialization. Removing inactive modes must not break current packets.
+        saved_config = dict(sh_degree=0, hidden=16, grid_dim=4, levels=[2], planes=False,
+                            depth=2, rates=[0,2,4,6], block_size=8, morton_bits=16,
+                            architecture='learned_joint', geometry_rates=[], geometry_weight=1.,
+                            shape_weight=.25, opacity_weight=1., dc_weight=1., sh_weight=.25,
+                            geometry_floor=.0001, loss_profile='learned_v1', scale_weight=1.,
+                            position_head='learned_affine', individual_tiers=True,
+                            decoder_window=4, attention_heads=4, power_floor=.01, xyz_loss_scale=.05)
+        digest=hashlib.sha256(json.dumps(saved_config,sort_keys=True).encode())
+        for name,value in sorted(m.state_dict().items()):
+            digest.update(name.encode())
+            digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+        self.assertEqual(model_id(m),digest.hexdigest())
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'v4.pt'
+            torch.save({'version':4,'config':saved_config,'state_dict':m.state_dict()},path)
+            loaded=load_checkpoint(path,'cpu')
+            self.assertEqual(model_id(loaded),digest.hexdigest())
 
     def test_xyz_responds_to_received_symbols_and_not_clamped(self):
         _,g,f,m = setup(8)
@@ -216,8 +239,8 @@ class LearnedTests(unittest.TestCase):
             self.assertEqual(len(log),2)
             self.assertEqual(log[0]['clip_mode'],'none')
             self.assertGreater(log[0]['update_norm'],0)
-            _,old = fixture(4,degree=0)
-            save_checkpoint(root/'old.pt',old,0)
+            # No historical implementation is kept solely to create a fixture.
+            torch.save({'version':3,'config':{'architecture':'geometry_first'}},root/'old.pt')
             argv[argv.index('--out')+1] = str(root/'reject')
             with patch('sys.argv',argv+['--init',str(root/'old.pt')]):
                 with self.assertRaisesRegex(ValueError,'learned_joint'):

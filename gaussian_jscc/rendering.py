@@ -76,15 +76,8 @@ def load_cameras(source, resolution=2, white_background=False, images="images", 
     return cameraList_from_camInfos(infos, 1.0, args)
 
 
-def render(raw, camera, degree, white_background=False, existence=None):
-    if existence is None:
-        from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-    else:
-        # Unlike multiplying opacity before the vanilla rasterizer's cutoff,
-        # MaskGaussian's kernel also computes mask gradients for inactive splats.
-        from mask_diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-        if existence.shape != (len(raw),):
-            raise ValueError("existence mask must have shape [N]")
+def render(raw, camera, degree, white_background=False):
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
     bg = raw.new_full((3,), float(white_background))
     if not len(raw):
@@ -103,8 +96,7 @@ def render(raw, camera, degree, white_background=False, existence=None):
         shs=sh, colors_precomp=None, opacities=raw[:, 3:4].sigmoid().contiguous(),
         scales=raw[:, 4:7].clamp(-20, 10).exp().contiguous(),
         rotations=torch.nn.functional.normalize(raw[:, 7:11], dim=-1).contiguous(),
-        cov3D_precomp=None,
-        **({} if existence is None else {"masks": existence[:, None].contiguous()}))
+        cov3D_precomp=None)
     return image
 
 
