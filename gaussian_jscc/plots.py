@@ -247,12 +247,14 @@ def plot_training(training_dir, output_dir=None):
                      color=TIER_COLORS[1], linewidth=2, label="Expected payload")
         axes[0].set_title("Expected JSCC payload")
         axes[0].set_ylabel("Complex symbols / source Gaussian")
-        temp_axis = axes[0].twinx()
-        temp_axis.grid(False)
-        temp_axis.plot(joint_steps, temperatures, color=REFERENCE, linestyle="--", linewidth=1,
-                       label="Gumbel temperature")
-        temp_axis.set_ylabel("Temperature", color=REFERENCE)
-        lines = axes[0].lines[-1:] + temp_axis.lines
+        lines = axes[0].lines[-1:]
+        if np.isfinite(temperatures).any():
+            temp_axis = axes[0].twinx()
+            temp_axis.grid(False)
+            temp_axis.plot(joint_steps, temperatures, color=REFERENCE, linestyle="--", linewidth=1,
+                           label="Gumbel temperature")
+            temp_axis.set_ylabel("Temperature", color=REFERENCE)
+            lines += temp_axis.lines
         axes[0].legend(lines, [line.get_label() for line in lines], loc="upper right")
         axes[1].stackplot(joint_steps, shares.T, labels=TIER_NAMES, colors=TIER_COLORS, alpha=.9)
         axes[1].set_ylim(0, 1)
@@ -275,7 +277,7 @@ def plot_training(training_dir, output_dir=None):
                      ["Smoothing is per contiguous phase/profile, window=min(101, max(1, phase_rows//40)).",
                       "Objective panels have independent axes; losses are not comparable across changed objectives.",
                       "Missing historical weighted contributions are not inferred; raw terms use different units.",
-                      "Tier composition records hard Gumbel samples, not deployment argmax counts."])
+                      "Tier composition records sampled hard actions (possibly sample averages), not deployment argmax counts."])
 
 
 def _evaluation_series(row):

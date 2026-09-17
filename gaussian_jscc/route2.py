@@ -18,7 +18,7 @@ from .codec import CodecConfig, GaussianCodec
 from .data import prepare, read_ply, to_features
 from .transport import load_checkpoint, model_id, save_checkpoint
 from .losses import (add_arguments, config_options, configure_training, reconstruction_loss,
-                     objective_stats, initialize_position_head)
+                     objective_stats, initialize_position_head, position_training_inputs)
 from .optimization import clip_codec_gradients
 from .training import joint_scene_step
 
@@ -151,6 +151,11 @@ def train_joint(args):
     record["rate_objective"] = "expected payload symbols per source Gaussian / maximum tier length"
     record["metadata_objective"] = "2-bit full tier map assumed fixed; actual zlib bytes measured only on transmit"
     record["gradient_estimator"] = "hard Gumbel forward, biased straight-through backward"
+    if model.cfg.position_head=='reference_v6':
+        record['geometry_objective']='shared v6 subgroup/size-aware + persistent clean constraint; full weight across phases'
+        record['grouping_gradient']='hard retained-row membership/partition and phase unwrap branches detached; conditional ST through slots, power and context'
+        if model.cfg.individual_tiers:
+            record['grouping_gradient']='source-row group boundaries fixed; within-group q0 compaction and phase unwrapping discrete; conditional ST through slots, power and context'
     (out / "training.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     model.train()
     mask.train()
@@ -170,7 +175,8 @@ def train_joint(args):
                 f, xyz = to_features(rb, geometry, model)
                 q = sample_tiers(len(rb), device)
                 pred, seed = model(f, xyz, q, snr, args.channel, return_seed=True)
-                loss, terms = reconstruction_loss(pred, f, geometry, model, return_terms=True)
+                loss, terms = reconstruction_loss(pred, f, geometry, model, return_terms=True,
+                                                  **position_training_inputs(model,f,q,snr))
                 values = {"phase": "codec_warmup",
                           **{f"{key}_loss": float(value.detach().mean()) for key, value in terms.items()}}
             elif not args.attribute_only:
@@ -190,7 +196,7 @@ def train_joint(args):
                 values.update(phase="joint_render", distortion=values["render_loss"])
                 backward_done = True
             else:
-                auxiliary, expected, hard_counts = [], [], []
+                auxiliary, geometry_auxiliary, expected, hard_counts = [], [], [], []
                 # Explicit CPU diagnostic proxy, never used in render training.
                 selected = [random.choice(starts)]
                 diagnostic = []
@@ -210,7 +216,11 @@ def train_joint(args):
                     probs = scores.softmax(-1)
                     expected.append(expected_rate(probs, model.cfg.rates).sum())
                     hard_counts.append(choices.detach().sum(0))
-                    auxiliary.append(reconstruction_loss(pred, f, geometry, model, active=active, reduction="sum"))
+                    aux,terms=reconstruction_loss(pred,f,geometry,model,active=active,reduction='sum',return_terms=True,
+                                                   **position_training_inputs(model,f,choices,snr))
+                    auxiliary.append(aux)
+                    if model.cfg.position_head=='reference_v6':
+                        geometry_auxiliary.append(terms['geometry'].sum()*model.cfg.geometry_weight)
                     diagnostic.append(F.smooth_l1_loss(pred * active[:, None], f, reduction="sum") / f.shape[1])
                 count = sum(int(c.sum()) for c in hard_counts)
                 payload_mean = torch.stack(expected).sum() / count
@@ -218,11 +228,15 @@ def train_joint(args):
                 aux_loss = torch.stack(auxiliary).sum() / count
                 distortion = torch.stack(diagnostic).sum() / count
                 loss = distortion + args.attr_weight * aux_loss + args.beta * rate_loss
+                if geometry_auxiliary:
+                    loss=loss+(1-args.attr_weight)*torch.stack(geometry_auxiliary).sum()/count
                 counts = torch.stack(hard_counts).sum(0)
                 values = {"phase": "joint_attribute_diagnostic",
                           "distortion": float(distortion.detach()), "aux_loss": float(aux_loss.detach()),
                           "expected_symbols_per_gaussian": float(payload_mean.detach()),
                           "sampled_tier_counts": counts.cpu().tolist(), "temperature": tau}
+                if geometry_auxiliary:
+                    values['geometry_loss']=float((torch.stack(geometry_auxiliary).sum()/count).detach())/max(model.cfg.geometry_weight,1e-12)
             if not torch.isfinite(loss):
                 raise RuntimeError("nonfinite route2 loss")
             if not backward_done:

@@ -2,7 +2,20 @@
 
 ## Gaussian JSCC codec extension
 
-New training uses **geometry-first JSCC**: separate geometry/attribute symbol
+The current mainline is **fully learned joint JSCC** (`train-learned`): XYZ and
+attributes share a learned variable-length payload, and the receiver jointly
+decodes local noisy features without source/predicted-coordinate grids. Each
+Gaussian retains its own q0/q1/q2/q3 decision. No handcrafted coordinate
+reference, repetition, or reserved geometry sub-budget is used.
+Start with `bash scripts/train_codec_learned.sh`; see the
+[architecture, training, validation and limitations](docs/learned_joint_jscc.md).
+Old weights remain evaluable but cannot initialize this new mainline.
+
+The following paragraphs describe **historical implementations**, not the
+recommended new training entry point. The old `train` and `train-route2`
+commands are retained for reproduction; do not confuse them with `train-learned`.
+
+Historical **geometry-first JSCC** used separate geometry/attribute symbol
 paths within the same tier budget, direct XYZ decoding, physical reconstruction
 losses, and frozen source-PLY rendering targets. Both codec-only and joint-mask
 render training support batched replay (default 32 blocks).

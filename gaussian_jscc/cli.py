@@ -17,7 +17,7 @@ from .data import (load_tiers, prepare, read_ply, to_features,
 from .transport import load_checkpoint, receive, save_checkpoint, transmit
 from .training import full_scene_step
 from .losses import (add_arguments, config_options, configure_training, reconstruction_loss,
-                     objective_stats, initialize_position_head)
+                     objective_stats, initialize_position_head, position_training_inputs)
 from .optimization import all_tier_attribute_step, clip_codec_gradients, preserved_rng
 
 
@@ -47,6 +47,21 @@ def sample_tiers(n, device, drop=0.):
 def train(args):
     from tqdm import trange
 
+    if args.fixed_snr is not None:
+        if not math.isfinite(args.fixed_snr):
+            raise ValueError('fixed-snr must be finite')
+        args.snr_range = [args.fixed_snr, args.fixed_snr]
+        args.position_eval_snrs = [args.fixed_snr]
+    if not all(math.isfinite(x) for x in args.snr_range) or args.snr_range[0] > args.snr_range[1]:
+        raise ValueError('snr-range must be finite and ordered')
+    if args.geometry_only and (args.render_steps or args.rate_map or args.attribute_drop or args.tier_training != 'all'):
+        raise ValueError('geometry-only requires render-steps 0, tier-training all, attribute-drop 0, no rate-map')
+    if args.geometry_clean_weight is not None and (not math.isfinite(args.geometry_clean_weight) or args.geometry_clean_weight < 0):
+        raise ValueError('geometry-clean-weight must be finite and nonnegative')
+    if args.position_patience < 0 or args.position_min_delta < 0 or not math.isfinite(args.position_min_delta):
+        raise ValueError('invalid position stopping settings')
+    if args.position_patience and (not args.geometry_only or not args.position_eval_every or args.fixed_snr is None or args.channel != 'awgn'):
+        raise ValueError('position-patience requires geometry-only, AWGN, fixed-snr and position evaluation')
     if args.steps < 0 or args.render_steps < 0 or args.steps + args.render_steps == 0:
         raise ValueError("request at least one training step")
     if not 0 <= args.attribute_drop < 1:
@@ -88,9 +103,18 @@ def train(args):
         model.attr_mean.copy_(raw[:, 3:].mean(0).to(device))
         model.attr_std.copy_(raw[:, 3:].std(0, unbiased=False).clamp_min(.01).to(device))
     configure_training(model, args)
+    if args.geometry_clean_weight is None:
+        args.geometry_clean_weight = (model.cfg.geometry_clean_weight if model.cfg.position_head=='reference_v6'
+                                      else 1. if model.cfg.position_head == 'block_pilot_v5' else 0.)
+    if args.geometry_only:
+        if model.cfg.position_head not in ('block_relative_v4', 'block_pilot_v5', 'reference_v6'):
+            raise ValueError('geometry-only requires a block geometry position head')
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith('block_geometry.'))
+        print('Geometry-only: all previous codec parameters frozen; train new geometric payload at fixed budgets.')
     raw, geometry, fixed_q = prepare(raw, model.cfg.morton_bits, fixed_q)
     initialize_position_head(model, raw, geometry)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
     model.train()
     starts = list(range(0, len(raw), model.cfg.block_size))
     if fixed_q is not None:
@@ -125,9 +149,22 @@ def train(args):
     record.pop("func", None)
     record["codec_config"] = model.cfg.to_dict()
     record["seed_position_weight_effective"] = 0  # no seed stage in geometry-first
+    if args.geometry_only:
+        record['training_objective'] = ('block_local_v4: local-radius SmoothL1(beta=.01) + bbox SmoothL1(beta=.001); '
+                                        f'noisy objective + {args.geometry_clean_weight} * clean objective')
+    if model.cfg.position_head=='reference_v6':
+        record['training_objective']='v6 actual compact-group scale (floor .001), bounded Gaussian-size weight [1,4], world-axis correction; persistent clean geometry constraint'
+        record['render_geometry_weight']='cfg.geometry_weight, not reduced by attr_weight'
+        record['mask_gradient']='biased ST for slots/power/context; hard retained-row grouping and phase unwrap branches detached'
+        if model.cfg.individual_tiers:
+            record['grouping']='fixed source-row intervals; within-group retained rows compacted for phase multiplexing'
+            record['tier_training_layouts']='75% mixed, 25% randomly selected uniform tier when --tier-training all'
+            record['mask_gradient']='biased ST; group boundaries fixed; within-group retention and phase unwrap remain discrete'
     (out / "training.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     fixed_evaluations = []
+    best_score, best_step, stale_evaluations = float('inf'), None, 0
     def fixed_position_evaluation(step):
+        nonlocal best_score, best_step, stale_evaluations
         if args.position_eval_every:
             from types import SimpleNamespace
             from .gradient_diagnostics import evaluate_blocks
@@ -144,8 +181,26 @@ def train(args):
             print(f"[Fixed position evaluation {step}] " + "; ".join(
                 f"q{r['tier']} RMSE={r['position_rmse']:.5g}, P95={r['distance_p95']:.5g}"
                 for r in rows if r['channel']=='none'),flush=True)
+            if args.geometry_only and args.fixed_snr is not None and args.channel == 'awgn':
+                selected = [r for r in rows if r['channel'] == 'awgn' and r['snr'] == args.fixed_snr]
+                score = sum(r['unclipped_position_rmse'] for r in selected) / len(selected)
+                improved = math.isfinite(score) and score < best_score - args.position_min_delta
+                if improved:
+                    best_score, best_step, stale_evaluations = score, step, 0
+                    save_checkpoint(out / 'codec_best.pt', model, step, record)
+                else:
+                    stale_evaluations += 1
+                print(f'[Fixed AWGN {args.fixed_snr:g} dB] mean raw XYZ RMSE={score:.6g}; best={best_score:.6g} at {best_step}', flush=True)
+                (out / 'position_selection.json').write_text(json.dumps({
+                    'metric': 'mean_over_tiers_unclipped_position_rmse', 'snr': args.fixed_snr,
+                    'best_step': best_step, 'best_score': best_score, 'latest_step': step,
+                    'latest_score': score, 'stale_evaluations': stale_evaluations,
+                    'scope': 'fixed source-scene blocks; not held-out scene generalization'}, indent=2), encoding='utf-8')
+                return bool(args.position_patience and stale_evaluations >= args.position_patience)
+        return False
     fixed_position_evaluation(0)
     progress = trange(args.steps + args.render_steps, desc="Gaussian JSCC training")
+    completed_steps = 0
     with (out / "loss.jsonl").open("w", encoding="utf-8") as log:
         for step in progress:
             step_started = time.perf_counter()
@@ -159,7 +214,12 @@ def train(args):
             if not is_render:
                 index = random.randrange(len(feature_blocks))
                 features = feature_blocks[index].to(device)
-                if args.tier_training == "all":
+                if args.geometry_only:
+                    from .optimization import all_tier_geometry_step
+                    loss, render_values = all_tier_geometry_step(model, features, geometry, snr, args.channel,
+                                                                args.geometry_clean_weight)
+                    backward_done = True
+                elif args.tier_training == "all":
                     loss,render_values=all_tier_attribute_step(model,features,geometry,snr,args.channel)
                     backward_done=True
                 else:
@@ -169,10 +229,13 @@ def train(args):
                     if not keep.any():
                         qb[0] = 1
                         keep = qb > 0
-                    features, qb = features[keep], qb[keep]
+                    if not model.cfg.individual_tiers:
+                        features, qb = features[keep], qb[keep]
                     unit = features[:, :3]
                     pred, seed = model(features, unit, qb, snr, args.channel, return_seed=True)
-                    loss, terms = reconstruction_loss(pred, features, geometry, model, return_terms=True)
+                    loss, terms = reconstruction_loss(pred, features, geometry, model, return_terms=True,
+                                                      active=(qb>0).to(features) if model.cfg.individual_tiers else None,
+                                                      **position_training_inputs(model,features,qb,snr))
                     render_values = {f"{key}_loss": float(value.detach().mean()) for key, value in terms.items()}
                 image_loss = None
             else:
@@ -202,7 +265,7 @@ def train(args):
                 loss.backward()
             if args.profile_every and (step+1)%args.profile_every==0:
                 from .gradient_diagnostics import update_stats, largest_gradients
-                before={n:p.detach().clone() for n,p in model.named_parameters()}
+                before={n:p.detach().clone() for n,p in model.named_parameters() if p.requires_grad}
                 render_values['largest_parameter_gradients']=largest_gradients(model)
             else:
                 before=None
@@ -211,12 +274,16 @@ def train(args):
             if before is not None:
                 render_values['updates']=update_stats(model,before)
                 del before
-            values = {"step": step + 1, "phase": "render" if is_render else "attribute",
+            values = {"step": step + 1, "phase": "geometry" if args.geometry_only else ("render" if is_render else "attribute"),
                       "loss": float(loss.detach()), "snr": snr, "grad_norm": float(norm),
                       "step_seconds": time.perf_counter() - step_started, **render_values}
             if image_loss is not None:
                 values["render_loss"] = float(image_loss)
-            values.update(objective_stats(values, model, args.attr_weight if is_render else 1.))
+            if args.geometry_only:
+                values.update(loss_profile='reference_v6' if model.cfg.position_head=='reference_v6' else 'block_local_v4',
+                              geometry_contribution=values['loss'])
+            else:
+                values.update(objective_stats(values, model, args.attr_weight if is_render else 1.))
             values.update(clip_stats)
             values["learning_rate"] = optimizer.param_groups[0]["lr"]
             log.write(json.dumps(values) + "\n")
@@ -226,9 +293,12 @@ def train(args):
                                      sec=f"{values['step_seconds']:.2f}")
             if (step + 1) % args.save_every == 0:
                 save_checkpoint(out / f"codec_{step + 1}.pt", model, step + 1, record)
+            completed_steps = step + 1
             if args.position_eval_every and ((step+1)%args.position_eval_every==0 or step+1 in (args.steps,args.steps+args.render_steps)):
-                fixed_position_evaluation(step+1)
-        save_checkpoint(out / "codec.pt", model, args.steps + args.render_steps, record)
+                if fixed_position_evaluation(step+1):
+                    print(f'Early stop after {completed_steps} steps; best fixed-condition checkpoint: codec_best.pt')
+                    break
+        save_checkpoint(out / "codec.pt", model, completed_steps, record)
     from .plots import safe_plot
     safe_plot("training", out)
     print(f"Saved shared codec: {out / 'codec.pt'}")
@@ -319,6 +389,8 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     from .route2 import add_parsers
     add_parsers(sub)
+    from .learned_train import add_parser as add_learned_parser
+    add_learned_parser(sub)
     from .plots import add_parser as add_plot_parser
     add_plot_parser(sub)
     from .benchmark import add_parser as add_benchmark_parser
@@ -345,6 +417,10 @@ def main():
     p.add_argument("--attr-weight", type=float, default=1.,
                    help="render-stage reconstruction multiplier; default keeps the auxiliary active at weight 1")
     p.add_argument("--snr-range", type=float, nargs=2, default=[0., 20.])
+    p.add_argument('--fixed-snr', type=float, help='override training range and fixed evaluation SNR; training noise stays random')
+    p.add_argument('--geometry-only', action='store_true', help='train only block-relative geometric payload; freeze all other weights')
+    p.add_argument('--position-patience', type=int, default=0, help='stop after N fixed AWGN evaluations without improvement; 0 disables')
+    p.add_argument('--position-min-delta', type=float, default=0., help='minimum improvement in scene-unit raw XYZ RMSE')
     p.add_argument("--rates", type=int, nargs=4, default=[0, 8, 16, 32])
     p.add_argument("--hidden", type=int, default=96)
     p.add_argument("--grid-dim", type=int, default=16)

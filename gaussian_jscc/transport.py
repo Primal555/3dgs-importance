@@ -30,17 +30,17 @@ def model_id(model):
 
 
 def save_checkpoint(path, model, step, training=None):
-    torch.save({"version": 3 if model.cfg.architecture == "geometry_first" else 2,
+    torch.save({"version": 4 if model.cfg.architecture == 'learned_joint' else 3 if model.cfg.architecture == "geometry_first" else 2,
                 "config": model.cfg.to_dict(), "state_dict": model.state_dict(),
                 "step": step, "training": training or {}}, path)
 
 
 def load_checkpoint(path, device):
     saved = torch.load(path, map_location="cpu", weights_only=True)
-    if saved.get("version") not in (2, 3):
+    if saved.get("version") not in (2, 3, 4):
         raise ValueError("unsupported codec checkpoint version")
     cfg = CodecConfig.from_dict(saved["config"])
-    if (saved["version"] == 3) != (cfg.architecture == "geometry_first"):
+    if saved['version'] != {'legacy': 2, 'geometry_first': 3, 'learned_joint': 4}[cfg.architecture]:
         raise ValueError("checkpoint version/architecture mismatch")
     model = GaussianCodec(cfg)
     model.load_state_dict(saved["state_dict"], strict=True)
@@ -117,15 +117,18 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
     device = next(model.parameters()).device
     raw, geometry, q = prepare(raw, model.cfg.morton_bits, q)
     received = []
+    transmitted_energy = 0.
     generator = torch.Generator(device=device).manual_seed(seed)
     for start in range(0, len(raw), model.cfg.block_size):
         end = start + model.cfg.block_size
         keep = q[start:end] > 0
-        qb, rb = q[start:end][keep], raw[start:end][keep]
-        if not len(qb):
+        if not keep.any():
             continue
+        qb, rb = ((q[start:end],raw[start:end]) if model.cfg.individual_tiers else
+                  (q[start:end][keep], raw[start:end][keep]))
         features, unit = to_features(rb.to(device), geometry, model)
         z = model.encode(features, unit, qb.to(device), snr)
+        transmitted_energy += float(z.square().sum())
         received.append(channel(z, snr, kind, generator).cpu())
     received = torch.cat(received) if received else torch.empty((0, 2))
     header = {"version": 2, "config": model.cfg.to_dict(), "model_id": model_id(model),
@@ -139,6 +142,7 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
     stats = {"source_gaussians": len(raw), "retained_gaussians": int((q > 0).sum()),
              "tier_counts": torch.bincount(q, minlength=4).tolist(),
              "payload_complex_symbols": len(received), "metadata_bytes": len(metadata),
+             "transmitted_mean_complex_energy": transmitted_energy / max(1,len(received)),
              "tier_map_uncompressed_bytes": (len(q) + 3) // 4,
              "per_gaussian_coordinates_in_metadata": False,
              "global_geometry_floats": 6,
@@ -153,7 +157,43 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
              "shared_model_tensor_bytes": sum(t.numel() * t.element_size() for t in model.state_dict().values()),
              "disk_payload_bytes": (output / "received.npy").stat().st_size}
     stats["architecture"] = model.cfg.architecture
-    stats["position_seed_is_final"] = model.cfg.architecture == "geometry_first"
+    if model.cfg.position_head == 'block_relative_v4':
+        stats.update(position_coding='block_relative_v4',
+                     block_reference_in_metadata=False,
+                     geometry_reference_real_slots_per_retained_gaussian=4,
+                     geometry_energy_completion_real_slots_per_retained_gaussian=1,
+                     power_normalization='geometry constant energy per row; attributes unit mean energy per block')
+    elif model.cfg.position_head == 'block_pilot_v5':
+        stats.update(position_coding='block_pilot_v5',
+                     geometry_group_size=model.cfg.geometry_group_size,
+                     block_reference_in_metadata=False,
+                     geometry_reference_real_slots_per_retained_gaussian=4,
+                     geometry_pilot_real_slots_per_retained_gaussian=1,
+                     geometry_energy_completion_real_slots_per_retained_gaussian=0,
+                     power_normalization='geometry unit mean energy per deterministic retained-row group; '
+                                         'attributes unit mean energy per block')
+    elif model.cfg.position_head == 'reference_v6':
+        stats.update(position_coding='reference_v6',geometry_group_size=model.cfg.geometry_group_size,
+                     block_reference_in_metadata=False,geometry_reference_real_slots_per_retained_gaussian=4,
+                     geometry_local_pilot_real_slots_per_retained_gaussian=1,
+                     reference_frequencies=[1,4,16],small_group_fallback='v5 when retained group count < 24',
+                     power_normalization='fixed-energy phase reference plus local detail normalization; group mean unit energy')
+        if model.cfg.individual_tiers:
+            stats.update(grouping='fixed source-row intervals before q0 removal',
+                         reference_energy='same per retained Gaussian, independent of positive tier',
+                         geometry_local_pilot_real_slots_per_retained_gaussian=1,
+                         geometry_energy_completion_real_slots_per_tier=[0,0,1,2],
+                         sparse_geometry_completion_real_slots_per_tier=[0,1,2,3],
+                         local_pilot_scope='dense groups only; sparse base uses known gain and energy completion',
+                         small_group_fallback='tier-independent shared analog base plus personal enhancement for fewer than 24 retained rows',
+                         power_normalization='tier-independent base group normalization plus per-row enhancement energy; attribute per-row tanh/RMS with energy floor .1, mean energy <= 1')
+    stats["position_seed_is_final"] = model.cfg.architecture in ("geometry_first", "learned_joint")
+    if model.cfg.architecture == 'learned_joint':
+        stats.update(position_coding='learned_joint', geometry_sub_budget=None,
+                     block_reference_in_metadata=False, handcrafted_coordinate_symbols=0,
+                     receiver_context='local received features; no source or predicted XYZ inputs',
+                     grouping='fixed source-row intervals; q0 holes retained in syntax',
+                     power_normalization='smooth per-row RMS; mean complex energy <= 1')
     if model.cfg.architecture == "geometry_first":
         geometry_symbols = int(torch.as_tensor(model.cfg.geometry_rates)[q].sum())
         stats.update(geometry_complex_symbols=geometry_symbols,
@@ -189,8 +229,8 @@ def receive(model, packet, return_position_seed=False):
     model.eval()
     for start in range(0, len(q), model.cfg.block_size):
         qb = q[start:start + model.cfg.block_size]
-        qb = qb[qb > 0].to(device)
-        count = len(qb)
+        qb = (qb if model.cfg.individual_tiers else qb[qb > 0]).to(device)
+        count = int((qb>0).sum())
         if not count:
             continue
         length = int(torch.as_tensor(model.cfg.rates, device=device)[qb].sum())
@@ -199,9 +239,13 @@ def receive(model, packet, return_position_seed=False):
                                return_seed=return_position_seed)
         if return_position_seed:
             pred, seed = decoded
+            if model.cfg.individual_tiers:
+                pred,seed=pred[qb>0],seed[qb>0]
             position_seeds.append(geometry.denormalize(seed).cpu())
         else:
             pred = decoded
+            if model.cfg.individual_tiers:
+                pred=pred[qb>0]
         rows.append(to_raw(pred, geometry, model).cpu())
         i += count
         j += length

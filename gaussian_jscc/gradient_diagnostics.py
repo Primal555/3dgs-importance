@@ -19,7 +19,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from .cli import device_for, sample_tiers, seed_all
 from .data import prepare, read_ply, to_features, to_raw
-from .losses import reconstruction_loss, objective_stats
+from .losses import reconstruction_loss, objective_stats, position_training_inputs
 from .training import full_scene_step
 from .transport import load_checkpoint, save_checkpoint
 from .optimization import parameter_group
@@ -86,6 +86,8 @@ def gradient_stats(model):
 def update_stats(model, before):
     groups = {}
     for name, p in model.named_parameters():
+        if name not in before:
+            continue
         groups.setdefault(parameter_group(name), []).append((before[name], p.detach()-before[name]))
     return {k: {'update_norm': float(torch.cat([d.reshape(-1) for _, d in v]).norm()),
                 'relative_update': float(torch.cat([d.reshape(-1) for _, d in v]).norm()/
@@ -312,7 +314,8 @@ def main(argv=None):
                     index=random.randrange(len(blocks)); f=blocks[index].to(device)
                     q=sample_tiers(len(f),device)
                     pred=model(f,f[:,:3],q,snr,'awgn')
-                    loss,terms=reconstruction_loss(pred,f,geometry,model,return_terms=True)
+                    loss,terms=reconstruction_loss(pred,f,geometry,model,return_terms=True,
+                                                    **position_training_inputs(model,f,q,snr))
                     stats={k+'_loss':float(v.detach().mean()) for k,v in terms.items()}
                     if probe:
                         geo=terms['geometry'].mean()*model.cfg.geometry_weight

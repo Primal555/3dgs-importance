@@ -19,6 +19,8 @@ PROFILES = {
     "position_v3": dict(geometry_weight=10., shape_weight=.25, opacity_weight=1.,
                         dc_weight=1., sh_weight=.25, scale_weight=1., geometry_floor=1e-4,
                         position_beta=.001, position_tail_margin=.01, position_tail_weight=2.),
+    "robust_v4": dict(geometry_weight=10., shape_weight=.25, opacity_weight=1.,
+                      dc_weight=1., sh_weight=.25, scale_weight=1., geometry_floor=1e-4),
 }
 
 
@@ -140,6 +142,17 @@ def physical_terms(pred, target, geometry, model):
     shape = (log_cov - ref_log_cov).square().sum((1, 2)) / 9
     scale = F.smooth_l1_loss(log_scale.sort(-1).values, ref_log_scale.sort(-1).values,
                              reduction="none").mean(-1)
+    if model.cfg.loss_profile == 'robust_v4':
+        # Fixed checkpoint statistic, never a trainable loss attenuation.
+        # Remove isotropic trace: scale handles size; shape handles anisotropy
+        # and orientation. Radial pseudo-Huber preserves rotation invariance.
+        unit=model.attr_std[1:4].detach().square().mean().sqrt().clamp_min(1.).to(pred)
+        error=(log_cov-ref_log_cov)/unit
+        eye=torch.eye(3,device=pred.device,dtype=pred.dtype)
+        error=error-error.diagonal(dim1=-2,dim2=-1).mean(-1)[:,None,None]*eye
+        shape=2*((1+error.square().sum((1,2))/9).sqrt()-1)
+        delta=(log_scale.sort(-1).values-ref_log_scale.sort(-1).values)/unit
+        scale=F.smooth_l1_loss(delta,torch.zeros_like(delta),reduction='none').mean(-1)
     alpha = F.smooth_l1_loss(attr[:, 0].sigmoid(), ref_attr[:, 0].sigmoid(), reduction="none")
     logit = F.smooth_l1_loss(attr[:, 0], ref_attr[:, 0], reduction="none")
     return {
@@ -157,14 +170,33 @@ def objective_stats(values, model, auxiliary_weight=1.):
     for name in ("geometry", "shape", "scale", "opacity", "dc", "sh"):
         if name + "_loss" in values:
             stats[name + "_contribution"] = (
-                auxiliary_weight * getattr(model.cfg, name + "_weight") * values[name + "_loss"])
+                (1. if name=='geometry' and model.cfg.position_head=='reference_v6' else auxiliary_weight)
+                * getattr(model.cfg, name + "_weight") * values[name + "_loss"])
     if "aux_loss" in values:
         stats["aux_contribution"] = auxiliary_weight * values["aux_loss"]
+        if model.cfg.position_head=='reference_v6' and 'geometry_loss' in values:
+            stats['aux_contribution']+=(1-auxiliary_weight)*model.cfg.geometry_weight*values['geometry_loss']
     return stats
 
 
+def position_training_inputs(model, features, q, snr):
+    """Preserve original packet boundaries BEFORE flattening padded batches."""
+    if model.cfg.position_head != 'reference_v6':
+        return {}
+    choices=q if q.is_floating_point() else None
+    tiers=q.detach().argmax(-1) if choices is not None else q
+    scale=model.block_geometry.supervision_scale(features[...,:3],tiers)
+    result={'position_scale':scale}
+    if model.cfg.geometry_clean_weight:
+        z=(model.block_geometry.encode_choices(features[...,:3],choices,snr) if choices is not None else
+           model.block_geometry.encode(features[...,:3],tiers,snr))
+        result['clean_pred']=model.block_geometry.decode(z,tiers,snr)
+    return result
+
+
 def reconstruction_loss(pred, target, geometry, model, seed=None, seed_weight=.2,
-                        active=None, reduction="mean", return_terms=False):
+                        active=None, reduction="mean", return_terms=False,
+                        position_scale=None, clean_pred=None):
     """Shared by warmup, packed/batched training, replay and joint allocation.
 
     Detached activity weighting offers no DIRECT reward for suppressing an
@@ -181,7 +213,21 @@ def reconstruction_loss(pred, target, geometry, model, seed=None, seed_weight=.2
             row = row + seed_weight * F.smooth_l1_loss(seed, target[:, :3], reduction="none").mean(-1)
         terms = {"legacy": row}
     else:
-        terms = physical_terms(pred, target, geometry, model)
+        if model.cfg.architecture == 'learned_joint':
+            from .learned_objective import learned_terms
+            terms = learned_terms(pred, target, model)
+        else:
+            terms = physical_terms(pred, target, geometry, model)
+        if model.cfg.position_head == 'reference_v6':
+            from .reference_geometry import reference_position_rows
+            if position_scale is None:
+                q=torch.ones(len(target),device=target.device,dtype=torch.long)
+                if active is not None: q=(active.detach()>.5).long()
+                position_scale=model.block_geometry.supervision_scale(target[:,:3],q)
+            terms['geometry']=reference_position_rows(pred,target,geometry,model,position_scale)
+            if clean_pred is not None:
+                terms['geometry']=terms['geometry']+model.cfg.geometry_clean_weight*reference_position_rows(
+                    clean_pred,target,geometry,model,position_scale)
         row = sum(getattr(model.cfg, name + "_weight") * value for name, value in terms.items())
     if active is not None:
         row = row * active.detach()
@@ -202,10 +248,16 @@ def add_arguments(parser):
                         help="training objective; old checkpoints are explicitly migrated for fine-tuning")
     parser.add_argument("--geometry-rates", type=int, nargs=4,
                         help="geometry complex symbols per tier; default floor(total/2), not a measured optimum")
-    parser.add_argument("--position-head", choices=("sigmoid", "normalized_affine_v3"),
+    parser.add_argument("--position-head", choices=("sigmoid", "normalized_affine_v3", "block_relative_v4", "block_pilot_v5", "reference_v6"),
                         help="position_v3 selects normalized_affine_v3 unless explicitly overridden")
+    parser.add_argument("--geometry-group-size", type=int,
+                        help="v5 deterministic retained-row group size; default 256")
+    parser.add_argument('--geometry-clean-weight',type=float,
+                        help='v6 persistent clean geometry constraint across all training phases; default 1')
+    parser.add_argument('--individual-tiers',action='store_true',
+                        help='explicit wire upgrade: stable source-row groups and per-Gaussian detail power')
     parser.add_argument("--upgrade-position-head", action="store_true",
-                        help="explicitly reset ONLY the position head when changing an initializer's parameterization")
+                        help="authorize position migration; block_relative_v4 replaces the geometric payload and power layout")
     parser.add_argument("--position-beta", type=float, help="SmoothL1 transition in per-axis bbox units")
     parser.add_argument("--position-tail-margin", type=float, help="large-error margin in per-axis bbox units")
     parser.add_argument("--position-tail-weight", type=float, help="additional bounded-slope tail penalty")
@@ -224,6 +276,7 @@ def config_options(args):
     profile = args.loss_profile
     defaults = PROFILES[profile]
     return {"geometry_rates": tuple(args.geometry_rates or ()),
+            "geometry_group_size": getattr(args, 'geometry_group_size', None) or 256,
             "loss_profile": profile,
             "position_head": args.position_head or ("normalized_affine_v3" if profile == "position_v3" else "sigmoid"),
             **{name: default if getattr(args, name) is None else getattr(args, name)
@@ -231,20 +284,30 @@ def config_options(args):
 
 
 def configure_training(model, args):
+    if model.cfg.architecture == 'learned_joint':
+        raise ValueError('learned_joint uses the train-learned command; historical train/route2 objectives cannot migrate it')
     if model.cfg.architecture != "geometry_first":
         raise ValueError("Legacy codec cannot initialize geometry-first training. Omit --init/--codec-init "
                          "to train the upgraded architecture; old checkpoints remain evaluable.")
     if args.geometry_rates is not None and tuple(args.geometry_rates) != model.cfg.geometry_rates:
         raise ValueError("geometry-rates cannot change when initializing a checkpoint")
-    requested_head = args.position_head or ("normalized_affine_v3" if args.loss_profile == "position_v3" else model.cfg.position_head)
+    requested_head = args.position_head or ("normalized_affine_v3" if args.loss_profile == "position_v3"
+                                           and model.cfg.position_head == "sigmoid" else model.cfg.position_head)
     if model.cfg.position_head != requested_head:
         if not args.upgrade_position_head:
             raise ValueError("Position head change requires --upgrade-position-head; "
                              "the old XYZ head cannot be silently reused. Other weights will be retained.")
-        if requested_head != "normalized_affine_v3":
-            raise ValueError("Only an explicit upgrade to normalized_affine_v3 is supported")
-        model.cfg.position_head = requested_head
-        model.reset_position_head()
+        if requested_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
+            if getattr(args, 'geometry_group_size', None) is not None:
+                model.cfg.geometry_group_size = args.geometry_group_size
+            model.enable_block_geometry(requested_head)
+            print("Enabled block-relative geometry payload with systematic initialization; "
+                  "geometry residual heads reset; attribute weights retained, but coding/power layout changed.")
+        elif requested_head == "normalized_affine_v3" and not hasattr(model, "block_geometry"):
+            model.cfg.position_head = requested_head
+            model.reset_position_head()
+        else:
+            raise ValueError("Unsupported position migration; block_relative_v4 cannot be downgraded in place")
     if not torch.isfinite(torch.tensor(args.clip_norm)) or args.clip_norm <= 0:
         raise ValueError("clip-norm must be positive and finite")
     if model.cfg.loss_profile != args.loss_profile:
@@ -258,3 +321,15 @@ def configure_training(model, args):
         if name not in ("geometry_rates", "loss_profile", "position_head") and getattr(args, name) is not None:
             setattr(model.cfg, name, value)
     model.cfg.__post_init__()
+    if model.cfg.position_head in ('block_pilot_v5','reference_v6'):
+        model.block_geometry.group_size = model.cfg.geometry_group_size
+    if model.cfg.position_head == 'reference_v6' and getattr(args,'geometry_clean_weight',None) is not None:
+        model.cfg.geometry_clean_weight=args.geometry_clean_weight
+        model.cfg.__post_init__()
+    if getattr(args,'individual_tiers',False) and not model.cfg.individual_tiers:
+        if model.cfg.position_head!='reference_v6':
+            raise ValueError('--individual-tiers requires --position-head reference_v6')
+        model.cfg.individual_tiers=True
+        model.block_geometry.individual=True
+        model.cfg.__post_init__()
+        print('Explicit individual-tier wire upgrade: stable source-row groups; tier-independent base; per-row enhancement layers. Retraining required.')

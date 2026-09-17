@@ -37,9 +37,17 @@ class CodecConfig:
     loss_profile: str = "balanced_v2"
     scale_weight: float = 1.
     position_head: str = "sigmoid"
+    geometry_group_size: int = 256
+    geometry_clean_weight: float = 1.
+    reference_bounded: bool = True
+    individual_tiers: bool = False
     position_beta: float = .001
     position_tail_margin: float = .01
     position_tail_weight: float = 2.
+    decoder_window: int = 32
+    attention_heads: int = 4
+    power_floor: float = .01
+    xyz_loss_scale: float = .05
 
     def __post_init__(self):
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
@@ -55,8 +63,20 @@ class CodecConfig:
             raise ValueError("grid levels must be integers in 2..64")
         if min(self.hidden, self.grid_dim, self.depth) < 1:
             raise ValueError("hidden, grid_dim and depth must be positive")
-        if self.architecture not in ("legacy", "geometry_first"):
+        if self.architecture not in ("legacy", "geometry_first", "learned_joint"):
             raise ValueError("unknown codec architecture")
+        if self.architecture == 'learned_joint':
+            if self.geometry_rates or self.position_head not in ('sigmoid', 'learned_affine'):
+                raise ValueError('learned_joint has no geometry sub-budget or historical position head')
+            self.position_head = 'learned_affine'
+            self.loss_profile = 'learned_v1'
+            self.individual_tiers = True
+            if self.decoder_window < 2 or self.attention_heads < 1 or self.hidden % self.attention_heads:
+                raise ValueError('invalid local attention window/head dimensions')
+            if not math.isfinite(self.power_floor) or self.power_floor <= 0:
+                raise ValueError('power_floor must be finite and positive')
+            if not math.isfinite(self.xyz_loss_scale) or self.xyz_loss_scale <= 0:
+                raise ValueError('xyz_loss_scale must be finite and positive')
         self.geometry_rates = tuple(self.geometry_rates)
         if self.architecture == "geometry_first":
             # A configurable engineering starting point, NOT a measured optimum.
@@ -70,10 +90,20 @@ class CodecConfig:
                 x > y for seq in (g, a) for x, y in zip(seq, seq[1:])
             ):
                 raise ValueError("geometry and attribute lengths must be positive and nondecreasing at q1..q3")
-        if self.loss_profile not in ("physical_v1", "balanced_v2", "position_v3"):
+        if self.loss_profile not in ("physical_v1", "balanced_v2", "position_v3", "robust_v4", "learned_v1"):
             raise ValueError("unknown reconstruction loss profile")
-        if self.position_head not in ("sigmoid", "normalized_affine_v3"):
+        if self.position_head not in ("sigmoid", "normalized_affine_v3", "block_relative_v4", "block_pilot_v5", "reference_v6", "learned_affine"):
             raise ValueError("unknown position head")
+        if self.position_head == 'learned_affine' and self.architecture != 'learned_joint':
+            raise ValueError('learned_affine requires learned_joint architecture')
+        if self.individual_tiers and self.position_head != 'reference_v6' and self.architecture != 'learned_joint':
+            raise ValueError('individual_tiers requires reference_v6')
+        if self.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6") and min(self.geometry_rates[1:] or (0,)) < 4:
+            raise ValueError("block_relative_v4 requires at least 4 complex geometry symbols")
+        if not isinstance(self.geometry_group_size, int) or self.geometry_group_size < 1:
+            raise ValueError("geometry_group_size must be a positive integer")
+        if not math.isfinite(self.geometry_clean_weight) or self.geometry_clean_weight < 0:
+            raise ValueError("geometry_clean_weight must be finite and nonnegative")
         if self.architecture == "legacy" and self.position_head != "sigmoid":
             raise ValueError("legacy architecture requires sigmoid positions")
         if not math.isfinite(self.position_beta) or self.position_beta <= 0:
@@ -94,6 +124,17 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.architecture != 'learned_joint':
+            for key in ('decoder_window', 'attention_heads', 'power_floor', 'xyz_loss_scale'):
+                result.pop(key)
+        if not self.individual_tiers:
+            result.pop('individual_tiers')
+        if self.position_head not in ("block_pilot_v5", "reference_v6"):
+            result.pop("geometry_group_size")
+        if self.position_head != "reference_v6":
+            result.pop("geometry_clean_weight")
+        if self.position_head != 'reference_v6' or not self.reference_bounded:
+            result.pop('reference_bounded')
         # Preserve every historical model/packet hash when the new options are
         # inactive; new readers still load those files without changing outputs.
         if self.position_head == "sigmoid":
@@ -116,6 +157,7 @@ class CodecConfig:
     @classmethod
     def from_dict(cls, values):
         return cls(**{**values, "architecture": values.get("architecture", "legacy"),
+                      'reference_bounded':values.get('reference_bounded',values.get('position_head')!='reference_v6'),
                       "loss_profile": values.get("loss_profile", "physical_v1")})
 
 
@@ -280,6 +322,11 @@ class GaussianCodec(nn.Module):
         self.detach_attribute_context_xyz = False
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
+        if cfg.architecture == 'learned_joint':
+            from .learned_codec import LearnedCore
+            self.learned = LearnedCore(cfg)
+            self.position_head_needs_initialization = False
+            return
         self.tier_emb = nn.Embedding(4, cfg.hidden)
         self.enc_condition = nn.Sequential(nn.Linear(4, cfg.hidden), nn.GELU(),
                                            nn.Linear(cfg.hidden, cfg.hidden))
@@ -318,6 +365,67 @@ class GaussianCodec(nn.Module):
         if cfg.sh_degree:
             sizes["sh"] = cfg.attr_dim - 11
         self.heads = nn.ModuleDict({k: nn.Linear(cfg.hidden, v) for k, v in sizes.items()})
+        if cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
+            self.enable_block_geometry(cfg.position_head)
+
+    def enable_block_geometry(self, version="block_relative_v4"):
+        from .block_geometry import BlockGeometry, PilotBlockGeometry
+        if version not in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
+            raise ValueError("unknown block geometry version")
+        changed = self.cfg.position_head != version
+        self.cfg.position_head = version
+        self.cfg.__post_init__()
+        if changed or not hasattr(self, "block_geometry"):
+            # Migration explicitly resets geometry residuals: learned v4 values
+            # are not calibrated to v5 amplitude/reference statistics.
+            from .reference_geometry import ReferenceGeometry
+            self.block_geometry = (ReferenceGeometry(self.cfg.geometry_rates,self.cfg.hidden,self.cfg.geometry_group_size,
+                                                     self.cfg.reference_bounded,self.cfg.individual_tiers)
+                                   if version == 'reference_v6' else
+                                   PilotBlockGeometry(self.cfg.geometry_rates, self.cfg.hidden,
+                                                      self.cfg.geometry_group_size)
+                                   if version == "block_pilot_v5" else
+                                   BlockGeometry(self.cfg.geometry_rates, self.cfg.hidden)).to(self.attr_mean)
+        self.position_head_needs_initialization = False
+
+    def tiers_from_mask(self, mask):
+        lengths = mask.sum(-1).detach()
+        table = lengths.new_tensor(self.cfg.rates) * 2
+        return (lengths[..., None] - table).abs().argmin(-1)
+
+    def block_payload(self, h, xyz, mask, snr, choices=None):
+        """Independent geometry/attribute power, with no extra amplitude metadata.
+
+        Geometry has unit mean complex energy (v4 per row; v5 per group). Attribute
+        energy is normalized per packet, independently of geometry. Their union
+        has unit average energy, except for the degenerate zero-attribute signal.
+        """
+        q = self.tiers_from_mask(mask)
+        geo = (self.block_geometry.encode_choices(xyz,choices,snr)
+               if self.cfg.position_head == 'reference_v6' and choices is not None else
+               self.block_geometry.encode(xyz, q, snr))
+        a_mask = mask[..., self.attribute_slots]
+        raw_attr = self.enc_out(h)
+        attr = raw_attr * a_mask
+        if self.cfg.individual_tiers:
+            # Per-Gaussian companding + bounded RMS gain. A tier change cannot
+            # rescale another row, nor can a near-zero/all-dropped row amplify
+            # its ST gradients by 1e6. Most rows retain unit complex energy;
+            # rows below the .1 energy floor deliberately use less power.
+            attr = raw_attr.tanh() * a_mask
+            energy=attr.square().sum(-1,keepdim=True)/(a_mask.sum(-1,keepdim=True)/2).clamp_min(1)
+            attr=attr/energy.clamp_min(.1).sqrt()
+        else:
+            energy = attr.square().sum((-2, -1), keepdim=True) / (a_mask.sum((-2, -1), keepdim=True) / 2).clamp_min(1)
+            attr = attr / energy.clamp_min(1e-12).sqrt()
+        latent = h.new_zeros(mask.shape)
+        return latent.index_copy(-1, self.geometry_slots, geo).index_copy(-1, self.attribute_slots, attr)
+
+    def geometry_forward(self, xyz, q, snr, kind="awgn"):
+        """Geometry-only training; same geometric payload/power as transport."""
+        z = self.block_geometry.encode(xyz, q, snr)
+        received = channel(z.reshape(-1, 2), snr, kind).reshape_as(z)
+        return self.block_geometry.decode(received, q, snr)
 
     def encode_latent(self, h, xyz):
         if self.cfg.architecture == "legacy":
@@ -341,7 +449,7 @@ class GaussianCodec(nn.Module):
         normalized = F.layer_norm(hidden, (self.cfg.hidden,), eps=1e-5)
         return .5 + .25 * self.position_seed(normalized)
 
-    def decode_latent(self, received, mask, condition, active=None):
+    def decode_latent(self, received, mask, condition, active=None, snr=None):
         if self.cfg.architecture == "legacy":
             h = self.dec_in(torch.cat((received, mask), -1)) + condition
             seed = self.position_seed(h).sigmoid()
@@ -351,8 +459,13 @@ class GaussianCodec(nn.Module):
                 xyz = update(h).sigmoid()
         else:
             g, a = self.geometry_slots, self.attribute_slots
-            gh = self.geo_dec(torch.cat((received[..., g], mask[..., g]), -1)) + condition
-            xyz = self.predict_position(gh)
+            if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
+                if snr is None:
+                    raise ValueError("block geometry decoding requires the receiver SNR condition")
+                xyz = self.block_geometry.decode(received[..., g], self.tiers_from_mask(mask), snr)
+            else:
+                gh = self.geo_dec(torch.cat((received[..., g], mask[..., g]), -1)) + condition
+                xyz = self.predict_position(gh)
             # Compatibility diagnostic: there is no intermediate position seed
             # in this architecture; the returned position is already final.
             seed = xyz
@@ -373,18 +486,26 @@ class GaussianCodec(nn.Module):
 
     def encode(self, features, xyz, q, snr):
         validate_tiers(q, len(features))
-        if (q == 0).any():
+        if self.cfg.architecture == 'learned_joint':
+            return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
+        if (q == 0).any() and not self.cfg.individual_tiers:
             raise ValueError("remove tier-0 Gaussians before building context")
         condition = self.encoder_conditioning(xyz, q, snr)
         h = self.enc_in(features) + condition
-        plan = self.enc_blocks[0].grid.geometry_plan(xyz)
+        active = (q > 0).to(features) if self.cfg.individual_tiers else None
+        plan = self.enc_blocks[0].grid.geometry_plan(xyz, active)
         for block in self.enc_blocks:
-            h = block(h, xyz, condition, plan=plan)
+            h = block(h, xyz, condition, active, plan=plan)
+        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
+            return pack(self.block_payload(h, xyz, prefix_mask(q, self.cfg.rates).to(h), snr), q, self.cfg.rates)
         return normalize_power(pack(self.encode_latent(h, xyz), q, self.cfg.rates))
 
     def decode(self, symbols, q, snr, return_seed=False):
         validate_tiers(q, len(q))
-        if (q == 0).any():
+        if self.cfg.architecture == 'learned_joint':
+            result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr)[0]
+            return (result, result[:, :3]) if return_seed else result
+        if (q == 0).any() and not self.cfg.individual_tiers:
             raise ValueError("decoder metadata must contain only retained Gaussians")
         if len(q) == 0:
             empty = symbols.new_empty((0, 3 + self.cfg.attr_dim))
@@ -392,7 +513,8 @@ class GaussianCodec(nn.Module):
         padded = unpack(symbols, q, self.cfg.rates)
         mask = prefix_mask(q, self.cfg.rates).to(padded.dtype)
         condition = self.decoder_conditioning(symbols, q, snr)
-        result, seed = self.decode_latent(padded, mask, condition)
+        active = (q > 0).to(padded) if self.cfg.individual_tiers else None
+        result, seed = self.decode_latent(padded, mask, condition, active=active, snr=snr)
         return (result, seed) if return_seed else result
 
     def forward(self, features, xyz, q, snr, kind="awgn", return_seed=False):
@@ -420,6 +542,26 @@ class GaussianCodec(nn.Module):
         """
         if choices.shape != (*features.shape[:2], 4) or features.ndim != 3:
             raise ValueError("batched choices must have shape [B,N,4]")
+        if self.cfg.architecture == 'learned_joint':
+            if choices.requires_grad or not torch.equal(choices, F.one_hot(choices.argmax(-1), 4).to(choices)):
+                raise ValueError('learned_joint uses hard actions and score-function mask gradients, not ST choices')
+            q = choices.argmax(-1)
+            latent = self.learned.encode(features, xyz, q, snr)
+            mask = prefix_mask(q.flatten(), self.cfg.rates).reshape_as(latent)
+            # Sample only transmitted symbols, identical to the packed path.
+            noisy = channel(latent[mask].reshape(-1, 2), snr, kind)
+            received = latent.new_zeros(latent.shape).masked_scatter(mask, noisy.flatten())
+            result = self.learned.decode(received, q, snr)
+            return result, result[..., :3], (q > 0).to(features)
+        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5") and choices.requires_grad:
+            raise ValueError("block_relative_v4 currently supports fixed hard tiers, not joint mask optimization")
+        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5") and not torch.equal(
+            choices, F.one_hot(choices.argmax(-1), 4).to(choices)
+        ):
+            raise ValueError("block_relative_v4 requires one-hot hard tiers")
+        if self.cfg.position_head == 'reference_v6' and not torch.equal(
+            choices.detach(),F.one_hot(choices.detach().argmax(-1),4).to(choices)):
+            raise ValueError('reference_v6 requires hard or straight-through one-hot choices')
         table = prefix_mask(torch.arange(4, device=features.device), self.cfg.rates).to(features.dtype)
         mask = choices @ table
         active = choices[..., 1:].sum(-1)
@@ -430,6 +572,12 @@ class GaussianCodec(nn.Module):
         plan = self.enc_blocks[0].grid.geometry_plan(xyz, active)
         for block in self.enc_blocks:
             h = block(h, xyz, condition, active, plan=plan)
+        if self.cfg.position_head in ("block_relative_v4", "block_pilot_v5", "reference_v6"):
+            normalized = self.block_payload(h, xyz, mask, snr, choices)
+            received = channel(normalized.reshape(-1, 2), snr, kind).reshape_as(normalized) * mask
+            condition = embedding + self.dec_condition(snr_col)
+            result, seed = self.decode_latent(received, mask, condition, active, snr=snr)
+            return result, seed, active
         latent = self.encode_latent(h, xyz)
         energy = (latent.square() * mask).sum((1, 2), keepdim=True) / (
             mask.sum((1, 2), keepdim=True) / 2).clamp_min(1.)
