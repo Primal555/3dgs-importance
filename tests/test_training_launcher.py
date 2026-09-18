@@ -56,6 +56,37 @@ class LauncherTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('Set CUDA_VISIBLE_DEVICES',result.stderr)
 
+    def test_pure_render_baseline_requires_gpu(self):
+        result=self.launch(script='scripts/train_quantized12_render_only.sh')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Set CUDA_VISIBLE_DEVICES',result.stderr)
+
+    def test_pure_render_baseline_ignores_two_stage_environment(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'1','BOOTSTRAP_STEPS':'2000',
+                            'BOOTSTRAP_OBJECTIVE':'local-response','JOINT_STEPS':'100',
+                            'RENDER_LR':'0.00001','TRAIN_VIEWS':'12','POSITION_DELIVERY':'learned',
+                            'POSITION_BITS':'8','CLIP_MODE':'global','INIT':'missing.pt'},
+                           script='scripts/train_quantized12_render_only.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--bootstrap-steps 0','--joint-steps 0','--render-steps 5000',
+                     '--position-delivery quantized','--position-bits 12','--render-lr 0.0001',
+                     '--train-views 0','--clip-mode none','--blocks-per-batch 64'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+        self.assertNotIn('local-response',result.stdout)
+
+    def test_pure_render_weight_continuation_is_explicit(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'1','INITIALIZATION':'checkpoint',
+                            'INIT':'fixture','RENDER_STEPS':'4000'},
+                           script='scripts/train_quantized12_render_only.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('--init ',result.stdout)
+        self.assertIn('--render-steps 4000',result.stdout)
+        self.assertIn('NOT exact resume',result.stdout)
+        rejected=self.launch({'CUDA_VISIBLE_DEVICES':'1','INITIALIZATION':'checkpoint'},
+                             script='scripts/train_quantized12_render_only.sh')
+        self.assertNotEqual(rejected.returncode,0)
+
     def test_local_response_two_stage_launcher(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'nonexistent.pt'},
                            script='scripts/test_local_response.sh')

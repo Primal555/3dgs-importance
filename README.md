@@ -27,7 +27,13 @@ random initializations with learned XYZ, reliable float32 XYZ, or reliable
 quantized XYZ. Extra coordinate bits are counted; this is not an equal-total-rate
 comparison and does not simulate error correction for that side stream.
 
-For the new two-stage experiment, use
+The current observation priority is the preserved **quantized-12-bit, render-only**
+baseline: `CUDA_VISIBLE_DEVICES=2 bash scripts/train_quantized12_render_only.sh`
+(choose a free GPU). It fixes LR=1e-4, all training views, zero bootstrap/joint
+steps and defaults to 5000 steps. See [historical snapshot and continuation commands](docs/quantized12_render_only.md).
+The two-stage experiment is retained for later testing; it is not required by this launcher.
+
+For the optional two-stage experiment, use
 `CUDA_VISIBLE_DEVICES=2 bash scripts/test_local_response.sh` (choose a free GPU).
 It starts from random weights with 12-bit/axis reliable XYZ, trains isolated
 Gaussian responses for 2000 steps, then full-scene rendering for 300 steps.
