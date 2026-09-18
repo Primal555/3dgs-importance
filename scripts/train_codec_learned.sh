@@ -34,6 +34,8 @@ printf 'Architecture: learned_joint\nInitialization: %s\nBootstrap steps: %s\nGP
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --ply "$PLY" --source "$SCENE" --out "$OUT" "${EXTRA[@]}" \
   --device cuda --snr 10 --channel awgn \
+  --position-delivery "${POSITION_DELIVERY:-learned}" --position-bits "${POSITION_BITS:-12}" \
+  --position-net-bits-per-use "${POSITION_NET_BITS_PER_USE:-2}" \
   --bootstrap-steps "${BOOTSTRAP_STEPS:-0}" --render-steps "${RENDER_STEPS:-1000}" --joint-steps "${JOINT_STEPS:-0}" \
   --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" \
   --rates 0 8 16 32 --lr "${LR:-0.0001}" --render-lr "${RENDER_LR:-0.00001}" \

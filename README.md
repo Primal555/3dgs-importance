@@ -2,7 +2,7 @@
 
 ## Gaussian JSCC codec extension
 
-The maintained codec is **fully learned joint JSCC**: XYZ and attributes share
+The default codec is **fully learned joint JSCC**: XYZ and attributes share
 a learned variable-length payload; the receiver jointly decodes local noisy
 features without source/predicted-coordinate grids. Each Gaussian has its own
 q0/q1/q2/q3 decision. There is no handcrafted coordinate reference, repetition,
@@ -20,6 +20,12 @@ See [architecture, objectives and server commands](docs/learned_joint_jscc.md),
 [mask joint training](docs/route2_joint_jscc.md),
 [training performance](docs/training_performance.md) and
 [position/attribute ablation](docs/hybrid_codec_ablation.md).
+
+To test whether position recovery blocks render-only cold starts, run the
+[explicit XYZ-delivery comparison](docs/position_delivery_ablation.md): matched
+random initializations with learned XYZ, reliable float32 XYZ, or reliable
+quantized XYZ. Extra coordinate bits are counted; this is not an equal-total-rate
+comparison and does not simulate error correction for that side stream.
 
 The independent `benchmark_codec.py` and packet-only receiver remain available.
 Training and evaluation export PNG/SVG charts, machine-readable logs and CSV data.

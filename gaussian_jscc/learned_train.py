@@ -14,6 +14,7 @@ from .render_objective import bootstrap_loss, MultiViewRenderTask, split_cameras
 from .render_validation import append_json, validate_render
 from .training import full_scene_step
 from .transport import load_checkpoint, save_checkpoint
+from .position_delivery import training_position_cost
 
 
 def add_parser(sub):
@@ -28,6 +29,11 @@ def add_parser(sub):
     p.add_argument('--device', default='cuda')
     p.add_argument('--snr', type=float, default=10.)
     p.add_argument('--channel', choices=['awgn', 'none'], default='awgn')
+    p.add_argument('--position-delivery', choices=['learned','float32','quantized'], default='learned',
+                   help='explicit modes replace XYZ output with a charged reliable side stream; attributes still use JSCC')
+    p.add_argument('--position-bits', type=int, default=12, help='quantized XYZ bits per axis (1..16)')
+    p.add_argument('--position-net-bits-per-use', type=float, default=2.,
+                   help='assumed digital net information bits/complex use for training charts; not a tested FEC')
     p.add_argument('--bootstrap-steps', '--steps', dest='bootstrap_steps', type=int, default=0,
                    help='optional normalized-feature initialization, NOT the main objective')
     p.add_argument('--render-steps', type=int, default=1000)
@@ -82,7 +88,7 @@ def train(args):
         raise ValueError('counts must be positive')
     if not 0 <= args.drop < 1 or args.mask_samples < 2:
         raise ValueError('invalid drop probability or mask-samples')
-    for key in ('lr','render_lr','mask_lr','clip_norm','power_floor'):
+    for key in ('lr','render_lr','mask_lr','clip_norm','power_floor','position_net_bits_per_use'):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             raise ValueError(f'{key} must be positive and finite')
     for key in ('beta','min_delta'):
@@ -107,18 +113,25 @@ def train(args):
         model = load_checkpoint(args.init,device).train()
         if model.cfg.architecture != 'learned_joint' or model.cfg.sh_degree != degree:
             raise ValueError('requires matching learned_joint weights; omit --init for old architectures')
+        if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
+            raise ValueError('initializer position delivery/bits must match explicit construction flags')
         print('Loaded learned_joint weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
-        print('Architecture, rates and feature statistics come from the checkpoint; construction flags apply only without --init.',flush=True)
+        print('Architecture, rates and feature statistics come from the checkpoint; position-delivery flags must match it.',flush=True)
     else:
         cfg = CodecConfig(architecture='learned_joint',loss_profile='learned_v1',sh_degree=degree,
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
-                          decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor)
+                          decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
+                          position_delivery=args.position_delivery,position_bits=args.position_bits)
         model = GaussianCodec(cfg).to(device)
         model.attr_mean.copy_(original[:,3:].mean(0).to(device))
         model.attr_std.copy_(original[:,3:].std(0,unbiased=False).clamp_min(.01).to(device))
         if not args.bootstrap_steps:
             print('Training from random weights without bootstrap: valid, but render gradients may be poorly conditioned.',flush=True)
+    if args.joint_steps and model.cfg.position_delivery != 'learned':
+        raise ValueError('position delivery ablation disables joint mask training: its rate penalty must include XYZ cost first')
+    if args.bootstrap_steps and model.cfg.position_delivery != 'learned':
+        raise ValueError('explicit position ablation is render-only; use --bootstrap-steps 0')
     if args.allocation_init:
         from .route2 import load_mask
         mask = load_mask(args.allocation_init,original,model,device).train()
@@ -172,9 +185,16 @@ def train(args):
                   budget='per-Gaussian payload; optional Lagrange penalty, NOT a hard cap',
                   metadata='reliable global bbox + per-row tier syntax unchanged; chart payload excludes metadata',
                   clipping='none by default; any threshold is an explicit empirical hyperparameter')
+    record.update(position_delivery=model.cfg.position_delivery,
+                  position_protocol=('XYZ learned from JSCC payload; no coordinate side stream'
+                                     if model.cfg.position_delivery == 'learned' else
+                                     'normalized XYZ for q>0 only; reliable side stream; no learned XYZ residual'),
+                  comparison='same JSCC payload, NOT equal total rate when side stream is enabled',
+                  position_net_bits_per_use=args.position_net_bits_per_use)
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
-          f'clip={args.clip_mode}; train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
+          f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
+          f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
 
     @torch.no_grad()
     def validate_bootstrap(step):
@@ -198,7 +218,8 @@ def train(args):
     def validation(step,phase):
         return validate_render(model,groups,group_ids,raw,geometry,val_cameras,reference,args.snr,
                                args.channel,args.validation_trials,args.seed,out,step,phase,
-                               mask=mask if phase == 'joint' else None,white_background=args.white_background,beta=args.beta)
+                               mask=mask if phase == 'joint' else None,white_background=args.white_background,beta=args.beta,
+                               position_net_bits_per_use=args.position_net_bits_per_use)
 
     def save(suffix,phase,step):
         if phase == 'joint':
@@ -258,6 +279,8 @@ def train(args):
                                                     task,attr_weight=0.,mode=args.render_backward)
                     stats.update(details,**task.stats)
                     stats['symbols_per_source_gaussian'] = sum(float(torch.tensor(model.cfg.rates,device=q.device)[q].sum()) for q in qs)/len(raw)
+                    stats.update(training_position_cost(model.cfg,details['retained_gaussians'],len(raw),
+                                 stats['symbols_per_source_gaussian']*len(raw),args.position_net_bits_per_use))
                 else:
                     loss,details = discrete_joint_step(model,mask,groups,group_ids,geometry,args.snr,args.channel,
                                                        task,beta=args.beta,auxiliary_weight=0.,samples=args.mask_samples,

@@ -3,7 +3,8 @@
 metadata.bin is a CRC-protected zlib-compressed metadata record. It is assumed
 reliably delivered, as in NTSCC; CRC detects file corruption, not channel FEC.
 received.npy stores channel outputs for simulation, NOT a digital wire bitrate.
-Per-Gaussian coordinates are carried by the JSCC payload, not this metadata.
+By default coordinates are learned from JSCC. Explicit position experiments
+add xyz.bin, assumed reliably delivered and separately charged to the budget.
 """
 
 import hashlib
@@ -18,6 +19,7 @@ import torch
 
 from .codec import CodecConfig, GaussianCodec, channel
 from .data import Geometry, prepare, to_features, to_raw
+from .position_delivery import encode_positions, decode_positions, position_cost
 
 
 def model_id(model):
@@ -113,6 +115,11 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
     model.eval()
     device = next(model.parameters()).device
     raw, geometry, q = prepare(raw, model.cfg.morton_bits, q)
+    coordinate_bits = 0
+    if model.cfg.position_delivery != 'learned':
+        xyz_stream = encode_positions(geometry.normalize(raw[:, :3]), q, model.cfg)
+        (output / 'xyz.bin').write_bytes(xyz_stream)
+        coordinate_bits = len(xyz_stream)*8
     received = []
     transmitted_energy = 0.
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -135,6 +142,7 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
     np.save(output / "received.npy", received.numpy(), allow_pickle=False)
     bits = len(metadata) * 8
     meta_uses = metadata_channel_uses(bits, snr, code_rate, modulation_bits)
+    coordinate_uses = metadata_channel_uses(coordinate_bits, snr, code_rate, modulation_bits)
     stats = {"source_gaussians": len(raw), "retained_gaussians": int((q > 0).sum()),
              "tier_counts": torch.bincount(q, minlength=4).tolist(),
              "payload_complex_symbols": len(received), "metadata_bytes": len(metadata),
@@ -142,8 +150,8 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
              "tier_map_uncompressed_bytes": (len(q) + 3) // 4,
              "per_gaussian_coordinates_in_metadata": False,
              "global_geometry_floats": 6,
-             "metadata_channel_uses": meta_uses, "total_channel_uses": len(received) + meta_uses,
-             "total_uses_per_source_gaussian": (len(received) + meta_uses) / len(raw),
+             "metadata_channel_uses": meta_uses, "total_channel_uses": len(received) + meta_uses + coordinate_uses,
+             "total_uses_per_source_gaussian": (len(received) + meta_uses + coordinate_uses) / len(raw),
              "snr_db": snr, "channel": kind, "seed": seed,
              "metadata_assumption": "reliably delivered; no header channel errors simulated",
              "metadata_cost_model": "ideal_complex_AWGN_capacity" if code_rate is None else "specified_code_modulation",
@@ -159,6 +167,14 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
                  receiver_context='local received features; no source or predicted XYZ inputs',
                  grouping='fixed source-row intervals; q0 holes retained in syntax',
                  power_normalization='smooth per-row RMS; mean complex energy <= 1')
+    stats.update(position_cost(model.cfg, int((q > 0).sum())),
+                 position_channel_uses=coordinate_uses,
+                 position_stream_assumption='reliably delivered; no FEC or coordinate packet errors simulated',
+                 position_coding=model.cfg.position_delivery,
+                 coordinate_cost_model=stats['metadata_cost_model'])
+    if model.cfg.position_delivery != 'learned':
+        stats.update(receiver_context='local received features; explicit XYZ replaces output only',
+                     per_gaussian_coordinates_in_side_stream=True)
     (output / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
 
@@ -176,6 +192,8 @@ def receive(model, packet, return_position_seed=False):
         raise ValueError("packet and shared codec checkpoint do not match")
     if CodecConfig.from_dict(header["config"]) != model.cfg:
         raise ValueError("codec configuration mismatch")
+    delivered_xyz = (decode_positions((packet / 'xyz.bin').read_bytes(), q, model.cfg)
+                     if model.cfg.position_delivery != 'learned' else None)
     z = np.load(packet / "received.npy", mmap_mode="r", allow_pickle=False)
     expected = int(torch.as_tensor(model.cfg.rates)[q].sum())
     if z.shape != (expected, 2) or z.dtype != np.float32 or not np.isfinite(z).all():
@@ -196,7 +214,9 @@ def receive(model, packet, return_position_seed=False):
         length = int(torch.as_tensor(model.cfg.rates, device=device)[qb].sum())
         symbols = torch.from_numpy(z[j:j + length].copy()).to(device)
         decoded = model.decode(symbols, qb, header["snr_db"],
-                               return_seed=return_position_seed)
+                               return_seed=return_position_seed,
+                               delivered_xyz=delivered_xyz[start:start+len(qb)].to(device)
+                               if delivered_xyz is not None else None)
         if return_position_seed:
             pred, seed = decoded
             pred,seed=pred[qb>0],seed[qb>0]

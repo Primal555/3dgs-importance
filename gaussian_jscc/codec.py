@@ -36,8 +36,15 @@ class CodecConfig:
     # Keeping these two constants preserves existing learned-v4 packet hashes.
     geometry_rates: tuple = ()
     geometry_floor: float = 1e-4
+    # Explicit diagnostic alternative; learned remains the unchanged default.
+    position_delivery: str = 'learned'
+    position_bits: int = 12
 
     def __post_init__(self):
+        if self.position_delivery not in ('learned', 'float32', 'quantized'):
+            raise ValueError('position_delivery must be learned, float32 or quantized')
+        if not isinstance(self.position_bits, int) or not 1 <= self.position_bits <= 16:
+            raise ValueError('position_bits must be an integer in 1..16')
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
         self.geometry_rates = tuple(self.geometry_rates)
         if self.architecture != 'learned_joint':
@@ -73,7 +80,12 @@ class CodecConfig:
         return 8 + 3 * (self.sh_degree + 1) ** 2
 
     def to_dict(self):
-        return asdict(self)
+        result = asdict(self)
+        if self.position_delivery == 'learned' and self.position_bits == 12:
+            # Preserve existing v4 shared-model hashes exactly.
+            result.pop('position_delivery')
+            result.pop('position_bits')
+        return result
 
     @classmethod
     def from_dict(cls, values):
@@ -243,19 +255,40 @@ class GaussianCodec(nn.Module):
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
         self.learned = LearnedCore(cfg)
+        if cfg.position_delivery != 'learned':
+            # Keep identical initialization/RNG for the paired experiment, but
+            # do not train the bypassed XYZ head or claim its gradients improve.
+            self.learned.heads['xyz'].requires_grad_(False)
 
     def encode(self, features, xyz, q, snr):
         validate_tiers(q, len(features))
         return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
 
-    def decode(self, symbols, q, snr, return_seed=False):
+    def decode(self, symbols, q, snr, return_seed=False, delivered_xyz=None):
         validate_tiers(q, len(q))
         result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr)[0]
+        result = self.apply_position_delivery(result, q, delivered_xyz)
         # Optional benchmark diagnostic is final XYZ, not a bootstrap decoder.
         return (result, result[:, :3]) if return_seed else result
 
     def forward(self, features, xyz, q, snr, kind="awgn", return_seed=False):
-        return self.decode(channel(self.encode(features, xyz, q, snr), snr, kind), q, snr, return_seed)
+        from .position_delivery import delivered_positions
+        side = delivered_positions(features[..., :3], q, self.cfg)
+        return self.decode(channel(self.encode(features, xyz, q, snr), snr, kind), q, snr, return_seed,
+                           delivered_xyz=side)
+
+    def apply_position_delivery(self, result, q, delivered_xyz):
+        if self.cfg.position_delivery == 'learned':
+            if delivered_xyz is not None:
+                raise ValueError('learned decoder must not receive source coordinates')
+            return result
+        if delivered_xyz is None or delivered_xyz.shape != result[..., :3].shape:
+            raise ValueError('explicit position decoder requires delivered XYZ with matching slots')
+        if not torch.isfinite(delivered_xyz).all():
+            raise ValueError('nonfinite delivered XYZ')
+        # No positional residual or new context input: isolate position bypass.
+        side = delivered_xyz.detach().to(result) * (q > 0)[..., None]
+        return torch.cat((side, result[..., 3:]), -1)
 
     def forward_tiers(self, features, xyz, choices, snr, kind="awgn"):
         if choices.shape != (len(features), 4):
@@ -274,4 +307,6 @@ class GaussianCodec(nn.Module):
         noisy = channel(latent[mask].reshape(-1, 2), snr, kind)
         received = latent.new_zeros(latent.shape).masked_scatter(mask, noisy.flatten())
         result = self.learned.decode(received, q, snr)
+        from .position_delivery import delivered_positions
+        result = self.apply_position_delivery(result, q, delivered_positions(features[..., :3], q, self.cfg))
         return result, result[..., :3], (q > 0).to(features)
