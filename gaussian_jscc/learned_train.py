@@ -1,4 +1,4 @@
-"""Render-first, fully learned Gaussian JSCC training at a fixed channel condition."""
+"""Render-targeted JSCC with optional feature/local-response pretraining."""
 import json
 import math
 import time
@@ -15,6 +15,7 @@ from .render_validation import append_json, validate_render
 from .training import full_scene_step
 from .transport import load_checkpoint, save_checkpoint
 from .position_delivery import training_position_cost
+from .local_response import local_response_loss
 
 
 def add_parser(sub):
@@ -35,7 +36,10 @@ def add_parser(sub):
     p.add_argument('--position-net-bits-per-use', type=float, default=2.,
                    help='assumed digital net information bits/complex use for training charts; not a tested FEC')
     p.add_argument('--bootstrap-steps', '--steps', dest='bootstrap_steps', type=int, default=0,
-                   help='optional normalized-feature initialization, NOT the main objective')
+                   help='optional feature or local-response initialization, NOT the final scene objective')
+    p.add_argument('--bootstrap-objective', choices=['feature','local-response'], default='feature',
+                   help='local-response: isolated orthographic RGB responses; requires explicit XYZ delivery')
+    p.add_argument('--local-response-views', type=int, default=4)
     p.add_argument('--render-steps', type=int, default=1000)
     p.add_argument('--joint-steps', type=int, default=0)
     p.add_argument('--block-size', type=int, default=256)
@@ -48,7 +52,7 @@ def add_parser(sub):
     p.add_argument('--levels', nargs='+', type=int, default=[4,8])
     p.add_argument('--rates', nargs=4, type=int, default=[0,8,16,32])
     p.add_argument('--lr', type=float, default=1e-4, help='bootstrap learning rate')
-    p.add_argument('--render-lr', type=float, default=1e-5, help='render and joint codec learning rate')
+    p.add_argument('--render-lr', type=float, default=1e-4, help='render and joint codec learning rate')
     p.add_argument('--mask-lr', type=float, default=1e-3)
     p.add_argument('--mask-samples', type=int, default=2)
     p.add_argument('--beta', type=float, default=.001, help='joint-only normalized payload penalty; not a hard cap')
@@ -84,7 +88,7 @@ def train(args):
     if min(args.bootstrap_steps,args.render_steps,args.joint_steps,args.patience,args.train_views) < 0 or args.bootstrap_steps+args.render_steps+args.joint_steps < 1:
         raise ValueError('invalid stage lengths/view count')
     if min(args.validate_every,args.validation_blocks,args.validation_views,args.validation_trials,
-           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads) < 1:
+           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views) < 1:
         raise ValueError('counts must be positive')
     if not 0 <= args.drop < 1 or args.mask_samples < 2:
         raise ValueError('invalid drop probability or mask-samples')
@@ -96,6 +100,8 @@ def train(args):
             raise ValueError(f'{key} must be nonnegative and finite')
     if not math.isfinite(args.snr):
         raise ValueError('SNR must be finite')
+    if args.bootstrap_steps and args.bootstrap_objective == 'local-response' and args.position_delivery == 'learned':
+        raise ValueError('local-response bootstrap requires explicit XYZ delivery; no XYZ learning objective is included')
     needs_render = bool(args.render_steps or args.joint_steps)
     if needs_render and (not args.source or not args.device.startswith('cuda')):
         raise ValueError('render/joint stages require CUDA and --source; CPU bootstrap checks set both to 0')
@@ -130,8 +136,6 @@ def train(args):
             print('Training from random weights without bootstrap: valid, but render gradients may be poorly conditioned.',flush=True)
     if args.joint_steps and model.cfg.position_delivery != 'learned':
         raise ValueError('position delivery ablation disables joint mask training: its rate penalty must include XYZ cost first')
-    if args.bootstrap_steps and model.cfg.position_delivery != 'learned':
-        raise ValueError('explicit position ablation is render-only; use --bootstrap-steps 0')
     if args.allocation_init:
         from .route2 import load_mask
         mask = load_mask(args.allocation_init,original,model,device).train()
@@ -180,7 +184,10 @@ def train(args):
                   scope='scene-trained codec; held-out camera validation, NOT unseen-scene or final test evidence',
                   target='original full PLY rendered images; photographs are evaluation references only',
                   loss_design='mean multiview RGB MSE only during render; no parameter/projection auxiliary',
-                  bootstrap_design='optional uniform SmoothL1 on normalized feature vector; initialization only',
+                  bootstrap_design=('isolated orthographic Gaussian response RGB MSE; shared center, random directions, '
+                                    'source+detached-prediction footprint probes, black+white backgrounds; no scene occlusion'
+                                    if args.bootstrap_objective == 'local-response' else
+                                    'uniform SmoothL1 on normalized features; explicit XYZ modes supervise attributes only'),
                   mask_gradient='REINFORCE image MSE; exact expected normalized payload penalty',
                   budget='per-Gaussian payload; optional Lagrange penalty, NOT a hard cap',
                   metadata='reliable global bbox + per-row tier syntax unchanged; chart payload excludes metadata',
@@ -196,6 +203,12 @@ def train(args):
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
           f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
 
+    def initialization_loss(pred, target):
+        if args.bootstrap_objective == 'local-response':
+            return local_response_loss(pred,target,geometry,model,args.local_response_views)
+        start = 0 if model.cfg.position_delivery == 'learned' else 3
+        return bootstrap_loss(pred[:,start:],target[:,start:]), {}
+
     @torch.no_grad()
     def validate_bootstrap(step):
         # This diagnostic is never substituted for render quality or used to
@@ -210,10 +223,10 @@ def train(args):
                     f = blocks[i].to(device)
                     q = hard_layout(ids[i].to(device),tier,0.)
                     pred = model(f,f[:,:3],q,args.snr,args.channel)
-                    losses.append(float(bootstrap_loss(pred,f)))
-                values.append({'layout':'mixed' if tier is None else str(tier),'feature_loss':sum(losses)/len(losses)})
+                    losses.append(float(initialization_loss(pred,f)[0]))
+                values.append({'layout':'mixed' if tier is None else str(tier),'loss':sum(losses)/len(losses)})
             model.train()
-            append_json(out/'bootstrap_validation.jsonl',{'step':step,'layouts':values})
+            append_json(out/'bootstrap_validation.jsonl',{'step':step,'objective':args.bootstrap_objective,'layouts':values})
 
     def validation(step,phase):
         return validate_render(model,groups,group_ids,raw,geometry,val_cameras,reference,args.snr,
@@ -230,6 +243,8 @@ def train(args):
     step, selections, last_phase = 0, {}, None
     # Record actual render quality of the initializer, before changing weights.
     initial_validation = validation(0,'initial') if needs_render else None
+    if args.bootstrap_steps:
+        validate_bootstrap(0)
     for phase,maximum in [('bootstrap',args.bootstrap_steps),('render',args.render_steps),('joint',args.joint_steps)]:
         if not maximum:
             continue
@@ -263,7 +278,8 @@ def train(args):
                     q[gi>=0] = 1
                 choices = torch.nn.functional.one_hot(q,4).to(f)
                 pred,_,_ = model.forward_tier_batches(f,f[...,:3],choices,args.snr,args.channel)
-                loss = bootstrap_loss(pred[q>0],f[q>0])
+                loss, local_stats = initialization_loss(pred[q>0],f[q>0])
+                stats.update(local_stats,bootstrap_objective=args.bootstrap_objective)
                 if not torch.isfinite(loss):
                     raise RuntimeError('nonfinite bootstrap loss; no optimizer step performed')
                 loss.backward()
@@ -312,6 +328,10 @@ def train(args):
             if local_step%args.validate_every == 0 or local_step == maximum:
                 if phase == 'bootstrap':
                     validate_bootstrap(step)
+                    # Track actual scene quality during initialization too; the
+                    # local objective is not a substitute for held-out renders.
+                    if needs_render:
+                        validation(step,phase)
                 else:
                     score = validation(step,phase)['score']
                     # Best checkpoint tracks EVERY improvement; patience has

@@ -27,6 +27,15 @@ random initializations with learned XYZ, reliable float32 XYZ, or reliable
 quantized XYZ. Extra coordinate bits are counted; this is not an equal-total-rate
 comparison and does not simulate error correction for that side stream.
 
+For the new two-stage experiment, use
+`CUDA_VISIBLE_DEVICES=2 bash scripts/test_local_response.sh` (choose a free GPU).
+It starts from random weights with 12-bit/axis reliable XYZ, trains isolated
+Gaussian responses for 2000 steps, then full-scene rendering for 300 steps.
+Both learning rates default to 1e-4. See
+[local-response objective, limitations and logs](docs/local_response_pretraining.md).
+This replaces attribute-wise weighted losses in pretraining, not the final
+scene-rendering objective; it does not yet establish improved rendering quality.
+
 The independent `benchmark_codec.py` and packet-only receiver remain available.
 Training and evaluation export PNG/SVG charts, machine-readable logs and CSV data.
 The implementation adapts ROI-JSCC prefix transport and FCGS-inspired sender

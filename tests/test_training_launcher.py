@@ -56,6 +56,17 @@ class LauncherTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('Set CUDA_VISIBLE_DEVICES',result.stderr)
 
+    def test_local_response_two_stage_launcher(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'nonexistent.pt'},
+                           script='scripts/test_local_response.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--bootstrap-steps 2000','--render-steps 300',
+                     '--bootstrap-objective local-response','--position-delivery quantized',
+                     '--position-bits 12','--render-lr 0.0001','--joint-steps 0'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+        self.assertNotEqual(self.launch(script='scripts/test_local_response.sh').returncode,0)
+
     def test_position_comparison_forces_three_random_render_only_runs(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INITIALIZATION':'checkpoint',
                             'INIT':'nonexistent.pt','BOOTSTRAP_STEPS':'2000','JOINT_STEPS':'100'},

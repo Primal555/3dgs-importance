@@ -15,6 +15,22 @@ from gaussian_jscc.plots import plot_allocation, plot_evaluation, plot_training,
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "requires matplotlib")
 class PlotTests(unittest.TestCase):
+    def test_local_response_and_render_labels_remain_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [dict(step=1,phase='bootstrap',objective='render_mse_v1',
+                         bootstrap_objective='local-response',loss=.1),
+                    dict(step=2,phase='render',objective='render_mse_v1',loss=.2)]
+            (root/'loss.jsonl').write_text('\n'.join(json.dumps(r) for r in rows),encoding='utf-8')
+            with patch('gaussian_jscc.render_plots._finish',wraps=_finish) as finish:
+                plot_training(root)
+            axes = finish.call_args_list[0].args[0].axes
+            self.assertEqual(len(axes),2)
+            self.assertEqual(axes[0].get_ylabel(),'Isolated response RGB MSE')
+            self.assertNotIn('SmoothL1',axes[0].get_ylabel())
+            self.assertEqual(list(axes[0].lines[0].get_xdata()),[1])
+            self.assertEqual(list(axes[1].lines[0].get_xdata()),[2])
+
     def test_phase_panels_and_weighted_csv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
