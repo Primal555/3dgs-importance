@@ -1,4 +1,4 @@
-"""Render-targeted JSCC with optional feature/local-response pretraining."""
+"""Render-targeted JSCC plus optional/isolated bootstrap experiments."""
 import json
 import math
 import time
@@ -16,6 +16,7 @@ from .training import full_scene_step
 from .transport import load_checkpoint, save_checkpoint
 from .position_delivery import training_position_cost
 from .local_response import local_response_loss
+from .spatial_response import spatial_response_loss, DEFAULT_BANDWIDTHS
 
 
 def add_parser(sub):
@@ -37,9 +38,11 @@ def add_parser(sub):
                    help='assumed digital net information bits/complex use for training charts; not a tested FEC')
     p.add_argument('--bootstrap-steps', '--steps', dest='bootstrap_steps', type=int, default=0,
                    help='optional feature or local-response initialization, NOT the final scene objective')
-    p.add_argument('--bootstrap-objective', choices=['feature','local-response'], default='feature',
-                   help='local-response: isolated orthographic RGB responses; requires explicit XYZ delivery')
+    p.add_argument('--bootstrap-objective', choices=['feature','local-response','spatial-response'], default='feature',
+                   help='local-response requires explicit XYZ; spatial-response is a learned-XYZ bootstrap-only experiment')
     p.add_argument('--local-response-views', type=int, default=4)
+    p.add_argument('--spatial-bandwidths', nargs='+', type=float, default=list(DEFAULT_BANDWIDTHS),
+                   help='experimental spatial-response footprint widths in bbox-diagonal units')
     p.add_argument('--render-steps', type=int, default=1000)
     p.add_argument('--joint-steps', type=int, default=0)
     p.add_argument('--block-size', type=int, default=256)
@@ -113,6 +116,12 @@ def train(args):
         raise ValueError('min-lr must not exceed any active phase starting LR')
     if args.bootstrap_steps and args.bootstrap_objective == 'local-response' and args.position_delivery == 'learned':
         raise ValueError('local-response bootstrap requires explicit XYZ delivery; no XYZ learning objective is included')
+    spatial_test = args.bootstrap_objective == 'spatial-response'
+    if spatial_test:
+        if args.position_delivery != 'learned' or args.render_steps or args.joint_steps or not args.bootstrap_steps:
+            raise ValueError('spatial-response test requires learned XYZ and bootstrap-only training')
+        if not args.spatial_bandwidths or any(not math.isfinite(s) or s <= 0 for s in args.spatial_bandwidths):
+            raise ValueError('spatial bandwidths must be positive and finite')
     needs_render = bool(args.render_steps or args.joint_steps)
     if needs_render and (not args.source or not args.device.startswith('cuda')):
         raise ValueError('render/joint stages require CUDA and --source; CPU bootstrap checks set both to 0')
@@ -209,8 +218,17 @@ def train(args):
                                      'normalized XYZ for q>0 only; reliable side stream; no learned XYZ residual'),
                   comparison='same JSCC payload, NOT equal total rate when side stream is enabled',
                   position_net_bits_per_use=args.position_net_bits_per_use)
+    if spatial_test:
+        record.update(objective='spatial_response_v1',
+                      target='paired source Gaussian multiscale spatial responses, NOT scene rendering',
+                      loss_design='equal mean integrated squared error over views, bandwidths and 7 response channels',
+                      bootstrap_design='unit-L2 projected footprints with true center displacement; unit geometry + black RGB + white contrast RGB',
+                      scope='bootstrap-only; held-out spatial blocks from the same scene, NOT held-out rendered views',
+                      diagnostic_aggregation='equal block/trial means; XYZ RMSE is mean per-block RMSE, not pooled global RMSE',
+                      spatial_bandwidth_units='fraction of global source bbox diagonal; empirical fixed scales',
+                      position_side_stream_bits=0)
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
-    print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
+    print(f'{record["objective"]}: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
           f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
     backward_description = {
@@ -218,10 +236,15 @@ def train(args):
         'direct': 'retain the entire codec graph; no automatic recomputation fallback.',
         'checkpoint': 'checkpoint codec batches and recompute during backward.',
     }
-    print(f'Backward: {args.render_backward}; LR schedule: {args.lr_schedule}. '
-          + backward_description[args.render_backward],flush=True)
+    if spatial_test:
+        print(f'Bootstrap-only: ordinary minibatch backward; no scene replay. LR schedule: {args.lr_schedule}.',flush=True)
+    else:
+        print(f'Backward: {args.render_backward}; LR schedule: {args.lr_schedule}. '
+              + backward_description[args.render_backward],flush=True)
 
     def initialization_loss(pred, target):
+        if spatial_test:
+            return spatial_response_loss(pred,target,geometry,model,args.local_response_views,args.spatial_bandwidths)
         if args.bootstrap_objective == 'local-response':
             return local_response_loss(pred,target,geometry,model,args.local_response_views)
         start = 0 if model.cfg.position_delivery == 'learned' else 3
@@ -237,14 +260,31 @@ def train(args):
             values = []
             for tier in (1,2,3,None):
                 losses = []
-                for i in validation_indices:
-                    f = blocks[i].to(device)
-                    q = hard_layout(ids[i].to(device),tier,0.)
-                    pred = model(f,f[:,:3],q,args.snr,args.channel)
-                    losses.append(float(initialization_loss(pred,f)[0]))
-                values.append({'layout':'mixed' if tier is None else str(tier),'loss':sum(losses)/len(losses)})
+                measurements = []
+                symbols, points = 0, 0
+                for trial in range(args.validation_trials if spatial_test else 1):
+                    for i in validation_indices:
+                        f = blocks[i].to(device)
+                        q = hard_layout(ids[i].to(device),tier,0.)
+                        if spatial_test:
+                            symbols += int(torch.tensor(model.cfg.rates,device=q.device)[q].sum())
+                            points += len(q)
+                        pred = model(f,f[:,:3],q,args.snr,args.channel)
+                        value, diagnostics = initialization_loss(pred,f)
+                        losses.append(float(value))
+                        measurements.append(diagnostics)
+                entry = {'layout':'mixed' if tier is None else str(tier),'loss':sum(losses)/len(losses)}
+                if spatial_test:
+                    entry.update({key:sum(r[key] for r in measurements)/len(measurements) for key in measurements[0]})
+                    entry.update(position_side_stream_bits=0,validation_blocks=len(validation_indices),
+                                 validation_trials=args.validation_trials,
+                                 symbols_per_gaussian=symbols/points)
+                values.append(entry)
             model.train()
             append_json(out/'bootstrap_validation.jsonl',{'step':step,'objective':args.bootstrap_objective,'layouts':values})
+            if spatial_test:
+                print(f'Spatial validation step={step}: '+', '.join(
+                    f'q{v["layout"]} XYZ NRMSE={v["xyz_nrmse_bbox"]:.6g}' for v in values),flush=True)
             return sum(v['loss'] for v in values)/len(values)
 
     def validation(step,phase):
@@ -295,6 +335,10 @@ def train(args):
             schedule_lr(best,baseline=True)
         else:
             schedule_lr(initial_bootstrap_score,baseline=True)
+            if spatial_test:
+                best = initial_bootstrap_score
+                selections[phase] = {'step':0,'score':best,'criterion':'mean_layout_spatial_response'}
+                save('_best_bootstrap',phase,0)
         for local_step in range(1,maximum+1):
             started = time.perf_counter()
             if device.type == 'cuda':
@@ -351,7 +395,7 @@ def train(args):
             optimizer.step()
             updates = update_stats(model,before)
             update_norm = math.sqrt(sum(v['update_norm']**2 for v in updates.values()))
-            row = {'step':step,'phase':phase,'objective':'render_mse_v1','loss':float(loss.detach()),
+            row = {'step':step,'phase':phase,'objective':record['objective'],'loss':float(loss.detach()),
                    'snr':args.snr,'lr':optimizer.param_groups[0]['lr'],'grad_norm':float(norm),
                    'update_norm':update_norm,'updates':updates,'step_seconds':time.perf_counter()-started,
                    **stats,**gradient_stats}
@@ -366,7 +410,12 @@ def train(args):
                 save(f'_{step}',phase,step)
             if local_step%args.validate_every == 0 or local_step == maximum:
                 if phase == 'bootstrap':
-                    schedule_lr(validate_bootstrap(step))
+                    bootstrap_score = validate_bootstrap(step)
+                    schedule_lr(bootstrap_score)
+                    if spatial_test and bootstrap_score < best:
+                        best = bootstrap_score
+                        selections[phase] = {'step':step,'score':best,'criterion':'mean_layout_spatial_response'}
+                        save('_best_bootstrap',phase,step)
                     # Track actual scene quality during initialization too; the
                     # local objective is not a substitute for held-out renders.
                     if needs_render:
@@ -394,7 +443,8 @@ def train(args):
     # weights "best", silently restore them, or mismatch a codec/mask pair.
     save('',last_phase,step)
     (out/'selection.json').write_text(json.dumps({'best_by_phase':selections,'codec.pt':'last executed step; not necessarily best',
-                                                'evaluation':'best_render or matched best_joint pair; final held-out test still required'},indent=2),encoding='utf-8')
-    print(f'Saved last codec: {out/"codec.pt"}; render-selected checkpoints: {selections}',flush=True)
+                                                'evaluation':('best_bootstrap selects local spatial response, NOT render quality' if spatial_test else
+                                                              'best_render or matched best_joint pair; final held-out test still required')},indent=2),encoding='utf-8')
+    print(f'Saved last codec: {out/"codec.pt"}; selected checkpoints: {selections}',flush=True)
     from .plots import safe_plot
     safe_plot('training',out)

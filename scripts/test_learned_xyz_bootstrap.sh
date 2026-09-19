@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Isolated experiment: random learned XYZ + attributes, bootstrap only, no XYZ side stream.
+set -euo pipefail
+PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT"
+: "${CUDA_VISIBLE_DEVICES:?Set CUDA_VISIBLE_DEVICES to an available GPU}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+PLY="${PLY:-$PROJECT/output/truck_mask_0005/point_cloud/iteration_30000/point_cloud.ply}"
+OUT="${1:-$PROJECT/output/truck_learned_xyz_bootstrap_$(date +%Y%m%d_%H%M%S)}"
+[[ -f "$PLY" ]] || { echo "Missing PLY: $PLY" >&2; exit 1; }
+[[ ! -e "$OUT" ]] || { echo "Output exists: $OUT" >&2; exit 1; }
+command -v "$PYTHON_BIN" >/dev/null || { echo 'Activate maskgs or set PYTHON_BIN.' >&2; exit 1; }
+echo 'Random weights; learned XYZ; no coordinate side stream; bootstrap only (no cameras/render training).'
+# Deliberately do not inherit INIT, POSITION_DELIVERY, RENDER_STEPS, JOINT_STEPS or LR_SCHEDULE.
+exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
+  --ply "$PLY" --out "$OUT" --device "${DEVICE:-cuda}" \
+  --position-delivery learned --bootstrap-objective spatial-response \
+  --bootstrap-steps "${BOOTSTRAP_STEPS:-5000}" --render-steps 0 --joint-steps 0 \
+  --snr "${SNR:-10}" --channel "${CHANNEL:-awgn}" --rates 0 8 16 32 \
+  --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" \
+  --local-response-views "${LOCAL_RESPONSE_VIEWS:-4}" \
+  --lr "${LR:-0.0002}" --lr-schedule constant --clip-mode none \
+  --training-data-device cpu --validate-every "${VALIDATE_EVERY:-100}" \
+  --validation-blocks "${VALIDATION_BLOCKS:-16}" --validation-trials "${VALIDATION_TRIALS:-2}" \
+  --save-every "${SAVE_EVERY:-500}" --seed "${SEED:-42}"

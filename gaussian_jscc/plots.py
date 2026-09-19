@@ -138,6 +138,28 @@ def plot_training(training_dir, output_dir=None):
     charts = []
     plt = _plt()
 
+    if rows[0].get('objective') == 'spatial_response_v1':
+        validation_rows = _read_jsonl(training_dir / 'bootstrap_validation.jsonl')
+        entries = [dict(entry,step=r['step']) for r in validation_rows for entry in r['layouts']]
+        fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+        fig.suptitle('Learned XYZ bootstrap: fixed validation blocks\nBlock/trial means; no coordinate side stream or scene rendering')
+        fields = (('loss','Spatial response loss'),('xyz_nrmse_bbox','XYZ RMSE / bbox diagonal'),
+                  ('xyz_distance_p95_world','Mean block P95 point distance (world units)'),
+                  ('spatial_appearance_response','Appearance response error'))
+        for axis, (key,label) in zip(axes.flat,fields):
+            for tier,color,style in zip(('1','2','3','mixed'),
+                                        (TIER_COLORS[1],TIER_COLORS[2],TIER_COLORS[3],REFERENCE),
+                                        ('-','--','-.',':')):
+                group = [r for r in entries if r['layout']==tier]
+                axis.plot([r['step'] for r in group],_numeric(group,key),style,color=color,label='q'+tier)
+            axis.set(xlabel='Bootstrap step',ylabel=label)
+            axis.legend(fontsize=8)
+        charts += _finish(fig,out/'bootstrap_position_validation')
+        _write_csv(out/'bootstrap_position_validation.csv',entries,
+                   ['step','layout','loss','xyz_rmse_world','xyz_nrmse_bbox',
+                    'xyz_distance_p50_world','xyz_distance_p95_world','spatial_geometry_response',
+                    'spatial_appearance_response','symbols_per_gaussian','position_side_stream_bits'])
+
     segments = _phase_segments(rows)
     fig, axes = plt.subplots(2, len(segments), figsize=(6 * len(segments), 7), squeeze=False)
     fig.suptitle("Training objectives by phase\nIndependent axes; smoothing stays within each phase", fontsize=12)

@@ -125,6 +125,19 @@ class LauncherTests(unittest.TestCase):
         for flag in ('--lr-patience 5','--lr-factor 0.3','--min-lr 0.000002'):
             self.assertIn(flag,result.stdout)
 
+    def test_learned_xyz_isolated_bootstrap(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt',
+                            'INITIALIZATION':'checkpoint','POSITION_DELIVERY':'quantized',
+                            'RENDER_STEPS':'1000','JOINT_STEPS':'100','LR_SCHEDULE':'plateau'},
+                           script='scripts/test_learned_xyz_bootstrap.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--position-delivery learned','--bootstrap-objective spatial-response',
+                     '--bootstrap-steps 5000','--render-steps 0','--joint-steps 0',
+                     '--lr 0.0002','--lr-schedule constant','--clip-mode none'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+        self.assertNotIn('--source ',result.stdout)
+
     def test_position_comparison_forces_three_random_render_only_runs(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INITIALIZATION':'checkpoint',
                             'INIT':'nonexistent.pt','BOOTSTRAP_STEPS':'2000','JOINT_STEPS':'100'},
