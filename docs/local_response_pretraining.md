@@ -41,7 +41,7 @@
 
 `--render-steps 300`，使用原始 PLY 渲染作为教师，完整场景多视角 RGB MSE。
 不再加入局部响应或参数重建辅助项。阶段切换保留模型权重、重置 Adam moments；
-两个阶段的初始学习率都是 1e-4，各自按固定验证指标独立调度，见下文。
+两个阶段的学习率默认都固定为 2e-4，不自动下降，见下文。
 300/2000 是便于迭代的预算，不是收敛保证。
 默认不裁剪梯度。模型最终是否有效以固定验证视角/噪声的渲染表现判断。
 
@@ -58,18 +58,22 @@
 `loss.jsonl` 会记录每步 `peak_allocated_mib` / `peak_reserved_mib`（CUDA运行时）。
 历史 `replay/checkpoint` 仅作为显式选项保留，纯渲染历史基线脚本仍固定 replay + constant LR。
 
-学习率默认 `--lr-schedule plateau`：
+学习率默认 `--lr 2e-4 --render-lr 2e-4 --lr-schedule constant`，
+两个阶段均固定，不因验证波动自动降低。为避免旧shell变量影响本轮，启动时可显式设置
+`LR=2e-4 RENDER_LR=2e-4 LR_SCHEDULE=constant`。
 
-- 初始：阶段一 `--lr 1e-4`，阶段二 `--render-lr 1e-4`。
+以下是保留的**显式可选** `--lr-schedule plateau` 行为，本轮默认不开启：
+
+- 阶段初始值分别来自 `--lr` 和 `--render-lr`。
 - 连续3次固定验证未超过0.5%的相对改善，乘0.5，最低1e-6。
 - 阶段一监控四布局平均局部验证loss；阶段二监控原有固定视角/噪声的渲染验证score。
 - 切换阶段重置调度状态与阶段初始LR，不比较不同目标的loss；不调节mask优化器LR。
 - 每次实际降LR后重置早停计数，避免刚降速就停止；最佳模型仍按每次真实改善保存。
-- `--lr-schedule constant` 可禁用；这些阈值是可配置工程默认值，不是理论最优值。
+- 这些阈值是可配置工程默认值，不是理论最优值。
 
 对应环境变量：`LR_SCHEDULE`、`LR_PATIENCE`、`LR_FACTOR`、`LR_THRESHOLD`、`MIN_LR`。
-调度只在验证时更新，`VALIDATE_EVERY` 决定两次更新之间训练多少步。
-短测默认阶段二只有300步，可能到末尾才首次降LR；欲观察降LR之后的训练，可设 `RENDER_STEPS=1000`。
+若显式开启调度，它只在验证时更新，`VALIDATE_EVERY` 决定两次更新之间训练多少步。
+固定学习率模式仍记录验证及学习率日志，但不会降LR或因调度重置早停计数。
 
 ## 服务器小实验
 

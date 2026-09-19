@@ -19,7 +19,8 @@ class LauncherTests(unittest.TestCase):
             (folder/'sparse').mkdir()
             (folder/'codec.pt').touch()
             env=os.environ.copy()
-            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES'):
+            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES',
+                        'LR','RENDER_LR','LR_SCHEDULE'):
                 env.pop(key,None)
             env.update(PYTHON_BIN='/bin/echo',PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
             env.update(overrides or {})
@@ -93,8 +94,8 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         for flag in ('--bootstrap-steps 2000','--render-steps 300',
                      '--bootstrap-objective local-response','--position-delivery quantized',
-                     '--position-bits 12','--render-lr 0.0001','--joint-steps 0',
-                     '--render-backward direct','--lr-schedule plateau','--lr-patience 3'):
+                     '--position-bits 12','--lr 0.0002','--render-lr 0.0002','--joint-steps 0',
+                     '--render-backward direct','--lr-schedule constant','--lr-patience 3'):
             self.assertIn(flag,result.stdout)
         self.assertNotIn('--init ',result.stdout)
         self.assertNotEqual(self.launch(script='scripts/test_local_response.sh').returncode,0)

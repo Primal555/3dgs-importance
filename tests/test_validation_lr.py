@@ -54,7 +54,7 @@ class ValidationLRTests(unittest.TestCase):
                   '--source','mock','--device','cuda','--render-steps','12','--validation-views','1',
                   '--validate-every','1','--hidden','16','--depth','1','--grid-dim','4','--levels','2',
                   '--block-size','8','--decoder-window','4','--lr-patience','2','--patience','2',
-                  '--min-lr','0.000025']
+                  '--min-lr','0.000025','--lr-schedule','plateau','--render-lr','0.0001']
             with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
                  patch('gaussian_jscc.rendering.load_cameras',return_value=render_fixture.RenderFirstTests().cameras()*2), \
                  patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \

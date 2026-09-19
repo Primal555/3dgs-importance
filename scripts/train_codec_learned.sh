@@ -39,8 +39,8 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --bootstrap-steps "${BOOTSTRAP_STEPS:-0}" --render-steps "${RENDER_STEPS:-1000}" --joint-steps "${JOINT_STEPS:-0}" \
   --bootstrap-objective "${BOOTSTRAP_OBJECTIVE:-feature}" --local-response-views "${LOCAL_RESPONSE_VIEWS:-4}" \
   --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" \
-  --rates 0 8 16 32 --lr "${LR:-0.0001}" --render-lr "${RENDER_LR:-0.0001}" \
-  --lr-schedule "${LR_SCHEDULE:-plateau}" --lr-factor "${LR_FACTOR:-0.5}" \
+  --rates 0 8 16 32 --lr "${LR:-0.0002}" --render-lr "${RENDER_LR:-0.0002}" \
+  --lr-schedule "${LR_SCHEDULE:-constant}" --lr-factor "${LR_FACTOR:-0.5}" \
   --lr-patience "${LR_PATIENCE:-3}" --lr-threshold "${LR_THRESHOLD:-0.005}" --min-lr "${MIN_LR:-0.000001}" \
   --clip-mode "${CLIP_MODE:-none}" --clip-norm "${CLIP_NORM:-10}" \
   --render-backward "${RENDER_BACKWARD:-direct}" --training-data-device "${TRAINING_DATA_DEVICE:-cpu}" --resolution "${RESOLUTION:-2}" \

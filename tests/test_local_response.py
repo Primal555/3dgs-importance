@@ -149,12 +149,14 @@ class LocalResponseTests(unittest.TestCase):
             self.assertEqual([r['phase'] for r in rows],['bootstrap','bootstrap','render','render'])
             self.assertTrue(all(r['grad_norm']>0 for r in rows))
             self.assertTrue(all(r['aux_loss']==0 for r in rows[2:]))
-            self.assertEqual([r['lr'] for r in rows],[1e-4,5e-5,1e-4,5e-5])
+            self.assertEqual([r['lr'] for r in rows],[2e-4]*4)
             self.assertTrue(all(r['render_backward']=='direct' for r in rows[2:]))
             lr_events=[json.loads(s) for s in (root/'run'/'lr_schedule.jsonl').read_text().splitlines()]
             baselines=[e for e in lr_events if e['baseline']]
             self.assertEqual([e['phase'] for e in baselines],['bootstrap','render'])
-            self.assertTrue(all(e['lr_before']==[1e-4] for e in baselines))
+            self.assertTrue(all(e['lr_before']==[2e-4] for e in baselines))
+            # Even aggressive plateau settings must not activate the opt-in scheduler.
+            self.assertTrue(all(not e['reduced'] and e['lr_after']==[2e-4] for e in lr_events))
             self.assertTrue((root/'run'/'codec_end_bootstrap.pt').exists())
             self.assertTrue((root/'run'/'codec_best_render.pt').exists())
             self.assertEqual(load_checkpoint(root/'run'/'codec.pt','cpu').cfg.position_delivery,'quantized')
