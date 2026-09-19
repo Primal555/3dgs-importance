@@ -163,7 +163,7 @@ class TrainingPerformanceTests(unittest.TestCase):
         with patch.object(model, 'forward_tier_batches', wraps=model.forward_tier_batches) as forward, \
              patch('gaussian_jscc.training.checkpoint', side_effect=AssertionError('must not checkpoint')):
             _, stats = full_scene_step(model,batches,geometry,10,'awgn',
-                                       lambda scene:scene.square().mean(),attr_weight=0,profile=True)
+                                       lambda scene:scene.square().mean(),attr_weight=0,profile=True,mode='direct')
         self.assertEqual(forward.call_count,len(batches))
         self.assertEqual(stats['render_backward'],'direct')
         self.assertIn('codec_backward_seconds',stats)

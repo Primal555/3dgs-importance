@@ -18,7 +18,7 @@ def policy_objective(log_probabilities, costs):
 
 
 def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr, kind,
-                        distortion_fn, beta=.001, auxiliary_weight=0., samples=2, mode='direct'):
+                        distortion_fn, beta=.001, auxiliary_weight=0., samples=2, mode='replay'):
     """Codec gets conditional backprop; categorical masks get REINFORCE.
 
     distortion_fn(decoded_rows, retained_original_ids) returns a render task

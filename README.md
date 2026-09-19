@@ -39,8 +39,10 @@ It starts from random weights with 12-bit/axis reliable XYZ, trains isolated
 Gaussian responses for 2000 steps, then full-scene rendering for 300 steps.
 Both learning rates are fixed at 2e-4 by default (`LR_SCHEDULE=constant`).
 Validation plateau decay remains explicit opt-in, not enabled for this experiment.
-The latest two-stage launcher uses **direct backward without codec recomputation**;
-it retains full-scene codec activations, so CUDA memory requirements are higher.
+The latest two-stage launcher uses **replay backward for full-scene rendering**;
+it recomputes codec batches with matching channel RNG to limit activation memory.
+Local-response pretraining uses ordinary backward without recomputation.
+Direct backward remains opt-in and exceeded memory in the full Truck experiment.
 There is no mixed mechanism or automatic fallback. LR events and per-step CUDA
 peak memory are logged. See
 [local-response objective, limitations and logs](docs/local_response_pretraining.md).

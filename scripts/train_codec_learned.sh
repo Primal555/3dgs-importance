@@ -43,7 +43,7 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --lr-schedule "${LR_SCHEDULE:-constant}" --lr-factor "${LR_FACTOR:-0.5}" \
   --lr-patience "${LR_PATIENCE:-3}" --lr-threshold "${LR_THRESHOLD:-0.005}" --min-lr "${MIN_LR:-0.000001}" \
   --clip-mode "${CLIP_MODE:-none}" --clip-norm "${CLIP_NORM:-10}" \
-  --render-backward "${RENDER_BACKWARD:-direct}" --training-data-device "${TRAINING_DATA_DEVICE:-cpu}" --resolution "${RESOLUTION:-2}" \
+  --render-backward "${RENDER_BACKWARD:-replay}" --training-data-device "${TRAINING_DATA_DEVICE:-cpu}" --resolution "${RESOLUTION:-2}" \
   --train-views "${TRAIN_VIEWS:-0}" --views-per-step "${VIEWS_PER_STEP:-2}" \
   --validate-every "${VALIDATE_EVERY:-100}" --validation-views "${VALIDATION_VIEWS:-4}" \
   --validation-trials "${VALIDATION_TRIALS:-2}" --patience "${PATIENCE:-8}" --save-every "${SAVE_EVERY:-500}"

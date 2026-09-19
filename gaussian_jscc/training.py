@@ -54,7 +54,7 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
 
 
 def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
-                    attr_weight=.1, seed_weight=.2, mode="direct", profile=False,
+                    attr_weight=.1, seed_weight=.2, mode="replay", profile=False,
                     batch_forward=None, gradient_observer=None):
     """Compute AND backpropagate one loss; caller clips/steps the optimizer.
 

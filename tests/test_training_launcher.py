@@ -20,7 +20,7 @@ class LauncherTests(unittest.TestCase):
             (folder/'codec.pt').touch()
             env=os.environ.copy()
             for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES',
-                        'LR','RENDER_LR','LR_SCHEDULE'):
+                        'LR','RENDER_LR','LR_SCHEDULE','RENDER_BACKWARD','BLOCKS_PER_BATCH'):
                 env.pop(key,None)
             env.update(PYTHON_BIN='/bin/echo',PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
             env.update(overrides or {})
@@ -95,10 +95,28 @@ class LauncherTests(unittest.TestCase):
         for flag in ('--bootstrap-steps 2000','--render-steps 300',
                      '--bootstrap-objective local-response','--position-delivery quantized',
                      '--position-bits 12','--lr 0.0002','--render-lr 0.0002','--joint-steps 0',
-                     '--render-backward direct','--lr-schedule constant','--lr-patience 3'):
+                     '--render-backward replay','--lr-schedule constant','--lr-patience 3'):
             self.assertIn(flag,result.stdout)
         self.assertNotIn('--init ',result.stdout)
         self.assertNotEqual(self.launch(script='scripts/test_local_response.sh').returncode,0)
+
+    def test_render_continuation_from_bootstrap(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INITIALIZATION':'checkpoint',
+                            'INIT':'fixture','BOOTSTRAP_STEPS':'0','RENDER_STEPS':'1000',
+                            'POSITION_DELIVERY':'quantized','POSITION_BITS':'12',
+                            'BLOCKS_PER_BATCH':'64','JOINT_STEPS':'0'},
+                           script='scripts/train_codec_learned.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--init ', '--bootstrap-steps 0','--render-steps 1000',
+                     '--position-delivery quantized','--position-bits 12',
+                     '--blocks-per-batch 64','--render-backward replay',
+                     '--lr 0.0002','--render-lr 0.0002','--lr-schedule constant'):
+            self.assertIn(flag,result.stdout)
+
+    def test_direct_remains_explicit_opt_in(self):
+        result=self.launch({'RENDER_BACKWARD':'direct'},script='scripts/train_codec_learned.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('--render-backward direct',result.stdout)
 
     def test_lr_settings_can_be_overridden(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','LR_PATIENCE':'5',

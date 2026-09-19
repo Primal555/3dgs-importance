@@ -63,7 +63,7 @@ class ValidationLRTests(unittest.TestCase):
                 main()
             rows=[json.loads(s) for s in (root/'run'/'loss.jsonl').read_text().splitlines()]
             self.assertEqual([r['lr'] for r in rows],[1e-4,1e-4,5e-5,5e-5,2.5e-5,2.5e-5])
-            self.assertTrue(all(r['render_backward']=='direct' for r in rows))
+            self.assertTrue(all(r['render_backward']=='replay' for r in rows))
             events=[json.loads(s) for s in (root/'run'/'lr_schedule.jsonl').read_text().splitlines()]
             self.assertEqual([e['step'] for e in events if e['reduced']],[2,4])
             self.assertTrue(events[0]['baseline'])

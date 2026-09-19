@@ -4,8 +4,8 @@
 
 当前 block 默认包含 256 个 Gaussian；`blocks-per-batch` 表示一次处理多少个这样的块。它不改变每个点的档位，也不把整块强制设成同一档。
 
-最新 `train-learned` / 两阶段入口默认 `direct`：保存全场景编解码图，反向不重算。
-没有混合机制或自动回退。原有 `replay` / `checkpoint` 仍可显式用于历史比较，二者都会重算。
+最新 `train-learned` / 两阶段入口默认 `replay`：第二阶段逐批重算编解码器以降低显存。
+第一阶段局部预训练不重算。没有混合机制或自动回退；`direct` / `checkpoint` 仍可显式选择。
 计时工具也接受 `--backward direct replay`；但下面的历史benchmark目标含辅助项，
 不能直接当作当前两阶段纯渲染训练的精确耗时。完整训练日志会记录CUDA峰值显存。
 

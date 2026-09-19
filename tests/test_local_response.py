@@ -150,7 +150,7 @@ class LocalResponseTests(unittest.TestCase):
             self.assertTrue(all(r['grad_norm']>0 for r in rows))
             self.assertTrue(all(r['aux_loss']==0 for r in rows[2:]))
             self.assertEqual([r['lr'] for r in rows],[2e-4]*4)
-            self.assertTrue(all(r['render_backward']=='direct' for r in rows[2:]))
+            self.assertTrue(all(r['render_backward']=='replay' for r in rows[2:]))
             lr_events=[json.loads(s) for s in (root/'run'/'lr_schedule.jsonl').read_text().splitlines()]
             baselines=[e for e in lr_events if e['baseline']]
             self.assertEqual([e['phase'] for e in baselines],['bootstrap','render'])

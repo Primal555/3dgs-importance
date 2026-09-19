@@ -45,18 +45,24 @@
 300/2000 是便于迭代的预算，不是收敛保证。
 默认不裁剪梯度。模型最终是否有效以固定验证视角/噪声的渲染表现判断。
 
-## 不重算反向传播与学习率
+## 分批重算反向传播与学习率
 
-最新两阶段入口默认 `--render-backward direct`：每批编解码器只前向一次，
-保留全部批次计算图；各相机依次渲染、累计场景梯度，最后通过保留的编解码图反传。
-没有混合缓存机制，也不会在显存不足时自动退回 replay。损失、信道抽样、档位和梯度
-语义不变。第一阶段仍是普通局部批次前向/反向。
+第二阶段默认 `--render-backward replay`：先无梯度编解码完整场景，计算渲染损失对
+场景的梯度，再用相同信道随机数逐批重算编解码器并反传。只保留当前批次的 codec
+激活；完整场景与渲染器仍占显存。第一阶段仍是普通局部批次前向/反向，不额外重算。
+没有混合缓存或自动切换机制，损失、档位和信道配置不变。
 
-**显存注意**：阶段二保留全场景 codec 激活，因此峰值可能远高于原来的 replay。
-第一阶段成功运行不代表阶段二能装入24 GB；减小 `BLOCKS_PER_BATCH` 也不能消除
-全场景激活总量。若 OOM，应停止并提供报错，不能把这个配置当成已验证能在4090跑通。
+`direct` 仍可显式选择，但 Truck 的883438点全场景运行已在第二阶段编码器前向 OOM。
+减小 `BLOCKS_PER_BATCH` 不能消除 direct 的全场景激活总量。replay 可尝试64个block，
+若峰值过高可降至32；旧版本约2秒/步不能作为新结构、多视角训练的速度保证。
 `loss.jsonl` 会记录每步 `peak_allocated_mib` / `peak_reserved_mib`（CUDA运行时）。
-历史 `replay/checkpoint` 仅作为显式选项保留，纯渲染历史基线脚本仍固定 replay + constant LR。
+
+第一阶段完成后若第二阶段 OOM，不必重跑预训练。使用 `scripts/train_codec_learned.sh`，
+设置 `INITIALIZATION=checkpoint INIT=/path/to/codec_end_bootstrap.pt BOOTSTRAP_STEPS=0`，
+并保持 `POSITION_DELIVERY=quantized POSITION_BITS=12`，显式设置 `RENDER_BACKWARD=replay`。
+不要使用强制随机初始化的 `test_local_response.sh` 来续训。输出目录必须另建。
+`--init` 加载模型及统计，不恢复Adam或随机数；正常 bootstrap→render 本来也清空Adam状态，
+但重新启动并非逐步完全复现原运行。
 
 学习率默认 `--lr 2e-4 --render-lr 2e-4 --lr-schedule constant`，
 两个阶段均固定，不因验证波动自动降低。为避免旧shell变量影响本轮，启动时可显式设置

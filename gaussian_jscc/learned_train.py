@@ -65,8 +65,8 @@ def add_parser(sub):
     p.add_argument('--power-floor', type=float, default=.01)
     p.add_argument('--clip-mode', choices=['none','global','branch'], default='none')
     p.add_argument('--clip-norm', type=float, default=10., help='only used if clipping enabled; empirical threshold')
-    p.add_argument('--render-backward', choices=['direct','replay','checkpoint'], default='direct',
-                   help='direct retains codec activations; no recomputation or automatic fallback')
+    p.add_argument('--render-backward', choices=['direct','replay','checkpoint'], default='replay',
+                   help='replay recomputes codec batches with the same channel RNG to save memory; direct retains all activations')
     p.add_argument('--training-data-device', choices=['cpu','cuda'], default='cpu')
     p.add_argument('--resolution', type=int, default=2)
     p.add_argument('--images', default='images')
@@ -213,8 +213,13 @@ def train(args):
     print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
           f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
+    backward_description = {
+        'replay': 'recompute codec batches with matching channel RNG; retain one batch of codec activations.',
+        'direct': 'retain the entire codec graph; no automatic recomputation fallback.',
+        'checkpoint': 'checkpoint codec batches and recompute during backward.',
+    }
     print(f'Backward: {args.render_backward}; LR schedule: {args.lr_schedule}. '
-          'direct retains the entire codec graph; no automatic recomputation fallback.',flush=True)
+          + backward_description[args.render_backward],flush=True)
 
     def initialization_loss(pred, target):
         if args.bootstrap_objective == 'local-response':
