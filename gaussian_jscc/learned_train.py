@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import pad_sequence
 from .codec import CodecConfig, GaussianCodec
 from .data import read_ply, Geometry, morton_order, to_features
 from .learned_training import discrete_joint_step, hard_layout
-from .optimization import clip_codec_gradients, preserved_rng, update_stats
+from .optimization import clip_codec_gradients, preserved_rng, update_stats, ValidationLRSchedule
 from .render_objective import bootstrap_loss, MultiViewRenderTask, split_cameras
 from .render_validation import append_json, validate_render
 from .training import full_scene_step
@@ -53,6 +53,11 @@ def add_parser(sub):
     p.add_argument('--rates', nargs=4, type=int, default=[0,8,16,32])
     p.add_argument('--lr', type=float, default=1e-4, help='bootstrap learning rate')
     p.add_argument('--render-lr', type=float, default=1e-4, help='render and joint codec learning rate')
+    p.add_argument('--lr-schedule', choices=['plateau','constant'], default='plateau')
+    p.add_argument('--lr-factor', type=float, default=.5)
+    p.add_argument('--lr-patience', type=int, default=3, help='consecutive bad validation checks before LR reduction')
+    p.add_argument('--lr-threshold', type=float, default=.005, help='relative validation improvement required by LR scheduler')
+    p.add_argument('--min-lr', type=float, default=1e-6)
     p.add_argument('--mask-lr', type=float, default=1e-3)
     p.add_argument('--mask-samples', type=int, default=2)
     p.add_argument('--beta', type=float, default=.001, help='joint-only normalized payload penalty; not a hard cap')
@@ -60,7 +65,8 @@ def add_parser(sub):
     p.add_argument('--power-floor', type=float, default=.01)
     p.add_argument('--clip-mode', choices=['none','global','branch'], default='none')
     p.add_argument('--clip-norm', type=float, default=10., help='only used if clipping enabled; empirical threshold')
-    p.add_argument('--render-backward', choices=['replay','checkpoint'], default='replay')
+    p.add_argument('--render-backward', choices=['direct','replay','checkpoint'], default='direct',
+                   help='direct retains codec activations; no recomputation or automatic fallback')
     p.add_argument('--training-data-device', choices=['cpu','cuda'], default='cpu')
     p.add_argument('--resolution', type=int, default=2)
     p.add_argument('--images', default='images')
@@ -88,11 +94,11 @@ def train(args):
     if min(args.bootstrap_steps,args.render_steps,args.joint_steps,args.patience,args.train_views) < 0 or args.bootstrap_steps+args.render_steps+args.joint_steps < 1:
         raise ValueError('invalid stage lengths/view count')
     if min(args.validate_every,args.validation_blocks,args.validation_views,args.validation_trials,
-           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views) < 1:
+           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views,args.lr_patience) < 1:
         raise ValueError('counts must be positive')
     if not 0 <= args.drop < 1 or args.mask_samples < 2:
         raise ValueError('invalid drop probability or mask-samples')
-    for key in ('lr','render_lr','mask_lr','clip_norm','power_floor','position_net_bits_per_use'):
+    for key in ('lr','render_lr','mask_lr','clip_norm','power_floor','position_net_bits_per_use','min_lr'):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             raise ValueError(f'{key} must be positive and finite')
     for key in ('beta','min_delta'):
@@ -100,6 +106,11 @@ def train(args):
             raise ValueError(f'{key} must be nonnegative and finite')
     if not math.isfinite(args.snr):
         raise ValueError('SNR must be finite')
+    if not 0 < args.lr_factor < 1 or not 0 <= args.lr_threshold < 1:
+        raise ValueError('invalid LR factor or relative threshold')
+    active_lrs = ([args.lr] if args.bootstrap_steps else []) + ([args.render_lr] if args.render_steps or args.joint_steps else [])
+    if args.lr_schedule == 'plateau' and args.min_lr > min(active_lrs):
+        raise ValueError('min-lr must not exceed any active phase starting LR')
     if args.bootstrap_steps and args.bootstrap_objective == 'local-response' and args.position_delivery == 'learned':
         raise ValueError('local-response bootstrap requires explicit XYZ delivery; no XYZ learning objective is included')
     needs_render = bool(args.render_steps or args.joint_steps)
@@ -202,6 +213,8 @@ def train(args):
     print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
           f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
+    print(f'Backward: {args.render_backward}; LR schedule: {args.lr_schedule}. '
+          'direct retains the entire codec graph; no automatic recomputation fallback.',flush=True)
 
     def initialization_loss(pred, target):
         if args.bootstrap_objective == 'local-response':
@@ -227,6 +240,7 @@ def train(args):
                 values.append({'layout':'mixed' if tier is None else str(tier),'loss':sum(losses)/len(losses)})
             model.train()
             append_json(out/'bootstrap_validation.jsonl',{'step':step,'objective':args.bootstrap_objective,'layouts':values})
+            return sum(v['loss'] for v in values)/len(values)
 
     def validation(step,phase):
         return validate_render(model,groups,group_ids,raw,geometry,val_cameras,reference,args.snr,
@@ -243,8 +257,7 @@ def train(args):
     step, selections, last_phase = 0, {}, None
     # Record actual render quality of the initializer, before changing weights.
     initial_validation = validation(0,'initial') if needs_render else None
-    if args.bootstrap_steps:
-        validate_bootstrap(0)
+    initial_bootstrap_score = validate_bootstrap(0) if args.bootstrap_steps else None
     for phase,maximum in [('bootstrap',args.bootstrap_steps),('render',args.render_steps),('joint',args.joint_steps)]:
         if not maximum:
             continue
@@ -255,14 +268,32 @@ def train(args):
         # moments across render -> joint, whose distortion is unchanged.
         if phase == 'render' and args.bootstrap_steps:
             optimizer.state.clear()
+        lr_schedule = ValidationLRSchedule(optimizer,args.lr_schedule,args.lr_factor,args.lr_patience,
+                                           args.lr_threshold,args.min_lr)
+
+        def schedule_lr(score, baseline=False):
+            event = lr_schedule.observe(score)
+            event.update(step=step,phase=phase,baseline=baseline,
+                         monitor='local_validation_loss' if phase == 'bootstrap' else 'render_validation_score')
+            append_json(out/'lr_schedule.jsonl',event)
+            if event['reduced']:
+                print(f'{phase}: validation plateau, LR {event["lr_before"][0]:g} -> '
+                      f'{event["lr_after"][0]:g}',flush=True)
+            return event['reduced']
+
         best, patience_best, stale = float('inf'),float('inf'),0
         if phase != 'bootstrap':
             initial = initial_validation if phase == 'render' and step == 0 else validation(step,phase)
             best = patience_best = initial['score']
             selections[phase] = {'step':step,'score':best}
             save('_best_'+phase,phase,step)
+            schedule_lr(best,baseline=True)
+        else:
+            schedule_lr(initial_bootstrap_score,baseline=True)
         for local_step in range(1,maximum+1):
             started = time.perf_counter()
+            if device.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats(device)
             step += 1
             optimizer.zero_grad(set_to_none=True)
             if mask_optimizer is not None:
@@ -319,15 +350,18 @@ def train(args):
                    'snr':args.snr,'lr':optimizer.param_groups[0]['lr'],'grad_norm':float(norm),
                    'update_norm':update_norm,'updates':updates,'step_seconds':time.perf_counter()-started,
                    **stats,**gradient_stats}
+            if device.type == 'cuda':
+                row.update(peak_allocated_mib=torch.cuda.max_memory_allocated(device)/2**20,
+                           peak_reserved_mib=torch.cuda.max_memory_reserved(device)/2**20)
             append_json(out/'loss.jsonl',row)
             if local_step == 1 or local_step%10 == 0:
                 print(f'{phase} {local_step}/{maximum}: loss={row["loss"]:.6f}, grad={float(norm):.4g}, '
-                      f'update={update_norm:.4g}, sec={row["step_seconds"]:.2f}',flush=True)
+                      f'update={update_norm:.4g}, lr={row["lr"]:g}, sec={row["step_seconds"]:.2f}',flush=True)
             if step%args.save_every == 0:
                 save(f'_{step}',phase,step)
             if local_step%args.validate_every == 0 or local_step == maximum:
                 if phase == 'bootstrap':
-                    validate_bootstrap(step)
+                    schedule_lr(validate_bootstrap(step))
                     # Track actual scene quality during initialization too; the
                     # local objective is not a substitute for held-out renders.
                     if needs_render:
@@ -344,6 +378,9 @@ def train(args):
                         patience_best,stale = score,0
                     else:
                         stale += 1
+                    if schedule_lr(score):
+                        # Let the reduced LR optimize before early stopping.
+                        stale = 0
                     if args.patience and stale >= args.patience:
                         print(f'{phase}: stopping after {stale} validation checks without sufficient MSE improvement.',flush=True)
                         break

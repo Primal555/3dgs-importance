@@ -40,8 +40,10 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --bootstrap-objective "${BOOTSTRAP_OBJECTIVE:-feature}" --local-response-views "${LOCAL_RESPONSE_VIEWS:-4}" \
   --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" \
   --rates 0 8 16 32 --lr "${LR:-0.0001}" --render-lr "${RENDER_LR:-0.0001}" \
+  --lr-schedule "${LR_SCHEDULE:-plateau}" --lr-factor "${LR_FACTOR:-0.5}" \
+  --lr-patience "${LR_PATIENCE:-3}" --lr-threshold "${LR_THRESHOLD:-0.005}" --min-lr "${MIN_LR:-0.000001}" \
   --clip-mode "${CLIP_MODE:-none}" --clip-norm "${CLIP_NORM:-10}" \
-  --render-backward replay --training-data-device "${TRAINING_DATA_DEVICE:-cpu}" --resolution "${RESOLUTION:-2}" \
+  --render-backward "${RENDER_BACKWARD:-direct}" --training-data-device "${TRAINING_DATA_DEVICE:-cpu}" --resolution "${RESOLUTION:-2}" \
   --train-views "${TRAIN_VIEWS:-0}" --views-per-step "${VIEWS_PER_STEP:-2}" \
   --validate-every "${VALIDATE_EVERY:-100}" --validation-views "${VALIDATION_VIEWS:-4}" \
   --validation-trials "${VALIDATION_TRIALS:-2}" --patience "${PATIENCE:-8}" --save-every "${SAVE_EVERY:-500}"

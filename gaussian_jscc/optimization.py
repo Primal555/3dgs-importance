@@ -5,6 +5,41 @@ import numpy as np
 import torch
 
 
+class ValidationLRSchedule:
+    """Phase-local plateau schedule; patience counts bad validation checks.
+
+    Defaults are explicit engineering choices, not loss-derived constants.
+    No training-step loss or cross-phase metric enters this scheduler.
+    """
+    def __init__(self, optimizer, mode='plateau', factor=.5, patience=3,
+                 threshold=.005, min_lr=1e-6):
+        if mode not in ('plateau', 'constant'):
+            raise ValueError('unknown learning-rate schedule')
+        if not 0 < factor < 1 or patience < 1 or not 0 <= threshold < 1:
+            raise ValueError('invalid LR factor/patience/relative threshold')
+        if not np.isfinite(min_lr) or min_lr <= 0:
+            raise ValueError('minimum LR must be positive and finite')
+        if mode == 'plateau' and min_lr > min(g['lr'] for g in optimizer.param_groups):
+            raise ValueError('minimum LR exceeds phase starting LR')
+        self.optimizer = optimizer
+        self.scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=factor, patience=patience-1,
+            threshold=threshold, threshold_mode='rel', min_lr=min_lr, eps=0.)
+            if mode == 'plateau' else None)
+
+    def observe(self, score):
+        score = float(score)
+        if not np.isfinite(score):
+            raise ValueError('nonfinite validation metric for LR schedule')
+        before = [g['lr'] for g in self.optimizer.param_groups]
+        if self.scheduler is not None:
+            self.scheduler.step(score)
+        after = [g['lr'] for g in self.optimizer.param_groups]
+        return {'metric': score, 'lr_before': before, 'lr_after': after,
+                'reduced': any(b > a for b, a in zip(before, after)),
+                'bad_checks': self.scheduler.num_bad_epochs if self.scheduler else 0}
+
+
 def parameter_group(name):
     if name.startswith('learned.'):
         part = name.split('.')[1]

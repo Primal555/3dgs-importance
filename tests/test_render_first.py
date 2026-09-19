@@ -54,21 +54,25 @@ class RenderFirstTests(unittest.TestCase):
         _,geometry,f,model=setup(16)
         batches=[(f[:8][None],torch.tensor([[1,2,3,1,2,3,0,1]])),
                  (f[8:][None],torch.tensor([[3,2,1,3,2,1,2,3]]))]
-        other=copy.deepcopy(model)
         outputs=[]
+        gradients=[]
         with patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
              patch('gaussian_jscc.training.reconstruction_loss',side_effect=AssertionError('auxiliary must not execute')):
-            for mode,m in [('replay',model),('checkpoint',other)]:
+            for mode in ('replay','checkpoint','direct'):
+                m=copy.deepcopy(model)
                 torch.manual_seed(125)
                 task=MultiViewRenderTask(self.cameras(),Reference(),0)
                 loss,stats=full_scene_step(m,batches,geometry,10,'awgn',task,attr_weight=0,mode=mode)
                 outputs.append(loss)
+                gradients.append([p.grad.clone() if p.grad is not None else None for p in m.parameters()])
                 self.assertEqual(stats['aux_loss'],0)
                 self.assertEqual(len(task.stats['view_mse']),2)
-        torch.testing.assert_close(outputs[0],outputs[1])
-        for (name,p),(_,q) in zip(model.named_parameters(),other.named_parameters()):
-            if p.grad is not None:
-                torch.testing.assert_close(p.grad,q.grad,atol=2e-6,rtol=2e-4,msg=name)
+        for i in (1,2):
+            torch.testing.assert_close(outputs[0],outputs[i])
+            for p,q in zip(gradients[0],gradients[i]):
+                self.assertEqual(p is None,q is None)
+                if p is not None:
+                    torch.testing.assert_close(p,q,atol=2e-6,rtol=2e-4)
 
     def test_render_equivalence_not_parameter_copy(self):
         raw,_,_,_=setup(16)

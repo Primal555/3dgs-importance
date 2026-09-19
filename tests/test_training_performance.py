@@ -117,7 +117,7 @@ class TrainingPerformanceTests(unittest.TestCase):
                 # Coupled scene objective: gradients depend on other blocks too.
                 def distortion(scene):
                     return scene.square().mean() + scene.mean(0).square().sum() * .1
-                for mode in ("autograd", "checkpoint", "replay"):
+                for mode in ("autograd", "checkpoint", "replay", "direct"):
                     torch.manual_seed(31)
                     model.zero_grad(set_to_none=True)
                     if mode == "autograd":
@@ -131,7 +131,7 @@ class TrainingPerformanceTests(unittest.TestCase):
                     losses.append(loss.detach())
                     gradients.append([p.grad.clone() if p.grad is not None else None for p in model.parameters()])
                     next_random.append(torch.rand(4))
-                for index in (1, 2):
+                for index in (1, 2, 3):
                     torch.testing.assert_close(losses[0], losses[index])
                     torch.testing.assert_close(next_random[0], next_random[index], atol=0, rtol=0)
                     for a, b in zip(gradients[0], gradients[index]):
@@ -144,18 +144,30 @@ class TrainingPerformanceTests(unittest.TestCase):
         model, geometry, _, _, batches = self.make_batches()
         model = model.cuda()
         results = []
-        for mode in ("checkpoint", "replay"):
+        for mode in ("checkpoint", "replay", "direct"):
             torch.manual_seed(71)
             model.zero_grad(set_to_none=True)
             loss, _ = full_scene_step(model, batches, geometry, 3., "awgn",
                                       lambda scene: scene.square().mean(), mode=mode)
             results.append((loss, [p.grad.clone() if p.grad is not None else None for p in model.parameters()],
                             torch.rand(8, device="cuda")))
-        torch.testing.assert_close(results[0][0], results[1][0])
-        torch.testing.assert_close(results[0][2], results[1][2], atol=0, rtol=0)
-        for a, b in zip(results[0][1], results[1][1]):
-            if a is not None:
-                torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-4)
+        for result in results[1:]:
+            torch.testing.assert_close(results[0][0], result[0])
+            torch.testing.assert_close(results[0][2], result[2], atol=0, rtol=0)
+            for a, b in zip(results[0][1], result[1]):
+                if a is not None:
+                    torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-4)
+
+    def test_direct_executes_codec_once_per_batch_and_never_checkpoints(self):
+        model, geometry, _, _, batches = self.make_batches()
+        with patch.object(model, 'forward_tier_batches', wraps=model.forward_tier_batches) as forward, \
+             patch('gaussian_jscc.training.checkpoint', side_effect=AssertionError('must not checkpoint')):
+            _, stats = full_scene_step(model,batches,geometry,10,'awgn',
+                                       lambda scene:scene.square().mean(),attr_weight=0,profile=True)
+        self.assertEqual(forward.call_count,len(batches))
+        self.assertEqual(stats['render_backward'],'direct')
+        self.assertIn('codec_backward_seconds',stats)
+        self.assertNotIn('codec_replay_backward_seconds',stats)
 
 
 if __name__ == "__main__":

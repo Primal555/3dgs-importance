@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--out", required=True, help="new timing output directory")
     parser.add_argument("--blocks-per-batch", type=int, nargs="+", default=[32])
-    parser.add_argument("--backward", nargs="+", choices=["replay", "checkpoint"], default=["replay"])
+    parser.add_argument("--backward", nargs="+", choices=["direct", "replay", "checkpoint"], default=["direct"])
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--snr", type=float, default=10.)

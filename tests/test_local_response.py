@@ -136,6 +136,7 @@ class LocalResponseTests(unittest.TestCase):
             argv=['gaussian_jscc','train-learned','--ply',str(root/'input.ply'),'--out',str(root/'run'),
                   '--source','mock','--device','cuda','--bootstrap-steps','2','--render-steps','2',
                   '--bootstrap-objective','local-response','--position-delivery','quantized',
+                  '--lr-patience','1','--lr-threshold','0.99',
                   '--validation-views','1','--validation-trials','1','--validate-every','1',
                   '--hidden','16','--depth','1','--grid-dim','4','--levels','2',
                   '--block-size','8','--blocks-per-batch','2','--decoder-window','4']
@@ -148,7 +149,12 @@ class LocalResponseTests(unittest.TestCase):
             self.assertEqual([r['phase'] for r in rows],['bootstrap','bootstrap','render','render'])
             self.assertTrue(all(r['grad_norm']>0 for r in rows))
             self.assertTrue(all(r['aux_loss']==0 for r in rows[2:]))
-            self.assertTrue(all(r['lr']==1e-4 for r in rows))
+            self.assertEqual([r['lr'] for r in rows],[1e-4,5e-5,1e-4,5e-5])
+            self.assertTrue(all(r['render_backward']=='direct' for r in rows[2:]))
+            lr_events=[json.loads(s) for s in (root/'run'/'lr_schedule.jsonl').read_text().splitlines()]
+            baselines=[e for e in lr_events if e['baseline']]
+            self.assertEqual([e['phase'] for e in baselines],['bootstrap','render'])
+            self.assertTrue(all(e['lr_before']==[1e-4] for e in baselines))
             self.assertTrue((root/'run'/'codec_end_bootstrap.pt').exists())
             self.assertTrue((root/'run'/'codec_best_render.pt').exists())
             self.assertEqual(load_checkpoint(root/'run'/'codec.pt','cpu').cfg.position_delivery,'quantized')

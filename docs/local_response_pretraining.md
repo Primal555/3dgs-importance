@@ -41,8 +41,35 @@
 
 `--render-steps 300`，使用原始 PLY 渲染作为教师，完整场景多视角 RGB MSE。
 不再加入局部响应或参数重建辅助项。阶段切换保留模型权重、重置 Adam moments；
-两个阶段默认学习率都是 1e-4。300/2000 是便于迭代的预算，不是收敛保证。
+两个阶段的初始学习率都是 1e-4，各自按固定验证指标独立调度，见下文。
+300/2000 是便于迭代的预算，不是收敛保证。
 默认不裁剪梯度。模型最终是否有效以固定验证视角/噪声的渲染表现判断。
+
+## 不重算反向传播与学习率
+
+最新两阶段入口默认 `--render-backward direct`：每批编解码器只前向一次，
+保留全部批次计算图；各相机依次渲染、累计场景梯度，最后通过保留的编解码图反传。
+没有混合缓存机制，也不会在显存不足时自动退回 replay。损失、信道抽样、档位和梯度
+语义不变。第一阶段仍是普通局部批次前向/反向。
+
+**显存注意**：阶段二保留全场景 codec 激活，因此峰值可能远高于原来的 replay。
+第一阶段成功运行不代表阶段二能装入24 GB；减小 `BLOCKS_PER_BATCH` 也不能消除
+全场景激活总量。若 OOM，应停止并提供报错，不能把这个配置当成已验证能在4090跑通。
+`loss.jsonl` 会记录每步 `peak_allocated_mib` / `peak_reserved_mib`（CUDA运行时）。
+历史 `replay/checkpoint` 仅作为显式选项保留，纯渲染历史基线脚本仍固定 replay + constant LR。
+
+学习率默认 `--lr-schedule plateau`：
+
+- 初始：阶段一 `--lr 1e-4`，阶段二 `--render-lr 1e-4`。
+- 连续3次固定验证未超过0.5%的相对改善，乘0.5，最低1e-6。
+- 阶段一监控四布局平均局部验证loss；阶段二监控原有固定视角/噪声的渲染验证score。
+- 切换阶段重置调度状态与阶段初始LR，不比较不同目标的loss；不调节mask优化器LR。
+- 每次实际降LR后重置早停计数，避免刚降速就停止；最佳模型仍按每次真实改善保存。
+- `--lr-schedule constant` 可禁用；这些阈值是可配置工程默认值，不是理论最优值。
+
+对应环境变量：`LR_SCHEDULE`、`LR_PATIENCE`、`LR_FACTOR`、`LR_THRESHOLD`、`MIN_LR`。
+调度只在验证时更新，`VALIDATE_EVERY` 决定两次更新之间训练多少步。
+短测默认阶段二只有300步，可能到末尾才首次降LR；欲观察降LR之后的训练，可设 `RENDER_STEPS=1000`。
 
 ## 服务器小实验
 
@@ -68,6 +95,7 @@ GPU 2 只是示例，运行前确认空闲。可以通过 `PLY`、`SCENE` 指定
 
 - `training.json`：目标、初始化、学习率、采样和通信配置。
 - `loss.jsonl`：phase=bootstrap/render；局部黑/白 MSE、总梯度、分支梯度、更新量。
+- `lr_schedule.jsonl`：各阶段基准指标、每次验证的学习率前后值、是否降低；`loss.jsonl.lr` 是该步实际使用值。
 - `bootstrap_validation.jsonl`：固定随机种子下各档位局部响应误差；与渲染 MSE 不可直接比较。
 - `validation.jsonl` 和 `validation_images/`：初始化、阶段一期间、阶段边界和阶段二的真实场景恢复。
 - `codec_end_bootstrap.pt`：阶段一终点；`codec_best_render.pt`：阶段二按验证 MSE 选择；
@@ -81,6 +109,8 @@ XYZ 侧流和源模型统计的交付假设、开销统计保持不变，不能�
 
 ```bash
 python -m unittest discover -s tests -p test_local_response.py -v
+python -m unittest discover -s tests -p test_training_performance.py -v
+python -m unittest discover -s tests -p test_validation_lr.py -v
 python -m unittest discover -s tests -v
 ```
 

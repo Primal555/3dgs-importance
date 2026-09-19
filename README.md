@@ -27,17 +27,22 @@ random initializations with learned XYZ, reliable float32 XYZ, or reliable
 quantized XYZ. Extra coordinate bits are counted; this is not an equal-total-rate
 comparison and does not simulate error correction for that side stream.
 
-The current observation priority is the preserved **quantized-12-bit, render-only**
-baseline: `CUDA_VISIBLE_DEVICES=2 bash scripts/train_quantized12_render_only.sh`
+The preserved **quantized-12-bit, render-only** baseline remains available:
+`CUDA_VISIBLE_DEVICES=2 bash scripts/train_quantized12_render_only.sh`
 (choose a free GPU). It fixes LR=1e-4, all training views, zero bootstrap/joint
 steps and defaults to 5000 steps. See [historical snapshot and continuation commands](docs/quantized12_render_only.md).
-The two-stage experiment is retained for later testing; it is not required by this launcher.
+It retains replay backward and constant LR for historical comparisons.
 
 For the optional two-stage experiment, use
 `CUDA_VISIBLE_DEVICES=2 bash scripts/test_local_response.sh` (choose a free GPU).
 It starts from random weights with 12-bit/axis reliable XYZ, trains isolated
 Gaussian responses for 2000 steps, then full-scene rendering for 300 steps.
-Both learning rates default to 1e-4. See
+Both learning rates start at 1e-4, with phase-local validation plateau decay
+(3 bad checks, 0.5% relative improvement threshold, factor 0.5, floor 1e-6).
+The latest two-stage launcher uses **direct backward without codec recomputation**;
+it retains full-scene codec activations, so CUDA memory requirements are higher.
+There is no mixed mechanism or automatic fallback. LR events and per-step CUDA
+peak memory are logged. See
 [local-response objective, limitations and logs](docs/local_response_pretraining.md).
 This replaces attribute-wise weighted losses in pretraining, not the final
 scene-rendering objective; it does not yet establish improved rendering quality.

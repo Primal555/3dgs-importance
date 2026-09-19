@@ -93,10 +93,18 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         for flag in ('--bootstrap-steps 2000','--render-steps 300',
                      '--bootstrap-objective local-response','--position-delivery quantized',
-                     '--position-bits 12','--render-lr 0.0001','--joint-steps 0'):
+                     '--position-bits 12','--render-lr 0.0001','--joint-steps 0',
+                     '--render-backward direct','--lr-schedule plateau','--lr-patience 3'):
             self.assertIn(flag,result.stdout)
         self.assertNotIn('--init ',result.stdout)
         self.assertNotEqual(self.launch(script='scripts/test_local_response.sh').returncode,0)
+
+    def test_lr_settings_can_be_overridden(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','LR_PATIENCE':'5',
+                            'LR_FACTOR':'0.3','MIN_LR':'0.000002'},script='scripts/test_local_response.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--lr-patience 5','--lr-factor 0.3','--min-lr 0.000002'):
+            self.assertIn(flag,result.stdout)
 
     def test_position_comparison_forces_three_random_render_only_runs(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INITIALIZATION':'checkpoint',
