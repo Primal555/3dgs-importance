@@ -1,4 +1,4 @@
-"""Decoupled XYZ / native shape / centered appearance bootstrap (v2).
+"""Decoupled XYZ / native shape / centered appearance bootstrap (v3).
 
 Position kernels never use predicted covariance or opacity. Unblurred shape
 matching cannot hide behind the global bandwidth floor or low alpha. Targets
@@ -12,6 +12,26 @@ from .local_response import footprint, view_frames, centered_response_loss
 
 
 DEFAULT_BANDWIDTHS = (.5, .125, .03125, .0078125)
+
+
+def fine_position_response(decoded, source, geometry, reference):
+    """Teacher-radius pseudo-Huber distance with bounded output-space slope.
+
+    d and r are in bbox-diagonal units. rho=(sqrt(d^2+r^2)-r)/reference.
+    The teacher max-axis radius controls quadratic-to-linear transition, NOT
+    the gradient magnitude: ||d rho / d delta|| <= 1/reference regardless of
+    how small the teacher splat is. Unlike an overlap kernel, the linear tail
+    still attracts displaced points. Predicted shape/alpha cannot change rho.
+    This is a 3D precision surrogate, not a camera/pixel loss, and does not give
+    every relative point error equal weight. Shared-network gradients can still
+    be amplified by its Jacobian; this is not a guarantee against all explosions.
+    """
+    diagonal = geometry.span.to(decoded).double().norm()
+    delta = (decoded[:,:3].double()-source[:,:3].detach().double())/diagonal
+    radius = (source[:,4:7].detach().double().amax(-1).exp()/diagonal).clamp_min(1e-12)
+    squared = delta.square().sum(-1)
+    # Rationalized form is exact at zero and stable for d << r.
+    return (squared / ((squared+radius.square()).sqrt()+radius) / reference).mean()
 
 
 def fixed_position_response(delta, bandwidths):
@@ -80,12 +100,12 @@ def position_metrics(pred, target, geometry):
 
 
 def spatial_response_loss(pred, target, geometry, model, views=4,
-                          bandwidths=DEFAULT_BANDWIDTHS, directions=None):
-    """Equal mean of fixed-position, native-shape and centered RGB responses.
+                          bandwidths=DEFAULT_BANDWIDTHS, directions=None, fine_weight=1.):
+    """Mean of (coarse + weighted fine position), native shape and centered RGB.
 
     Equal weights are an explicit experimental choice, not a claim that scalar
-    values imply equal gradient influence. Fixed position bandwidths only give
-    cold-start capture; render validation is still required for usable geometry.
+    values imply equal gradient influence. Fine position uses a teacher-radius
+    transition; render validation is still required for usable geometry.
     """
     if model.cfg.position_delivery != 'learned':
         raise ValueError('spatial-response requires learned XYZ, without a position side stream')
@@ -93,6 +113,8 @@ def spatial_response_loss(pred, target, geometry, model, views=4,
         raise ValueError('spatial response needs matching nonempty [N,D] inputs and positive views')
     if not bandwidths or any(not math.isfinite(s) or s <= 0 for s in bandwidths):
         raise ValueError('bandwidths must be positive and finite bbox-diagonal fractions')
+    if not math.isfinite(fine_weight) or fine_weight<0:
+        raise ValueError('fine_weight must be finite and nonnegative')
     target = target.detach()
     decoded = to_raw(pred, geometry, model)
     with torch.no_grad():
@@ -107,11 +129,17 @@ def spatial_response_loss(pred, target, geometry, model, views=4,
     delta = torch.einsum('vij,nj->nvi', frames, (decoded[:, :3]-source[:, :3])/diagonal)
 
     scale_losses = fixed_position_response(delta, bandwidths)
-    position = scale_losses.mean()
+    coarse = scale_losses.mean()
+    fine = fine_position_response(decoded,source,geometry,min(bandwidths))
+    position = coarse + fine_weight*fine
     shape = native_shape_response(decoded, source, frames)
     appearance, appearance_stats = centered_response_loss(decoded, source, directions, frames, model.cfg.sh_degree)
     loss = ((position+shape+appearance)/3).to(pred.dtype)
     stats = {'spatial_position_response':float(position.detach()),
+             'spatial_coarse_position_response':float(coarse.detach()),
+             'spatial_fine_position_response':float(fine.detach()),
+             'spatial_fine_weight':float(fine_weight),
+             'spatial_fine_contribution':float((fine_weight*fine/3).detach()),
              'spatial_native_shape_response':float(shape.detach()),
              'spatial_geometry_response':float(position.detach()),
              'spatial_appearance_response':float(appearance.detach()),

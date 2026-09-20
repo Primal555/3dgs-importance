@@ -7,6 +7,7 @@ image-quality benchmark. Sampled complete blocks preserve decoder context.
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -26,9 +27,13 @@ def main():
     p.add_argument('--sample-blocks',type=int,default=16)
     p.add_argument('--device',default='cpu')
     p.add_argument('--seed',type=int,default=42)
+    p.add_argument('--fine-weight',type=float,default=1.,help='0: v2 ablation; 1: v3 fine precision')
+    p.add_argument('--lr',type=float,default=2e-4)
     args=p.parse_args()
     if args.steps<0 or args.sample_blocks<4:
         p.error('steps >= 0 and sample-blocks >= 4 required')
+    if not math.isfinite(args.lr) or args.lr<=0 or not math.isfinite(args.fine_weight) or args.fine_weight<0:
+        p.error('positive finite lr and nonnegative finite fine-weight required')
     out=Path(args.out)
     if out.exists():
         raise FileExistsError(out)
@@ -72,13 +77,13 @@ def main():
                 v=pred.clone()
                 if xyz:v[:,:3]=target[:,:3]
                 if shape:v[:,4:7]=target[:,4:7]
-                loss,stats=spatial_response_loss(v,target,g,model,directions=directions)
+                loss,stats=spatial_response_loss(v,target,g,model,directions=directions,fine_weight=args.fine_weight)
                 variants[name]={'loss':float(loss),**stats}
             results[str(tier)]=variants
         return results
 
     before=evaluate()
-    optimizer=torch.optim.Adam(model.parameters(),lr=2e-4)
+    optimizer=torch.optim.Adam(model.parameters(),lr=args.lr)
     trace=[]
     for step in range(args.steps):
         model.train()
@@ -90,7 +95,7 @@ def main():
         q=(torch.randint(1,4,f.shape[:2],device=device) if tier==4 else
            torch.full(f.shape[:2],tier,device=device))
         pred=decode(f,q)
-        loss,stats=spatial_response_loss(pred.flatten(0,1),f.flatten(0,1),g,model)
+        loss,stats=spatial_response_loss(pred.flatten(0,1),f.flatten(0,1),g,model,fine_weight=args.fine_weight)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grads=[v.grad for v in model.parameters() if v.grad is not None]

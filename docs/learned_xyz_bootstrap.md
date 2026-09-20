@@ -40,13 +40,62 @@ v2替换训练目标，不修改接收端、不引入坐标侧流，也不裁小
 不得只凭新loss下降或尺度正常就宣称初始化成功，仍需检查离线真实渲染。
 旧v1的loss值不能直接与v2比较，日志中的objective已改为`spatial_response_v2`。
 
+## v3：原始椭球尺度控制的细位置项
+
+v2训练到20000步，参数损失继续改善但渲染没有改善，因此增加细位置监督。
+宽尺度核、原生形状、中心对齐外观均保留。新的位置项为：
+
+`L_position = L_coarse + w * L_fine`
+
+`L_fine = mean[(sqrt(d^2 + r^2) - r) / h]`
+
+- d：三维中心距离 / bbox对角线；不使用随机投影，因此每步都约束全部XYZ方向。
+- r：原始Gaussian最大轴标准差 / bbox对角线（仅数值下限1e-12）。
+- h：`min(spatial_bandwidths)`，默认0.0078125。它控制数值/梯度幅度，不是细位置的平滑宽度。
+- w：`--spatial-fine-weight`，默认1；脚本可用`SPATIAL_FINE_WEIGHT`设置。0严格退回v2目标组合。
+
+d较小时为平滑平方误差，偏差大于原始尺度后为近似线性惩罚，不会像Gaussian重叠核那样
+在偏差较大时失去吸引梯度。r只控制转折尺度，**不直接以1/r放大梯度**。
+相对bbox归一化位移的单点梯度范数不超过1/h；总loss中的贡献还乘w/3并平均。
+预测尺寸、旋转、透明度均不能改变此项，teacher仅用于loss，接收端无新增输入或额外坐标传输。
+采用等价有理式`d^2/(sqrt(d^2+r^2)+r)/h`避免小偏移的浮点抵消，float64计算后返回模型精度。
+
+这不是“无权重/无超参数”：w和h仍是实验选择，也不意味着神经网络参数梯度被同样上界限制。
+共享网络Jacobian仍可能放大梯度；不启用隐式梯度裁剪。它使用最大轴而非最小轴或真实相机
+footprint，不对每个相对误差等权，仍不是像素损失，更不保证渲染已经恢复。
+全流程保持bootstrap-only，没有暗中加入场景渲染训练或使用真实XYZ替换预测XYZ。
+
+新增日志/验证CSV字段：`spatial_coarse_position_response`、`spatial_fine_position_response`、
+`spatial_fine_weight`、`spatial_fine_contribution`（包含w/3的实际标量贡献）。
+日志objective为`spatial_response_v3`，不要直接比较v2/v3总loss数值。
+诊断脚本支持`--fine-weight 0/1`和`--lr`做相同起点、块采样、噪声与优化步数的对照。
+
+### v3 本地验证边界
+
+单元测试验证恒等点零loss/零梯度、极小teacher尺度下有限且有界的输出梯度、远处预测仍有
+吸引梯度、teacher无梯度、预测尺度不影响细位置项，以及w=0复现v2组合。
+
+真实Truck 20000步权重上，固定32个完整块（16训练、16验证）、相同噪声及120步优化：
+- 新建Adam、LR2e-4：w=0/0.1/1均出现位置反弹，不作为支持新目标优越性的证据。
+- 新建Adam、LR2e-5：w=0的q1/q2/q3验证XYZ RMSE约0.932/0.853/0.754；
+  w=1约0.912/0.845/0.754。初始约0.957/0.836/0.764；q2仍比初始略差。
+  这是单次固定噪声、小样本检查，改善很小，不能宣称优于v2或渲染已恢复。
+- 从随机权重运行缩小网络120步，q1/q2/q3 XYZ NRMSE约
+  0.10149/0.12711/0.15940 → 0.07568/0.07669/0.07422；与v2的短测试接近。
+  新目标的梯度幅度比v2更大但有限，未启用裁剪。输出空间上界不等于模型参数梯度上界。
+
+正式脚本仍保持随机初始化与2e-4，不默认加载旧权重；诊断中的小学习率不是偷偷修改正式参数。
+所有检查均未使用CUDA渲染，本机不能提供新目标的PSNR提升证据。
+
 ## 服务器启动
+
+当前默认使用v3，保留以上v2形状与外观约束，增加下述细位置项。
 
 ```bash
 cd /data/home/zhangyueheng/projects/3dgs-importance || exit 1
 conda activate maskgs
 git -c submodule.recurse=false pull --ff-only --no-recurse-submodules origin main || exit 1
-OUT="$PWD/output/truck_learned_xyz_v2_$(date +%Y%m%d_%H%M%S)"
+OUT="$PWD/output/truck_learned_xyz_v3_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$PWD/output"
 CUDA_VISIBLE_DEVICES=2 PYTHON_BIN="$(command -v python)" \
 BOOTSTRAP_STEPS=5000 BLOCKS_PER_BATCH=32 LR=2e-4 \

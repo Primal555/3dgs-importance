@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import torch
-from gaussian_jscc.spatial_response import spatial_response_loss, position_metrics, native_shape_response
+from gaussian_jscc.spatial_response import spatial_response_loss, position_metrics, native_shape_response, fine_position_response
 from gaussian_jscc.local_response import view_frames
 from gaussian_jscc.data import write_ply
 from test_learned_joint import setup
@@ -43,6 +43,42 @@ class SpatialResponseTests(unittest.TestCase):
         loss.backward()
         self.assertGreater(float(pred.grad[:,:3].sum()),1e-6)
         self.assertTrue(torch.isfinite(pred.grad).all())
+
+    def test_fine_gradient_bound_tiny_scales_and_zero(self):
+        raw,g,_,_=self.fixture()
+        for logscale in (-20.,-10.,0.):
+            source=raw.double().clone();source[:,4:7]=logscale
+            for shift in (0.,1e-8,.01,1000.):
+                pred=source.clone();pred[:,0]+=shift;pred.requires_grad_()
+                loss=fine_position_response(pred,source,g,.0078125)
+                loss.backward()
+                self.assertTrue(torch.isfinite(pred.grad).all())
+                # derivative wrt world XYZ includes 1 / bbox diagonal and mean N
+                bound=1/(.0078125*float(g.span.double().norm())*len(raw))
+                self.assertLessEqual(float(pred.grad[:,:3].norm(dim=-1).max()),bound*(1+1e-8))
+                self.assertEqual(float(pred.grad[:,3:].abs().sum()),0.)
+                if shift==0:
+                    self.assertEqual(float(loss.detach()),0.)
+                    self.assertEqual(float(pred.grad.abs().sum()),0.)
+                else:self.assertGreater(float(pred.grad[:,0].sum()),0.)
+
+    def test_fine_target_detached_and_prediction_shape_independent(self):
+        raw,g,_,_=self.fixture()
+        target=raw.clone().requires_grad_()
+        pred=raw.clone();pred[:,:3]+=.1;pred.requires_grad_()
+        first=fine_position_response(pred,target,g,.0078125)
+        first.backward()
+        self.assertIsNone(target.grad)
+        changed=pred.detach().clone();changed[:,3:]+=5
+        torch.testing.assert_close(first.detach(),fine_position_response(changed,target,g,.0078125))
+
+    def test_zero_weight_reproduces_v2_composition(self):
+        _,g,f,m=self.fixture()
+        pred=f.clone();pred[:,:3]+=.05
+        old,s=spatial_response_loss(pred,f,g,m,directions=torch.eye(3),fine_weight=0.)
+        new,t=spatial_response_loss(pred,f,g,m,directions=torch.eye(3),fine_weight=1.)
+        self.assertAlmostEqual(float(old),(s['spatial_coarse_position_response']+s['spatial_native_shape_response']+s['spatial_appearance_response'])/3,places=6)
+        self.assertAlmostEqual(float(new-old),t['spatial_fine_position_response']/3,places=6)
 
     def test_displaced_centers_cannot_reward_inflation(self):
         _,g,f,m=self.fixture()
@@ -140,7 +176,7 @@ class SpatialResponseTests(unittest.TestCase):
             self.assertEqual(len(rows),3)
             for r in rows:
                 self.assertEqual(r['phase'],'bootstrap')
-                self.assertEqual(r['objective'],'spatial_response_v2')
+                self.assertEqual(r['objective'],'spatial_response_v3')
                 self.assertGreater(r['gradient_groups']['xyz_head']['before'],0)
                 for key in ('spatial_position_response','spatial_native_shape_response',
                             'max_axis_ratio_p50','xyz_distance_over_source_radius_p50'):
@@ -149,7 +185,7 @@ class SpatialResponseTests(unittest.TestCase):
             self.assertEqual(len(vals),4)
             self.assertEqual([r['layout'] for r in vals[-1]['layouts']],['1','2','3','mixed'])
             self.assertTrue(all(r['position_side_stream_bits']==0 for r in vals[-1]['layouts']))
-            self.assertEqual(vals[-1]['loss_version'],'spatial_response_v2')
+            self.assertEqual(vals[-1]['loss_version'],'spatial_response_v3')
             self.assertTrue((root/'run/codec_best_bootstrap.pt').exists())
             self.assertTrue((root/'run/codec_end_bootstrap.pt').exists())
             self.assertFalse((root/'run/validation.jsonl').exists())

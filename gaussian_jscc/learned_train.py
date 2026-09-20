@@ -43,6 +43,8 @@ def add_parser(sub):
     p.add_argument('--local-response-views', type=int, default=4)
     p.add_argument('--spatial-bandwidths', nargs='+', type=float, default=list(DEFAULT_BANDWIDTHS),
                    help='fixed position-only kernel widths in bbox-diagonal units; native shape remains unblurred')
+    p.add_argument('--spatial-fine-weight', type=float, default=1.,
+                   help='teacher-radius bounded-slope position loss weight; 0 is the v2 objective ablation')
     p.add_argument('--render-steps', type=int, default=1000)
     p.add_argument('--joint-steps', type=int, default=0)
     p.add_argument('--block-size', type=int, default=256)
@@ -122,6 +124,8 @@ def train(args):
             raise ValueError('spatial-response test requires learned XYZ and bootstrap-only training')
         if not args.spatial_bandwidths or any(not math.isfinite(s) or s <= 0 for s in args.spatial_bandwidths):
             raise ValueError('spatial bandwidths must be positive and finite')
+        if not math.isfinite(args.spatial_fine_weight) or args.spatial_fine_weight<0:
+            raise ValueError('spatial-fine-weight must be finite and nonnegative')
     needs_render = bool(args.render_steps or args.joint_steps)
     if needs_render and (not args.source or not args.device.startswith('cuda')):
         raise ValueError('render/joint stages require CUDA and --source; CPU bootstrap checks set both to 0')
@@ -219,9 +223,10 @@ def train(args):
                   comparison='same JSCC payload, NOT equal total rate when side stream is enabled',
                   position_net_bits_per_use=args.position_net_bits_per_use)
     if spatial_test:
-        record.update(objective='spatial_response_v2',
+        record.update(objective='spatial_response_v3',
                       target='decoupled position, native shape and centered appearance; NOT scene rendering',
-                      loss_design='(fixed_position_response + native_shape_negative_log_overlap + centered_RGB_response) / 3; empirical equal weights',
+                      loss_design='(coarse_position + fine_weight * teacher_radius_pseudo_huber + native_shape_negative_log_overlap + centered_RGB_response) / 3; empirical weights',
+                      fine_position_design='3D distance; teacher max-axis transition radius; divided by min(spatial_bandwidths); slope bounded by inverse reference bandwidth in bbox-diagonal coordinates',
                       bootstrap_design='XYZ-only fixed kernels; unblurred coincident-center covariance; source/native footprint RGB probes',
                       scope='bootstrap-only; held-out spatial blocks from the same scene, NOT held-out rendered views',
                       diagnostic_aggregation='equal block/trial means; XYZ RMSE is mean per-block RMSE, not pooled global RMSE',
@@ -245,7 +250,8 @@ def train(args):
 
     def initialization_loss(pred, target):
         if spatial_test:
-            return spatial_response_loss(pred,target,geometry,model,args.local_response_views,args.spatial_bandwidths)
+            return spatial_response_loss(pred,target,geometry,model,args.local_response_views,args.spatial_bandwidths,
+                                         fine_weight=args.spatial_fine_weight)
         if args.bootstrap_objective == 'local-response':
             return local_response_loss(pred,target,geometry,model,args.local_response_views)
         start = 0 if model.cfg.position_delivery == 'learned' else 3
@@ -408,6 +414,7 @@ def train(args):
             append_json(out/'loss.jsonl',row)
             if local_step == 1 or local_step%10 == 0:
                 spatial_note = (f', pos={stats["spatial_position_response"]:.4g}'
+                                f', fine={stats["spatial_fine_position_response"]:.4g}'
                                 f', shape={stats["spatial_native_shape_response"]:.4g}'
                                 f', appearance={stats["spatial_appearance_response"]:.4g}'
                                 f', radius_ratio_p50={stats["max_axis_ratio_p50"]:.3g}'

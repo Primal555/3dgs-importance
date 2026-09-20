@@ -138,7 +138,7 @@ def plot_training(training_dir, output_dir=None):
     charts = []
     plt = _plt()
 
-    if rows[0].get('objective') in ('spatial_response_v1', 'spatial_response_v2'):
+    if rows[0].get('objective') in ('spatial_response_v1', 'spatial_response_v2', 'spatial_response_v3'):
         validation_rows = _read_jsonl(training_dir / 'bootstrap_validation.jsonl')
         entries = [dict(entry,step=r['step']) for r in validation_rows for entry in r['layouts']]
         fig, axes = plt.subplots(2, 2, figsize=(11, 7))
@@ -160,6 +160,8 @@ def plot_training(training_dir, output_dir=None):
                     'xyz_distance_p50_world','xyz_distance_p95_world','spatial_geometry_response',
                     'spatial_appearance_response','symbols_per_gaussian','position_side_stream_bits',
                     'spatial_position_response','spatial_native_shape_response',
+                    'spatial_coarse_position_response','spatial_fine_position_response',
+                    'spatial_fine_weight','spatial_fine_contribution',
                     'max_axis_ratio_p05','max_axis_ratio_p50','max_axis_ratio_p95',
                     'max_axis_ratio_gt10_fraction','max_axis_ratio_lt0_1_fraction',
                     'decoded_max_axis_p50_world','source_max_axis_p50_world',

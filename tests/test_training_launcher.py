@@ -133,7 +133,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         for flag in ('--position-delivery learned','--bootstrap-objective spatial-response',
                      '--bootstrap-steps 5000','--render-steps 0','--joint-steps 0',
-                     '--lr 0.0002','--lr-schedule constant','--clip-mode none'):
+                     '--lr 0.0002','--lr-schedule constant','--clip-mode none','--spatial-fine-weight 1'):
             self.assertIn(flag,result.stdout)
         self.assertNotIn('--init ',result.stdout)
         self.assertNotIn('--source ',result.stdout)
