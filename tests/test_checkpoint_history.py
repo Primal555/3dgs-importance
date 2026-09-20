@@ -1,4 +1,5 @@
 """Real codec and fixed noisy decoding; CPU renderer stand-in for offline history."""
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -38,7 +39,7 @@ class HistoryTests(unittest.TestCase):
                 save_checkpoint(train/f'codec_{step}.pt',model,step,{'source_gaussians':len(raw)})
             hashes={p.name:file_hash(p) for p in train.iterdir()}
             args=build_parser().parse_args(['--training',str(train),'--ply',str(ply),'--source','mock',
-                                          '--out',str(root/'eval'),'--stop','1000','--views','2',
+                                          '--stop','1000','--views','2',
                                           '--blocks-per-batch','2','--trials','2'])
             def render(*values):
                 self.assertFalse(torch.is_grad_enabled())
@@ -51,12 +52,23 @@ class HistoryTests(unittest.TestCase):
                 results=evaluate_history(args)
             self.assertEqual(load.call_count,1)
             self.assertEqual(results[0]['layouts'],results[1]['layouts'])
-            self.assertEqual(hashes,{p.name:file_hash(p) for p in train.iterdir()})
+            self.assertEqual(hashes,{p.name:file_hash(p) for p in train.iterdir() if p.is_file()})
+            out=train/'render_history'
+            self.assertFalse((root/'training_render_history').exists())
             for step in ('000500','001000'):
                 for tier in ('1','2','3','mixed'):
-                    self.assertTrue((root/'eval/validation_images'/step/f'{tier}_view00.png').exists())
+                    self.assertTrue((out/'validation_images'/step/f'{tier}_view00.png').exists())
             for name in ('metrics.csv','results.json','quality_vs_step.png','quality_vs_step.svg','evaluation_config.json'):
-                self.assertTrue((root/'eval'/name).exists())
+                self.assertTrue((out/name).exists())
+            config=json.loads((out/'evaluation_config.json').read_text())
+            self.assertEqual(config['out'],str(out))
+            with self.assertRaisesRegex(FileExistsError,'new evaluation directory'):
+                evaluate_history(args)
+
+    def test_explicit_output_override_is_still_accepted(self):
+        args=build_parser().parse_args(['--training','run','--ply','input.ply','--source','scene',
+                                      '--out','run/render_history_alternate'])
+        self.assertEqual(args.out,'run/render_history_alternate')
 
     def test_cpu_render_request_rejected(self):
         args=build_parser().parse_args(['--training','missing','--ply','missing','--source','missing',

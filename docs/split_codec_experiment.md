@@ -88,8 +88,13 @@ tail -f "${OUT}.log"
 
 - `$OUT/training.json`：确认 `codec_config.architecture=learned_split`、`init=null`。
 - `$OUT/loss.jsonl`、`bootstrap_validation.jsonl`、`charts/`：训练与参数组梯度。
-- `${OUT}_render_history/quality_vs_step.png`、`metrics.csv`、`results.json`：渲染曲线与明细。
-- `${OUT}_render_history/validation_images/000500/3_view00.png` 等：photo / source PLY / received / error。
+- `$OUT/render_history/quality_vs_step.png`、`metrics.csv`、`results.json`：渲染曲线与明细。
+- `$OUT/render_history/validation_images/000500/3_view00.png` 等：photo / source PLY / received / error。
+
+训练权重、结构化日志和评估现在都位于同一个实验目录。离线评估省略 `--out` 时，
+也默认使用 `--training` 目录下的 `render_history/`；不会覆盖已有评估。
+同一模型若需不同评估条件，可显式指定 `$OUT/render_history_noiseless` 等子目录。
+之前下载的同级 `_render_history` 目录不会自动移动、删除或覆盖。
 
 ## 本机能力检查与结果边界
 
@@ -121,3 +126,42 @@ python diagnose_split_codec.py --ply "$PLY" --out output/split_fit_check \
 各分支梯度、SH3、checkpoint/packet 往返、replay 一致性、离散 mask 联合梯度、
 CLI 随机初始化和架构不匹配拒绝、实际 Bash 参数构造。
 本轮完整测试：111 项，108 通过、3 项 CUDA 相关检查因本机条件跳过。
+
+## Truck 20000 步服务器结果复核（173021 实验）
+
+训练记录确认：随机初始化 learned_split、spatial_response_v3、fine_weight=1、
+固定 10 dB AWGN、LR=2e-4、无裁剪；仅 20000 步 bootstrap，render_steps=joint_steps=0。
+离线渲染并没有继续优化模型，不应把这些曲线称为渲染目标训练曲线。
+
+- 最终 q3：source PSNR=13.269 dB、SSIM=0.250、全场景 XYZ RMSE=0.723。
+  上一轮相同评估协议的共享结构对应 12.231 / 0.308 / 0.591。
+  新结构 PSNR 改善不等于结构恢复全面改善；不是等参数量实验。
+- 总梯度范数中位数 / 95 分位 / 最大值为 37.646 / 62.469 / 97.024。
+  上一轮对应中位数约 225、最大值约 346；本轮未见持续增长的爆炸模式。
+- 最后 1000 步，几何 decoder / 外观 decoder 的梯度范数中位数约 10.891 / 0.0039，
+  但 Adam 相对参数更新约 3.39e-4 / 4.49e-4。不能把梯度范数差异解释为外观分支不更新。
+- 固定验证块 q3：形状损失在 5000→20000 步仅 0.704→0.667；最大轴尺度比的
+  块中位数均值约 0.384，位置误差/原始最大轴半径的块中位数均值约 22.94。
+  这里不是全场景中位数，也不是球化程度指标。
+
+额外只读 CPU 检查：从 Morton 排序场景中均匀抽取 16 个完整 256 点块，
+固定 seed=142、q3、SNR 条件输入始终 10 dB，总共 4096 点：
+
+| 指标 | 数值 |
+|---|---:|
+| 无噪声 XYZ RMSE（抽样点整体统计） | 3.136 |
+| AWGN XYZ RMSE（抽样点整体统计） | 3.158 |
+| 原始最长/最短轴比值中位数 | 44.428 |
+| 解码最长/最短轴比值中位数，AWGN | 1.662 |
+| 解码/原始最大轴比值中位数，AWGN | 0.394 |
+| 位置距离小于原始最大轴半径的点比例，AWGN | 0.49% |
+
+抽样 RMSE 受背景/离群点影响，不能直接和全场景或按块平均的日志数值混比。
+这些样本显著趋于球形，不能从全场景渲染图单独确认的形状问题在参数层面得到了支持。
+
+用三个正交方向检查原生形状损失，原解码为 0.620；只替换原始尺度为 0.970，
+只替换原始旋转为 0.609，同时替换两者接近零。
+这是有 teacher 的损失诊断，不是合法通信方案，也不是实际渲染提升证据。
+尺度/旋转的配对和轴置换等价性意味着不能把单项替换解释为纯粹的旋转因果结论。
+它支持联合检查协方差形状恢复，不支持直接在部署时统一放大所有椭球。
+检查前后 checkpoint SHA256 一致，没有重新训练或改动权重。

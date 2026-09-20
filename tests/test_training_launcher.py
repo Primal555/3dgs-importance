@@ -162,6 +162,8 @@ class LauncherTests(unittest.TestCase):
                      '--resolution 4','--channel awgn'):
             self.assertIn(flag, result.stdout)
         self.assertNotIn('--init ', result.stdout)
+        self.assertIn('/run/render_history', result.stdout)
+        self.assertNotIn('/run_render_history', result.stdout)
 
     def test_split_codec_requires_gpu_and_valid_history_steps(self):
         result = self.launch(script='scripts/test_split_codec_bootstrap.sh')

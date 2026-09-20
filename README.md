@@ -55,6 +55,9 @@ An opt-in **geometry/appearance split codec** is now available with
 geometry/appearance decoder streams, and the same shared per-Gaussian payload.
 Run `CUDA_VISIBLE_DEVICES=2 bash scripts/test_split_codec_bootstrap.sh` on a free
 GPU for random bootstrap training followed by render history every 500 steps.
+Training files and evaluation results now share one experiment directory:
+render history lives in `EXPERIMENT/render_history/`. The offline evaluator also
+uses this location when `--out` is omitted, without overwriting existing results.
 This is experimental, not a demonstrated PSNR improvement. See
 [design, local checks and server commands](docs/split_codec_experiment.md).
 

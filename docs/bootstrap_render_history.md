@@ -16,7 +16,7 @@ cd /data/home/zhangyueheng/projects/3dgs-importance || exit 1
 conda activate maskgs
 git -c submodule.recurse=false pull --ff-only --no-recurse-submodules origin main || exit 1
 TRAIN="$PWD/output/truck_learned_xyz_bootstrap_20260920_101516"
-EVAL="$PWD/output/truck_xyz_render_history_$(date +%Y%m%d_%H%M%S)"
+EVAL="$TRAIN/render_history"
 CUDA_VISIBLE_DEVICES=2 nohup python -u evaluate_bootstrap_history.py \
   --training "$TRAIN" \
   --ply "$PWD/output/truck_mask_0005/point_cloud/iteration_30000/point_cloud.ply" \
@@ -33,7 +33,10 @@ GPU 2仅作示例，选空闲卡；需要安装CUDA光栅化扩展及完整Truck
 本机CPU只能执行模拟renderer的流程测试，不能给出真实场景PSNR。
 必须使用本轮原始PLY；脚本核对点数与SH阶数，但同点数不同PLY仍需用户保证身份正确。
 检查点配置与归一化统计不一致时停止，缺失任意请求步数也停止，不静默跳过。
-所有输出进入新目录，训练目录和权重只读；逐检查点保存结果，异常前完成的结果仍保留。
+默认所有评估输出进入训练目录内的 `render_history/` 子目录，下载一个实验目录即可。
+可以省略 `--out` 使用此默认位置。权重和已有训练日志只读；评估目录必须不存在，
+不会覆盖先前评估。不同条件可显式使用 `$TRAIN/render_history_noiseless` 等子目录。
+逐检查点保存结果，异常前完成的结果仍保留。历史同级目录不自动迁移或删除。
 
 ## 输出
 

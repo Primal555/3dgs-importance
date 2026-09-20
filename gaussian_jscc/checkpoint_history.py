@@ -63,8 +63,10 @@ def plot_history(rows, out):
 
 def build_parser():
     p=argparse.ArgumentParser(description=__doc__)
-    for name in ('training','ply','source','out'):
+    for name in ('training','ply','source'):
         p.add_argument('--'+name,required=True)
+    p.add_argument('--out', default=None,
+                   help='default: TRAINING/render_history; existing output is never overwritten')
     p.add_argument('--start',type=int,default=500)
     p.add_argument('--stop',type=int,default=5000)
     p.add_argument('--every',type=int,default=500)
@@ -92,10 +94,11 @@ def evaluate_history(args):
     if min(args.trials,args.blocks_per_batch)<1 or args.views<0 or not math.isfinite(args.snr):
         raise ValueError('invalid trials, batch size, views or SNR')
     paths=checkpoint_paths(args.training,args.start,args.stop,args.every)
-    out=Path(args.out)
+    out=Path(args.out) if args.out is not None else Path(args.training)/'render_history'
     if out.exists():
         raise FileExistsError(f'Use a new evaluation directory: {out}')
-    # Avoid writing evaluation artefacts into the training/checkpoint directory.
+    # Keep evaluation files in a separate subdirectory, not alongside weights.
+    # The experiment can now be copied as one complete directory.
     device=device_for(args.device)
     raw,degree=read_ply(args.ply)
     model=load_checkpoint(paths[0][1],device).eval()
@@ -121,6 +124,7 @@ def evaluate_history(args):
     reference=RenderReference(raw,degree,args.white_background,'source')
     out.mkdir(parents=True,exist_ok=False)
     record=vars(args).copy()
+    record['out']=str(out)
     record.update(scope='offline checkpoint evaluation, no optimization; same scene, not unseen-scene evidence',
                   source_gaussians=len(raw),checkpoint_steps=[s for s,_ in paths],
                   camera_indices=indices,camera_names=[str(getattr(c,'image_name',i)) for i,c in enumerate(cameras)],
