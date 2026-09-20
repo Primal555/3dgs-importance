@@ -67,6 +67,10 @@ GPU需选择空闲卡。可设置CHANNEL=none对照，但默认仍是10 dB AWGN�
 判断时必须同时看held-out块的位置误差、局部外观响应和xyz_head梯度，不能用总loss
 下降替代位置恢复证据，也不能由本测试宣称渲染质量、跨场景或多SNR能力已经解决。
 
+如需查看每500步的真实场景恢复图和PSNR，可在训练结束后运行
+[`evaluate_bootstrap_history.py`](bootstrap_render_history.md)补做只读渲染评估，
+不需要重跑第一阶段，也不会进入第二阶段优化。
+
 ## 本机检查
 
 CPU下验证了相同输入近零损失、位移产生朝目标的梯度、低透明度不屏蔽位置梯度、

@@ -55,6 +55,10 @@ For a separate **bootstrap-only learned XYZ experiment**, use
 It starts randomly, sends no per-point coordinate side stream, and jointly
 supervises XYZ/attributes with multiscale spatial responses; no camera loading
 or scene-render training runs. See [experimental loss, diagnostics and commands](docs/learned_xyz_bootstrap.md).
+To inspect saved bootstrap checkpoints every 500 steps without further training,
+use [offline render history evaluation](docs/bootstrap_render_history.md)
+(`evaluate_bootstrap_history.py`): fixed-camera images, source/photo PSNR/SSIM,
+PNG/SVG curves and CSV/JSON metrics, with read-only checkpoint verification.
 Training and evaluation export PNG/SVG charts, machine-readable logs and CSV data.
 The implementation adapts ROI-JSCC prefix transport and FCGS-inspired sender
 aggregation; upstream MaskGaussian scene training is unchanged.
