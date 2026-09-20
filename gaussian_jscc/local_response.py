@@ -9,7 +9,8 @@ the final objective. Sampling and regularization are explicit design choices.
 import math
 import torch
 from torch.nn import functional as F
-from .data import to_raw
+from .data import to_scene
+from .covariance import is_covariance_scene, scene_covariance, scene_sh_start
 from utils.sh_utils import eval_sh
 
 
@@ -31,12 +32,22 @@ def view_frames(directions):
 def footprint(raw, frames):
     # Factor out the largest log scale before forming covariance. All matrix
     # solves then operate on bounded 2x2 matrices, not scene-sized coordinates.
-    log_radius = raw[:,4:7].amax(-1)
-    factor = rotation_matrix(raw[:,7:11]) * (raw[:,4:7]-log_radius[:,None]).exp()[:,None,:]
-    projected = torch.einsum('vij,njk->nvik', frames, factor)
-    covariance = projected @ projected.transpose(-1,-2)
+    if is_covariance_scene(raw):
+        cov3 = scene_covariance(raw).double()
+        # Trace is a smooth positive scale even at repeated eigenvalues.
+        # No predicted eigenvectors or eigenvalues in this autograd path.
+        radius_squared = cov3.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min(1e-30)
+        log_radius = .5*radius_squared.log()
+        normalized = cov3 / radius_squared[:, None, None]
+        frames = frames.double()
+        covariance = frames[None] @ normalized[:, None] @ frames.transpose(-1,-2)[None]
+    else:
+        log_radius = raw[:,4:7].amax(-1)
+        factor = rotation_matrix(raw[:,7:11]) * (raw[:,4:7]-log_radius[:,None]).exp()[:,None,:]
+        projected = torch.einsum('vij,njk->nvik', frames, factor)
+        covariance = projected @ projected.transpose(-1,-2)
     # Finite footprint floor relative to the largest 3D axis (not loss weight).
-    covariance = covariance + 1e-5*torch.eye(2,device=raw.device,dtype=raw.dtype)
+    covariance = covariance + 1e-5*torch.eye(2,device=raw.device,dtype=covariance.dtype)
     return torch.linalg.cholesky(covariance), log_radius
 
 
@@ -52,8 +63,9 @@ def response_terms(raw, directions, cholesky, log_radius, reference_radius, prob
     squared_distance = whitened.square().sum(-2)
     alpha = raw[:,3].sigmoid()[:,None,None] * (-.5*squared_distance).exp()
     # PLY SH is channel-major; DC is stored separately from higher orders.
-    rest = raw[:,14:].reshape(len(raw),3,(degree+1)**2-1)
-    sh = torch.cat((raw[:,11:14,None],rest),-1)
+    start = scene_sh_start(raw)
+    rest = raw[:,start+3:].reshape(len(raw),3,(degree+1)**2-1)
+    sh = torch.cat((raw[:,start:start+3,None],rest),-1)
     color = (eval_sh(degree,sh[:,None],directions[None])+.5).clamp_min(0)
     black = alpha[...,None]*color[:,:,None,:]
     white = black + 1-alpha[...,None]
@@ -73,9 +85,9 @@ def local_response_loss(pred, target, geometry, model, views=4, directions=None)
     if views < 1 or pred.ndim != 2 or pred.shape != target.shape or not len(pred):
         raise ValueError('local response needs nonempty matching [N,D] inputs and positive views')
     target = target.detach()
-    decoded = to_raw(pred,geometry,model)
+    decoded = to_scene(pred,geometry,model)
     with torch.no_grad():
-        source = to_raw(target,geometry,model)
+        source = to_scene(target,geometry,model)
         if directions is None:
             directions = torch.randn(views,3,device=pred.device,dtype=pred.dtype)
         if directions.ndim != 2 or directions.shape[-1] != 3 or not torch.isfinite(directions).all() or (directions.norm(dim=-1)<1e-8).any():
@@ -96,7 +108,7 @@ def centered_response_loss(decoded, source, directions, frames, degree):
         source_chol, source_radius = footprint(source,frames)
     decoded_chol, decoded_radius = footprint(decoded,frames)
     with torch.no_grad():
-        points = stencil(decoded)
+        points = stencil(decoded).to(decoded_chol)
         source_probes = torch.einsum('nvij,pj->nvpi',source_chol,points)
         decoded_probes = torch.einsum('nvij,pj->nvpi',decoded_chol.detach(),points)
         decoded_probes *= (decoded_radius.detach()-source_radius).exp()[:,None,None,None]

@@ -16,6 +16,16 @@ def learned_terms(pred, target, model):
                      target[:, :3]/model.cfg.xyz_loss_scale, beta=.1)
     pa = pred[:, 3:] * model.attr_std + model.attr_mean
     ta = target[:, 3:] * model.attr_std + model.attr_mean
+    if model.cfg.architecture == 'learned_split_logcov':
+        from .covariance import unpack_symmetric
+        terms = dict(geometry=geometry,
+                     shape=unpack_symmetric(pa[:,1:7]-ta[:,1:7]).square().mean((-1,-2)),
+                     opacity=huber(pa[:,:1].sigmoid(),ta[:,:1].sigmoid(),.1)
+                             + .1*huber(pred[:,3:4],target[:,3:4]),
+                     dc=huber(pred[:,10:13],target[:,10:13]))
+        if pred.shape[-1] > 13:
+            terms['sh'] = huber(pred[:,13:],target[:,13:])
+        return terms
     # Quaternion sign ambiguity is handled without acos singularities.
     pq = F.normalize(pa[:, 4:8], dim=-1, eps=1e-4)
     tq = F.normalize(ta[:, 4:8], dim=-1, eps=1e-4)

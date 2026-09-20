@@ -14,7 +14,7 @@ import torch
 from torch.nn import functional as F
 
 from gaussian_jscc.codec import CodecConfig, GaussianCodec
-from gaussian_jscc.data import read_ply, prepare, to_features
+from gaussian_jscc.data import read_ply, prepare, to_features, fit_feature_statistics
 from gaussian_jscc.optimization import clip_codec_gradients, preserved_rng, update_stats
 from gaussian_jscc.spatial_response import spatial_response_loss
 
@@ -23,7 +23,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--ply', required=True)
     p.add_argument('--out', required=True)
-    p.add_argument('--architecture', choices=['learned_split', 'learned_joint'], default='learned_split')
+    p.add_argument('--architecture', choices=['learned_split', 'learned_joint', 'learned_split_logcov'], default='learned_split')
     p.add_argument('--steps', type=int, default=300)
     p.add_argument('--sample-blocks', type=int, default=4)
     p.add_argument('--block-size', type=int, default=256)
@@ -50,8 +50,7 @@ def main():
     m = GaussianCodec(CodecConfig(architecture=args.architecture, sh_degree=degree,
                                  hidden=args.hidden, depth=args.depth, block_size=args.block_size,
                                  decoder_window=args.window)).to(device)
-    m.attr_mean.copy_(raw[:, 3:].mean(0).to(device))
-    m.attr_std.copy_(raw[:, 3:].std(0, unbiased=False).clamp_min(.01).to(device))
+    fit_feature_statistics(raw, m)
     raw, geometry, _ = prepare(raw, m.cfg.morton_bits)
     count = len(raw) // args.block_size
     if count < args.sample_blocks:
@@ -63,7 +62,7 @@ def main():
     fitted, heldout = features[::2], features[1::2]
     out.mkdir(parents=True, exist_ok=False)
     manifest = dict(vars(args), initialization='random weights; PLY feature statistics',
-                    objective='spatial_response_v3; fine_weight=1; no clipping', snr=10,
+                    objective=('spatial_logcov_v1' if args.architecture == 'learned_split_logcov' else 'spatial_response_v3')+'; fine_weight=1; no clipping', snr=10,
                     parameters=sum(v.numel() for v in m.parameters()),
                     sample_indices=indices.tolist(), training_entries='even', heldout_entries='odd',
                     scope='fixed-block diagnostic only; no camera/render PSNR; no XYZ side stream')
@@ -99,7 +98,7 @@ def main():
                         append('validation.jsonl', row)
                         if label == '3':
                             print(f'{step} {name} {channel} q3: XYZ RMSE={stats["xyz_rmse_world"]:.5f}, '
-                                  f'shape={stats["spatial_native_shape_response"]:.5f}', flush=True)
+                                  f'shape={stats["spatial_shape_objective"]:.5f}', flush=True)
         m.train()
         return rows
 

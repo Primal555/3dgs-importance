@@ -10,7 +10,7 @@ OUT="${1:-$PROJECT/output/truck_learned_xyz_v3_$(date +%Y%m%d_%H%M%S)}"
 [[ -f "$PLY" ]] || { echo "Missing PLY: $PLY" >&2; exit 1; }
 [[ ! -e "$OUT" ]] || { echo "Output exists: $OUT" >&2; exit 1; }
 command -v "$PYTHON_BIN" >/dev/null || { echo 'Activate maskgs or set PYTHON_BIN.' >&2; exit 1; }
-echo 'spatial_response_v3: coarse + teacher-radius fine XYZ + native shape + centered RGB; random weights, no XYZ side stream or render training.'
+echo 'Random weights; position capture + fine XYZ + shape + centered RGB. No XYZ side stream or render training; exact objective is logged in training.json.'
 # Deliberately do not inherit INIT, POSITION_DELIVERY, RENDER_STEPS, JOINT_STEPS or LR_SCHEDULE.
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --ply "$PLY" --out "$OUT" --device "${DEVICE:-cuda}" \

@@ -7,14 +7,15 @@ This experimental surrogate is NOT scene-render distortion.
 """
 import math
 import torch
-from .data import to_raw
+from .data import to_scene
+from .covariance import max_log_radius, shape_spectrum, unpack_symmetric
 from .local_response import footprint, view_frames, centered_response_loss
 
 
 DEFAULT_BANDWIDTHS = (.5, .125, .03125, .0078125)
 
 
-def fine_position_response(decoded, source, geometry, reference):
+def fine_position_response(decoded, source, geometry, reference, source_log_radius=None):
     """Teacher-radius pseudo-Huber distance with bounded output-space slope.
 
     d and r are in bbox-diagonal units. rho=(sqrt(d^2+r^2)-r)/reference.
@@ -28,7 +29,8 @@ def fine_position_response(decoded, source, geometry, reference):
     """
     diagonal = geometry.span.to(decoded).double().norm()
     delta = (decoded[:,:3].double()-source[:,:3].detach().double())/diagonal
-    radius = (source[:,4:7].detach().double().amax(-1).exp()/diagonal).clamp_min(1e-12)
+    log_radius = max_log_radius(source) if source_log_radius is None else source_log_radius.detach()
+    radius = (log_radius.double().exp()/diagonal).clamp_min(1e-12)
     squared = delta.square().sum(-1)
     # Rationalized form is exact at zero and stable for d << r.
     return (squared / ((squared+radius.square()).sqrt()+radius) / reference).mean()
@@ -71,12 +73,23 @@ def native_shape_response(decoded, source, frames):
 
 
 @torch.no_grad()
-def shape_metrics(decoded, source):
-    pred_radius = decoded[:,4:7].amax(-1).exp()
-    source_radius = source[:,4:7].amax(-1).exp()
+def shape_metrics(decoded, source, predicted_logcov=None, target_logcov=None):
+    # For logcov models diagnose S directly: eigvalsh(exp(S).float()) can
+    # lose the very small axis of extremely flat splats to float32 roundoff.
+    pred_spectrum = (shape_spectrum(decoded) if predicted_logcov is None else
+                     torch.linalg.eigvalsh(predicted_logcov.double()))
+    source_spectrum = (shape_spectrum(source) if target_logcov is None else
+                       torch.linalg.eigvalsh(target_logcov.double()))
+    pred_radius = (.5*pred_spectrum[:,-1]).exp()
+    source_radius = (.5*source_spectrum[:,-1]).exp()
     ratio = pred_radius/source_radius
     distance = (decoded[:,:3]-source[:,:3]).norm(dim=-1)
-    return {'max_axis_ratio_p50':float(ratio.median()),
+    pred_anisotropy = (.5*(pred_spectrum[:,-1]-pred_spectrum[:,0])).exp()
+    source_anisotropy = (.5*(source_spectrum[:,-1]-source_spectrum[:,0])).exp()
+    return {'decoded_anisotropy_p50':float(pred_anisotropy.median()),
+            'source_anisotropy_p50':float(source_anisotropy.median()),
+            'decoded_near_sphere_fraction':float((pred_anisotropy<1.5).float().mean()),
+            'max_axis_ratio_p50':float(ratio.median()),
             'max_axis_ratio_p05':float(torch.quantile(ratio,.05)),
             'max_axis_ratio_p95':float(torch.quantile(ratio,.95)),
             'max_axis_ratio_gt10_fraction':float((ratio>10).float().mean()),
@@ -116,9 +129,9 @@ def spatial_response_loss(pred, target, geometry, model, views=4,
     if not math.isfinite(fine_weight) or fine_weight<0:
         raise ValueError('fine_weight must be finite and nonnegative')
     target = target.detach()
-    decoded = to_raw(pred, geometry, model)
+    decoded = to_scene(pred, geometry, model)
     with torch.no_grad():
-        source = to_raw(target, geometry, model)
+        source = to_scene(target, geometry, model)
         if directions is None:
             directions = torch.randn(views, 3, device=pred.device, dtype=pred.dtype)
         if (directions.ndim != 2 or directions.shape[-1] != 3 or
@@ -130,9 +143,21 @@ def spatial_response_loss(pred, target, geometry, model, views=4,
 
     scale_losses = fixed_position_response(delta, bandwidths)
     coarse = scale_losses.mean()
-    fine = fine_position_response(decoded,source,geometry,min(bandwidths))
+    logcov = model.cfg.architecture == 'learned_split_logcov'
+    predicted_logcov = target_logcov = source_log_radius = None
+    if logcov:
+        predicted_logcov = unpack_symmetric(pred[:,4:10]*model.attr_std[1:7]+model.attr_mean[1:7])
+        target_logcov = unpack_symmetric(target[:,4:10]*model.attr_std[1:7]+model.attr_mean[1:7])
+        with torch.no_grad():
+            source_log_radius = .5*torch.linalg.eigvalsh(target_logcov.double())[:,-1]
+        # Mean over nine matrix entries = ||S-S*||_F^2/9. Off-diagonal
+        # entries occur twice: packing six numbers does not change the metric.
+        residual = (pred[:,4:10]-target[:,4:10])*model.attr_std[1:7]
+        shape = unpack_symmetric(residual).square().mean()
+    else:
+        shape = native_shape_response(decoded, source, frames)
+    fine = fine_position_response(decoded,source,geometry,min(bandwidths),source_log_radius)
     position = coarse + fine_weight*fine
-    shape = native_shape_response(decoded, source, frames)
     appearance, appearance_stats = centered_response_loss(decoded, source, directions, frames, model.cfg.sh_degree)
     loss = ((position+shape+appearance)/3).to(pred.dtype)
     stats = {'spatial_position_response':float(position.detach()),
@@ -140,10 +165,11 @@ def spatial_response_loss(pred, target, geometry, model, views=4,
              'spatial_fine_position_response':float(fine.detach()),
              'spatial_fine_weight':float(fine_weight),
              'spatial_fine_contribution':float((fine_weight*fine/3).detach()),
-             'spatial_native_shape_response':float(shape.detach()),
+             ('spatial_logcov_shape_mse' if logcov else 'spatial_native_shape_response'):float(shape.detach()),
+             'spatial_shape_objective':float(shape.detach()),
              'spatial_geometry_response':float(position.detach()),
              'spatial_appearance_response':float(appearance.detach()),
-             **appearance_stats, **shape_metrics(decoded,source)}
+             **appearance_stats, **shape_metrics(decoded,source,predicted_logcov,target_logcov)}
     stats.update({f'spatial_scale_{i}_loss': float(x.detach()) for i, x in enumerate(scale_losses)})
     stats.update(position_metrics(pred, target, geometry))
     return loss, stats

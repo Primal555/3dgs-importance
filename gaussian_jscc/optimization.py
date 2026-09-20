@@ -44,6 +44,8 @@ def parameter_group(name):
     if name.startswith('learned.'):
         part = name.split('.')[1]
         if part == 'heads':
+            if name.split('.')[2] == 'logcov':
+                return 'covariance_head'
             return 'xyz_head' if name.split('.')[2] == 'xyz' else 'attribute_heads'
         if part.startswith(('enc_geometry', 'enc_appearance', 'dec_geometry', 'dec_appearance')):
             prefix, stream = part.split('_')[:2]

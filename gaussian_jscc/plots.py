@@ -138,7 +138,7 @@ def plot_training(training_dir, output_dir=None):
     charts = []
     plt = _plt()
 
-    if rows[0].get('objective') in ('spatial_response_v1', 'spatial_response_v2', 'spatial_response_v3'):
+    if rows[0].get('objective') in ('spatial_response_v1', 'spatial_response_v2', 'spatial_response_v3', 'spatial_logcov_v1'):
         validation_rows = _read_jsonl(training_dir / 'bootstrap_validation.jsonl')
         entries = [dict(entry,step=r['step']) for r in validation_rows for entry in r['layouts']]
         fig, axes = plt.subplots(2, 2, figsize=(11, 7))
@@ -159,13 +159,32 @@ def plot_training(training_dir, output_dir=None):
                    ['step','layout','loss','xyz_rmse_world','xyz_nrmse_bbox',
                     'xyz_distance_p50_world','xyz_distance_p95_world','spatial_geometry_response',
                     'spatial_appearance_response','symbols_per_gaussian','position_side_stream_bits',
-                    'spatial_position_response','spatial_native_shape_response',
+                    'spatial_position_response','spatial_native_shape_response','spatial_logcov_shape_mse',
+                    'decoded_anisotropy_p50','source_anisotropy_p50','decoded_near_sphere_fraction',
                     'spatial_coarse_position_response','spatial_fine_position_response',
                     'spatial_fine_weight','spatial_fine_contribution',
                     'max_axis_ratio_p05','max_axis_ratio_p50','max_axis_ratio_p95',
                     'max_axis_ratio_gt10_fraction','max_axis_ratio_lt0_1_fraction',
                     'decoded_max_axis_p50_world','source_max_axis_p50_world',
                     'xyz_distance_over_source_radius_p50','decoded_alpha_p50'])
+        if rows[0].get('objective') == 'spatial_logcov_v1':
+            fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+            fig.suptitle('Log-covariance: fixed-block shape diagnostics (not render quality)')
+            fields = (('spatial_logcov_shape_mse','Physical log-covariance Frobenius MSE / 9'),
+                      ('decoded_anisotropy_p50','Decoded max/min axis ratio: mean block median'),
+                      ('decoded_near_sphere_fraction','Decoded max/min axis ratio < 1.5: fraction'),
+                      ('max_axis_ratio_p50','Decoded/source max radius: mean block median'))
+            for axis, (key, label) in zip(axes.flat, fields):
+                for tier in ('1','2','3','mixed'):
+                    group = [r for r in entries if r['layout']==tier]
+                    axis.plot([r['step'] for r in group],_numeric(group,key),label='q'+tier)
+                if key == 'decoded_anisotropy_p50':
+                    teacher = [r for r in entries if r['layout']=='3']
+                    axis.plot([r['step'] for r in teacher],_numeric(teacher,'source_anisotropy_p50'),
+                              '--',color=REFERENCE,label='Source')
+                axis.set(xlabel='Bootstrap step',ylabel=label)
+                axis.legend(fontsize=8)
+            charts += _finish(fig,out/'bootstrap_logcov_shape')
 
     segments = _phase_segments(rows)
     fig, axes = plt.subplots(2, len(segments), figsize=(6 * len(segments), 7), squeeze=False)

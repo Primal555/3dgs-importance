@@ -76,9 +76,11 @@ class SplitLearnedCore(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.logcov = cfg.architecture == 'learned_split_logcov'
         h = cfg.hidden
-        self.enc_geometry_in = mlp(10, h)  # XYZ + log scale + quaternion
-        self.enc_appearance_in = mlp(cfg.attr_dim - 7, h)  # alpha + all SH
+        self.shape_end = 10 if self.logcov else 11
+        self.enc_geometry_in = mlp(self.shape_end - 1, h)
+        self.enc_appearance_in = mlp(cfg.attr_dim - (6 if self.logcov else 7), h)
         self.tier = nn.Embedding(4, h)
         self.snr = mlp(1, h)
         self.enc_geometry_blocks = nn.ModuleList(GeometryWindowBlock(cfg, i % 2 == 1) for i in range(cfg.depth))
@@ -98,8 +100,10 @@ class SplitLearnedCore(nn.Module):
         self.dec_geometry_refine = nn.Sequential(nn.LayerNorm(h), mlp(h, h))
         self.dec_appearance_refine = nn.Sequential(nn.LayerNorm(h), mlp(h, h))
         sizes = {'xyz': 3, 'opacity': 1, 'scale': 3, 'rotation': 4, 'dc': 3}
+        if self.logcov:
+            sizes = {'xyz': 3, 'opacity': 1, 'logcov': 6, 'dc': 3}
         if cfg.sh_degree:
-            sizes['sh'] = cfg.attr_dim - 11
+            sizes['sh'] = 3*((cfg.sh_degree+1)**2-1)
         self.heads = nn.ModuleDict({key: nn.Linear(h, size) for key, size in sizes.items()})
         nn.init.normal_(self.heads['xyz'].weight, std=.02)
         nn.init.constant_(self.heads['xyz'].bias, .5)
@@ -111,8 +115,8 @@ class SplitLearnedCore(nn.Module):
     def encode(self, features, xyz, q, snr):
         active = q > 0
         condition = self.condition(q, snr, features.dtype)
-        geometry = torch.cat((features[..., :3]*2-1, features[..., 4:11]), -1)
-        appearance = torch.cat((features[..., 3:4], features[..., 11:]), -1)
+        geometry = torch.cat((features[..., :3]*2-1, features[..., 4:self.shape_end]), -1)
+        appearance = torch.cat((features[..., 3:4], features[..., self.shape_end:]), -1)
         g = (self.enc_geometry_in(geometry) + condition) * active[..., None]
         a = (self.enc_appearance_in(appearance) + condition) * active[..., None]
         for gb, ab, exchange in zip(self.enc_geometry_blocks, self.enc_appearance_blocks, self.enc_exchange):
@@ -146,5 +150,5 @@ class SplitLearnedCore(nn.Module):
             a = (a + exchange(torch.cat((a, g), -1))) * active[..., None]
         g = self.dec_geometry_refine(g)
         a = self.dec_appearance_refine(a)
-        return torch.cat([head(g if key in ('xyz', 'scale', 'rotation') else a)
+        return torch.cat([head(g if key in ('xyz', 'scale', 'rotation', 'logcov') else a)
                           for key, head in self.heads.items()], -1) * active[..., None]

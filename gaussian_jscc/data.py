@@ -103,15 +103,21 @@ class Geometry:
 
 
 def to_features(raw, geometry, model):
+    from .covariance import feature_attributes
     unit = geometry.normalize(raw[:, :3])
-    attrs = (raw[:, 3:] - model.attr_mean) / model.attr_std
+    attrs = (feature_attributes(raw, model.cfg) - model.attr_mean) / model.attr_std
     return torch.cat((unit, attrs), -1), unit
 
 
-def to_raw(features, geometry, model):
+def to_scene(features, geometry, model):
+    """Differentiable physical scene; logcov models emit packed covariance."""
     unit = features[:, :3]
     xyz = geometry.denormalize(unit)
     attrs = features[:, 3:] * model.attr_std + model.attr_mean
+    if model.cfg.architecture == 'learned_split_logcov':
+        from .covariance import covariance_exp, pack_symmetric
+        covariance = pack_symmetric(covariance_exp(attrs[:, 1:7]))
+        return torch.cat((xyz, attrs[:, :1].clamp(-20, 20), covariance, attrs[:, 7:]), -1)
     rotation = attrs[:, 4:8]
     identity = torch.zeros_like(rotation)
     identity[:, 0] = 1
@@ -121,6 +127,20 @@ def to_raw(features, geometry, model):
     attrs = torch.cat((attrs[:, :1].clamp(-20, 20), attrs[:, 1:4].clamp(-20, 10),
                        rotation, attrs[:, 8:]), -1)
     return torch.cat((xyz, attrs), -1)
+
+
+def to_raw(features, geometry, model):
+    """Legacy PLY output. Logcov models support this only without gradients."""
+    from .covariance import export_raw
+    return export_raw(to_scene(features, geometry, model))
+
+
+@torch.no_grad()
+def fit_feature_statistics(raw, model):
+    from .covariance import feature_attributes
+    attrs = feature_attributes(raw, model.cfg)
+    model.attr_mean.copy_(attrs.mean(0).to(model.attr_mean))
+    model.attr_std.copy_(attrs.std(0, unbiased=False).clamp_min(.01).to(model.attr_std))
 
 
 def prepare(raw, bits, q=None):

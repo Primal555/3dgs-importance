@@ -4,7 +4,11 @@ set -euo pipefail
 PROJECT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT"
 : "${CUDA_VISIBLE_DEVICES:?Set CUDA_VISIBLE_DEVICES to an available GPU}"
-export ARCHITECTURE=learned_split
+case "${SPLIT_REPRESENTATION:-scale_rotation}" in
+  scale_rotation) export ARCHITECTURE=learned_split ;;
+  logcov) export ARCHITECTURE=learned_split_logcov ;;
+  *) echo 'Unknown SPLIT_REPRESENTATION' >&2; exit 1 ;;
+esac
 export BOOTSTRAP_STEPS="${BOOTSTRAP_STEPS:-5000}"
 export SAVE_EVERY="${SAVE_EVERY:-500}"
 export PLY="${PLY:-$PROJECT/output/truck_mask_0005/point_cloud/iteration_30000/point_cloud.ply}"
@@ -22,8 +26,12 @@ if [[ "$RENDER_HISTORY" == 1 ]]; then
   }
   [[ ! -e "$OUT/render_history" ]] || { echo 'Render history output exists.' >&2; exit 1; }
 fi
-echo 'learned_split: geometry/appearance streams, sender-relative local attention, ONE shared JSCC payload.'
-echo 'Loss, rates, LR and SNR remain matched to spatial_response_v3; this isolates the architecture change.'
+echo "$ARCHITECTURE: geometry/appearance streams, sender-relative local attention, ONE shared JSCC payload."
+if [[ "$ARCHITECTURE" == learned_split_logcov ]]; then
+  echo 'spatial_logcov_v1: logcov head and physical Frobenius shape loss replace scale/quaternion and native overlap.'
+else
+  echo 'Loss, rates, LR and SNR remain matched to spatial_response_v3; this isolates the architecture change.'
+fi
 bash "$PROJECT/scripts/test_learned_xyz_bootstrap.sh" "$OUT"
 if [[ "$RENDER_HISTORY" == 1 ]]; then
   "$PYTHON_BIN" -u evaluate_bootstrap_history.py \

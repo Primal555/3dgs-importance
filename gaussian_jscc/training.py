@@ -12,7 +12,7 @@ import torch
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .data import to_raw
+from .data import to_scene
 from .losses import reconstruction_loss
 
 
@@ -41,7 +41,7 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
     keep = q > 0
     pred, seed, target = pred[keep], seed[keep], features[keep]
     if len(pred) == 0:
-        result = (to_raw(pred, geometry, model), pred.sum())
+        result = (to_scene(pred, geometry, model), pred.sum())
         return (*result, {'geometry': pred.sum()}) if return_metrics else result
     if compute_auxiliary:
         auxiliary, terms = reconstruction_loss(pred, target, geometry, model, seed, seed_weight, return_terms=True)
@@ -49,7 +49,7 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
         # Render-only training must not even evaluate the historical parameter
         # objective (zero times an invalid auxiliary could still produce NaN).
         auxiliary, terms = pred.sum() * 0, {}
-    result = (to_raw(pred, geometry, model), auxiliary)
+    result = (to_scene(pred, geometry, model), auxiliary)
     return (*result, {key: value.mean() for key, value in terms.items()}) if return_metrics else result
 
 

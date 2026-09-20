@@ -47,8 +47,8 @@ class CodecConfig:
             raise ValueError('position_bits must be an integer in 1..16')
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
         self.geometry_rates = tuple(self.geometry_rates)
-        if self.architecture not in ('learned_joint', 'learned_split'):
-            raise ValueError('Supported architectures: learned_joint, learned_split; use Git history for old codecs')
+        if self.architecture not in ('learned_joint', 'learned_split', 'learned_split_logcov'):
+            raise ValueError('Supported architectures: learned_joint, learned_split, learned_split_logcov')
         if self.loss_profile != 'learned_v1' or self.position_head != 'learned_affine':
             raise ValueError('learned codecs require learned_v1 and learned_affine')
         if not self.individual_tiers or self.geometry_rates or self.geometry_floor != 1e-4:
@@ -77,7 +77,7 @@ class CodecConfig:
 
     @property
     def attr_dim(self):
-        return 8 + 3 * (self.sh_degree + 1) ** 2
+        return (7 if self.architecture == 'learned_split_logcov' else 8) + 3 * (self.sh_degree + 1) ** 2
 
     def to_dict(self):
         result = asdict(self)
@@ -89,8 +89,8 @@ class CodecConfig:
 
     @classmethod
     def from_dict(cls, values):
-        if values.get('architecture') not in ('learned_joint', 'learned_split'):
-            raise ValueError('Supported checkpoints: learned_joint, learned_split; use Git history for old codecs')
+        if values.get('architecture') not in ('learned_joint', 'learned_split', 'learned_split_logcov'):
+            raise ValueError('Supported checkpoints: learned_joint, learned_split, learned_split_logcov')
         return cls(**values)
 
 
@@ -254,7 +254,7 @@ class GaussianCodec(nn.Module):
         self.cfg = cfg
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
-        if cfg.architecture == 'learned_split':
+        if cfg.architecture in ('learned_split', 'learned_split_logcov'):
             from .split_codec import SplitLearnedCore
             self.learned = SplitLearnedCore(cfg)
         else:

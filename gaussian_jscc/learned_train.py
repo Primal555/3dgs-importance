@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from .codec import CodecConfig, GaussianCodec
-from .data import read_ply, Geometry, morton_order, to_features
+from .data import read_ply, Geometry, morton_order, to_features, fit_feature_statistics
 from .learned_training import discrete_joint_step, hard_layout
 from .optimization import clip_codec_gradients, preserved_rng, update_stats, ValidationLRSchedule
 from .render_objective import bootstrap_loss, MultiViewRenderTask, split_cameras
@@ -25,7 +25,7 @@ def add_parser(sub):
     for key in ('ply', 'out'):
         p.add_argument('--'+key, required=True)
     p.add_argument('--init', help='learned codec weights/statistics; fresh optimizer, NOT exact resume')
-    p.add_argument('--architecture', choices=['learned_joint', 'learned_split'], default=None,
+    p.add_argument('--architecture', choices=['learned_joint', 'learned_split', 'learned_split_logcov'], default=None,
                    help='random start defaults to learned_joint; init inherits checkpoint unless explicitly checked')
     p.add_argument('--allocation-init', help='matching route2.pt; requires --init and --joint-steps')
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
@@ -158,8 +158,7 @@ def train(args):
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
                           position_delivery=args.position_delivery,position_bits=args.position_bits)
         model = GaussianCodec(cfg).to(device)
-        model.attr_mean.copy_(original[:,3:].mean(0).to(device))
-        model.attr_std.copy_(original[:,3:].std(0,unbiased=False).clamp_min(.01).to(device))
+        fit_feature_statistics(original, model)
         if not args.bootstrap_steps:
             print('Training from random weights without bootstrap: valid, but render gradients may be poorly conditioned.',flush=True)
     if args.joint_steps and model.cfg.position_delivery != 'learned':
@@ -237,6 +236,14 @@ def train(args):
                       spatial_bandwidth_units='fraction of global source bbox diagonal; position-only cold-start scales, NOT shape smoothing',
                       initialization_success='requires native scale diagnostics AND offline fixed-view render quality; bootstrap loss alone is insufficient',
                       position_side_stream_bits=0)
+    if model.cfg.architecture == 'learned_split_logcov':
+        record.update(shape_representation='symmetric log covariance (xx,xy,xz,yy,yz,zz)',
+                      renderer_shape='matrix_exp -> packed covariance -> cov3D_precomp; no eigenvectors',
+                      export_shape='eigh -> scale/quaternion only for no-grad PLY export')
+        if spatial_test:
+            record.update(objective='spatial_logcov_v1',
+                          loss_design='(coarse_position + fine_weight * teacher_radius_pseudo_huber + logcov_Frobenius_squared/9 + centered_RGB_response) / 3; empirical equal group weights',
+                          bootstrap_design='unchanged XYZ kernels and centered RGB; replaces native shape overlap by physical logcov MSE')
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'{record["objective"]}: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
@@ -419,7 +426,7 @@ def train(args):
             if local_step == 1 or local_step%10 == 0:
                 spatial_note = (f', pos={stats["spatial_position_response"]:.4g}'
                                 f', fine={stats["spatial_fine_position_response"]:.4g}'
-                                f', shape={stats["spatial_native_shape_response"]:.4g}'
+                                f', shape={stats["spatial_shape_objective"]:.4g}'
                                 f', appearance={stats["spatial_appearance_response"]:.4g}'
                                 f', radius_ratio_p50={stats["max_axis_ratio_p50"]:.3g}'
                                 if spatial_test else '')

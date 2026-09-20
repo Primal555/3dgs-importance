@@ -61,6 +61,15 @@ uses this location when `--out` is omitted, without overwriting existing results
 This is experimental, not a demonstrated PSNR improvement. See
 [design, local checks and server commands](docs/split_codec_experiment.md).
 
+The opt-in `learned_split_logcov` experiment replaces separate scale/quaternion
+prediction with a symmetric log-covariance head and Frobenius shape supervision.
+Training renders its matrix exponential directly with `cov3D_precomp`; only
+no-gradient PLY export decomposes covariance into scales/rotation. Launch with
+`CUDA_VISIBLE_DEVICES=2 bash scripts/test_logcov_codec_bootstrap.sh` on a free GPU.
+Random start, individual 8/16/32-symbol tiers, no coordinate side stream, and
+nested `render_history/` are preserved. See
+[loss, representation boundaries, diagnostics and commands](docs/logcov_codec_experiment.md).
+
 For a separate **bootstrap-only learned XYZ experiment**, use
 `CUDA_VISIBLE_DEVICES=2 bash scripts/test_learned_xyz_bootstrap.sh`.
 It starts randomly, sends no per-point coordinate side stream, and jointly

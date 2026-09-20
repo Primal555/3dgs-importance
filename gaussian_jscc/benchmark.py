@@ -119,7 +119,9 @@ def benchmark_codec(args):
                         stats = transmit(model, raw, q, snr, channel_kind, args.seed + trial,
                                          packet, args.metadata_code_rate,
                                          args.metadata_modulation_bits)
-                        recovered = receive(model, packet)
+                        recovered_scene = receive(model, packet, native_scene=True)
+                        from .covariance import export_raw
+                        recovered = export_raw(recovered_scene)
                     finally:
                         if temporary is not None:
                             temporary.cleanup()
@@ -136,7 +138,7 @@ def benchmark_codec(args):
                     if cameras:
                         from .rendering import evaluate_views
                         hybrid = args.hybrid_ablation
-                        metrics = evaluate_views(recovered.to(device), reference, cameras, degree,
+                        metrics = evaluate_views(recovered_scene.to(device), reference, cameras, degree,
                                                  args.white_background,
                                                  run / "views" if args.save_images else None,
                                                  args.lpips,

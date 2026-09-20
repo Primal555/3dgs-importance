@@ -173,6 +173,19 @@ class LauncherTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('positive multiple', result.stderr)
 
+    def test_logcov_launcher_is_random_and_evaluates_inside_experiment(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt',
+                            'ARCHITECTURE':'learned_joint','POSITION_DELIVERY':'quantized',
+                            'BOOTSTRAP_STEPS':'1000','SAVE_EVERY':'500'},
+                           script='scripts/test_logcov_codec_bootstrap.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--architecture learned_split_logcov','--position-delivery learned',
+                     '--bootstrap-steps 1000','--render-steps 0','--lr 0.0002',
+                     '--clip-mode none','--channel awgn','--snr 10',
+                     '--start 500 --stop 1000 --every 500','/run/render_history'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+
 
 if __name__=='__main__':
     unittest.main()
