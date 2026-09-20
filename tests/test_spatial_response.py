@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import torch
-from gaussian_jscc.spatial_response import spatial_response_loss, position_metrics
+from gaussian_jscc.spatial_response import spatial_response_loss, position_metrics, native_shape_response
+from gaussian_jscc.local_response import view_frames
 from gaussian_jscc.data import write_ply
 from test_learned_joint import setup
 
@@ -41,6 +42,58 @@ class SpatialResponseTests(unittest.TestCase):
         loss, _=spatial_response_loss(pred,target,g,m)
         loss.backward()
         self.assertGreater(float(pred.grad[:,:3].sum()),1e-6)
+        self.assertTrue(torch.isfinite(pred.grad).all())
+
+    def test_displaced_centers_cannot_reward_inflation(self):
+        _,g,f,m=self.fixture()
+        directions=torch.eye(3)
+        shifted=f.clone();shifted[:,:3]+=.2
+        base,bs=spatial_response_loss(shifted,f,g,m,directions=directions)
+        for factor in (.01,.1,.5,2.,10.,34.,266.):
+            inflated=shifted.clone()
+            inflated[:,4:7]+=torch.log(torch.tensor(factor))/m.attr_std[1:4]
+            inflated.requires_grad_()
+            loss,stats=spatial_response_loss(inflated,f,g,m,directions=directions)
+            self.assertAlmostEqual(stats['spatial_position_response'],bs['spatial_position_response'],places=10)
+            self.assertGreater(float(loss.detach()),float(base.detach()))
+            loss.backward()
+            # Correct both inflation and contraction, not just make all small.
+            derivative=float((inflated.grad[:,4:7]/m.attr_std[1:4]).sum())
+            self.assertGreater(derivative*(1 if factor>1 else -1),0)
+            self.assertTrue(torch.isfinite(inflated.grad).all())
+
+    def test_shape_cannot_hide_in_low_opacity_or_shift(self):
+        _,g,f,m=self.fixture()
+        inflated=f.clone();inflated[:,4:7]+=2/m.attr_std[1:4]
+        _,a=spatial_response_loss(inflated,f,g,m,directions=torch.eye(3))
+        inflated[:,:3]+=10;inflated[:,3]=-100
+        _,b=spatial_response_loss(inflated,f,g,m,directions=torch.eye(3))
+        self.assertAlmostEqual(a['spatial_native_shape_response'],b['spatial_native_shape_response'],places=10)
+        self.assertGreater(b['spatial_native_shape_response'],0)
+
+    def test_native_shape_scale_invariance_and_nonsaturating_gradient(self):
+        raw,_,_,_=self.fixture()
+        _,frames=view_frames(torch.eye(3))
+        target=raw.clone(); target[:,4:7]=-8
+        for factor in (34.,266.,10000.):
+            pred=target.clone();pred[:,4:7]+=torch.log(torch.tensor(factor));pred.requires_grad_()
+            loss=native_shape_response(pred,target,frames)
+            loss.backward()
+            self.assertTrue(torch.isfinite(pred.grad).all())
+            self.assertGreater(float(pred.grad[:,4:7].sum()),.5)
+            scaled_p=pred.detach().clone();scaled_t=target.clone()
+            scaled_p[:,4:7]+=3;scaled_t[:,4:7]+=3
+            self.assertAlmostEqual(float(loss.detach()),float(native_shape_response(scaled_p,scaled_t,frames)),places=5)
+
+    def test_extreme_anisotropy_finite_gradients(self):
+        _,g,f,m=self.fixture()
+        target=f.clone();pred=f.clone()
+        target[:,4:7]=(torch.tensor([-12.,-5.,0.])-m.attr_mean[1:4])/m.attr_std[1:4]
+        pred[:,4:7]=(torch.tensor([8.,-10.,-3.])-m.attr_mean[1:4])/m.attr_std[1:4]
+        pred.requires_grad_()
+        loss,_=spatial_response_loss(pred,target,g,m,directions=torch.eye(3))
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
         self.assertTrue(torch.isfinite(pred.grad).all())
 
     def test_all_heads_receive_gradients_and_loss_can_decrease(self):
@@ -87,12 +140,16 @@ class SpatialResponseTests(unittest.TestCase):
             self.assertEqual(len(rows),3)
             for r in rows:
                 self.assertEqual(r['phase'],'bootstrap')
-                self.assertEqual(r['objective'],'spatial_response_v1')
+                self.assertEqual(r['objective'],'spatial_response_v2')
                 self.assertGreater(r['gradient_groups']['xyz_head']['before'],0)
+                for key in ('spatial_position_response','spatial_native_shape_response',
+                            'max_axis_ratio_p50','xyz_distance_over_source_radius_p50'):
+                    self.assertIn(key,r)
             vals=[json.loads(s) for s in (root/'run/bootstrap_validation.jsonl').read_text().splitlines()]
             self.assertEqual(len(vals),4)
             self.assertEqual([r['layout'] for r in vals[-1]['layouts']],['1','2','3','mixed'])
             self.assertTrue(all(r['position_side_stream_bits']==0 for r in vals[-1]['layouts']))
+            self.assertEqual(vals[-1]['loss_version'],'spatial_response_v2')
             self.assertTrue((root/'run/codec_best_bootstrap.pt').exists())
             self.assertTrue((root/'run/codec_end_bootstrap.pt').exists())
             self.assertFalse((root/'run/validation.jsonl').exists())

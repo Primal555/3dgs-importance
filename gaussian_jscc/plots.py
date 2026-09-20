@@ -138,7 +138,7 @@ def plot_training(training_dir, output_dir=None):
     charts = []
     plt = _plt()
 
-    if rows[0].get('objective') == 'spatial_response_v1':
+    if rows[0].get('objective') in ('spatial_response_v1', 'spatial_response_v2'):
         validation_rows = _read_jsonl(training_dir / 'bootstrap_validation.jsonl')
         entries = [dict(entry,step=r['step']) for r in validation_rows for entry in r['layouts']]
         fig, axes = plt.subplots(2, 2, figsize=(11, 7))
@@ -158,7 +158,12 @@ def plot_training(training_dir, output_dir=None):
         _write_csv(out/'bootstrap_position_validation.csv',entries,
                    ['step','layout','loss','xyz_rmse_world','xyz_nrmse_bbox',
                     'xyz_distance_p50_world','xyz_distance_p95_world','spatial_geometry_response',
-                    'spatial_appearance_response','symbols_per_gaussian','position_side_stream_bits'])
+                    'spatial_appearance_response','symbols_per_gaussian','position_side_stream_bits',
+                    'spatial_position_response','spatial_native_shape_response',
+                    'max_axis_ratio_p05','max_axis_ratio_p50','max_axis_ratio_p95',
+                    'max_axis_ratio_gt10_fraction','max_axis_ratio_lt0_1_fraction',
+                    'decoded_max_axis_p50_world','source_max_axis_p50_world',
+                    'xyz_distance_over_source_radius_p50','decoded_alpha_p50'])
 
     segments = _phase_segments(rows)
     fig, axes = plt.subplots(2, len(segments), figsize=(6 * len(segments), 7), squeeze=False)

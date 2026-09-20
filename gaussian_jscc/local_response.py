@@ -81,16 +81,28 @@ def local_response_loss(pred, target, geometry, model, views=4, directions=None)
         if directions.ndim != 2 or directions.shape[-1] != 3 or not torch.isfinite(directions).all() or (directions.norm(dim=-1)<1e-8).any():
             raise ValueError('directions must be finite nonzero [views,3]')
         directions, frames = view_frames(directions.to(pred))
+    return centered_response_loss(decoded, source, directions, frames, model.cfg.sh_degree)
+
+
+def centered_response_loss(decoded, source, directions, frames, degree):
+    """Native-scale appearance/footprint matching with both centers at zero.
+
+    Training-only teacher. Neither XYZ tensor is used, so misplacement cannot
+    improve this objective by broadening a splat. The explicit-position public
+    loss above and the learned-XYZ bootstrap share precisely this computation.
+    """
+    source = source.detach()
+    with torch.no_grad():
         source_chol, source_radius = footprint(source,frames)
     decoded_chol, decoded_radius = footprint(decoded,frames)
     with torch.no_grad():
-        points = stencil(pred)
+        points = stencil(decoded)
         source_probes = torch.einsum('nvij,pj->nvpi',source_chol,points)
         decoded_probes = torch.einsum('nvij,pj->nvpi',decoded_chol.detach(),points)
         decoded_probes *= (decoded_radius.detach()-source_radius).exp()[:,None,None,None]
         probes = torch.cat((source_probes,decoded_probes),-2)
-        teacher = response_terms(source,directions,source_chol,source_radius,source_radius,probes,model.cfg.sh_degree)
-    received = response_terms(decoded,directions,decoded_chol,decoded_radius,source_radius,probes,model.cfg.sh_degree)
+        teacher = response_terms(source,directions,source_chol,source_radius,source_radius,probes,degree)
+    received = response_terms(decoded,directions,decoded_chol,decoded_radius,source_radius,probes,degree)
     black = (received[0]-teacher[0]).square().mean()
     white = (received[1]-teacher[1]).square().mean()
     return (black+white)*.5, {'local_black_mse':float(black.detach()),

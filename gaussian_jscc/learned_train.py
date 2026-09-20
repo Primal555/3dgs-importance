@@ -42,7 +42,7 @@ def add_parser(sub):
                    help='local-response requires explicit XYZ; spatial-response is a learned-XYZ bootstrap-only experiment')
     p.add_argument('--local-response-views', type=int, default=4)
     p.add_argument('--spatial-bandwidths', nargs='+', type=float, default=list(DEFAULT_BANDWIDTHS),
-                   help='experimental spatial-response footprint widths in bbox-diagonal units')
+                   help='fixed position-only kernel widths in bbox-diagonal units; native shape remains unblurred')
     p.add_argument('--render-steps', type=int, default=1000)
     p.add_argument('--joint-steps', type=int, default=0)
     p.add_argument('--block-size', type=int, default=256)
@@ -219,13 +219,14 @@ def train(args):
                   comparison='same JSCC payload, NOT equal total rate when side stream is enabled',
                   position_net_bits_per_use=args.position_net_bits_per_use)
     if spatial_test:
-        record.update(objective='spatial_response_v1',
-                      target='paired source Gaussian multiscale spatial responses, NOT scene rendering',
-                      loss_design='equal mean integrated squared error over views, bandwidths and 7 response channels',
-                      bootstrap_design='unit-L2 projected footprints with true center displacement; unit geometry + black RGB + white contrast RGB',
+        record.update(objective='spatial_response_v2',
+                      target='decoupled position, native shape and centered appearance; NOT scene rendering',
+                      loss_design='(fixed_position_response + native_shape_negative_log_overlap + centered_RGB_response) / 3; empirical equal weights',
+                      bootstrap_design='XYZ-only fixed kernels; unblurred coincident-center covariance; source/native footprint RGB probes',
                       scope='bootstrap-only; held-out spatial blocks from the same scene, NOT held-out rendered views',
                       diagnostic_aggregation='equal block/trial means; XYZ RMSE is mean per-block RMSE, not pooled global RMSE',
-                      spatial_bandwidth_units='fraction of global source bbox diagonal; empirical fixed scales',
+                      spatial_bandwidth_units='fraction of global source bbox diagonal; position-only cold-start scales, NOT shape smoothing',
+                      initialization_success='requires native scale diagnostics AND offline fixed-view render quality; bootstrap loss alone is insufficient',
                       position_side_stream_bits=0)
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'{record["objective"]}: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
@@ -281,10 +282,12 @@ def train(args):
                                  symbols_per_gaussian=symbols/points)
                 values.append(entry)
             model.train()
-            append_json(out/'bootstrap_validation.jsonl',{'step':step,'objective':args.bootstrap_objective,'layouts':values})
+            append_json(out/'bootstrap_validation.jsonl',{'step':step,'objective':args.bootstrap_objective,
+                                                         'loss_version':record['objective'],'layouts':values})
             if spatial_test:
                 print(f'Spatial validation step={step}: '+', '.join(
-                    f'q{v["layout"]} XYZ NRMSE={v["xyz_nrmse_bbox"]:.6g}' for v in values),flush=True)
+                    f'q{v["layout"]} XYZ NRMSE={v["xyz_nrmse_bbox"]:.6g}'
+                    f' radius_ratio_p50={v["max_axis_ratio_p50"]:.3g}' for v in values),flush=True)
             return sum(v['loss'] for v in values)/len(values)
 
     def validation(step,phase):
@@ -404,8 +407,14 @@ def train(args):
                            peak_reserved_mib=torch.cuda.max_memory_reserved(device)/2**20)
             append_json(out/'loss.jsonl',row)
             if local_step == 1 or local_step%10 == 0:
+                spatial_note = (f', pos={stats["spatial_position_response"]:.4g}'
+                                f', shape={stats["spatial_native_shape_response"]:.4g}'
+                                f', appearance={stats["spatial_appearance_response"]:.4g}'
+                                f', radius_ratio_p50={stats["max_axis_ratio_p50"]:.3g}'
+                                if spatial_test else '')
                 print(f'{phase} {local_step}/{maximum}: loss={row["loss"]:.6f}, grad={float(norm):.4g}, '
-                      f'update={update_norm:.4g}, lr={row["lr"]:g}, sec={row["step_seconds"]:.2f}',flush=True)
+                      f'update={update_norm:.4g}, lr={row["lr"]:g}, sec={row["step_seconds"]:.2f}'
+                      + spatial_note,flush=True)
             if step%args.save_every == 0:
                 save(f'_{step}',phase,step)
             if local_step%args.validate_every == 0 or local_step == maximum:

@@ -1,19 +1,70 @@
-"""Experimental bootstrap loss: analytic, center-sensitive splat responses.
+"""Decoupled XYZ / native shape / centered appearance bootstrap (v2).
 
-No renderer, anchor side stream, or target-conditioned decoder. Each view uses
-L2-normalized 2D Gaussian footprints at several *fixed* bandwidths measured in
-source bbox-diagonal units. Analytic integrals avoid missing displaced splats
-with a small probe stencil. Broad scales provide cold-start attraction; narrow
-scales provide precision. This surrogate is not scene-render distortion.
+Position kernels never use predicted covariance or opacity. Unblurred shape
+matching cannot hide behind the global bandwidth floor or low alpha. Targets
+are training-only; receiver inputs and communication budgets are unchanged.
+This experimental surrogate is NOT scene-render distortion.
 """
 import math
 import torch
 from .data import to_raw
-from .local_response import footprint, view_frames
-from utils.sh_utils import eval_sh
+from .local_response import footprint, view_frames, centered_response_loss
 
 
 DEFAULT_BANDWIDTHS = (.5, .125, .03125, .0078125)
+
+
+def fixed_position_response(delta, bandwidths):
+    """Unit-L2 isotropic kernels: 2*(1-exp(-|delta|^2/(4*sigma^2))).
+
+    The only learned input is center displacement. Equal fixed source/predicted
+    bandwidths deliberately exclude shape, rotation, alpha and color. This is
+    coarse capture, not a guarantee of pixel-accurate positions.
+    """
+    squared = delta.double().square().sum(-1)
+    return torch.stack([(-2*torch.expm1(-squared/(4*sigma*sigma))).mean()
+                        for sigma in bandwidths])
+
+
+def native_shape_response(decoded, source, frames):
+    """Negative log normalized Gaussian overlap at coincident centers.
+
+    No global blur. Work relative to each teacher's max axis, in float64.
+    -log(overlap), rather than 1-overlap, avoids saturation for huge splats.
+    The relative 1e-5 covariance floor in footprint() is numerical, not a
+    bbox-sized physical floor. Scale and rotation are coupled as covariance,
+    not independently weighted parameter errors; alpha cannot mask this term.
+    """
+    cp, rp = footprint(decoded, frames)
+    with torch.no_grad():
+        ct, rt = footprint(source.detach(), frames)
+    cp, ct = cp.double(), ct.double()
+    a = (cp @ cp.transpose(-1,-2)) * (2*(rp.double()-rt.double())).exp()[:,None,None,None]
+    b = ct @ ct.transpose(-1,-2)
+    # Analytic log determinants of the factors avoid forming/inverting an
+    # ill-scaled 3x3 covariance. Cholesky on a+b is only 2x2 per point/view.
+    logdet_a = 2*cp.diagonal(dim1=-2,dim2=-1).log().sum(-1) + 4*(rp.double()-rt.double())[:,None]
+    logdet_b = 2*ct.diagonal(dim1=-2,dim2=-1).log().sum(-1)
+    cs = torch.linalg.cholesky(a+b)
+    logdet_sum = 2*cs.diagonal(dim1=-2,dim2=-1).log().sum(-1)
+    return (.5*logdet_sum-.25*(logdet_a+logdet_b)-math.log(2)).clamp_min(0).mean()
+
+
+@torch.no_grad()
+def shape_metrics(decoded, source):
+    pred_radius = decoded[:,4:7].amax(-1).exp()
+    source_radius = source[:,4:7].amax(-1).exp()
+    ratio = pred_radius/source_radius
+    distance = (decoded[:,:3]-source[:,:3]).norm(dim=-1)
+    return {'max_axis_ratio_p50':float(ratio.median()),
+            'max_axis_ratio_p05':float(torch.quantile(ratio,.05)),
+            'max_axis_ratio_p95':float(torch.quantile(ratio,.95)),
+            'max_axis_ratio_gt10_fraction':float((ratio>10).float().mean()),
+            'max_axis_ratio_lt0_1_fraction':float((ratio<.1).float().mean()),
+            'decoded_max_axis_p50_world':float(pred_radius.median()),
+            'source_max_axis_p50_world':float(source_radius.median()),
+            'xyz_distance_over_source_radius_p50':float((distance/source_radius).median()),
+            'decoded_alpha_p50':float(decoded[:,3].sigmoid().median())}
 
 
 def position_metrics(pred, target, geometry):
@@ -30,14 +81,11 @@ def position_metrics(pred, target, geometry):
 
 def spatial_response_loss(pred, target, geometry, model, views=4,
                           bandwidths=DEFAULT_BANDWIDTHS, directions=None):
-    """Mean integrated squared response error over N, views, scales, channels.
+    """Equal mean of fixed-position, native-shape and centered RGB responses.
 
-    Seven channels: unit geometry response, RGB on black, RGB contrast to white.
-    The unit channel prevents opacity/color suppression from hiding XYZ errors.
-    All channels and scales have equal weight; their choice and bandwidths are
-    experimental hyperparameters, not an established optimal physical loss.
-    Unit-L2 footprints give self inner product 1; cross inner product K includes
-    both center displacement and projected covariance mismatch.
+    Equal weights are an explicit experimental choice, not a claim that scalar
+    values imply equal gradient influence. Fixed position bandwidths only give
+    cold-start capture; render validation is still required for usable geometry.
     """
     if model.cfg.position_delivery != 'learned':
         raise ValueError('spatial-response requires learned XYZ, without a position side stream')
@@ -58,43 +106,16 @@ def spatial_response_loss(pred, target, geometry, model, views=4,
     diagonal = geometry.span.to(pred).norm()
     delta = torch.einsum('vij,nj->nvi', frames, (decoded[:, :3]-source[:, :3])/diagonal)
 
-    def fields(raw):
-        chol, radius = footprint(raw, frames)
-        # Existing relative footprint floor stabilizes highly anisotropic splats.
-        covariance = (chol @ chol.transpose(-1, -2)) * (radius.exp()/diagonal).square()[:, None, None, None]
-        degree = model.cfg.sh_degree
-        rest = raw[:, 14:].reshape(len(raw), 3, (degree+1)**2-1)
-        sh = torch.cat((raw[:, 11:14, None], rest), -1)
-        color = (eval_sh(degree, sh[:, None], directions[None])+.5).clamp_min(0)
-        alpha = raw[:, 3].sigmoid()[:, None, None]
-        amplitude = torch.cat((torch.ones_like(color[..., :1]), alpha*color, alpha*(color-1)), -1)
-        return covariance, amplitude
-
-    cov_p, amp_p = fields(decoded)
-    with torch.no_grad():
-        cov_t, amp_t = fields(source)
-    # Tiny matrices in double precision keep log determinants and overlap stable;
-    # learned features/codec remain float32. No inverse or detached XYZ path.
-    eye = torch.eye(2, device=pred.device, dtype=torch.float64)
-    scale_losses, geometry_losses, appearance_losses = [], [], []
-    for sigma in bandwidths:
-        a = cov_p.double() + sigma**2*eye
-        b = cov_t.double() + sigma**2*eye
-        ca, cb, cs = (torch.linalg.cholesky(c) for c in (a, b, a+b))
-        logdet = lambda c: 2*c.diagonal(dim1=-2, dim2=-1).log().sum(-1)
-        whitened = torch.linalg.solve_triangular(cs, delta.double()[..., None], upper=False)
-        log_k = math.log(2) + .25*(logdet(ca)+logdet(cb)) - .5*logdet(cs) - .5*whitened.square().sum((-2,-1))
-        # Cauchy-Schwarz: K <= 1; tolerate roundoff near identical footprints.
-        log_k = log_k.clamp_max(0)
-        one_minus_k = -torch.expm1(log_k)
-        # Equivalent to ap^2+at^2-2*ap*at*K, without cancellation at identity.
-        terms = (amp_p.double()-amp_t.double()).square() + 2*amp_p.double()*amp_t.double()*one_minus_k[..., None]
-        scale_losses.append(terms.mean())
-        geometry_losses.append(terms[..., 0].mean())
-        appearance_losses.append(terms[..., 1:].mean())
-    loss = torch.stack(scale_losses).mean().to(pred.dtype)
-    stats = {'spatial_geometry_response': float(torch.stack(geometry_losses).mean().detach()),
-             'spatial_appearance_response': float(torch.stack(appearance_losses).mean().detach())}
+    scale_losses = fixed_position_response(delta, bandwidths)
+    position = scale_losses.mean()
+    shape = native_shape_response(decoded, source, frames)
+    appearance, appearance_stats = centered_response_loss(decoded, source, directions, frames, model.cfg.sh_degree)
+    loss = ((position+shape+appearance)/3).to(pred.dtype)
+    stats = {'spatial_position_response':float(position.detach()),
+             'spatial_native_shape_response':float(shape.detach()),
+             'spatial_geometry_response':float(position.detach()),
+             'spatial_appearance_response':float(appearance.detach()),
+             **appearance_stats, **shape_metrics(decoded,source)}
     stats.update({f'spatial_scale_{i}_loss': float(x.detach()) for i, x in enumerate(scale_losses)})
     stats.update(position_metrics(pred, target, geometry))
     return loss, stats
