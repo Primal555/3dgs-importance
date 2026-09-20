@@ -8,6 +8,17 @@ import unittest
 
 
 class LauncherTests(unittest.TestCase):
+    def test_camera_scene_random_two_phase(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt','INITIALIZATION':'checkpoint'},
+                           script='scripts/test_camera_scene_training.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--camera-init-steps 1000','--render-steps 1000','--lr 2e-4','--render-lr 2e-4',
+                     '--position-delivery learned','--architecture learned_split_logcov',
+                     '--validate-every 500','--save-every 500','--render-backward replay','--joint-steps 0'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+        self.assertNotEqual(self.launch(script='scripts/test_camera_scene_training.sh').returncode,0)
+
     def launch(self, overrides=None, script='scripts/test_render_first.sh'):
         bash = 'C:/softwares/Git/bin/bash.exe' if os.name=='nt' else shutil.which('bash')
         if not bash or not Path(bash).exists():

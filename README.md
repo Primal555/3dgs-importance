@@ -255,6 +255,15 @@ bash scripts/run_baseline_comparison.sh \
 The GPU still performs all training and rendering. `--data_device cpu` only
 keeps source camera images in CPU memory to reduce VRAM use.
 
+## Experimental camera-supervised JSCC training
+
+The learned-XYZ log-covariance codec now supports full-scene teacher-XYZ
+attribute initialization with camera projection/depth supervision, followed by
+complete decoded-scene RGB training. No coordinate side stream is added.
+See [training objectives, launcher, and diagnostics](docs/camera_scene_training.md).
+Start with `scripts/test_camera_scene_training.sh` and an explicitly selected
+`CUDA_VISIBLE_DEVICES`; all validation images and metrics stay inside that run.
+
 ## LICENSE
 
 Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting).
