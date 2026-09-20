@@ -24,7 +24,9 @@ def add_parser(sub):
     p.set_defaults(func=train)
     for key in ('ply', 'out'):
         p.add_argument('--'+key, required=True)
-    p.add_argument('--init', help='learned_joint weights/statistics; fresh optimizer, NOT exact resume')
+    p.add_argument('--init', help='learned codec weights/statistics; fresh optimizer, NOT exact resume')
+    p.add_argument('--architecture', choices=['learned_joint', 'learned_split'], default=None,
+                   help='random start defaults to learned_joint; init inherits checkpoint unless explicitly checked')
     p.add_argument('--allocation-init', help='matching route2.pt; requires --init and --joint-steps')
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
     p.add_argument('--source')
@@ -141,14 +143,16 @@ def train(args):
     fingerprint = scene_fingerprint(original) if args.joint_steps else None
     if args.init:
         model = load_checkpoint(args.init,device).train()
-        if model.cfg.architecture != 'learned_joint' or model.cfg.sh_degree != degree:
-            raise ValueError('requires matching learned_joint weights; omit --init for old architectures')
+        if model.cfg.sh_degree != degree:
+            raise ValueError('initializer SH degree must match the input PLY')
+        if args.architecture is not None and args.architecture != model.cfg.architecture:
+            raise ValueError('initializer architecture mismatch; a new architecture requires random initialization')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
-        print('Loaded learned_joint weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
+        print(f'Loaded {model.cfg.architecture} weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
         print('Architecture, rates and feature statistics come from the checkpoint; position-delivery flags must match it.',flush=True)
     else:
-        cfg = CodecConfig(architecture='learned_joint',loss_profile='learned_v1',sh_degree=degree,
+        cfg = CodecConfig(architecture=args.architecture or 'learned_joint',loss_profile='learned_v1',sh_degree=degree,
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,

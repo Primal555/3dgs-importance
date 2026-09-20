@@ -47,12 +47,12 @@ class CodecConfig:
             raise ValueError('position_bits must be an integer in 1..16')
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
         self.geometry_rates = tuple(self.geometry_rates)
-        if self.architecture != 'learned_joint':
-            raise ValueError('Only learned_joint is supported; use the historical Git revision for old codecs')
+        if self.architecture not in ('learned_joint', 'learned_split'):
+            raise ValueError('Supported architectures: learned_joint, learned_split; use Git history for old codecs')
         if self.loss_profile != 'learned_v1' or self.position_head != 'learned_affine':
-            raise ValueError('learned_joint requires learned_v1 and learned_affine')
+            raise ValueError('learned codecs require learned_v1 and learned_affine')
         if not self.individual_tiers or self.geometry_rates or self.geometry_floor != 1e-4:
-            raise ValueError('learned_joint requires individual tiers and no geometry sub-budget')
+            raise ValueError('learned codecs require individual tiers and no geometry sub-budget')
         if len(self.rates) != 4 or self.rates[0] != 0 or any(
             a >= b for a,b in zip(self.rates,self.rates[1:])
         ) or any(int(r) != r for r in self.rates):
@@ -89,8 +89,8 @@ class CodecConfig:
 
     @classmethod
     def from_dict(cls, values):
-        if values.get('architecture') != 'learned_joint':
-            raise ValueError('Only learned_joint checkpoints are supported; use historical Git for old codecs')
+        if values.get('architecture') not in ('learned_joint', 'learned_split'):
+            raise ValueError('Supported checkpoints: learned_joint, learned_split; use Git history for old codecs')
         return cls(**values)
 
 
@@ -247,14 +247,18 @@ class ContextBlock(nn.Module):
 
 
 class GaussianCodec(nn.Module):
-    """One learned architecture. Historical implementations live in Git history."""
+    """Shared transport for learned_joint and the opt-in learned_split experiment."""
     def __init__(self, cfg):
         super().__init__()
         from .learned_codec import LearnedCore
         self.cfg = cfg
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
-        self.learned = LearnedCore(cfg)
+        if cfg.architecture == 'learned_split':
+            from .split_codec import SplitLearnedCore
+            self.learned = SplitLearnedCore(cfg)
+        else:
+            self.learned = LearnedCore(cfg)
         if cfg.position_delivery != 'learned':
             # Keep identical initialization/RNG for the paired experiment, but
             # do not train the bypassed XYZ head or claim its gradients improve.

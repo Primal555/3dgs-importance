@@ -50,6 +50,14 @@ This replaces attribute-wise weighted losses in pretraining, not the final
 scene-rendering objective; it does not yet establish improved rendering quality.
 
 The independent `benchmark_codec.py` and packet-only receiver remain available.
+An opt-in **geometry/appearance split codec** is now available with
+`--architecture learned_split`: sender-relative local attention, separate
+geometry/appearance decoder streams, and the same shared per-Gaussian payload.
+Run `CUDA_VISIBLE_DEVICES=2 bash scripts/test_split_codec_bootstrap.sh` on a free
+GPU for random bootstrap training followed by render history every 500 steps.
+This is experimental, not a demonstrated PSNR improvement. See
+[design, local checks and server commands](docs/split_codec_experiment.md).
+
 For a separate **bootstrap-only learned XYZ experiment**, use
 `CUDA_VISIBLE_DEVICES=2 bash scripts/test_learned_xyz_bootstrap.sh`.
 It starts randomly, sends no per-point coordinate side stream, and jointly

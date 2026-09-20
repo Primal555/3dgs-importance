@@ -45,6 +45,11 @@ def parameter_group(name):
         part = name.split('.')[1]
         if part == 'heads':
             return 'xyz_head' if name.split('.')[2] == 'xyz' else 'attribute_heads'
+        if part.startswith(('enc_geometry', 'enc_appearance', 'dec_geometry', 'dec_appearance')):
+            prefix, stream = part.split('_')[:2]
+            return stream + ('_encoder' if prefix == 'enc' else '_decoder')
+        if part in ('enc_exchange', 'dec_exchange'):
+            return 'encoder_exchange' if part == 'enc_exchange' else 'decoder_exchange'
         if part.startswith('dec'):
             return 'shared_decoder'
         if part in ('tier', 'snr'):

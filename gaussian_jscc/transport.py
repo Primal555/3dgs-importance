@@ -40,7 +40,7 @@ def save_checkpoint(path, model, step, training=None):
 def load_checkpoint(path, device):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("version") != 4:
-        raise ValueError("Only learned_joint checkpoint v4 is supported; use historical Git for old codecs")
+        raise ValueError("Only learned_joint/learned_split checkpoint v4 is supported; use historical Git for old codecs")
     cfg = CodecConfig.from_dict(saved["config"])
     model = GaussianCodec(cfg)
     model.load_state_dict(saved["state_dict"], strict=True)

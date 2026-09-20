@@ -14,6 +14,7 @@ echo 'spatial_response_v3: coarse + teacher-radius fine XYZ + native shape + cen
 # Deliberately do not inherit INIT, POSITION_DELIVERY, RENDER_STEPS, JOINT_STEPS or LR_SCHEDULE.
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --ply "$PLY" --out "$OUT" --device "${DEVICE:-cuda}" \
+  --architecture "${ARCHITECTURE:-learned_joint}" \
   --position-delivery learned --bootstrap-objective spatial-response \
   --bootstrap-steps "${BOOTSTRAP_STEPS:-5000}" --render-steps 0 --joint-steps 0 \
   --snr "${SNR:-10}" --channel "${CHANNEL:-awgn}" --rates 0 8 16 32 \

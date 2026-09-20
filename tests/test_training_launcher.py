@@ -150,6 +150,27 @@ class LauncherTests(unittest.TestCase):
         for mode in ('learned','float32','quantized'):
             self.assertIn('--position-delivery '+mode,result.stdout)
 
+    def test_split_codec_random_bootstrap_then_fixed_render_history(self):
+        result = self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt',
+                              'ARCHITECTURE':'learned_joint','POSITION_DELIVERY':'quantized',
+                              'BOOTSTRAP_STEPS':'1000','SAVE_EVERY':'500'},
+                             script='scripts/test_split_codec_bootstrap.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for flag in ('--architecture learned_split','--position-delivery learned',
+                     '--bootstrap-steps 1000','--render-steps 0','--lr 0.0002',
+                     'evaluate_bootstrap_history.py','--start 500 --stop 1000 --every 500',
+                     '--resolution 4','--channel awgn'):
+            self.assertIn(flag, result.stdout)
+        self.assertNotIn('--init ', result.stdout)
+
+    def test_split_codec_requires_gpu_and_valid_history_steps(self):
+        result = self.launch(script='scripts/test_split_codec_bootstrap.sh')
+        self.assertNotEqual(result.returncode, 0)
+        result = self.launch({'CUDA_VISIBLE_DEVICES':'2','BOOTSTRAP_STEPS':'650'},
+                             script='scripts/test_split_codec_bootstrap.sh')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('positive multiple', result.stderr)
+
 
 if __name__=='__main__':
     unittest.main()
