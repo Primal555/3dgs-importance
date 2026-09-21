@@ -44,6 +44,8 @@ def add_parser(sub):
                    help='assumed digital net information bits/complex use for training charts; not a tested FEC')
     p.add_argument('--bootstrap-steps', '--steps', dest='bootstrap_steps', type=int, default=0,
                    help='optional feature or local-response initialization, NOT the final scene objective')
+    p.add_argument('--bootstrap-tier', type=int, choices=[1,2,3], default=None,
+                   help='isolated bootstrap-only test: fix all retained points to this tier, including validation')
     p.add_argument('--bootstrap-objective', choices=['feature','local-response','spatial-response'], default='feature',
                    help='local-response requires explicit XYZ; spatial-response is a learned-XYZ bootstrap-only experiment')
     p.add_argument('--local-response-views', type=int, default=4)
@@ -109,6 +111,8 @@ def train(args):
         raise ValueError('counts must be positive')
     if not 0 <= args.drop < 1 or args.mask_samples < 2:
         raise ValueError('invalid drop probability or mask-samples')
+    if args.bootstrap_tier is not None and (args.render_steps or args.joint_steps or not args.bootstrap_steps or args.drop):
+        raise ValueError('bootstrap-tier requires bootstrap-only training and drop=0')
     for key in ('lr','render_lr','mask_lr','clip_norm','power_floor','position_net_bits_per_use','min_lr'):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             raise ValueError(f'{key} must be positive and finite')
@@ -265,7 +269,11 @@ def train(args):
                       context_gate_initialization='tanh(0.1), trainable engineering initialization, NOT a loss weight',
                       receiver_context='packet-slot features only; no source XYZ, centroid or pooling features cross channel',
                       unchanged='logcov representation, spatial_logcov_v1 objective, per-Gaussian symbol budgets and normalization')
+    record.update(tier_protocol=f'fixed q{args.bootstrap_tier}' if args.bootstrap_tier is not None else 'cycle q1/q2/q3/mixed',
+                  channel_protocol='identity channel; SNR is conditioning only' if args.channel=='none' else 'AWGN at configured SNR')
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
+    if args.bootstrap_tier is not None:
+        print(f'Fixed bootstrap/validation q{args.bootstrap_tier}: {model.cfg.rates[args.bootstrap_tier]} complex symbols/G; {record["channel_protocol"]}.',flush=True)
     print(f'{record["objective"]}: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
           f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
@@ -297,7 +305,7 @@ def train(args):
             seed_all(args.seed+9000)
             model.eval()
             values = []
-            for tier in (1,2,3,None):
+            for tier in ((args.bootstrap_tier,) if args.bootstrap_tier is not None else (1,2,3,None)):
                 losses = []
                 measurements = []
                 symbols, points = 0, 0
@@ -321,7 +329,8 @@ def train(args):
                 values.append(entry)
             model.train()
             append_json(out/'bootstrap_validation.jsonl',{'step':step,'objective':args.bootstrap_objective,
-                                                         'loss_version':record['objective'],'layouts':values})
+                                                         'loss_version':record['objective'],'layouts':values,
+                                                         'channel':args.channel,'snr_conditioning':args.snr})
             if spatial_test:
                 print(f'Spatial validation step={step}: '+', '.join(
                     f'q{v["layout"]} XYZ NRMSE={v["xyz_nrmse_bbox"]:.6g}'
@@ -388,7 +397,7 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             if mask_optimizer is not None:
                 mask_optimizer.zero_grad(set_to_none=True)
-            tier = (1,2,3,None)[(local_step-1)%4]
+            tier = args.bootstrap_tier if args.bootstrap_tier is not None else (1,2,3,None)[(local_step-1)%4]
             stats = {'layout':'mixed' if tier is None else str(tier)}
             if phase == 'bootstrap':
                 selected = [training_indices[i] for i in torch.randint(len(training_indices),(args.blocks_per_batch,)).tolist()]
@@ -401,6 +410,8 @@ def train(args):
                 pred,_,_ = model.forward_tier_batches(f,f[...,:3],choices,args.snr,args.channel)
                 loss, local_stats = initialization_loss(pred[q>0],f[q>0])
                 stats.update(local_stats,bootstrap_objective=args.bootstrap_objective)
+                stats.update(tier_counts=torch.bincount(q[gi>=0],minlength=4).tolist(),
+                             symbols_per_source_gaussian=float(torch.tensor(model.cfg.rates,device=q.device)[q[gi>=0]].float().mean()))
                 if not torch.isfinite(loss):
                     raise RuntimeError('nonfinite bootstrap loss; no optimizer step performed')
                 loss.backward()

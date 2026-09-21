@@ -34,7 +34,12 @@ else
 fi
 bash "$PROJECT/scripts/test_learned_xyz_bootstrap.sh" "$OUT"
 if [[ "$RENDER_HISTORY" == 1 ]]; then
+  HISTORY_TIER_ARGS=()
+  if [[ -n "${BOOTSTRAP_TIER:-}" ]]; then
+    HISTORY_TIER_ARGS=(--tier "$BOOTSTRAP_TIER")
+  fi
   "$PYTHON_BIN" -u evaluate_bootstrap_history.py \
+    "${HISTORY_TIER_ARGS[@]}" \
     --training "$OUT" --ply "$PLY" --source "$SCENE" --out "$OUT/render_history" \
     --start "$SAVE_EVERY" --stop "$BOOTSTRAP_STEPS" --every "$SAVE_EVERY" \
     --snr "${SNR:-10}" --channel "${CHANNEL:-awgn}" --trials "${VALIDATION_TRIALS:-2}" \

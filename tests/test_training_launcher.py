@@ -8,6 +8,18 @@ import unittest
 
 
 class LauncherTests(unittest.TestCase):
+    def test_fixed_q3_noiseless_launcher_overrides_conflicting_environment(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','CHANNEL':'awgn','BOOTSTRAP_TIER':'1',
+                            'INIT':'missing.pt','VALIDATION_TRIALS':'2'},
+                           script='scripts/test_q3_noiseless_bootstrap.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--bootstrap-tier 3','--tier 3','--bootstrap-steps 10000',
+                     '--encoder-attention geometric_point','--rates 0 8 16 32','--render-steps 0',
+                     '--channel none','--trials 1','/run/render_history'):
+            self.assertIn(flag,result.stdout)
+        self.assertEqual(result.stdout.count('--channel none'),2)
+        self.assertNotIn('--init ',result.stdout)
+
     def test_multiscale_logcov_keeps_bootstrap_only_and_nested_history(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt','RENDER_STEPS':'1000'},
                            script='scripts/test_multiscale_logcov_bootstrap.sh')
@@ -30,7 +42,7 @@ class LauncherTests(unittest.TestCase):
             (folder/'codec.pt').touch()
             env=os.environ.copy()
             for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES',
-                        'LR','RENDER_LR','LR_SCHEDULE','RENDER_BACKWARD','BLOCKS_PER_BATCH'):
+                        'LR','RENDER_LR','LR_SCHEDULE','RENDER_BACKWARD','BLOCKS_PER_BATCH','BOOTSTRAP_TIER'):
                 env.pop(key,None)
             env.update(PYTHON_BIN='/bin/echo',PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
             env.update(overrides or {})

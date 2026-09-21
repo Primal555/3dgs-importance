@@ -31,7 +31,7 @@ def save_panel(path, photo, reference, decoded):
 @torch.no_grad()
 def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                     snr, channel, trials, seed, out, step, phase, mask=None,
-                    white_background=False, beta=0., position_net_bits_per_use=2.):
+                    white_background=False, beta=0., position_net_bits_per_use=2., fixed_tier=None):
     from .cli import seed_all
     from .rendering import render
     device = next(model.parameters()).device
@@ -39,11 +39,14 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
     entries = []
     # Uniform/mixed codec conditions stay visible even when a learned mask is
     # enabled. The mask is an additional, separately scored deployment layout.
-    layouts = (1,2,3,None) + (('mask',) if mask is not None else ())
+    if fixed_tier is not None and (fixed_tier not in (1,2,3) or mask is not None):
+        raise ValueError('fixed_tier must be 1/2/3 and cannot be combined with a learned mask')
+    layouts = (fixed_tier,) if fixed_tier is not None else (1,2,3,None) + (('mask',) if mask is not None else ())
     try:
         with preserved_rng(device):
             model.eval()
             for index, tier in enumerate(layouts):
+                index = (1,2,3,None,'mask').index(tier)  # Preserve per-tier RNG when selecting a subset.
                 label = 'mixed' if tier is None else str(tier)
                 seed_all(seed+10000+index*1000)
                 qs = [torch.where(ids.to(device)>=0,
@@ -90,7 +93,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                 entries.append(entry)
     finally:
         model.train(was_training)
-    codec_score = sum(e['source_mse'] for e in entries[:4])/4
+    codec_entries = [e for e in entries if e['layout'] != 'mask']
+    codec_score = sum(e['source_mse'] for e in codec_entries)/len(codec_entries)
     # Joint checkpoint selection evaluates ACTUAL hard deployment, not the
     # expected soft allocation rate used in score-function training.
     selected = entries[-1] if mask is not None else None

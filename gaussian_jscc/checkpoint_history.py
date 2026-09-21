@@ -43,13 +43,17 @@ def plot_history(rows, out):
     plt=_plt()
     fig,axes=plt.subplots(2,3,figsize=(16,8))
     first=rows[0]
-    fig.suptitle(f'Checkpoint render history | {first["channel"]}, {first["snr"]:g} dB | '
+    channel_label = (f'noiseless; SNR conditioning {first["snr"]:g} dB' if first['channel']=='none'
+                     else f'{first["channel"]}, {first["snr"]:g} dB')
+    fig.suptitle(f'Checkpoint render history | {channel_label} | '
                  f'{first["views"]} fixed views x {first["trials"]} trials\nEvaluation only: no weight updates')
     metrics=(('source_psnr','PSNR vs source PLY (dB)'),('source_ssim','SSIM vs source PLY'),
              ('source_mse','MSE vs source PLY'),('photo_psnr','PSNR vs photo (dB)'),
              ('photo_ssim','SSIM vs photo'),('xyz_rmse_retained','XYZ RMSE (scene units)'))
     for tier,color,marker in zip(('1','2','3','mixed'),('#2F6B9A','#D8A72E','#D96C2F','#737A36'),('o','s','^','D')):
         group=[r for r in rows if r['layout']==tier]
+        if not group:
+            continue
         for ax,(key,title) in zip(axes.flat,metrics):
             ax.plot([r['step'] for r in group],[r[key] for r in group],color=color,marker=marker,
                     linestyle='-' if len(group)>=8 else 'none',markersize=4,label='q'+tier)
@@ -73,6 +77,7 @@ def build_parser():
     p.add_argument('--device',default='cuda')
     p.add_argument('--snr',type=float,default=10.)
     p.add_argument('--channel',choices=['awgn','none'],default='awgn')
+    p.add_argument('--tier',type=int,choices=[1,2,3],default=None,help='evaluate only this uniform tier; default evaluates all layouts')
     p.add_argument('--trials',type=int,default=2)
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--blocks-per-batch',type=int,default=32)
@@ -150,7 +155,8 @@ def evaluate_history(args):
         before=file_hash(path)
         model.requires_grad_(False)
         result=validate_render(model,groups,group_ids,raw,geometry,cameras,reference,args.snr,args.channel,
-                               args.trials,args.seed,out,step,'offline_bootstrap',white_background=args.white_background)
+                               args.trials,args.seed,out,step,'offline_bootstrap',white_background=args.white_background,
+                               fixed_tier=args.tier)
         if file_hash(path)!=before:
             raise RuntimeError(f'Checkpoint changed during evaluation: {path}')
         result.update(checkpoint=path.name,checkpoint_sha256=before)

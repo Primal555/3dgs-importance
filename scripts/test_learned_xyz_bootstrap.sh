@@ -12,7 +12,12 @@ OUT="${1:-$PROJECT/output/truck_learned_xyz_v3_$(date +%Y%m%d_%H%M%S)}"
 command -v "$PYTHON_BIN" >/dev/null || { echo 'Activate maskgs or set PYTHON_BIN.' >&2; exit 1; }
 echo 'Random weights; position capture + fine XYZ + shape + centered RGB. No XYZ side stream or render training; exact objective is logged in training.json.'
 # Deliberately do not inherit INIT, POSITION_DELIVERY, RENDER_STEPS, JOINT_STEPS or LR_SCHEDULE.
+TIER_ARGS=()
+if [[ -n "${BOOTSTRAP_TIER:-}" ]]; then
+  TIER_ARGS=(--bootstrap-tier "$BOOTSTRAP_TIER")
+fi
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
+  "${TIER_ARGS[@]}" \
   --ply "$PLY" --out "$OUT" --device "${DEVICE:-cuda}" \
   --architecture "${ARCHITECTURE:-learned_joint}" \
   --context-mode "${CONTEXT_MODE:-window}" \
