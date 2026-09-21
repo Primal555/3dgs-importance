@@ -19,6 +19,7 @@ class CodecConfig:
     block_size: int = 256
     morton_bits: int = 16
     architecture: str = "learned_joint"
+    context_mode: str = 'window'
     loss_profile: str = "learned_v1"
     position_head: str = "learned_affine"
     individual_tiers: bool = True
@@ -41,6 +42,10 @@ class CodecConfig:
     position_bits: int = 12
 
     def __post_init__(self):
+        if self.context_mode not in ('window','multiscale_self'):
+            raise ValueError('unknown context mode')
+        if self.context_mode == 'multiscale_self' and (self.architecture != 'learned_split_logcov' or self.position_delivery != 'learned'):
+            raise ValueError('multiscale_self requires learned_split_logcov and learned XYZ')
         if self.position_delivery not in ('learned', 'float32', 'quantized'):
             raise ValueError('position_delivery must be learned, float32 or quantized')
         if not isinstance(self.position_bits, int) or not 1 <= self.position_bits <= 16:
@@ -81,6 +86,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.context_mode == 'window':
+            result.pop('context_mode')  # Preserve old checkpoint/packet hashes.
         if self.position_delivery == 'learned' and self.position_bits == 12:
             # Preserve existing v4 shared-model hashes exactly.
             result.pop('position_delivery')
@@ -254,7 +261,10 @@ class GaussianCodec(nn.Module):
         self.cfg = cfg
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
-        if cfg.architecture in ('learned_split', 'learned_split_logcov'):
+        if cfg.context_mode == 'multiscale_self':
+            from .multiscale_codec import MultiScaleSelfCore
+            self.learned = MultiScaleSelfCore(cfg)
+        elif cfg.architecture in ('learned_split', 'learned_split_logcov'):
             from .split_codec import SplitLearnedCore
             self.learned = SplitLearnedCore(cfg)
         else:

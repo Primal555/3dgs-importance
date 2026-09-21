@@ -262,6 +262,18 @@ def plot_training(training_dir, output_dir=None):
             axes[1,col].set(xlabel='Step', ylabel='Relative parameter update', yscale='symlog')
         charts += _finish(fig, out / 'training_gradient_groups')
 
+    gate_rows = [r for r in rows if r.get('context_gates')]
+    if gate_rows:
+        fig,axis = plt.subplots(figsize=(9,4))
+        for key in gate_rows[0]['context_gates']:
+            axis.plot([r['step'] for r in gate_rows],[r['context_gates'][key] for r in gate_rows],label=key)
+        axis.set(title='Learned context gates | not loss weights or importance scores',
+                 xlabel='Optimization step',ylabel='tanh(gate)',ylim=(-1.05,1.05))
+        axis.legend()
+        charts += _finish(fig,out/'training_context_gates')
+        flattened = [dict(step=r['step'],**r['context_gates']) for r in gate_rows]
+        _write_csv(out/'training_context_gates.csv',flattened,list(flattened[0]))
+
     position_path = training_dir / 'position_evaluation.json'
     if position_path.exists():
         evaluations = json.loads(position_path.read_text(encoding='utf-8'))

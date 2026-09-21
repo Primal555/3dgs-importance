@@ -28,6 +28,8 @@ def add_parser(sub):
     p.add_argument('--architecture', choices=['learned_joint', 'learned_split', 'learned_split_logcov'], default=None,
                    help='random start defaults to learned_joint; init inherits checkpoint unless explicitly checked')
     p.add_argument('--allocation-init', help='matching route2.pt; requires --init and --joint-steps')
+    p.add_argument('--context-mode', choices=['window','multiscale_self'], default=None,
+                   help='multiscale_self adds pointwise paths and pooled context; random start required when changing mode')
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
     p.add_argument('--source')
     p.add_argument('--device', default='cuda')
@@ -147,12 +149,15 @@ def train(args):
             raise ValueError('initializer SH degree must match the input PLY')
         if args.architecture is not None and args.architecture != model.cfg.architecture:
             raise ValueError('initializer architecture mismatch; a new architecture requires random initialization')
+        if args.context_mode is not None and args.context_mode != model.cfg.context_mode:
+            raise ValueError('initializer context mode mismatch; start the new structure from random weights')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
         print(f'Loaded {model.cfg.architecture} weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
         print('Architecture, rates and feature statistics come from the checkpoint; position-delivery flags must match it.',flush=True)
     else:
         cfg = CodecConfig(architecture=args.architecture or 'learned_joint',loss_profile='learned_v1',sh_degree=degree,
+                          context_mode=args.context_mode or 'window',
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
@@ -244,6 +249,11 @@ def train(args):
             record.update(objective='spatial_logcov_v1',
                           loss_design='(coarse_position + fine_weight * teacher_radius_pseudo_huber + logcov_Frobenius_squared/9 + centered_RGB_response) / 3; empirical equal group weights',
                           bootstrap_design='unchanged XYZ kernels and centered RGB; replaces native shape overlap by physical logcov MSE')
+    if model.cfg.context_mode == 'multiscale_self':
+        record.update(context_design='pointwise paths plus tanh-gated fine/x4/x16 pooled context within each block',
+                      context_gate_initialization='tanh(0.1), trainable engineering initialization, NOT a loss weight',
+                      receiver_context='packet-slot features only; no source XYZ, centroid or pooling features cross channel',
+                      unchanged='logcov representation, spatial_logcov_v1 objective, per-Gaussian symbol budgets and normalization')
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'{record["objective"]}: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
@@ -414,6 +424,8 @@ def train(args):
                 mask_optimizer.step()
             optimizer.step()
             updates = update_stats(model,before)
+            if hasattr(model.learned,'context_diagnostics'):
+                stats['context_gates'] = model.learned.context_diagnostics()
             update_norm = math.sqrt(sum(v['update_norm']**2 for v in updates.values()))
             row = {'step':step,'phase':phase,'objective':record['objective'],'loss':float(loss.detach()),
                    'snr':args.snr,'lr':optimizer.param_groups[0]['lr'],'grad_norm':float(norm),

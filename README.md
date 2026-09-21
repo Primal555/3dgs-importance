@@ -255,6 +255,13 @@ bash scripts/run_baseline_comparison.sh \
 The GPU still performs all training and rendering. `--data_device cpu` only
 keeps source camera images in CPU memory to reduce VRAM use.
 
+## Experimental multiscale logcov JSCC
+
+`scripts/test_multiscale_logcov_bootstrap.sh` runs the pointwise-self-path plus
+multiscale-context experiment. It preserves the existing logcov output,
+bootstrap objective and individual Gaussian symbol budgets; no render-training
+phase or coordinate side stream is added. See [design and launch instructions](docs/multiscale_logcov_codec.md).
+
 ## LICENSE
 
 Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting).

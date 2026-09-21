@@ -15,6 +15,16 @@ from gaussian_jscc.plots import plot_allocation, plot_evaluation, plot_training,
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "requires matplotlib")
 class PlotTests(unittest.TestCase):
+    def test_context_gate_plot_and_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            rows=[dict(step=i,phase='bootstrap',loss=1/i,context_gates={
+                'enc_context_gate':.1,'dec_geometry_gate':.12,'dec_appearance_gate':-.05}) for i in (1,2)]
+            (root/'loss.jsonl').write_text('\n'.join(json.dumps(r) for r in rows),encoding='utf-8')
+            plot_training(root)
+            self.assertTrue((root/'charts/training_context_gates.png').exists())
+            self.assertTrue((root/'charts/training_context_gates.csv').exists())
+
     def test_local_response_and_render_labels_remain_separate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

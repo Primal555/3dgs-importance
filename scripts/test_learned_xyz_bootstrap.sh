@@ -15,6 +15,7 @@ echo 'Random weights; position capture + fine XYZ + shape + centered RGB. No XYZ
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --ply "$PLY" --out "$OUT" --device "${DEVICE:-cuda}" \
   --architecture "${ARCHITECTURE:-learned_joint}" \
+  --context-mode "${CONTEXT_MODE:-window}" \
   --position-delivery learned --bootstrap-objective spatial-response \
   --bootstrap-steps "${BOOTSTRAP_STEPS:-5000}" --render-steps 0 --joint-steps 0 \
   --snr "${SNR:-10}" --channel "${CHANNEL:-awgn}" --rates 0 8 16 32 \

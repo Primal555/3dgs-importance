@@ -43,6 +43,10 @@ class ValidationLRSchedule:
 def parameter_group(name):
     if name.startswith('learned.'):
         part = name.split('.')[1]
+        if part == 'context_heads':
+            head = name.split('.')[2]
+            return ('xyz_context_head' if head == 'xyz' else
+                    'covariance_context_head' if head == 'logcov' else 'attribute_context_heads')
         if part == 'heads':
             if name.split('.')[2] == 'logcov':
                 return 'covariance_head'

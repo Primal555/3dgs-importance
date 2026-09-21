@@ -8,6 +8,16 @@ import unittest
 
 
 class LauncherTests(unittest.TestCase):
+    def test_multiscale_logcov_keeps_bootstrap_only_and_nested_history(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt','RENDER_STEPS':'1000'},
+                           script='scripts/test_multiscale_logcov_bootstrap.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--context-mode multiscale_self','--architecture learned_split_logcov',
+                     '--bootstrap-objective spatial-response','--render-steps 0','--joint-steps 0',
+                     '--rates 0 8 16 32','--lr 0.0002','--clip-mode none','/run/render_history'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+
     def launch(self, overrides=None, script='scripts/test_render_first.sh'):
         bash = 'C:/softwares/Git/bin/bash.exe' if os.name=='nt' else shutil.which('bash')
         if not bash or not Path(bash).exists():
