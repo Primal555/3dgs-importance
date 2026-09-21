@@ -48,12 +48,6 @@ def add_parser(sub):
     p.add_argument('--spatial-fine-weight', type=float, default=1.,
                    help='teacher-radius bounded-slope position loss weight; 0 is the v2 objective ablation')
     p.add_argument('--render-steps', type=int, default=1000)
-    p.add_argument('--camera-init-steps', type=int, default=0,
-                   help='full-scene teacher-XYZ attribute rendering plus pixel/depth XYZ supervision')
-    p.add_argument('--camera-geometry-weight', type=float, default=.01,
-                   help='explicit empirical initialization-only geometry coefficient')
-    p.add_argument('--camera-pixel-scale', type=float, default=2., help='SmoothL1 transition scale in loaded-image pixels')
-    p.add_argument('--camera-depth-scale', type=float, default=.1, help='relative depth SmoothL1 transition scale')
     p.add_argument('--joint-steps', type=int, default=0)
     p.add_argument('--block-size', type=int, default=256)
     p.add_argument('--blocks-per-batch', type=int, default=32)
@@ -104,7 +98,7 @@ def train(args):
     device = device_for(args.device)
     if device.type == 'cpu':
         torch.set_num_threads(args.cpu_threads)
-    if min(args.bootstrap_steps,args.camera_init_steps,args.render_steps,args.joint_steps,args.patience,args.train_views) < 0 or args.bootstrap_steps+args.camera_init_steps+args.render_steps+args.joint_steps < 1:
+    if min(args.bootstrap_steps,args.render_steps,args.joint_steps,args.patience,args.train_views) < 0 or args.bootstrap_steps+args.render_steps+args.joint_steps < 1:
         raise ValueError('invalid stage lengths/view count')
     if min(args.validate_every,args.validation_blocks,args.validation_views,args.validation_trials,
            args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views,args.lr_patience) < 1:
@@ -119,15 +113,9 @@ def train(args):
             raise ValueError(f'{key} must be nonnegative and finite')
     if not math.isfinite(args.snr):
         raise ValueError('SNR must be finite')
-    camera_init = args.camera_init_steps > 0
-    for key in ('camera_geometry_weight','camera_pixel_scale','camera_depth_scale'):
-        if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
-            raise ValueError(f'{key} must be positive and finite')
-    if camera_init and (args.bootstrap_steps or args.joint_steps or args.position_delivery != 'learned'):
-        raise ValueError('camera initialization requires learned XYZ, no legacy bootstrap and no mask joint stage')
     if not 0 < args.lr_factor < 1 or not 0 <= args.lr_threshold < 1:
         raise ValueError('invalid LR factor or relative threshold')
-    active_lrs = ([args.lr] if args.bootstrap_steps or camera_init else []) + ([args.render_lr] if args.render_steps or args.joint_steps else [])
+    active_lrs = ([args.lr] if args.bootstrap_steps else []) + ([args.render_lr] if args.render_steps or args.joint_steps else [])
     if args.lr_schedule == 'plateau' and args.min_lr > min(active_lrs):
         raise ValueError('min-lr must not exceed any active phase starting LR')
     if args.bootstrap_steps and args.bootstrap_objective == 'local-response' and args.position_delivery == 'learned':
@@ -140,9 +128,9 @@ def train(args):
             raise ValueError('spatial bandwidths must be positive and finite')
         if not math.isfinite(args.spatial_fine_weight) or args.spatial_fine_weight<0:
             raise ValueError('spatial-fine-weight must be finite and nonnegative')
-    needs_render = bool(camera_init or args.render_steps or args.joint_steps)
+    needs_render = bool(args.render_steps or args.joint_steps)
     if needs_render and (not args.source or not args.device.startswith('cuda')):
-        raise ValueError('camera-init/render/joint stages require CUDA and --source; CPU bootstrap checks set these stages to 0')
+        raise ValueError('render/joint stages require CUDA and --source; CPU bootstrap checks set both to 0')
     if args.allocation_init and (not args.init or not args.joint_steps):
         raise ValueError('allocation-init requires init and joint-steps')
     if args.existence_prior and (not args.joint_steps or args.allocation_init):
@@ -171,7 +159,7 @@ def train(args):
                           position_delivery=args.position_delivery,position_bits=args.position_bits)
         model = GaussianCodec(cfg).to(device)
         fit_feature_statistics(original, model)
-        if not args.bootstrap_steps and not camera_init:
+        if not args.bootstrap_steps:
             print('Training from random weights without bootstrap: valid, but render gradients may be poorly conditioned.',flush=True)
     if args.joint_steps and model.cfg.position_delivery != 'learned':
         raise ValueError('position delivery ablation disables joint mask training: its rate penalty must include XYZ cost first')
@@ -256,14 +244,6 @@ def train(args):
             record.update(objective='spatial_logcov_v1',
                           loss_design='(coarse_position + fine_weight * teacher_radius_pseudo_huber + logcov_Frobenius_squared/9 + centered_RGB_response) / 3; empirical equal group weights',
                           bootstrap_design='unchanged XYZ kernels and centered RGB; replaces native shape overlap by physical logcov MSE')
-    if camera_init:
-        record.update(objective='camera_scene_v1',
-                      loss_design='camera_init: teacher-XYZ scene RGB MSE + explicit weight * (pixel SmoothL1 + relative-depth SmoothL1); render: full predicted scene RGB MSE only',
-                      bootstrap_design='disabled; source XYZ is a training label/render scaffold, never decoder input',
-                      selection_criterion='complete decoded source-render MSE, never teacher-XYZ diagnostic',
-                      position_side_stream_bits=0,
-                      visibility='source camera frustum, not occlusion visibility',
-                      phase_transition='continue codec weights, reset Adam moments; no silent best-weight restore')
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'{record["objective"]}: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
@@ -331,8 +311,7 @@ def train(args):
         return validate_render(model,groups,group_ids,raw,geometry,val_cameras,reference,args.snr,
                                args.channel,args.validation_trials,args.seed,out,step,phase,
                                mask=mask if phase == 'joint' else None,white_background=args.white_background,beta=args.beta,
-                               position_net_bits_per_use=args.position_net_bits_per_use,
-                               teacher_xyz_diagnostic=camera_init)
+                               position_net_bits_per_use=args.position_net_bits_per_use)
 
     def save(suffix,phase,step):
         if phase == 'joint':
@@ -344,15 +323,15 @@ def train(args):
     # Record actual render quality of the initializer, before changing weights.
     initial_validation = validation(0,'initial') if needs_render else None
     initial_bootstrap_score = validate_bootstrap(0) if args.bootstrap_steps else None
-    for phase,maximum in [('bootstrap',args.bootstrap_steps),('camera_init',args.camera_init_steps),('render',args.render_steps),('joint',args.joint_steps)]:
+    for phase,maximum in [('bootstrap',args.bootstrap_steps),('render',args.render_steps),('joint',args.joint_steps)]:
         if not maximum:
             continue
         last_phase = phase
         for group in optimizer.param_groups:
-            group['lr'] = args.lr if phase in ('bootstrap','camera_init') else args.render_lr
+            group['lr'] = args.lr if phase == 'bootstrap' else args.render_lr
         # Reset Adam moments across genuinely different objectives; preserve
         # moments across render -> joint, whose distortion is unchanged.
-        if phase == 'render' and (args.bootstrap_steps or camera_init):
+        if phase == 'render' and args.bootstrap_steps:
             optimizer.state.clear()
         lr_schedule = ValidationLRSchedule(optimizer,args.lr_schedule,args.lr_factor,args.lr_patience,
                                            args.lr_threshold,args.min_lr)
@@ -369,7 +348,7 @@ def train(args):
 
         best, patience_best, stale = float('inf'),float('inf'),0
         if phase != 'bootstrap':
-            initial = initial_validation if step == 0 else validation(step,phase)
+            initial = initial_validation if phase == 'render' and step == 0 else validation(step,phase)
             best = patience_best = initial['score']
             selections[phase] = {'step':step,'score':best}
             save('_best_'+phase,phase,step)
@@ -408,19 +387,10 @@ def train(args):
             else:
                 view_ids = torch.randperm(len(cameras))[:args.views_per_step].tolist()
                 task = MultiViewRenderTask([cameras[i] for i in view_ids],reference,degree,args.white_background)
-                if phase in ('render','camera_init'):
+                if phase == 'render':
                     qs = [hard_layout(gi,tier,args.drop) for gi in group_ids]
                     if not any((q>0).any() for q in qs):
                         qs = [hard_layout(gi,1,0.) for gi in group_ids]
-                    if phase == 'camera_init':
-                        from .camera_objective import CameraInitializationTask
-                        # Groups are Morton ordered; strip padding before indexing
-                        # the same ordered source. Original row IDs are not indices here.
-                        retained = torch.cat([q[gi>=0].cpu() for q,gi in zip(qs,group_ids)]) > 0
-                        task = CameraInitializationTask([cameras[i] for i in view_ids],reference,degree,
-                                                       raw[retained,:3],args.white_background,
-                                                       args.camera_geometry_weight,args.camera_pixel_scale,
-                                                       args.camera_depth_scale)
                     loss, details = full_scene_step(model,list(zip(groups,qs)),geometry,args.snr,args.channel,
                                                     task,attr_weight=0.,mode=args.render_backward)
                     stats.update(details,**task.stats)
@@ -433,10 +403,7 @@ def train(args):
                                                        mode=args.render_backward)
                     stats.update(details)
                     stats['layout'] = 'learned_mask'
-                stats.update(image_mse=stats.get('teacher_xyz_image_mse',stats['render_loss']),
-                             training_view_indices=view_ids,views_per_step=len(view_ids))
-                if phase == 'camera_init':
-                    stats['task_loss'] = stats.pop('render_loss')
+                stats.update(image_mse=stats['render_loss'],training_view_indices=view_ids,views_per_step=len(view_ids))
             norm,gradient_stats = clip_codec_gradients(model,args.clip_norm,args.clip_mode)
             before = {name:p.detach().clone() for name,p in model.named_parameters()}
             if phase == 'joint':
@@ -465,10 +432,7 @@ def train(args):
                                 if spatial_test else '')
                 print(f'{phase} {local_step}/{maximum}: loss={row["loss"]:.6f}, grad={float(norm):.4g}, '
                       f'update={update_norm:.4g}, lr={row["lr"]:g}, sec={row["step_seconds"]:.2f}'
-                      + spatial_note + (f', teacher_rgb={stats["teacher_xyz_image_mse"]:.5f}, '
-                                        f'weighted_xyz={stats["geometry_contribution"]:.5f}, '
-                                        f'pixel_error={stats["pixel_error_mean"]:.2f}px'
-                                        if phase == 'camera_init' else ''),flush=True)
+                      + spatial_note,flush=True)
             if step%args.save_every == 0:
                 save(f'_{step}',phase,step)
             if local_step%args.validate_every == 0 or local_step == maximum:
@@ -507,7 +471,6 @@ def train(args):
     save('',last_phase,step)
     (out/'selection.json').write_text(json.dumps({'best_by_phase':selections,'codec.pt':'last executed step; not necessarily best',
                                                 'evaluation':('best_bootstrap selects local spatial response, NOT render quality' if spatial_test else
-                                                              'best_by_phase selects complete decoded rendering, never teacher-XYZ; final held-out test still required' if camera_init else
                                                               'best_render or matched best_joint pair; final held-out test still required')},indent=2),encoding='utf-8')
     print(f'Saved last codec: {out/"codec.pt"}; selected checkpoints: {selections}',flush=True)
     from .plots import safe_plot

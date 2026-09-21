@@ -14,7 +14,7 @@ def append_json(path, row):
         handle.write(json.dumps(row, allow_nan=False)+'\n')
 
 
-def save_panel(path, photo, reference, decoded, decoded_label='Received'):
+def save_panel(path, photo, reference, decoded):
     from PIL import Image, ImageDraw
     images = [photo, reference, decoded, (decoded-reference).abs().mean(0, keepdim=True).expand(3,-1,-1)*4]
     pixels = (torch.cat(images, 2).detach().clamp(0,1).permute(1,2,0).cpu().numpy()*255).round().astype('uint8')
@@ -22,7 +22,7 @@ def save_panel(path, photo, reference, decoded, decoded_label='Received'):
     canvas = Image.new('RGB', (panel.width, panel.height+24), 'white')
     canvas.paste(panel, (0,24))
     draw = ImageDraw.Draw(canvas)
-    for i,label in enumerate(('Photo', 'Source PLY', decoded_label, 'Abs error x4')):
+    for i,label in enumerate(('Photo', 'Source PLY', 'Received', 'Abs error x4')):
         draw.text((i*panel.width//4+4,5), label, fill='black')
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
@@ -31,8 +31,7 @@ def save_panel(path, photo, reference, decoded, decoded_label='Received'):
 @torch.no_grad()
 def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                     snr, channel, trials, seed, out, step, phase, mask=None,
-                    white_background=False, beta=0., position_net_bits_per_use=2.,
-                    teacher_xyz_diagnostic=False):
+                    white_background=False, beta=0., position_net_bits_per_use=2.):
     from .cli import seed_all
     from .rendering import render
     device = next(model.parameters()).device
@@ -57,8 +56,6 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                 for trial in range(trials):
                     seed_all(seed+20000+index*1000+trial)
                     scene = decode_batches(model,groups,qs,snr,channel,geometry)
-                    teacher_scene = (torch.cat((raw[flat_q>0,:3].to(device),scene[:,3:]),-1)
-                                     if teacher_xyz_diagnostic else None)
                     if len(scene):
                         xyz_errors.append(float((scene[:,:3]-raw[flat_q>0,:3].to(device)).square().mean().sqrt()))
                     view_scores = []
@@ -74,20 +71,13 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                                **{'source_'+k:v for k,v in source_metrics.items()},
                                **{'photo_'+k:v for k,v in photo_metrics.items()},
                                **{'reference_photo_'+k:v for k,v in baseline_metrics.items()}}
-                        if teacher_xyz_diagnostic:
-                            teacher_image = render(teacher_scene,camera,model.cfg.sh_degree,white_background)
-                            row.update({'teacher_xyz_source_'+k:v for k,v in image_metrics(teacher_image,target).items()})
-                            row.update({'teacher_xyz_photo_'+k:v for k,v in image_metrics(teacher_image,photo).items()})
-                            if trial == 0:
-                                save_panel(Path(out)/'teacher_xyz_images'/f'{step:06d}'/f'{label}_view{view:02d}.png',
-                                           photo,target,teacher_image,decoded_label='Teacher XYZ (oracle)')
                         observations.append(row)
                         view_scores.append(source_metrics['mse'])
                         if trial == 0:
                             save_panel(Path(out)/'validation_images'/f'{step:06d}'/f'{label}_view{view:02d}.png',
                                        photo,target,decoded)
                     trial_scores.append(sum(view_scores)/len(view_scores))
-                    del scene, teacher_scene
+                    del scene
                 keys = [k for k in observations[0] if k not in ('trial','view_index','view')]
                 entry = {'layout':label, **{k:sum(r[k] for r in observations)/len(observations) for k in keys},
                          'noise_trial_mse_std':float(torch.tensor(trial_scores).std(unbiased=False)),
@@ -109,12 +99,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
               'score_definition':'hard_mask_source_mse_plus_normalized_payload' if selected else 'mean_layout_source_mse',
               'codec_score':codec_score,'snr':snr,'channel':channel,'trials':trials,
               'validation_views':len(cameras),'layouts':entries,
-              'teacher_xyz_diagnostic':teacher_xyz_diagnostic,
               'metrics_note':'unclipped MSE/PSNR; displayed-RGB SSIM; no projection/parameter loss; payload excludes metadata'}
     append_json(Path(out)/'validation.jsonl',result)
     print(f'validation step={step}: source MSE={codec_score:.6f}; '+', '.join(
         f'q{e["layout"]} PSNR={e["source_psnr"]:.2f}' for e in entries),flush=True)
-    if teacher_xyz_diagnostic:
-        print('  teacher-XYZ diagnostic (not deployment): '+', '.join(
-            f'q{e["layout"]} PSNR={e["teacher_xyz_source_psnr"]:.2f}' for e in entries),flush=True)
     return result

@@ -32,10 +32,6 @@ def plot_render_training(training_dir, output_dir=None):
             _trace(ax,subset,'rate_loss','Payload penalty','#59636E',':')
         local = phase=='bootstrap' and subset[0].get('bootstrap_objective')=='local-response'
         ylabel = ('Isolated response RGB MSE' if local else 'Normalized-feature SmoothL1') if phase=='bootstrap' else 'RGB MSE + rate (joint only)'
-        if phase == 'camera_init':
-            ylabel = 'Teacher-XYZ RGB MSE + weighted camera geometry'
-            _trace(ax,subset,'teacher_xyz_image_mse','Teacher-XYZ RGB','#D96C2F','--')
-            _trace(ax,subset,'geometry_contribution','Weighted XYZ','#59636E',':')
         ax.set(title=phase + (' | local response' if local else ''),xlabel='Optimization step',ylabel=ylabel)
         if ax.get_legend_handles_labels()[0]:
             ax.legend()
@@ -54,14 +50,6 @@ def plot_render_training(training_dir, output_dir=None):
         else:
             ax.text(.5,.5,'Not recorded',transform=ax.transAxes,ha='center')
     charts += _finish(fig,out/'optimization')
-    init_rows = [r for r in rows if r['phase']=='camera_init']
-    if init_rows:
-        fig,axes = plt.subplots(1,3,figsize=(16,4))
-        for ax,key,title in zip(axes,('pixel_error_mean','pixel_loss','depth_loss'),
-                                ('Mean projected error (pixels)','Pixel SmoothL1','Relative depth SmoothL1')):
-            _trace(ax,init_rows,key,title,'#2F6B9A')
-            ax.set(title=title,xlabel='Optimization step')
-        charts += _finish(fig,out/'camera_geometry')
     validation = root/'validation.jsonl'
     if validation.exists():
         records = _read_jsonl(validation)
@@ -75,17 +63,6 @@ def plot_render_training(training_dir, output_dir=None):
                     'trials':r['trials'],'validation_views':r['validation_views']}
         flattened = list(indexed.values())
         _write_csv(out/'validation_metrics.csv',flattened,list(flattened[0]))
-        if 'teacher_xyz_source_psnr' in flattened[0]:
-            fig,axes = plt.subplots(2,2,figsize=(12,8))
-            fig.suptitle('Fixed validation | same decoded attributes and noise; source-render PSNR')
-            for ax,label in zip(axes.flat,('1','2','3','mixed')):
-                subset=sorted([r for r in flattened if r['layout']==label],key=lambda r:r['step'])
-                for key,name,color in [('source_psnr','Complete decoding','#2F6B9A'),
-                                       ('teacher_xyz_source_psnr','Teacher XYZ (diagnostic only)','#D96C2F')]:
-                    ax.plot([r['step'] for r in subset],[r[key] for r in subset],marker='o',color=color,label=name)
-                ax.set(title='q'+label,xlabel='Optimization step',ylabel='PSNR (dB)')
-                ax.legend()
-            charts += _finish(fig,out/'teacher_xyz_gap')
         fig,axes = plt.subplots(2,3,figsize=(16,8))
         first=records[0]
         fig.suptitle(f'Fixed validation | {first["channel"]}, {first["snr"]:g} dB, '
