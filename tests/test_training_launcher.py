@@ -8,6 +8,18 @@ import unittest
 
 
 class LauncherTests(unittest.TestCase):
+    def test_transformer_trunk_launcher(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','DECODER_ATTENTION':'window',
+                            'XYZ_DECODER':'block_center','DECODER_DEPTH':'6','INIT':'missing.pt'},
+                           script='scripts/test_transformer_trunk_q3.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--decoder-attention transformer_trunk','--decoder-depth 6',
+                     '--xyz-decoder additive','--bootstrap-tier 3','--channel none',
+                     '--render-steps 0','--bootstrap-steps 10000','--save-every 500',
+                     '--lr 0.0002','--clip-mode none','/run/render_history'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+
     def test_received_point_launcher_keeps_q3_noiseless_bootstrap(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','DECODER_ATTENTION':'window','XYZ_DECODER':'block_center'},
                            script='scripts/test_decoder_point_q3.sh')
@@ -60,7 +72,7 @@ class LauncherTests(unittest.TestCase):
             env=os.environ.copy()
             for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES',
                         'LR','RENDER_LR','LR_SCHEDULE','RENDER_BACKWARD','BLOCKS_PER_BATCH','BOOTSTRAP_TIER','XYZ_DECODER',
-                        'DECODER_ATTENTION','DECODER_NEIGHBORS'):
+                        'DECODER_ATTENTION','DECODER_NEIGHBORS','DECODER_DEPTH'):
                 env.pop(key,None)
             env.update(PYTHON_BIN='/bin/echo',PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
             env.update(overrides or {})

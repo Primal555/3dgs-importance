@@ -43,6 +43,15 @@ class ValidationLRSchedule:
 def parameter_group(name):
     if name.startswith('learned.'):
         part = name.split('.')[1]
+        if part == 'dec_trunk':
+            sub = name.split('.')[2]
+            if sub in ('xyz_readout','xyz_norms'):
+                return 'xyz_multidepth_head'
+            if sub == 'heads':
+                return 'covariance_head' if name.split('.')[3]=='logcov' else 'attribute_heads'
+            if sub == 'blocks':
+                return 'decoder_transformer_layer_'+name.split('.')[3]
+            return 'decoder_trunk_input_output'
         if part == 'dec_xyz_center':
             return 'xyz_center_head'
         if part == 'dec_xyz_symbols':

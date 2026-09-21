@@ -32,7 +32,8 @@ def add_parser(sub):
                    help='multiscale_self adds pointwise paths and pooled context; random start required when changing mode')
     p.add_argument('--encoder-attention', choices=['window','geometric_point'], default=None)
     p.add_argument('--encoder-neighbors', type=int, default=None)
-    p.add_argument('--decoder-attention',choices=['window','feature_point'],default=None)
+    p.add_argument('--decoder-attention',choices=['window','feature_point','transformer_trunk'],default=None)
+    p.add_argument('--decoder-depth',type=int,default=None,help='Transformer trunk layers, >=3; independent of encoder depth')
     p.add_argument('--decoder-neighbors',type=int,default=None)
     p.add_argument('--xyz-decoder',choices=['additive','block_center','context_center','residual_center','symbol_skip'],default=None)
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
@@ -168,6 +169,8 @@ def train(args):
             raise ValueError('initializer decoder attention mismatch; start from random weights')
         if args.decoder_neighbors is not None and args.decoder_neighbors!=model.cfg.decoder_neighbors:
             raise ValueError('initializer decoder neighbors mismatch')
+        if args.decoder_depth is not None and args.decoder_depth!=model.cfg.decoder_depth:
+            raise ValueError('initializer decoder depth mismatch; start from random weights')
         if args.xyz_decoder is not None and args.xyz_decoder != model.cfg.xyz_decoder:
             raise ValueError('initializer XYZ decoder mismatch; start from random weights')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
@@ -181,6 +184,7 @@ def train(args):
                           encoder_neighbors=16 if args.encoder_neighbors is None else args.encoder_neighbors,
                           decoder_attention=args.decoder_attention or 'window',
                           decoder_neighbors=16 if args.decoder_neighbors is None else args.decoder_neighbors,
+                          decoder_depth=4 if args.decoder_depth is None else args.decoder_depth,
                           xyz_decoder=args.xyz_decoder or 'additive',
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
@@ -293,6 +297,13 @@ def train(args):
         record['xyz_decoder_design']='block_center with pooled received own AND geometry Context features for centroid prediction; new Context weights start at zero; zero-mean offsets; no source center'
     record['decoder_attention_design']=('received-feature cosine kNN, grouped relation attention; no source XYZ or slot sinusoid; x4/x16 pooling still uses packet slots'
                                         if model.cfg.decoder_attention=='feature_point' else 'shifted sequence-window multihead attention with slot sinusoid')
+    if model.cfg.decoder_attention=='transformer_trunk':
+        record['decoder_attention_design']='received-only full attention within each codec block; pre-norm residual Transformer main path; no kNN, slot IDs, pooling or gated output bypass'
+        record['xyz_decoder_design']='separately normalized shallow/middle/deep Transformer features -> concatenation -> nonlinear XYZ readout; no source coordinates'
+        record['decoder_xyz_taps']=[i+1 for i in model.learned.dec_trunk.tap_indices]
+        record['context_design']='encoder retains gated fine/x4/x16 context; receiver replaced by block Transformer trunk'
+        record['context_gate_initialization']='encoder only: tanh(0.1); no receiver Context gate'
+        record['receiver_context']='full attention over received tokens within codec block; no source geometry, slot embedding or hard neighbors'
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     if args.bootstrap_tier is not None:
         print(f'Fixed bootstrap/validation q{args.bootstrap_tier}: {model.cfg.rates[args.bootstrap_tier]} complex symbols/G; {record["channel_protocol"]}.',flush=True)

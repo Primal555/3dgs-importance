@@ -54,6 +54,9 @@ class PositionPathTests(unittest.TestCase):
             args=SimpleNamespace(checkpoint=str(root/'codec.pt'),ply=str(root/'input.ply'),out=str(root/'report'),
                                  device='cpu',max_blocks=0,blocks_per_batch=2,cpu_threads=1,snr=10.)
             result=run(args)
+            if self.decoder_attention=='transformer_trunk':
+                self.assertFalse(any(key.startswith('self_only') for key in result['summary']))
+                self.assertIn('not applicable',result['self_only_warning'])
             self.assertEqual(result['summary']['full/all']['points'],17)
             self.assertEqual(result['summary']['full/heldout']['points'],8)
             self.assertEqual(result['checkpoint_sha256'],digest)

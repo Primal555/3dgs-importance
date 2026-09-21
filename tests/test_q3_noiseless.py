@@ -58,6 +58,11 @@ class Q3NoiselessTests(unittest.TestCase):
             self.assertEqual(model.cfg.encoder_attention,'geometric_point')
             self.assertEqual(model.cfg.xyz_decoder,self.xyz_decoder)
             self.assertEqual(model.cfg.decoder_attention,self.decoder_attention)
+            if self.decoder_attention=='transformer_trunk':
+                record=json.loads((root/'run/training.json').read_text())
+                self.assertEqual(record['decoder_xyz_taps'],[1,2,4])
+                self.assertEqual(record['codec_config']['decoder_depth'],4)
+                self.assertIn('no receiver Context gate',record['context_gate_initialization'])
             rows=[json.loads(s) for s in (root/'run/loss.jsonl').read_text().splitlines()]
             self.assertEqual(len(rows),5)
             for row in rows:
@@ -85,7 +90,7 @@ class Q3NoiselessTests(unittest.TestCase):
             bad=argv+['--drop','0.1']
             with patch('sys.argv',bad),self.assertRaisesRegex(ValueError,'drop=0'):
                 main()
-            if self.decoder_attention=='feature_point':
+            if self.decoder_attention!='window':
                 bad=argv+['--init',str(root/'run/codec.pt'),'--decoder-attention','window','--out',str(root/'mismatch')]
                 with patch('sys.argv',bad),self.assertRaisesRegex(ValueError,'decoder attention mismatch'):
                     main()

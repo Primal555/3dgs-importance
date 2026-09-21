@@ -23,6 +23,7 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --context-mode "${CONTEXT_MODE:-window}" \
   --xyz-decoder "${XYZ_DECODER:-additive}" \
   --decoder-attention "${DECODER_ATTENTION:-window}" --decoder-neighbors "${DECODER_NEIGHBORS:-16}" \
+  --decoder-depth "${DECODER_DEPTH:-4}" \
   --encoder-attention "${ENCODER_ATTENTION:-window}" --encoder-neighbors "${ENCODER_NEIGHBORS:-16}" \
   --position-delivery learned --bootstrap-objective spatial-response \
   --bootstrap-steps "${BOOTSTRAP_STEPS:-5000}" --render-steps 0 --joint-steps 0 \

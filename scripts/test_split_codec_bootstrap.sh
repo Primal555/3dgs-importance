@@ -26,7 +26,7 @@ if [[ "$RENDER_HISTORY" == 1 ]]; then
   }
   [[ ! -e "$OUT/render_history" ]] || { echo 'Render history output exists.' >&2; exit 1; }
 fi
-echo "$ARCHITECTURE: geometry/appearance streams, sender-relative local attention, ONE shared JSCC payload."
+echo "$ARCHITECTURE: sender geometry/appearance streams, ONE shared JSCC payload; receiver=${DECODER_ATTENTION:-window}."
 if [[ "$ARCHITECTURE" == learned_split_logcov ]]; then
   echo 'spatial_logcov_v1: logcov head and physical Frobenius shape loss replace scale/quaternion and native overlap.'
 else

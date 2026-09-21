@@ -24,6 +24,7 @@ class CodecConfig:
     encoder_neighbors: int = 16
     decoder_attention: str = 'window'
     decoder_neighbors: int = 16
+    decoder_depth: int = 4
     xyz_decoder: str = 'additive'
     loss_profile: str = "learned_v1"
     position_head: str = "learned_affine"
@@ -47,10 +48,14 @@ class CodecConfig:
     position_bits: int = 12
 
     def __post_init__(self):
-        if self.decoder_attention not in ('window','feature_point'):
+        if self.decoder_attention not in ('window','feature_point','transformer_trunk'):
             raise ValueError('unknown decoder attention')
-        if self.decoder_attention=='feature_point' and self.context_mode!='multiscale_self':
-            raise ValueError('feature_point decoder requires multiscale_self context')
+        if self.decoder_attention!='window' and self.context_mode!='multiscale_self':
+            raise ValueError('experimental decoder requires multiscale_self context')
+        if not isinstance(self.decoder_depth,int) or self.decoder_depth < 3:
+            raise ValueError('decoder_depth must be an integer >=3 for distinct XYZ readout depths')
+        if self.decoder_attention=='transformer_trunk' and self.xyz_decoder!='additive':
+            raise ValueError('transformer_trunk uses its own multi-depth XYZ readout; requires xyz_decoder=additive')
         if not isinstance(self.decoder_neighbors,int) or self.decoder_neighbors<1:
             raise ValueError('decoder_neighbors must be a positive integer')
         if self.xyz_decoder not in ('additive','block_center','context_center','residual_center','symbol_skip'):
@@ -107,6 +112,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.decoder_attention!='transformer_trunk' and self.decoder_depth==4:
+            result.pop('decoder_depth')
         if self.decoder_attention=='window' and self.decoder_neighbors==16:
             result.pop('decoder_attention');result.pop('decoder_neighbors')
         if self.xyz_decoder == 'additive':

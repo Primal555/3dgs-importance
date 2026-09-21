@@ -36,6 +36,9 @@ def summarize(roots, out, tail_checks=3):
                 for split in ('fit','heldout'):
                     for key in ('mse','common_mse','relative_mse'):
                         row[f'{split}_{key}']=sum(v[split][key] for v in tail)/len(tail)
+                    for key in ('loss','position','shape'):
+                        if all(key in v[split] for v in tail):
+                            row[f'{split}_{key}']=sum(v[split][key] for v in tail)/len(tail)
                 rows.append(row)
     if len({(r['mode'],r['seed']) for r in rows})!=len(rows):
         raise ValueError('duplicate mode/seed')
@@ -56,7 +59,7 @@ def summarize(roots, out, tail_checks=3):
     paired=[]
     index={(r['mode'],r['seed']):r for r in rows}
     for r in rows:
-        if r['mode'].startswith('feature_point__'):
+        if '__' in r['mode']:
             ref=index.get((r['mode'].split('__',1)[1],r['seed']))
             if ref is not None:
                 if ref['steps']!=r['steps']:
@@ -174,7 +177,7 @@ if __name__=='__main__':
     p.add_argument('--steps',type=int,default=300);p.add_argument('--every',type=int,default=50)
     p.add_argument('--threads',type=int,default=2)
     p.add_argument('--seeds',type=int,nargs='+',default=[42,43])
-    p.add_argument('--decoder-attentions',nargs='+',choices=['window','feature_point'],default=['window'])
+    p.add_argument('--decoder-attentions',nargs='+',choices=['window','feature_point','transformer_trunk'],default=['window'])
     p.add_argument('--modes',nargs='+',choices=['additive','block_center','context_center','residual_center','symbol_skip'],default=['additive','block_center','context_center'])
     p.add_argument('--blocks',type=int,nargs='+',default=[40,440,840,1240,1640,2040,2440,2840])
     run(p.parse_args())

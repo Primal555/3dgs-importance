@@ -82,8 +82,9 @@ def run(args):
     if any(i<0 or i>=blocks for i in selected):
         raise ValueError('invalid held-out block indices')
     captures={}
-    hooks=[model.learned.heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(own=o)),
-           model.learned.context_heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(context=o))]
+    trunk=model.cfg.decoder_attention=='transformer_trunk'
+    hooks=[] if trunk else [model.learned.heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(own=o)),
+                            model.learned.context_heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(context=o))]
     if model.cfg.xyz_decoder in ('block_center','context_center','residual_center'):
         hooks.append(model.learned.dec_xyz_center.register_forward_hook(lambda m,i,o:captures.update(center=o)))
     if model.cfg.xyz_decoder=='symbol_skip':
@@ -100,7 +101,8 @@ def run(args):
                 q[j,:len(r)]=3
             z=model.learned.encode(f,f[...,:3],q,args.snr)
             decoded=model.learned.decode(z,q,args.snr) # identity channel
-            own=captures['own'];correction=model.learned.dec_geometry_gate.tanh()*captures['context']
+            own=decoded[...,:3] if trunk else captures['own']
+            correction=torch.zeros_like(own) if trunk else model.learned.dec_geometry_gate.tanh()*captures['context']
             if model.cfg.xyz_decoder in ('block_center','context_center'):
                 from gaussian_jscc.multiscale_codec import zero_mean
                 own=captures['center']+zero_mean(own,q>0)
@@ -112,12 +114,15 @@ def run(args):
             torch.testing.assert_close(decoded[...,:3][q>0],(own+correction)[q>0],rtol=2e-5,atol=2e-6)
             for j,(index,source) in enumerate(zip(indices,sources)):
                 n=len(source);radii=source[:,4:7].amax(-1).exp()
-                for label,pred in (('full',decoded[j,:n,:3]),('self_only',own[j,:n])):
+                paths=[('full',decoded[j,:n,:3])]
+                if not trunk:
+                    paths.append(('self_only',own[j,:n]))
+                for label,pred in paths:
                     world=geometry.denormalize(pred).cpu()
                     row=decompose(world,source[:,:3],radii)
                     row.update(block=index,split='heldout' if index in held else 'training_pool',path=label)
                     corr=correction[j,:n].cpu()*geometry.span
-                    row['context_correction_rmse_world']=float(corr.square().mean().sqrt())
+                    row['context_correction_rmse_world']=None if trunk else float(corr.square().mean().sqrt())
                     rows.append(row)
             print(f'Diagnosed {min(offset+len(indices),len(selected))}/{len(selected)} blocks',flush=True)
     finally:
@@ -137,7 +142,9 @@ def run(args):
                 total_scene_blocks=blocks,selected_blocks=selected,
                 selection='all blocks' if args.max_blocks==0 else 'spaced blocks plus all recorded heldout blocks',
                 oracle_warning='centering and affine maps use source XYZ, diagnosis only; NOT a receiver or render PSNR',
-                self_only_warning='remove only final XYZ Context correction; latent still contains encoder Context; context_center and residual_center retain pooled decoder Context in their center paths',
+                self_only_warning=('not applicable: Transformer trunk has no own/context output split' if trunk else
+                                   'remove only final XYZ Context correction; latent still contains encoder Context; context_center and residual_center retain pooled decoder Context in their center paths'),
+                decoder_attention=model.cfg.decoder_attention,
                 xyz_decoder=model.cfg.xyz_decoder,
                 aggregation='point-weighted SSE/RMSE; radius statistics are equal-block mean of medians',
                 summary=summary)

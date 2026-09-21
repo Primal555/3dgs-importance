@@ -13,6 +13,7 @@ from .split_codec import GeometryWindowBlock, mlp
 from .learned_codec import LocalFeatureBlock
 from .point_attention import GeometricPointBlock
 from .decoder_attention import ReceivedPointBlock
+from .transformer_decoder import ReceivedTransformerDecoder
 
 
 def pool_slots(values, active, factor):
@@ -85,6 +86,11 @@ class MultiScaleSelfCore(nn.Module):
         self.enc_self_symbols = mlp(2*h,h,2*cfg.rates[-1])
         self.enc_context_symbols = mlp(2*h,h,2*cfg.rates[-1])
         self.enc_context_gate = nn.Parameter(torch.tensor(.1))
+        if cfg.decoder_attention == 'transformer_trunk':
+            # Encoder initialization is identical to the frozen baseline at the
+            # same seed. Do not allocate unused old receiver heads or gates.
+            self.dec_trunk = ReceivedTransformerDecoder(cfg)
+            return
         self.dec_geometry_in = mlp(4*cfg.rates[-1],h)
         self.dec_appearance_in = mlp(4*cfg.rates[-1],h)
         self.dec_geometry_context = MultiScaleContext(cfg,False)
@@ -166,6 +172,8 @@ class MultiScaleSelfCore(nn.Module):
         mask = prefix_mask(q.flatten(),self.cfg.rates).reshape_as(received)
         packet = torch.cat((received*mask,mask.to(received)),-1)
         condition = self.condition(q,snr,received.dtype)
+        if self.cfg.decoder_attention == 'transformer_trunk':
+            return self.dec_trunk(packet,condition,active)
         g = (self.dec_geometry_in(packet)+condition)*active[...,None]
         a = (self.dec_appearance_in(packet)+condition)*active[...,None]
         pos = torch.arange(q.shape[1],device=q.device,dtype=received.dtype)[:,None]
@@ -205,5 +213,7 @@ class MultiScaleSelfCore(nn.Module):
         return torch.cat(result,-1)*active[...,None]
 
     def context_diagnostics(self):
+        if self.cfg.decoder_attention == 'transformer_trunk':
+            return {'enc_context_gate': float(self.enc_context_gate.detach().tanh())}
         return {key:float(getattr(self,key).detach().tanh()) for key in
                 ('enc_context_gate','dec_geometry_gate','dec_appearance_gate')}
