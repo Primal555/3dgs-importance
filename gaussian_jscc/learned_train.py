@@ -34,6 +34,7 @@ def add_parser(sub):
     p.add_argument('--encoder-neighbors', type=int, default=None)
     p.add_argument('--decoder-attention',choices=['window','feature_point','transformer_trunk'],default=None)
     p.add_argument('--decoder-depth',type=int,default=None,help='Transformer trunk layers, >=3; independent of encoder depth')
+    p.add_argument('--decoder-localization',choices=['none','token_translation'],default=None)
     p.add_argument('--decoder-neighbors',type=int,default=None)
     p.add_argument('--xyz-decoder',choices=['additive','block_center','context_center','residual_center','symbol_skip'],default=None)
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
@@ -171,6 +172,8 @@ def train(args):
             raise ValueError('initializer decoder neighbors mismatch')
         if args.decoder_depth is not None and args.decoder_depth!=model.cfg.decoder_depth:
             raise ValueError('initializer decoder depth mismatch; start from random weights')
+        if args.decoder_localization is not None and args.decoder_localization!=model.cfg.decoder_localization:
+            raise ValueError('initializer decoder localization mismatch; start from random weights')
         if args.xyz_decoder is not None and args.xyz_decoder != model.cfg.xyz_decoder:
             raise ValueError('initializer XYZ decoder mismatch; start from random weights')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
@@ -185,6 +188,7 @@ def train(args):
                           decoder_attention=args.decoder_attention or 'window',
                           decoder_neighbors=16 if args.decoder_neighbors is None else args.decoder_neighbors,
                           decoder_depth=4 if args.decoder_depth is None else args.decoder_depth,
+                          decoder_localization=args.decoder_localization or 'none',
                           xyz_decoder=args.xyz_decoder or 'additive',
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
@@ -304,6 +308,9 @@ def train(args):
         record['context_design']='encoder retains gated fine/x4/x16 context; receiver replaced by block Transformer trunk'
         record['context_gate_initialization']='encoder only: tanh(0.1); no receiver Context gate'
         record['receiver_context']='full attention over received tokens within codec block; no source geometry, slot embedding or hard neighbors'
+        if model.cfg.decoder_localization=='token_translation':
+            record['xyz_decoder_design']+='; zero-start learned query reads all three depths and adds one common translation per block'
+            record['localization_design']='read-only cross-attention to received features; no added payload, source coordinates or auxiliary loss; relative positions unchanged for fixed base features'
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     if args.bootstrap_tier is not None:
         print(f'Fixed bootstrap/validation q{args.bootstrap_tier}: {model.cfg.rates[args.bootstrap_tier]} complex symbols/G; {record["channel_protocol"]}.',flush=True)

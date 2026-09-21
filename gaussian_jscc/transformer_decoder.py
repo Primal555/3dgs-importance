@@ -46,6 +46,9 @@ class ReceivedTransformerDecoder(nn.Module):
         if cfg.sh_degree:
             sizes['sh'] = 3*((cfg.sh_degree+1)**2-1)
         self.heads = nn.ModuleDict({key: nn.Linear(h, n) for key, n in sizes.items()})
+        # Allocate LAST: shared encoder/trunk/head initialization stays identical.
+        if cfg.decoder_localization == 'token_translation':
+            self.localization = BlockLocalizationToken(h, cfg.attention_heads, len(self.tap_indices))
 
     def forward(self, packet, condition, active):
         x = (self.input(packet.masked_fill(~active[..., None], 0)) + condition)
@@ -56,5 +59,40 @@ class ReceivedTransformerDecoder(nn.Module):
             if index in self.tap_indices:
                 taps.append(self.xyz_norms[len(taps)](x))
         xyz = self.xyz_readout(torch.cat(taps, dim=-1))
+        if hasattr(self, 'localization'):
+            xyz = xyz + self.localization(taps, active)
         last = self.final_norm(x)
         return torch.cat([xyz] + [head(last) for head in self.heads.values()], dim=-1).masked_fill(~active[..., None], 0)
+
+
+class BlockLocalizationToken(nn.Module):
+    """Learned query reads received shallow/middle/deep features, never GT XYZ.
+
+    Read-only attention does NOT modify point tokens. One translation is added
+    to all active points. Zero-start output preserves the complete base model.
+    """
+    def __init__(self, hidden, heads, levels):
+        super().__init__()
+        self.query = nn.Parameter(torch.empty(1, 1, hidden))
+        nn.init.normal_(self.query, std=.02)
+        self.query_norms = nn.ModuleList(nn.LayerNorm(hidden) for _ in range(levels))
+        self.attention = nn.ModuleList(nn.MultiheadAttention(hidden, heads, batch_first=True, dropout=0.) for _ in range(levels))
+        self.ff_norms = nn.ModuleList(nn.LayerNorm(hidden) for _ in range(levels))
+        self.ff = nn.ModuleList(nn.Sequential(nn.Linear(hidden, 2*hidden), nn.GELU(), nn.Linear(2*hidden, hidden)) for _ in range(levels))
+        self.output_norm = nn.LayerNorm(hidden)
+        self.translation = nn.Linear(hidden, 3)
+        nn.init.zeros_(self.translation.weight)
+        nn.init.zeros_(self.translation.bias)
+
+    def forward(self, taps, active):
+        query = self.query.expand(active.shape[0], -1, -1)
+        if active.shape[1] == 0:
+            return self.translation(self.output_norm(query))*0
+        safe = active.clone()
+        safe[:, 0] |= ~active.any(dim=1)
+        for features, norm, attention, ff_norm, ff in zip(taps, self.query_norms, self.attention, self.ff_norms, self.ff):
+            memory = features.masked_fill(~active[..., None], 0)
+            query = query + attention(norm(query), memory, memory, key_padding_mask=~safe, need_weights=False)[0]
+            query = query + ff(ff_norm(query))
+        shift = self.translation(self.output_norm(query))
+        return shift.masked_fill(~active.any(dim=1)[:, None, None], 0)
