@@ -257,6 +257,8 @@ keeps source camera images in CPU memory to reduce VRAM use.
 
 ## Experimental multiscale logcov JSCC
 
+Frozen noiseless baseline: branch `baseline/q3-noiseless-v1` at `1eccfc2`; [archive and full-scene position-path diagnosis](docs/q3_noiseless_baseline_and_position_diagnosis.md).
+
 Fixed-q3 noiseless diagnostic (32 complex symbols, bootstrap only): [protocol and background launch](docs/q3_noiseless_bootstrap.md), `scripts/test_q3_noiseless_bootstrap.sh`.
 
 Encoder-only geometric-neighbor Transformer experiment: [design and background launch](docs/point_transformer_logcov.md), `scripts/test_point_transformer_logcov.sh`. Receiver, logcov objective and per-Gaussian symbol budgets remain unchanged.
