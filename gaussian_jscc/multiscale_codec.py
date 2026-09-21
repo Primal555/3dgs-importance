@@ -24,6 +24,14 @@ def pool_slots(values, active, factor):
     return x.sum(-2)/count.clamp_min(1)[...,None], count>0
 
 
+def masked_mean(values, active):
+    return values.masked_fill(~active[...,None],0).sum(1,keepdim=True)/active.sum(1,keepdim=True).clamp_min(1)[...,None]
+
+
+def zero_mean(values, active):
+    return (values-masked_mean(values,active)).masked_fill(~active[...,None],0)
+
+
 class MultiScaleContext(nn.Module):
     """Fine windows + pooled x4/x16 windows within each independent block.
 
@@ -93,6 +101,17 @@ class MultiScaleSelfCore(nn.Module):
         for head in self.context_heads.values():
             nn.init.zeros_(head.bias)
         nn.init.normal_(self.context_heads['xyz'].weight,std=.02)
+        if cfg.xyz_decoder == 'block_center':
+            # Added after existing layers: encoder/attribute initialization is
+            # unchanged for an identical random seed. No source center is used.
+            self.dec_xyz_center = mlp(h,h,3)
+            nn.init.normal_(self.dec_xyz_center[-1].weight,std=.02)
+            nn.init.constant_(self.dec_xyz_center[-1].bias,.5)
+            # Bias would cancel under centering; do not keep dead parameters.
+            self.heads['xyz'] = nn.Linear(h,3,bias=False)
+            self.context_heads['xyz'] = nn.Linear(h,3,bias=False)
+            nn.init.normal_(self.heads['xyz'].weight,std=.02)
+            nn.init.normal_(self.context_heads['xyz'].weight,std=.02)
 
     def condition(self,q,snr,dtype):
         value = torch.full((*q.shape,1),float(snr)/20,device=q.device,dtype=dtype)
@@ -134,6 +153,12 @@ class MultiScaleSelfCore(nn.Module):
         for key,head in self.heads.items():
             geometry = key in ('xyz','logcov')
             gate = self.dec_geometry_gate if geometry else self.dec_appearance_gate
+            if key == 'xyz' and self.cfg.xyz_decoder == 'block_center':
+                center = self.dec_xyz_center(masked_mean(g,active))
+                own = zero_mean(head(g),active)
+                detail = zero_mean(self.context_heads[key](cg),active)
+                result.append(center+own+gate.tanh()*detail)
+                continue
             result.append(head(g if geometry else a)+gate.tanh()*self.context_heads[key](cg if geometry else ca))
         return torch.cat(result,-1)*active[...,None]
 

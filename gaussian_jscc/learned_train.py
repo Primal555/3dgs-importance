@@ -32,6 +32,7 @@ def add_parser(sub):
                    help='multiscale_self adds pointwise paths and pooled context; random start required when changing mode')
     p.add_argument('--encoder-attention', choices=['window','geometric_point'], default=None)
     p.add_argument('--encoder-neighbors', type=int, default=None)
+    p.add_argument('--xyz-decoder',choices=['additive','block_center'],default=None)
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
     p.add_argument('--source')
     p.add_argument('--device', default='cuda')
@@ -161,6 +162,8 @@ def train(args):
             raise ValueError('initializer encoder attention mismatch; start from random weights')
         if args.encoder_neighbors is not None and args.encoder_neighbors != model.cfg.encoder_neighbors:
             raise ValueError('initializer encoder neighbors mismatch')
+        if args.xyz_decoder is not None and args.xyz_decoder != model.cfg.xyz_decoder:
+            raise ValueError('initializer XYZ decoder mismatch; start from random weights')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
         print(f'Loaded {model.cfg.architecture} weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
@@ -170,6 +173,7 @@ def train(args):
                           context_mode=args.context_mode or 'window',
                           encoder_attention=args.encoder_attention or 'window',
                           encoder_neighbors=16 if args.encoder_neighbors is None else args.encoder_neighbors,
+                          xyz_decoder=args.xyz_decoder or 'additive',
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
@@ -271,6 +275,8 @@ def train(args):
                       unchanged='logcov representation, spatial_logcov_v1 objective, per-Gaussian symbol budgets and normalization')
     record.update(tier_protocol=f'fixed q{args.bootstrap_tier}' if args.bootstrap_tier is not None else 'cycle q1/q2/q3/mixed',
                   channel_protocol='identity channel; SNR is conditioning only' if args.channel=='none' else 'AWGN at configured SNR')
+    record['xyz_decoder_design'] = ('received-feature mean -> learned block center + zero-mean own offsets + gated zero-mean Context offsets; no source center'
+                                   if model.cfg.xyz_decoder=='block_center' else 'own absolute XYZ + gated Context correction')
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     if args.bootstrap_tier is not None:
         print(f'Fixed bootstrap/validation q{args.bootstrap_tier}: {model.cfg.rates[args.bootstrap_tier]} complex symbols/G; {record["channel_protocol"]}.',flush=True)
@@ -318,6 +324,11 @@ def train(args):
                             points += len(q)
                         pred = model(f,f[:,:3],q,args.snr,args.channel)
                         value, diagnostics = initialization_loss(pred,f)
+                        if spatial_test:
+                            delta=(pred[:,:3]-f[:,:3]).double()*geometry.span.to(pred).double()
+                            common=delta.mean(0,keepdim=True)
+                            diagnostics.update(block_xyz_common_mse=float(common.square().mean()),
+                                               block_xyz_relative_mse=float((delta-common).square().mean()))
                         losses.append(float(value))
                         measurements.append(diagnostics)
                 entry = {'layout':'mixed' if tier is None else str(tier),'loss':sum(losses)/len(losses)}

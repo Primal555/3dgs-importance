@@ -15,6 +15,17 @@ from gaussian_jscc.plots import plot_allocation, plot_evaluation, plot_training,
 
 @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "requires matplotlib")
 class PlotTests(unittest.TestCase):
+    def test_block_position_decomposition_chart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            rows=[dict(step=1,phase='bootstrap',objective='spatial_logcov_v1',loss=1.)]
+            (root/'loss.jsonl').write_text(json.dumps(rows[0])+'\n',encoding='utf-8')
+            val=dict(step=1,layouts=[dict(layout='3',loss=1.,block_xyz_common_mse=.2,block_xyz_relative_mse=.3)])
+            (root/'bootstrap_validation.jsonl').write_text(json.dumps(val)+'\n',encoding='utf-8')
+            plot_training(root)
+            self.assertTrue((root/'charts/bootstrap_xyz_decomposition.png').exists())
+            self.assertIn('block_xyz_relative_mse',(root/'charts/bootstrap_position_validation.csv').read_text())
+
     def test_context_gate_plot_and_csv(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

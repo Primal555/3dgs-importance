@@ -84,6 +84,8 @@ def run(args):
     captures={}
     hooks=[model.learned.heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(own=o)),
            model.learned.context_heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(context=o))]
+    if model.cfg.xyz_decoder=='block_center':
+        hooks.append(model.learned.dec_xyz_center.register_forward_hook(lambda m,i,o:captures.update(center=o)))
     rows=[]
     try:
         for offset in range(0,len(selected),args.blocks_per_batch):
@@ -97,6 +99,10 @@ def run(args):
             z=model.learned.encode(f,f[...,:3],q,args.snr)
             decoded=model.learned.decode(z,q,args.snr) # identity channel
             own=captures['own'];correction=model.learned.dec_geometry_gate.tanh()*captures['context']
+            if model.cfg.xyz_decoder=='block_center':
+                from gaussian_jscc.multiscale_codec import zero_mean
+                own=captures['center']+zero_mean(own,q>0)
+                correction=zero_mean(correction,q>0)
             torch.testing.assert_close(decoded[...,:3][q>0],(own+correction)[q>0],rtol=2e-5,atol=2e-6)
             for j,(index,source) in enumerate(zip(indices,sources)):
                 n=len(source);radii=source[:,4:7].amax(-1).exp()
@@ -126,6 +132,7 @@ def run(args):
                 selection='all blocks' if args.max_blocks==0 else 'spaced blocks plus all recorded heldout blocks',
                 oracle_warning='centering and affine maps use source XYZ, diagnosis only; NOT a receiver or render PSNR',
                 self_only_warning='remove only final XYZ Context correction; latent still contains encoder Context',
+                xyz_decoder=model.cfg.xyz_decoder,
                 aggregation='point-weighted SSE/RMSE; radius statistics are equal-block mean of medians',
                 summary=summary)
     out.mkdir(parents=True,exist_ok=False)

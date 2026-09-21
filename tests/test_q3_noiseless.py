@@ -17,6 +17,7 @@ from test_render_first import synthetic_render
 
 
 class Q3NoiselessTests(unittest.TestCase):
+    xyz_decoder='additive'
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
@@ -39,6 +40,7 @@ class Q3NoiselessTests(unittest.TestCase):
             root=Path(tmp);ply=root/'input.ply';write_ply(ply,raw,0)
             argv=['gaussian_jscc','train-learned','--architecture','learned_split_logcov',
                   '--context-mode','multiscale_self','--encoder-attention','geometric_point',
+                  '--xyz-decoder',self.xyz_decoder,
                   '--bootstrap-tier','3','--channel','none','--ply',str(ply),'--out',str(root/'run'),
                   '--device','cpu','--bootstrap-objective','spatial-response','--bootstrap-steps','5',
                   '--render-steps','0','--joint-steps','0','--hidden','16','--depth','1',
@@ -52,6 +54,7 @@ class Q3NoiselessTests(unittest.TestCase):
             model=load_checkpoint(root/'run/codec.pt','cpu')
             self.assertEqual(model.cfg.rates,(0,8,16,32))
             self.assertEqual(model.cfg.encoder_attention,'geometric_point')
+            self.assertEqual(model.cfg.xyz_decoder,self.xyz_decoder)
             rows=[json.loads(s) for s in (root/'run/loss.jsonl').read_text().splitlines()]
             self.assertEqual(len(rows),5)
             for row in rows:
@@ -61,6 +64,8 @@ class Q3NoiselessTests(unittest.TestCase):
                 self.assertEqual(row['objective'],'spatial_logcov_v1')
             val=[json.loads(s) for s in (root/'run/bootstrap_validation.jsonl').read_text().splitlines()]
             self.assertTrue(all([v['layout'] for v in r['layouts']]==['3'] and r['channel']=='none' for r in val))
+            self.assertTrue(all(v['layouts'][0]['block_xyz_common_mse']>=0 and
+                                v['layouts'][0]['block_xyz_relative_mse']>=0 for v in val))
             args=build_parser().parse_args(['--training',str(root/'run'),'--ply',str(ply),'--source','mock',
                                           '--start','5','--stop','5','--every','5','--tier','3',
                                           '--channel','none','--trials','1','--views','1'])

@@ -166,7 +166,20 @@ def plot_training(training_dir, output_dir=None):
                     'max_axis_ratio_p05','max_axis_ratio_p50','max_axis_ratio_p95',
                     'max_axis_ratio_gt10_fraction','max_axis_ratio_lt0_1_fraction',
                     'decoded_max_axis_p50_world','source_max_axis_p50_world',
-                    'xyz_distance_over_source_radius_p50','decoded_alpha_p50'])
+                    'xyz_distance_over_source_radius_p50','decoded_alpha_p50',
+                    'block_xyz_common_mse','block_xyz_relative_mse'])
+        if any('block_xyz_common_mse' in r for r in entries):
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+            fig.suptitle('XYZ error decomposition: fixed validation blocks\nEqual block/trial means, world units squared; diagnostic only')
+            for axis, key, label in zip(axes, ('block_xyz_common_mse','block_xyz_relative_mse'),
+                                        ('Common translation MSE','Within-block relative MSE')):
+                for tier in ('1','2','3','mixed'):
+                    group = [r for r in entries if r['layout']==tier]
+                    if group:
+                        axis.plot([r['step'] for r in group],_numeric(group,key),label='q'+tier)
+                axis.set(xlabel='Bootstrap step',ylabel=label)
+                axis.legend(fontsize=8)
+            charts += _finish(fig,out/'bootstrap_xyz_decomposition')
         if rows[0].get('objective') == 'spatial_logcov_v1':
             fig, axes = plt.subplots(2, 2, figsize=(11, 7))
             fig.suptitle('Log-covariance: fixed-block shape diagnostics (not render quality)')
