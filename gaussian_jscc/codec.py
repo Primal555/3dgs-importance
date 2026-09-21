@@ -20,6 +20,8 @@ class CodecConfig:
     morton_bits: int = 16
     architecture: str = "learned_joint"
     context_mode: str = 'window'
+    encoder_attention: str = 'window'
+    encoder_neighbors: int = 16
     loss_profile: str = "learned_v1"
     position_head: str = "learned_affine"
     individual_tiers: bool = True
@@ -42,6 +44,12 @@ class CodecConfig:
     position_bits: int = 12
 
     def __post_init__(self):
+        if self.encoder_attention not in ('window','geometric_point'):
+            raise ValueError('unknown encoder attention')
+        if self.encoder_attention == 'geometric_point' and self.context_mode != 'multiscale_self':
+            raise ValueError('geometric_point requires multiscale_self context')
+        if not isinstance(self.encoder_neighbors,int) or self.encoder_neighbors < 1:
+            raise ValueError('encoder_neighbors must be a positive integer')
         if self.context_mode not in ('window','multiscale_self'):
             raise ValueError('unknown context mode')
         if self.context_mode == 'multiscale_self' and (self.architecture != 'learned_split_logcov' or self.position_delivery != 'learned'):
@@ -86,6 +94,9 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.encoder_attention == 'window' and self.encoder_neighbors == 16:
+            result.pop('encoder_attention')
+            result.pop('encoder_neighbors')  # Preserve existing model hashes.
         if self.context_mode == 'window':
             result.pop('context_mode')  # Preserve old checkpoint/packet hashes.
         if self.position_delivery == 'learned' and self.position_bits == 12:

@@ -196,6 +196,16 @@ class LauncherTests(unittest.TestCase):
             self.assertIn(flag,result.stdout)
         self.assertNotIn('--init ',result.stdout)
 
+    def test_point_transformer_launcher_preserves_experiment_contract(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','BOOTSTRAP_STEPS':'1000'},
+                           script='scripts/test_point_transformer_logcov.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for flag in ('--encoder-attention geometric_point','--encoder-neighbors 16',
+                     '--context-mode multiscale_self','--architecture learned_split_logcov',
+                     '--lr 0.0002','--render-steps 0','--joint-steps 0','/run/render_history'):
+            self.assertIn(flag,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+
 
 if __name__=='__main__':
     unittest.main()

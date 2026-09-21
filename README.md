@@ -257,6 +257,8 @@ keeps source camera images in CPU memory to reduce VRAM use.
 
 ## Experimental multiscale logcov JSCC
 
+Encoder-only geometric-neighbor Transformer experiment: [design and background launch](docs/point_transformer_logcov.md), `scripts/test_point_transformer_logcov.sh`. Receiver, logcov objective and per-Gaussian symbol budgets remain unchanged.
+
 `scripts/test_multiscale_logcov_bootstrap.sh` runs the pointwise-self-path plus
 multiscale-context experiment. It preserves the existing logcov output,
 bootstrap objective and individual Gaussian symbol budgets; no render-training

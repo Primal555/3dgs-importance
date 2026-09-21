@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from .codec import prefix_mask
 from .split_codec import GeometryWindowBlock, mlp
 from .learned_codec import LocalFeatureBlock
+from .point_attention import GeometricPointBlock
 
 
 def pool_slots(values, active, factor):
@@ -35,6 +36,8 @@ class MultiScaleContext(nn.Module):
         super().__init__()
         self.geometry = geometry
         cls = GeometryWindowBlock if geometry else LocalFeatureBlock
+        if geometry and cfg.encoder_attention == 'geometric_point':
+            cls = GeometricPointBlock
         self.fine = nn.ModuleList(cls(cfg,i%2==1) for i in range(cfg.depth))
         self.coarse = nn.ModuleList(cls(cfg) for _ in self.factors)
         self.merge = nn.Sequential(nn.LayerNorm(3*cfg.hidden),mlp(3*cfg.hidden,cfg.hidden))

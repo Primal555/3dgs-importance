@@ -30,6 +30,8 @@ def add_parser(sub):
     p.add_argument('--allocation-init', help='matching route2.pt; requires --init and --joint-steps')
     p.add_argument('--context-mode', choices=['window','multiscale_self'], default=None,
                    help='multiscale_self adds pointwise paths and pooled context; random start required when changing mode')
+    p.add_argument('--encoder-attention', choices=['window','geometric_point'], default=None)
+    p.add_argument('--encoder-neighbors', type=int, default=None)
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
     p.add_argument('--source')
     p.add_argument('--device', default='cuda')
@@ -151,6 +153,10 @@ def train(args):
             raise ValueError('initializer architecture mismatch; a new architecture requires random initialization')
         if args.context_mode is not None and args.context_mode != model.cfg.context_mode:
             raise ValueError('initializer context mode mismatch; start the new structure from random weights')
+        if args.encoder_attention is not None and args.encoder_attention != model.cfg.encoder_attention:
+            raise ValueError('initializer encoder attention mismatch; start from random weights')
+        if args.encoder_neighbors is not None and args.encoder_neighbors != model.cfg.encoder_neighbors:
+            raise ValueError('initializer encoder neighbors mismatch')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
         print(f'Loaded {model.cfg.architecture} weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
@@ -158,6 +164,8 @@ def train(args):
     else:
         cfg = CodecConfig(architecture=args.architecture or 'learned_joint',loss_profile='learned_v1',sh_degree=degree,
                           context_mode=args.context_mode or 'window',
+                          encoder_attention=args.encoder_attention or 'window',
+                          encoder_neighbors=16 if args.encoder_neighbors is None else args.encoder_neighbors,
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
@@ -250,6 +258,9 @@ def train(args):
                           loss_design='(coarse_position + fine_weight * teacher_radius_pseudo_huber + logcov_Frobenius_squared/9 + centered_RGB_response) / 3; empirical equal group weights',
                           bootstrap_design='unchanged XYZ kernels and centered RGB; replaces native shape overlap by physical logcov MSE')
     if model.cfg.context_mode == 'multiscale_self':
+        record.update(encoder_attention=model.cfg.encoder_attention, encoder_neighbors=model.cfg.encoder_neighbors,
+                      encoder_graph='source kNN within each block/pooled scale; geometry enters weights and values'
+                      if model.cfg.encoder_attention == 'geometric_point' else 'Morton windows with relative attention bias')
         record.update(context_design='pointwise paths plus tanh-gated fine/x4/x16 pooled context within each block',
                       context_gate_initialization='tanh(0.1), trainable engineering initialization, NOT a loss weight',
                       receiver_context='packet-slot features only; no source XYZ, centroid or pooling features cross channel',
