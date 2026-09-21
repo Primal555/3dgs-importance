@@ -261,6 +261,8 @@ Frozen noiseless baseline: branch `baseline/q3-noiseless-v1` at `1eccfc2`; [arch
 
 Received-only block-center XYZ decoder experiment: [design, diagnostics and launch](docs/block_center_q3.md), `scripts/test_block_center_q3.sh`. Keeps q3/noiseless, logcov outputs and bootstrap loss unchanged.
 
+**Local screening first:** [matched decoder comparisons and current limitations](docs/xyz_decoder_local_screen.md). No tested decoder revision has passed the conservative multi-seed screen; do not treat the experimental launcher as a recommendation for long server training.
+
 Fixed-q3 noiseless diagnostic (32 complex symbols, bootstrap only): [protocol and background launch](docs/q3_noiseless_bootstrap.md), `scripts/test_q3_noiseless_bootstrap.sh`.
 
 Encoder-only geometric-neighbor Transformer experiment: [design and background launch](docs/point_transformer_logcov.md), `scripts/test_point_transformer_logcov.sh`. Receiver, logcov objective and per-Gaussian symbol budgets remain unchanged.

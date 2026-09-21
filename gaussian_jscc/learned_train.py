@@ -32,7 +32,7 @@ def add_parser(sub):
                    help='multiscale_self adds pointwise paths and pooled context; random start required when changing mode')
     p.add_argument('--encoder-attention', choices=['window','geometric_point'], default=None)
     p.add_argument('--encoder-neighbors', type=int, default=None)
-    p.add_argument('--xyz-decoder',choices=['additive','block_center'],default=None)
+    p.add_argument('--xyz-decoder',choices=['additive','block_center','context_center','residual_center','symbol_skip'],default=None)
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
     p.add_argument('--source')
     p.add_argument('--device', default='cuda')
@@ -277,6 +277,12 @@ def train(args):
                   channel_protocol='identity channel; SNR is conditioning only' if args.channel=='none' else 'AWGN at configured SNR')
     record['xyz_decoder_design'] = ('received-feature mean -> learned block center + zero-mean own offsets + gated zero-mean Context offsets; no source center'
                                    if model.cfg.xyz_decoder=='block_center' else 'own absolute XYZ + gated Context correction')
+    if model.cfg.xyz_decoder=='residual_center':
+        record['xyz_decoder_design']='unchanged additive XYZ + zero-initialized block translation residual from both received-feature paths; no source center'
+    if model.cfg.xyz_decoder=='symbol_skip':
+        record['xyz_decoder_design']='unchanged additive XYZ + zero-initialized learned linear readout of each received symbol vector; no coordinate side stream'
+    if model.cfg.xyz_decoder=='context_center':
+        record['xyz_decoder_design']='block_center with pooled received own AND geometry Context features for centroid prediction; new Context weights start at zero; zero-mean offsets; no source center'
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     if args.bootstrap_tier is not None:
         print(f'Fixed bootstrap/validation q{args.bootstrap_tier}: {model.cfg.rates[args.bootstrap_tier]} complex symbols/G; {record["channel_protocol"]}.',flush=True)

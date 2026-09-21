@@ -101,7 +101,7 @@ class MultiScaleSelfCore(nn.Module):
         for head in self.context_heads.values():
             nn.init.zeros_(head.bias)
         nn.init.normal_(self.context_heads['xyz'].weight,std=.02)
-        if cfg.xyz_decoder == 'block_center':
+        if cfg.xyz_decoder in ('block_center','context_center'):
             # Added after existing layers: encoder/attribute initialization is
             # unchanged for an identical random seed. No source center is used.
             self.dec_xyz_center = mlp(h,h,3)
@@ -112,6 +112,27 @@ class MultiScaleSelfCore(nn.Module):
             self.context_heads['xyz'] = nn.Linear(h,3,bias=False)
             nn.init.normal_(self.heads['xyz'].weight,std=.02)
             nn.init.normal_(self.context_heads['xyz'].weight,std=.02)
+            if cfg.xyz_decoder == 'context_center':
+                # Start exactly as block_center, but do not deprive its centroid
+                # predictor of the Context features that helped the old decoder.
+                original=self.dec_xyz_center[0]
+                expanded=nn.Linear(2*h,h)
+                with torch.no_grad():
+                    expanded.weight[:,:h].copy_(original.weight)
+                    expanded.weight[:,h:].zero_()
+                    expanded.bias.copy_(original.bias)
+                self.dec_xyz_center[0]=expanded
+
+        if cfg.xyz_decoder == 'residual_center':
+            # Keep the complete baseline XYZ path and its initialization.
+            # Pool BOTH received-feature paths, adding only a zero-start shift.
+            self.dec_xyz_center = nn.Sequential(nn.LayerNorm(2*h),mlp(2*h,h,3))
+            nn.init.zeros_(self.dec_xyz_center[-1][-1].weight)
+            nn.init.zeros_(self.dec_xyz_center[-1][-1].bias)
+        if cfg.xyz_decoder == 'symbol_skip':
+            # Learned shortcut from received payload, NOT a coordinate side stream.
+            self.dec_xyz_symbols = nn.Linear(2*cfg.rates[-1],3,bias=False)
+            nn.init.zeros_(self.dec_xyz_symbols.weight)
 
     def condition(self,q,snr,dtype):
         value = torch.full((*q.shape,1),float(snr)/20,device=q.device,dtype=dtype)
@@ -153,8 +174,18 @@ class MultiScaleSelfCore(nn.Module):
         for key,head in self.heads.items():
             geometry = key in ('xyz','logcov')
             gate = self.dec_geometry_gate if geometry else self.dec_appearance_gate
-            if key == 'xyz' and self.cfg.xyz_decoder == 'block_center':
-                center = self.dec_xyz_center(masked_mean(g,active))
+            if key == 'xyz' and self.cfg.xyz_decoder == 'symbol_skip':
+                base = head(g)+gate.tanh()*self.context_heads[key](cg)
+                result.append(base+self.dec_xyz_symbols(received*mask))
+                continue
+            if key == 'xyz' and self.cfg.xyz_decoder == 'residual_center':
+                base = head(g)+gate.tanh()*self.context_heads[key](cg)
+                correction = self.dec_xyz_center(masked_mean(torch.cat((g,cg),-1),active))
+                result.append(base+correction)
+                continue
+            if key == 'xyz' and self.cfg.xyz_decoder in ('block_center','context_center'):
+                center_features=torch.cat((g,cg),-1) if self.cfg.xyz_decoder=='context_center' else g
+                center = self.dec_xyz_center(masked_mean(center_features,active))
                 own = zero_mean(head(g),active)
                 detail = zero_mean(self.context_heads[key](cg),active)
                 result.append(center+own+gate.tanh()*detail)

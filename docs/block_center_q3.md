@@ -1,5 +1,7 @@
 # 无噪声 q3：块中心与逐点偏移解码（2026-09-21）
 
+更新：后续本地多种子筛选尚未证明稳定收益，**暂不建议按本文启动服务器长训**。参见[本地筛选结果与失败的修正尝试](xyz_decoder_local_screen.md)。下方命令保留为实验协议记录，不代表当前推荐。
+
 ## 为什么改这里
 
 冻结基线仍保存在 `baseline/q3-noiseless-v1`（`1eccfc2`）和本地 `output/code_snapshots/q3_noiseless_v1`。原实验文件不覆盖。

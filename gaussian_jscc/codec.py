@@ -45,10 +45,10 @@ class CodecConfig:
     position_bits: int = 12
 
     def __post_init__(self):
-        if self.xyz_decoder not in ('additive','block_center'):
+        if self.xyz_decoder not in ('additive','block_center','context_center','residual_center','symbol_skip'):
             raise ValueError('unknown XYZ decoder')
-        if self.xyz_decoder == 'block_center' and self.context_mode != 'multiscale_self':
-            raise ValueError('block_center requires multiscale_self context')
+        if self.xyz_decoder != 'additive' and self.context_mode != 'multiscale_self':
+            raise ValueError('experimental XYZ decoders require multiscale_self context')
         if self.encoder_attention not in ('window','geometric_point'):
             raise ValueError('unknown encoder attention')
         if self.encoder_attention == 'geometric_point' and self.context_mode != 'multiscale_self':

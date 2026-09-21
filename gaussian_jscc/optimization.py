@@ -45,6 +45,8 @@ def parameter_group(name):
         part = name.split('.')[1]
         if part == 'dec_xyz_center':
             return 'xyz_center_head'
+        if part == 'dec_xyz_symbols':
+            return 'xyz_symbol_head'
         if part == 'context_heads':
             head = name.split('.')[2]
             return ('xyz_context_head' if head == 'xyz' else
