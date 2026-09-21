@@ -18,6 +18,7 @@ from test_render_first import synthetic_render
 
 class Q3NoiselessTests(unittest.TestCase):
     xyz_decoder='additive'
+    decoder_attention='window'
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
@@ -41,6 +42,7 @@ class Q3NoiselessTests(unittest.TestCase):
             argv=['gaussian_jscc','train-learned','--architecture','learned_split_logcov',
                   '--context-mode','multiscale_self','--encoder-attention','geometric_point',
                   '--xyz-decoder',self.xyz_decoder,
+                  '--decoder-attention',self.decoder_attention,
                   '--bootstrap-tier','3','--channel','none','--ply',str(ply),'--out',str(root/'run'),
                   '--device','cpu','--bootstrap-objective','spatial-response','--bootstrap-steps','5',
                   '--render-steps','0','--joint-steps','0','--hidden','16','--depth','1',
@@ -55,6 +57,7 @@ class Q3NoiselessTests(unittest.TestCase):
             self.assertEqual(model.cfg.rates,(0,8,16,32))
             self.assertEqual(model.cfg.encoder_attention,'geometric_point')
             self.assertEqual(model.cfg.xyz_decoder,self.xyz_decoder)
+            self.assertEqual(model.cfg.decoder_attention,self.decoder_attention)
             rows=[json.loads(s) for s in (root/'run/loss.jsonl').read_text().splitlines()]
             self.assertEqual(len(rows),5)
             for row in rows:
@@ -82,6 +85,10 @@ class Q3NoiselessTests(unittest.TestCase):
             bad=argv+['--drop','0.1']
             with patch('sys.argv',bad),self.assertRaisesRegex(ValueError,'drop=0'):
                 main()
+            if self.decoder_attention=='feature_point':
+                bad=argv+['--init',str(root/'run/codec.pt'),'--decoder-attention','window','--out',str(root/'mismatch')]
+                with patch('sys.argv',bad),self.assertRaisesRegex(ValueError,'decoder attention mismatch'):
+                    main()
 
 
 if __name__=='__main__':

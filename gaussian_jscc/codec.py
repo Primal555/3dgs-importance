@@ -22,6 +22,8 @@ class CodecConfig:
     context_mode: str = 'window'
     encoder_attention: str = 'window'
     encoder_neighbors: int = 16
+    decoder_attention: str = 'window'
+    decoder_neighbors: int = 16
     xyz_decoder: str = 'additive'
     loss_profile: str = "learned_v1"
     position_head: str = "learned_affine"
@@ -45,6 +47,12 @@ class CodecConfig:
     position_bits: int = 12
 
     def __post_init__(self):
+        if self.decoder_attention not in ('window','feature_point'):
+            raise ValueError('unknown decoder attention')
+        if self.decoder_attention=='feature_point' and self.context_mode!='multiscale_self':
+            raise ValueError('feature_point decoder requires multiscale_self context')
+        if not isinstance(self.decoder_neighbors,int) or self.decoder_neighbors<1:
+            raise ValueError('decoder_neighbors must be a positive integer')
         if self.xyz_decoder not in ('additive','block_center','context_center','residual_center','symbol_skip'):
             raise ValueError('unknown XYZ decoder')
         if self.xyz_decoder != 'additive' and self.context_mode != 'multiscale_self':
@@ -99,6 +107,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.decoder_attention=='window' and self.decoder_neighbors==16:
+            result.pop('decoder_attention');result.pop('decoder_neighbors')
         if self.xyz_decoder == 'additive':
             result.pop('xyz_decoder')  # Existing checkpoint/packet hashes unchanged.
         if self.encoder_attention == 'window' and self.encoder_neighbors == 16:

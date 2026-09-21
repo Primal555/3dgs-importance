@@ -12,6 +12,7 @@ from .codec import prefix_mask
 from .split_codec import GeometryWindowBlock, mlp
 from .learned_codec import LocalFeatureBlock
 from .point_attention import GeometricPointBlock
+from .decoder_attention import ReceivedPointBlock
 
 
 def pool_slots(values, active, factor):
@@ -33,7 +34,7 @@ def zero_mean(values, active):
 
 
 class MultiScaleContext(nn.Module):
-    """Fine windows + pooled x4/x16 windows within each independent block.
+    """Fine context + pooled x4/x16 context within each independent block.
 
     Pooling does not drop Gaussian outputs or change individual tier assignment.
     No attention matrix grows with the complete scene size.
@@ -133,6 +134,12 @@ class MultiScaleSelfCore(nn.Module):
             # Learned shortcut from received payload, NOT a coordinate side stream.
             self.dec_xyz_symbols = nn.Linear(2*cfg.rates[-1],3,bias=False)
             nn.init.zeros_(self.dec_xyz_symbols.weight)
+        if cfg.decoder_attention=='feature_point':
+            # Replace only receiver attention blocks AFTER shared initialization.
+            # Encoder, output heads, merge layers and XYZ mode are unchanged.
+            for context in (self.dec_geometry_context,self.dec_appearance_context):
+                context.fine=nn.ModuleList(ReceivedPointBlock(cfg) for _ in range(cfg.depth))
+                context.coarse=nn.ModuleList(ReceivedPointBlock(cfg) for _ in context.factors)
 
     def condition(self,q,snr,dtype):
         value = torch.full((*q.shape,1),float(snr)/20,device=q.device,dtype=dtype)
@@ -167,8 +174,12 @@ class MultiScaleSelfCore(nn.Module):
         encoding[:,0::2] = torch.sin(pos*freq)
         encoding[:,1::2] = torch.cos(pos*freq[:encoding[:,1::2].shape[-1]])
         # Slot offsets are context-only; own-point recovery has no point ID.
-        cg = self.dec_geometry_context((g+encoding[None])*active[...,None],active)
-        ca = self.dec_appearance_context((a+encoding[None])*active[...,None],active)
+        if self.cfg.decoder_attention=='feature_point':
+            cg=self.dec_geometry_context(g,active)
+            ca=self.dec_appearance_context(a,active)
+        else:
+            cg = self.dec_geometry_context((g+encoding[None])*active[...,None],active)
+            ca = self.dec_appearance_context((a+encoding[None])*active[...,None],active)
         ca = (ca+self.dec_exchange(torch.cat((ca,cg),-1)))*active[...,None]
         result = []
         for key,head in self.heads.items():

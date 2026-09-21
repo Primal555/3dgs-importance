@@ -5,6 +5,7 @@ from diagnose_position_path import decompose, aggregate
 
 class PositionPathTests(unittest.TestCase):
     xyz_decoder='additive'
+    decoder_attention='window'
     def test_translation_and_exact_energy_decomposition(self):
         torch.manual_seed(42)
         target=torch.randn(32,3,dtype=torch.float64)
@@ -43,6 +44,7 @@ class PositionPathTests(unittest.TestCase):
         raw,_,_,old=setup(17)
         config=old.cfg.to_dict();config['rates']=[0,8,16,32];config['block_size']=8
         config['xyz_decoder']=self.xyz_decoder
+        config['decoder_attention']=self.decoder_attention
         model=GaussianCodec(CodecConfig.from_dict(config))
         model.attr_mean.copy_(old.attr_mean);model.attr_std.copy_(old.attr_std)
         with tempfile.TemporaryDirectory() as tmp:

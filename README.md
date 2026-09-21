@@ -263,6 +263,8 @@ Received-only block-center XYZ decoder experiment: [design, diagnostics and laun
 
 **Local screening first:** [matched decoder comparisons and current limitations](docs/xyz_decoder_local_screen.md). No tested decoder revision has passed the conservative multi-seed screen; do not treat the experimental launcher as a recommendation for long server training.
 
+Receiver feature-neighbor Transformer experiment: [architecture and protocol](docs/decoder_feature_transformer.md), `scripts/test_decoder_point_q3.sh`. Builds neighborhoods solely from received features, retaining the source-free receiver and unchanged payload/loss.
+
 Fixed-q3 noiseless diagnostic (32 complex symbols, bootstrap only): [protocol and background launch](docs/q3_noiseless_bootstrap.md), `scripts/test_q3_noiseless_bootstrap.sh`.
 
 Encoder-only geometric-neighbor Transformer experiment: [design and background launch](docs/point_transformer_logcov.md), `scripts/test_point_transformer_logcov.sh`. Receiver, logcov objective and per-Gaussian symbol budgets remain unchanged.

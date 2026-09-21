@@ -32,6 +32,8 @@ def add_parser(sub):
                    help='multiscale_self adds pointwise paths and pooled context; random start required when changing mode')
     p.add_argument('--encoder-attention', choices=['window','geometric_point'], default=None)
     p.add_argument('--encoder-neighbors', type=int, default=None)
+    p.add_argument('--decoder-attention',choices=['window','feature_point'],default=None)
+    p.add_argument('--decoder-neighbors',type=int,default=None)
     p.add_argument('--xyz-decoder',choices=['additive','block_center','context_center','residual_center','symbol_skip'],default=None)
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
     p.add_argument('--source')
@@ -162,6 +164,10 @@ def train(args):
             raise ValueError('initializer encoder attention mismatch; start from random weights')
         if args.encoder_neighbors is not None and args.encoder_neighbors != model.cfg.encoder_neighbors:
             raise ValueError('initializer encoder neighbors mismatch')
+        if args.decoder_attention is not None and args.decoder_attention!=model.cfg.decoder_attention:
+            raise ValueError('initializer decoder attention mismatch; start from random weights')
+        if args.decoder_neighbors is not None and args.decoder_neighbors!=model.cfg.decoder_neighbors:
+            raise ValueError('initializer decoder neighbors mismatch')
         if args.xyz_decoder is not None and args.xyz_decoder != model.cfg.xyz_decoder:
             raise ValueError('initializer XYZ decoder mismatch; start from random weights')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
@@ -173,6 +179,8 @@ def train(args):
                           context_mode=args.context_mode or 'window',
                           encoder_attention=args.encoder_attention or 'window',
                           encoder_neighbors=16 if args.encoder_neighbors is None else args.encoder_neighbors,
+                          decoder_attention=args.decoder_attention or 'window',
+                          decoder_neighbors=16 if args.decoder_neighbors is None else args.decoder_neighbors,
                           xyz_decoder=args.xyz_decoder or 'additive',
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
@@ -283,6 +291,8 @@ def train(args):
         record['xyz_decoder_design']='unchanged additive XYZ + zero-initialized learned linear readout of each received symbol vector; no coordinate side stream'
     if model.cfg.xyz_decoder=='context_center':
         record['xyz_decoder_design']='block_center with pooled received own AND geometry Context features for centroid prediction; new Context weights start at zero; zero-mean offsets; no source center'
+    record['decoder_attention_design']=('received-feature cosine kNN, grouped relation attention; no source XYZ or slot sinusoid; x4/x16 pooling still uses packet slots'
+                                        if model.cfg.decoder_attention=='feature_point' else 'shifted sequence-window multihead attention with slot sinusoid')
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     if args.bootstrap_tier is not None:
         print(f'Fixed bootstrap/validation q{args.bootstrap_tier}: {model.cfg.rates[args.bootstrap_tier]} complex symbols/G; {record["channel_protocol"]}.',flush=True)

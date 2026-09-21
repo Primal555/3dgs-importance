@@ -24,7 +24,8 @@ def summarize(roots, out, tail_checks=3):
     rows=[];curves=[]
     for root,p in zip(roots,protocols):
         for seed in p['seeds']:
-            for mode in p['modes']:
+            for mode in [m if a=='window' else a+'__'+m
+                         for a in p.get('decoder_attentions',['window']) for m in p['modes']]:
                 folder=root/f'{mode}_seed{seed}'
                 checks=[json.loads(s) for s in (folder/'validation.jsonl').read_text().splitlines()]
                 curves.append((mode,seed,checks))
@@ -52,6 +53,18 @@ def summarize(roots, out, tail_checks=3):
                          'seeds_passing':sum(checks),'seeds_tested':len(checks)}
     result={'criterion':'tail mean XYZ MSE no worse than matched additive in BOTH fit and heldout for every tested seed; >=2 seeds; engineering screen, NOT statistical significance or render quality',
             'tail_checks':tail_checks,'rows':rows,'decisions':decisions}
+    paired=[]
+    index={(r['mode'],r['seed']):r for r in rows}
+    for r in rows:
+        if r['mode'].startswith('feature_point__'):
+            ref=index.get((r['mode'].split('__',1)[1],r['seed']))
+            if ref is not None:
+                if ref['steps']!=r['steps']:
+                    raise ValueError('unmatched decoder-attention comparison steps')
+                paired.append(dict(mode=r['mode'],seed=r['seed'],reference=ref['mode'],
+                                   fit_mse_ratio=r['fit_mse']/max(ref['fit_mse'],1e-30),
+                                   heldout_mse_ratio=r['heldout_mse']/max(ref['heldout_mse'],1e-30)))
+    result['paired_decoder_attention']=paired
     out.mkdir(parents=True,exist_ok=False)
     (out/'comparison.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
     import matplotlib
@@ -94,14 +107,16 @@ def run(args):
     (out/'protocol.json').write_text(json.dumps(protocol,indent=2),encoding='utf-8')
     results={}
     for seed in args.seeds:
-        for mode in args.modes:
+        for attention,mode in [(a,m) for a in getattr(args,'decoder_attentions',['window']) for m in args.modes]:
             torch.manual_seed(seed)
             cfg=config.to_dict();cfg['xyz_decoder']=mode
+            cfg['decoder_attention']=attention
             model=GaussianCodec(CodecConfig.from_dict(cfg))
             model.attr_mean.copy_(template.attr_mean);model.attr_std.copy_(template.attr_std)
             optimizer=torch.optim.Adam(model.parameters(),lr=2e-4)
             sampler=torch.Generator().manual_seed(seed+10000)
-            key=f'{mode}_seed{seed}';folder=out/key;folder.mkdir()
+            case=mode if attention=='window' else attention+'__'+mode
+            key=f'{case}_seed{seed}';folder=out/key;folder.mkdir()
             history=[]
 
             @torch.no_grad()
@@ -159,6 +174,7 @@ if __name__=='__main__':
     p.add_argument('--steps',type=int,default=300);p.add_argument('--every',type=int,default=50)
     p.add_argument('--threads',type=int,default=2)
     p.add_argument('--seeds',type=int,nargs='+',default=[42,43])
+    p.add_argument('--decoder-attentions',nargs='+',choices=['window','feature_point'],default=['window'])
     p.add_argument('--modes',nargs='+',choices=['additive','block_center','context_center','residual_center','symbol_skip'],default=['additive','block_center','context_center'])
     p.add_argument('--blocks',type=int,nargs='+',default=[40,440,840,1240,1640,2040,2440,2840])
     run(p.parse_args())
