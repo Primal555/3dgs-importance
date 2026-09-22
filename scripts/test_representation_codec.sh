@@ -12,6 +12,9 @@ OUT="${1:-$PROJECT/output/truck_representation_$(date +%Y%m%d_%H%M%S)}"
 [[ -d "$SCENE" ]] || { echo "Missing scene: $SCENE" >&2; exit 1; }
 command -v "$PYTHON_BIN" >/dev/null || { echo 'Activate maskgs or set PYTHON_BIN.' >&2; exit 1; }
 EXTRA=()
+if [[ -n "${AXIS_FLOOR_WORLD:-}" ]]; then
+  EXTRA+=(--axis-floor-world "$AXIS_FLOOR_WORLD")
+fi
 if [[ -n "${INIT:-}" ]]; then
   [[ -f "$INIT" ]] || { echo "Missing INIT: $INIT" >&2; exit 1; }
   EXTRA+=(--init "$INIT")
@@ -33,6 +36,8 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-representation \
   --latent-dim "${LATENT_DIM:-64}" --block-size "${BLOCK_SIZE:-256}" \
   --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" --validation-region-size 512 \
   --lr "${LR:-0.0002}" --clean-weight "${CLEAN_WEIGHT:-1}" \
+  --position-objective "${POSITION_OBJECTIVE:-scene-scale}" \
+  --axis-floor-percentile "${AXIS_FLOOR_PERCENTILE:-1}" \
   --channel "${CHANNEL:-none}" --snr "${SNR:-10}" \
   --validate-every "${VALIDATE_EVERY:-100}" --render-every "${RENDER_EVERY:-500}" \
   --save-every 500 --profile-every 10 --resolution "${RESOLUTION:-2}" \

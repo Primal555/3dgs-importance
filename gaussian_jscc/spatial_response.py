@@ -113,7 +113,8 @@ def position_metrics(pred, target, geometry):
 
 
 def spatial_response_loss(pred, target, geometry, model, views=4,
-                          bandwidths=DEFAULT_BANDWIDTHS, directions=None, fine_weight=1.):
+                          bandwidths=DEFAULT_BANDWIDTHS, directions=None, fine_weight=1.,
+                          return_components=False):
     """Mean of (coarse + weighted fine position), native shape and centered RGB.
 
     Equal weights are an explicit experimental choice, not a claim that scalar
@@ -172,4 +173,6 @@ def spatial_response_loss(pred, target, geometry, model, views=4,
              **appearance_stats, **shape_metrics(decoded,source,predicted_logcov,target_logcov)}
     stats.update({f'spatial_scale_{i}_loss': float(x.detach()) for i, x in enumerate(scale_losses)})
     stats.update(position_metrics(pred, target, geometry))
+    if return_components:
+        return loss, stats, {'position': position/3, 'shape': shape/3, 'appearance': appearance/3}
     return loss, stats

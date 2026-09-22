@@ -7,6 +7,9 @@ as `python -m gaussian_jscc train-representation`. It separates four independent
 parameterized modules, validates both the clean and communicated reconstruction,
 and supports frozen-representation adapter warmup followed by joint training.
 See [the experiment design and launch commands](docs/representation_communication.md).
+An opt-in [teacher-axis position-supervision test](docs/teacher_axis_experiment.md)
+uses `scripts/test_teacher_axis_representation.sh`; it keeps the architecture and
+attribute objectives, trains only the clean representation, and saves renders every 500 steps.
 `scripts/test_representation_codec.sh` starts from random weights with clean
 representation training only by default; subsequent communication stages require
 explicit quality gates. This does not replace the existing research baseline.

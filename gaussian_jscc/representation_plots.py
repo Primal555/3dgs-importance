@@ -65,3 +65,32 @@ def plot_run(out):
         fig.tight_layout()
         fig.savefig(charts/'render_quality.png', dpi=150)
         plt.close(fig)
+    axis_rows = [r for r in validation if 'axis_native_radius_p50' in r['clean']]
+    if axis_rows:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        x = [r['step'] for r in axis_rows]
+        for kind in ('native', 'effective'):
+            for quantile in ('p50', 'p95'):
+                axes[0, 0].plot(x, [r['clean'][f'axis_{kind}_radius_{quantile}'] for r in axis_rows], label=f'{kind} {quantile}')
+            axes[0, 1].plot(x, [r['clean'][f'axis_{kind}_within_one_fraction'] for r in axis_rows], label=kind)
+        axes[0, 0].set_yscale('symlog', linthresh=1)
+        axes[0, 0].set_title('Clean heldout ellipsoid error (mean block quantiles)')
+        axes[0, 1].set_title('Fraction within one teacher ellipsoid (not pixels)')
+        for key in ('axis_clamped_fraction', 'axis_affected_point_fraction'):
+            axes[1, 0].plot(x, [r['clean'][key] for r in axis_rows], label=key)
+        axes[1, 0].set_title('Heldout axes/points affected by fixed scale floor')
+        profiled = [r for r in loss if 'position' in r.get('objective_module_grad_norms', {})]
+        for term in ('position', 'shape', 'appearance'):
+            for module in ('representation_encoder', 'representation_decoder'):
+                axes[1, 1].plot([r['step'] for r in profiled],
+                    [r['objective_module_grad_norms'][term][module] for r in profiled],
+                    label=term+' / '+module.replace('representation_', ''))
+        axes[1, 1].set_yscale('symlog', linthresh=.01)
+        axes[1, 1].set_title('Weighted objective gradient L2 (before clipping)')
+        for axis in axes.flat:
+            axis.set_xlabel('Optimization step')
+            axis.grid(alpha=.2)
+            axis.legend(fontsize=7)
+        fig.tight_layout()
+        fig.savefig(charts/'teacher_axis_diagnostics.png', dpi=150)
+        plt.close(fig)

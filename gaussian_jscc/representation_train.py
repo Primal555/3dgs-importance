@@ -1,7 +1,7 @@
 """Train clean Gaussian representations first, then fixed-q3 JSCC adapters.
 
-The existing spatial-response objective is unchanged. There is no scene-render
-backward in this experiment; scene images are validation, not a third objective.
+The existing spatial-response objective remains the default; teacher-axis is an
+opt-in representation-only position experiment. Scene renders are validation.
 """
 import json
 import math
@@ -47,6 +47,9 @@ def add_parser(sub):
     p.add_argument('--lr', type=float, default=2e-4)
     p.add_argument('--clean-weight', type=float, default=1., help='explicit joint clean-path engineering coefficient')
     p.add_argument('--spatial-fine-weight', type=float, default=1.)
+    p.add_argument('--position-objective', choices=['scene-scale', 'teacher-axis'], default='scene-scale')
+    p.add_argument('--axis-floor-percentile', type=float, default=1., help='teacher-axis: percentile across all source axis scales, fitted once')
+    p.add_argument('--axis-floor-world', type=float, help='optional explicit teacher-axis scale floor in scene units')
     p.add_argument('--local-response-views', type=int, default=4)
     p.add_argument('--channel', choices=['none', 'awgn'], default='none')
     p.add_argument('--snr', type=float, default=10.)
@@ -71,6 +74,19 @@ def add_parser(sub):
 
 
 def check_args(args):
+    # Older representation training states keep their original objective on resume.
+    for key, value in dict(position_objective='scene-scale', axis_floor_percentile=1., axis_floor_world=None).items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    if args.position_objective == 'teacher-axis':
+        if args.adapter_steps or args.joint_steps:
+            raise ValueError('teacher-axis is a representation-only experiment; disable adapter/joint steps')
+        if args.spatial_fine_weight != 1.:
+            raise ValueError('teacher-axis replaces the old position loss; do not adjust spatial-fine-weight')
+        if not math.isfinite(args.axis_floor_percentile) or not 0 <= args.axis_floor_percentile <= 100:
+            raise ValueError('axis-floor-percentile must be in [0,100]')
+        if args.axis_floor_world is not None and (not math.isfinite(args.axis_floor_world) or args.axis_floor_world <= 0):
+            raise ValueError('axis-floor-world must be positive and finite')
     if not args.ply or not args.out:
         raise ValueError('--ply and --out required unless --resume is supplied')
     counts = [getattr(args, p+'_steps') for p in PHASES]
@@ -117,6 +133,10 @@ def norm(values):
 def phase_objective(model, features, active, geometry, args, phase, directions):
     if phase == 'representation':
         clean = model.reconstruct_clean(features, active)
+        if getattr(args, 'position_objective', 'scene-scale') == 'teacher-axis':
+            loss, stats, components = objective(clean[active], features[active], geometry, model, args, directions, return_components=True)
+            # Profile actual /3 objective contributions, not just the combined loss.
+            return loss, components, stats
         clean_loss, stats = objective(clean[active], features[active], geometry, model, args, directions)
         return clean_loss, {'clean': clean_loss}, stats
     clean, comm, y, recovered = paths(model, features, active, args.snr, args.channel)
@@ -238,6 +258,16 @@ def train(args):
     seed_all(args.seed)
     original, degree = read_ply(args.ply)
     fingerprint = scene_fingerprint(original)
+    axis_floor = None
+    if args.position_objective == 'teacher-axis':
+        from .axis_position import fit_axis_floor
+        axis_floor = fit_axis_floor(original, args.axis_floor_percentile, args.axis_floor_world)
+        if resumed and resumed.get('axis_floor') is not None:
+            if axis_floor['world'] != resumed['axis_floor']['world']:
+                raise ValueError('axis supervision floor changed on resume')
+            axis_floor = resumed['axis_floor']
+        args.axis_floor_world = axis_floor['world']
+        print('Teacher-axis supervision: '+json.dumps(axis_floor), flush=True)
     if resumed:
         if fingerprint != resumed['fingerprint']:
             raise ValueError('resume PLY differs from original training scene')
@@ -292,6 +322,11 @@ def train(args):
               'metadata': 'existing reliable global bbox, model statistics and packet/tier syntax; no per-point XYZ side stream',
               'render_training': False, 'lr_schedule': 'constant; fresh Adam at each phase boundary',
               'gate_note': 'thresholds are explicit user/engineering criteria, not proven optimal values'}
+    if axis_floor is not None:
+        record.update(objective='teacher_axis_pseudo_huber_v1', axis_floor=axis_floor,
+                      loss_design='(sqrt(1+sum((R_source.T * delta_xyz / clamped_source_axes)^2))-1 + logcov_shape + centered_appearance)/3',
+                      old_position_terms='diagnostic only; no contribution to training objective',
+                      checkpoint_comparison='raw loss not comparable to scene-scale runs; compare fixed render and world/relative errors')
     if not resumed:
         (out/'training.json').write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding='utf-8')
     completed = resumed['completed'] if resumed else {p: 0 for p in PHASES}
@@ -320,7 +355,7 @@ def train(args):
         write_state(out/'training_state.pt', {'format': 'representation_training_v1', 'arguments': arguments,
                     'config': model.cfg.to_dict(), 'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
                     'phase': phase, 'completed': completed, 'best': best, 'best_steps': best_steps,
-                    'fingerprint': fingerprint, 'rng': rng_state()})
+                    'fingerprint': fingerprint, 'axis_floor': axis_floor, 'rng': rng_state()})
 
     if resumed:
         restore_rng(resumed['rng'])

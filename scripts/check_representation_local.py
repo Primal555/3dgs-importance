@@ -21,9 +21,13 @@ def main():
     p.add_argument('--joint-steps', type=int, default=100)
     p.add_argument('--hidden', type=int, default=48)
     p.add_argument('--threads', type=int, default=4)
+    p.add_argument('--position-objective', choices=['scene-scale', 'teacher-axis'], default='scene-scale')
+    p.add_argument('--axis-floor-percentile', type=float, default=1.)
     args = p.parse_args()
     if args.regions < 8 or args.block_size < 2:
         p.error('at least eight regions and block-size >=2 required')
+    if args.position_objective == 'teacher-axis' and (args.adapter_steps or args.joint_steps):
+        p.error('teacher-axis requires --adapter-steps 0 --joint-steps 0')
     root = Path(args.out).resolve()
     if root.exists():
         raise FileExistsError('choose a new local-check directory')
@@ -48,6 +52,7 @@ def main():
         '--blocks-per-batch', '4', '--validation-blocks', '4', '--latent-dim', '64',
         '--representation-steps', str(args.representation_steps), '--adapter-steps', str(args.adapter_steps),
         '--joint-steps', str(args.joint_steps), '--cpu-threads', str(args.threads),
+        '--position-objective', args.position_objective, '--axis-floor-percentile', str(args.axis_floor_percentile),
         '--validate-every', '50', '--render-every', '500', '--save-every', '100',
         '--max-clean-loss', '1000000000', '--max-adapter-loss-ratio', '1000000000'])
     train(train_args)

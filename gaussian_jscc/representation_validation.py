@@ -25,9 +25,27 @@ def paths(model, features, active, snr, kind, communication=True):
     return clean, core.representation_decoder(recovered, active), y, recovered
 
 
-def objective(pred, source, geometry, model, args, directions):
-    return spatial_response_loss(pred, source, geometry, model, args.local_response_views,
-                                 directions=directions, fine_weight=args.spatial_fine_weight)
+def objective(pred, source, geometry, model, args, directions, return_components=False):
+    axis_mode = getattr(args, 'position_objective', 'scene-scale') == 'teacher-axis'
+    result = spatial_response_loss(pred, source, geometry, model, args.local_response_views,
+                                   directions=directions, fine_weight=args.spatial_fine_weight,
+                                   return_components=axis_mode or return_components)
+    if axis_mode:
+        from .axis_position import teacher_axis_position
+        _, stats, components = result
+        position, axis_stats = teacher_axis_position(pred, source, geometry, model, args.axis_floor_world)
+        # REPLACE the old position term; no addition of the scene-scale objective.
+        components['position'] = position/3
+        loss = sum(components.values()).to(pred.dtype)
+        stats['legacy_scene_position_diagnostic'] = stats['spatial_position_response']
+        for key in list(stats):
+            if key.startswith(('spatial_coarse_', 'spatial_fine_', 'spatial_scale_')):
+                stats['legacy_diagnostic_'+key] = stats.pop(key)
+        stats.update(axis_stats, spatial_position_response=float(position.detach()),
+                     spatial_geometry_response=float(position.detach()),
+                     position_objective_contribution=float((position/3).detach()))
+        return (loss, stats, components) if return_components else (loss, stats)
+    return result
 
 
 @torch.no_grad()

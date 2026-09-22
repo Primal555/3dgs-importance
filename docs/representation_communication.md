@@ -4,6 +4,10 @@ This is an opt-in four-module architecture, not a renamed noiseless JSCC run.
 The prior Transformer research baseline remains runnable and its checkpoint
 identity is unchanged. Select the new architecture with `train-representation`.
 
+The separate [teacher-axis position experiment](teacher_axis_experiment.md)
+replaces only the position objective when explicitly requested. The default
+objective and original launcher remain available as the control.
+
 ## Architecture and objectives
 
 `G -> representation_encoder -> y -> representation_decoder -> G_clean`
@@ -23,7 +27,7 @@ identity is unchanged. Select the new architecture with `train-representation`.
 - Only sender-side Context sees source XYZ. Receiver uses received symbols,
   known tier/SNR and shared model/global normalization metadata. No source feature,
   neighbor graph, center, radius, or per-point coordinate side stream is provided.
-- The spatial-response/logcov objective is unchanged in all phases. It remains
+- By default the spatial-response/logcov objective is unchanged in all phases. It remains
   an engineering surrogate, not image MSE. Render quality is always measured
   separately. No full-scene rendering backward or replay is involved here.
 
