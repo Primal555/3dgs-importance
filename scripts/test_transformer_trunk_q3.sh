@@ -6,5 +6,5 @@ export DECODER_ATTENTION=transformer_trunk
 export DECODER_DEPTH="${DECODER_DEPTH:-4}"
 export XYZ_DECODER=additive
 OUT="${1:-$PROJECT/output/truck_transformer_trunk_q3_$(date +%Y%m%d_%H%M%S)}"
-echo "Receiver: ${DECODER_DEPTH}-layer block Transformer main path; multi-depth XYZ readout; no coordinate side stream."
+echo "Receiver: ${DECODER_DEPTH}-layer block Transformer; refinement=${DECODER_REFINEMENT:-none} (none=multi-depth readout); no coordinate side stream."
 exec bash "$PROJECT/scripts/test_q3_noiseless_bootstrap.sh" "$OUT"

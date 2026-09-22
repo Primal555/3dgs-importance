@@ -13,7 +13,7 @@ from .split_codec import GeometryWindowBlock, mlp
 from .learned_codec import LocalFeatureBlock
 from .point_attention import GeometricPointBlock
 from .decoder_attention import ReceivedPointBlock
-from .transformer_decoder import ReceivedTransformerDecoder
+from .transformer_decoder import ReceivedTransformerDecoder, ProgressiveTransformerDecoder
 
 
 def pool_slots(values, active, factor):
@@ -89,7 +89,8 @@ class MultiScaleSelfCore(nn.Module):
         if cfg.decoder_attention == 'transformer_trunk':
             # Encoder initialization is identical to the frozen baseline at the
             # same seed. Do not allocate unused old receiver heads or gates.
-            self.dec_trunk = ReceivedTransformerDecoder(cfg)
+            decoder = ProgressiveTransformerDecoder if cfg.decoder_refinement == 'progressive' else ReceivedTransformerDecoder
+            self.dec_trunk = decoder(cfg)
             return
         self.dec_geometry_in = mlp(4*cfg.rates[-1],h)
         self.dec_appearance_in = mlp(4*cfg.rates[-1],h)

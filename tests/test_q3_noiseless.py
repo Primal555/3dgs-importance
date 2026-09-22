@@ -20,6 +20,7 @@ class Q3NoiselessTests(unittest.TestCase):
     xyz_decoder='additive'
     decoder_attention='window'
     decoder_memory='none'
+    decoder_refinement='none'
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
@@ -45,6 +46,7 @@ class Q3NoiselessTests(unittest.TestCase):
                   '--xyz-decoder',self.xyz_decoder,
                   '--decoder-attention',self.decoder_attention,
                   '--decoder-memory',self.decoder_memory,
+                  '--decoder-refinement',self.decoder_refinement,
                   '--bootstrap-tier','3','--channel','none','--ply',str(ply),'--out',str(root/'run'),
                   '--device','cpu','--bootstrap-objective','spatial-response','--bootstrap-steps','5',
                   '--render-steps','0','--joint-steps','0','--hidden','16','--depth','1',
@@ -61,9 +63,10 @@ class Q3NoiselessTests(unittest.TestCase):
             self.assertEqual(model.cfg.xyz_decoder,self.xyz_decoder)
             self.assertEqual(model.cfg.decoder_attention,self.decoder_attention)
             self.assertEqual(model.cfg.decoder_memory,self.decoder_memory)
+            self.assertEqual(model.cfg.decoder_refinement,self.decoder_refinement)
             if self.decoder_attention=='transformer_trunk':
                 record=json.loads((root/'run/training.json').read_text())
-                self.assertEqual(record['decoder_xyz_taps'],[1,2,4])
+                self.assertEqual(record['decoder_xyz_taps'],[] if self.decoder_refinement=='progressive' else [1,2,4])
                 self.assertEqual(record['codec_config']['decoder_depth'],4)
                 self.assertIn('no receiver Context gate',record['context_gate_initialization'])
             rows=[json.loads(s) for s in (root/'run/loss.jsonl').read_text().splitlines()]
@@ -77,6 +80,14 @@ class Q3NoiselessTests(unittest.TestCase):
             self.assertTrue(all([v['layout'] for v in r['layouts']]==['3'] and r['channel']=='none' for r in val))
             self.assertTrue(all(v['layouts'][0]['block_xyz_common_mse']>=0 and
                                 v['layouts'][0]['block_xyz_relative_mse']>=0 for v in val))
+            if self.decoder_refinement=='progressive':
+                for v in val:
+                    stage=v['layouts'][0]['xyz_stage_pooled_world_rmse']
+                    self.assertEqual(len(stage),4)
+                    self.assertAlmostEqual(stage[-1],v['layouts'][0]['xyz_pooled_world_rmse'],places=6)
+                bad=argv+['--init',str(root/'run/codec.pt'),'--decoder-refinement','none','--out',str(root/'refinement_mismatch')]
+                with patch('sys.argv',bad),self.assertRaisesRegex(ValueError,'decoder refinement mismatch'):
+                    main()
             args=build_parser().parse_args(['--training',str(root/'run'),'--ply',str(ply),'--source','mock',
                                           '--start','5','--stop','5','--every','5','--tier','3',
                                           '--channel','none','--trials','1','--views','1'])

@@ -26,6 +26,7 @@ class CodecConfig:
     decoder_neighbors: int = 16
     decoder_depth: int = 4
     decoder_memory: str = 'none'
+    decoder_refinement: str = 'none'
     xyz_decoder: str = 'additive'
     loss_profile: str = "learned_v1"
     position_head: str = "learned_affine"
@@ -49,6 +50,10 @@ class CodecConfig:
     position_bits: int = 12
 
     def __post_init__(self):
+        if self.decoder_refinement not in ('none', 'progressive'):
+            raise ValueError('unknown decoder refinement')
+        if self.decoder_refinement != 'none' and (self.decoder_attention != 'transformer_trunk' or self.decoder_memory != 'none'):
+            raise ValueError('progressive refinement requires transformer_trunk and decoder_memory=none')
         if self.decoder_memory not in ('none', 'received'):
             raise ValueError('unknown decoder memory')
         if self.decoder_memory != 'none' and self.decoder_attention != 'transformer_trunk':
@@ -117,6 +122,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.decoder_refinement == 'none':
+            result.pop('decoder_refinement')
         if self.decoder_memory == 'none':
             result.pop('decoder_memory')  # Preserve baseline checkpoint/packet hashes.
         if self.decoder_attention!='transformer_trunk' and self.decoder_depth==4:

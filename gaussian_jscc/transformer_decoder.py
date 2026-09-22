@@ -5,6 +5,7 @@ or coordinate side stream. Attention spans only the caller's codec block.
 """
 import torch
 from torch import nn
+from contextlib import contextmanager
 
 
 class BlockSelfAttention(nn.Module):
@@ -15,7 +16,7 @@ class BlockSelfAttention(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.ff = nn.Sequential(nn.Linear(hidden, 4*hidden), nn.GELU(), nn.Linear(4*hidden, hidden))
 
-    def forward(self, x, active):
+    def forward(self, x, active, bias=None):
         if x.shape[1] == 0:
             return x
         x = x.masked_fill(~active[..., None], 0)
@@ -24,7 +25,10 @@ class BlockSelfAttention(nn.Module):
         safe = active.clone()
         safe[:, 0] |= ~active.any(dim=1)
         h = self.norm1(x)
-        update = self.attention(h, h, h, key_padding_mask=~safe, need_weights=False)[0]
+        padding = ~safe
+        if bias is not None:
+            padding = torch.zeros_like(safe, dtype=x.dtype).masked_fill(~safe, float('-inf'))
+        update = self.attention(h, h, h, key_padding_mask=padding, attn_mask=bias, need_weights=False)[0]
         x = (x + update).masked_fill(~active[..., None], 0)
         return (x + self.ff(self.norm2(x))).masked_fill(~active[..., None], 0)
 
@@ -94,3 +98,88 @@ class ReceivedMemoryRead(nn.Module):
         update = self.attention(self.query_norm(x), kv, kv,
                                 key_padding_mask=~safe, need_weights=False)[0]
         return (x + update).masked_fill(~active[..., None], 0)
+
+
+class PositionRefinement(nn.Module):
+    """Soft predicted-geometry attention, never ground-truth neighbors.
+
+    XYZ is in global normalized bbox coordinates. No inverse local radius,
+    hard kNN, detached coordinates, coordinate clamp or extra loss is used.
+    """
+    def __init__(self, hidden, heads):
+        super().__init__()
+        self.head_count = heads
+        self.position = nn.Sequential(nn.Linear(6, hidden), nn.GELU(), nn.Linear(hidden, hidden))
+        self.received = nn.Linear(hidden, hidden)
+        self.log_precision = nn.Parameter(torch.zeros(heads))
+        self.block = BlockSelfAttention(hidden, heads)
+        self.delta = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 3))
+        # Small but nonzero output: all refinement paths receive gradients at start.
+        nn.init.normal_(self.delta[-1].weight, std=.002)
+        nn.init.zeros_(self.delta[-1].bias)
+
+    def forward(self, x, memory, xyz, active):
+        xyz = xyz.masked_fill(~active[..., None], 0)
+        center = xyz.sum(1, keepdim=True) / active.sum(1, keepdim=True).clamp_min(1)[..., None]
+        relative = (xyz-center).masked_fill(~active[..., None], 0)
+        x = x + self.received(memory) + self.position(torch.cat([xyz, relative], -1))
+        # Translation-invariant pairwise squared distances, no N*N*hidden tensor.
+        squared = relative.square().sum(-1)
+        distance = (squared[:, :, None]+squared[:, None, :]-2*relative.bmm(relative.transpose(1, 2))).clamp_min(0)
+        precision = torch.nn.functional.softplus(self.log_precision)
+        bias = (-distance[:, None]*precision[None, :, None, None]).flatten(0, 1)
+        x = self.block(x, active, bias)
+        xyz = (xyz+self.delta(x)).masked_fill(~active[..., None], 0)
+        return x, xyz
+
+
+class ProgressiveTransformerDecoder(nn.Module):
+    """One initial XYZ prediction, then depth-1 learned per-point refinements.
+
+    Each token retains its identity and original received embedding. Final XYZ
+    alone is supervised by the existing objective; no new coordinate side stream.
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        h = cfg.hidden
+        self.input = nn.Sequential(nn.Linear(4*cfg.rates[-1], h), nn.GELU(), nn.Linear(h, h))
+        self.initial_block = BlockSelfAttention(h, cfg.attention_heads)
+        self.initial_xyz = nn.Sequential(nn.LayerNorm(h), nn.Linear(h, h), nn.GELU(), nn.Linear(h, 3))
+        nn.init.normal_(self.initial_xyz[-1].weight, std=.02)
+        nn.init.constant_(self.initial_xyz[-1].bias, .5)
+        self.refiners = nn.ModuleList(PositionRefinement(h, cfg.attention_heads) for _ in range(cfg.decoder_depth-1))
+        self.final_norm = nn.LayerNorm(h)
+        sizes = {'opacity': 1, 'logcov': 6, 'dc': 3}
+        if cfg.sh_degree:
+            sizes['sh'] = 3*((cfg.sh_degree+1)**2-1)
+        self.heads = nn.ModuleDict({key: nn.Linear(h, n) for key, n in sizes.items()})
+
+    def forward_stages(self, packet, condition, active):
+        memory = (self.input(packet.masked_fill(~active[..., None], 0))+condition).masked_fill(~active[..., None], 0)
+        x = self.initial_block(memory, active)
+        xyz = self.initial_xyz(x).masked_fill(~active[..., None], 0)
+        stages = [xyz]
+        for refiner in self.refiners:
+            x, xyz = refiner(x, memory, xyz, active)
+            stages.append(xyz)
+        last = self.final_norm(x)
+        result = torch.cat([xyz]+[head(last) for head in self.heads.values()], -1).masked_fill(~active[..., None], 0)
+        return result, stages
+
+    def forward(self, packet, condition, active):
+        return self.forward_stages(packet, condition, active)[0]
+
+
+@contextmanager
+def capture_xyz_stages(model):
+    """Optional validation diagnostics without a persistent activation cache."""
+    stages, hooks = [], []
+    if model.cfg.decoder_refinement == 'progressive':
+        decoder = model.learned.dec_trunk
+        hooks.append(decoder.initial_xyz.register_forward_hook(lambda m, a, y: stages.append(y.detach())))
+        hooks.extend(r.register_forward_hook(lambda m, a, y: stages.append(y[1].detach())) for r in decoder.refiners)
+    try:
+        yield stages
+    finally:
+        for hook in hooks:
+            hook.remove()

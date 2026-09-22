@@ -13,11 +13,16 @@ command -v "$PYTHON_BIN" >/dev/null || { echo 'Activate maskgs or set PYTHON_BIN
 echo 'Random weights; position capture + fine XYZ + shape + centered RGB. No XYZ side stream or render training; exact objective is logged in training.json.'
 # Deliberately do not inherit INIT, POSITION_DELIVERY, RENDER_STEPS, JOINT_STEPS or LR_SCHEDULE.
 TIER_ARGS=()
+REGION_ARGS=()
+if [[ -n "${VALIDATION_REGION_SIZE:-}" ]]; then
+  REGION_ARGS=(--validation-region-size "$VALIDATION_REGION_SIZE")
+fi
 if [[ -n "${BOOTSTRAP_TIER:-}" ]]; then
   TIER_ARGS=(--bootstrap-tier "$BOOTSTRAP_TIER")
 fi
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   "${TIER_ARGS[@]}" \
+  "${REGION_ARGS[@]}" \
   --ply "$PLY" --out "$OUT" --device "${DEVICE:-cuda}" \
   --architecture "${ARCHITECTURE:-learned_joint}" \
   --context-mode "${CONTEXT_MODE:-window}" \
@@ -25,11 +30,12 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --decoder-attention "${DECODER_ATTENTION:-window}" --decoder-neighbors "${DECODER_NEIGHBORS:-16}" \
   --decoder-depth "${DECODER_DEPTH:-4}" \
   --decoder-memory "${DECODER_MEMORY:-none}" \
+  --decoder-refinement "${DECODER_REFINEMENT:-none}" \
   --encoder-attention "${ENCODER_ATTENTION:-window}" --encoder-neighbors "${ENCODER_NEIGHBORS:-16}" \
   --position-delivery learned --bootstrap-objective spatial-response \
   --bootstrap-steps "${BOOTSTRAP_STEPS:-5000}" --render-steps 0 --joint-steps 0 \
   --snr "${SNR:-10}" --channel "${CHANNEL:-awgn}" --rates 0 8 16 32 \
-  --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" \
+  --block-size "${BLOCK_SIZE:-256}" --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-32}" \
   --local-response-views "${LOCAL_RESPONSE_VIEWS:-4}" \
   --spatial-fine-weight "${SPATIAL_FINE_WEIGHT:-1}" \
   --lr "${LR:-0.0002}" --lr-schedule constant --clip-mode none \

@@ -17,6 +17,7 @@ from .transport import load_checkpoint, save_checkpoint
 from .position_delivery import training_position_cost
 from .local_response import local_response_loss
 from .spatial_response import spatial_response_loss, DEFAULT_BANDWIDTHS
+from .transformer_decoder import capture_xyz_stages
 
 
 def add_parser(sub):
@@ -35,6 +36,7 @@ def add_parser(sub):
     p.add_argument('--decoder-attention',choices=['window','feature_point','transformer_trunk'],default=None)
     p.add_argument('--decoder-depth',type=int,default=None,help='Transformer trunk layers, >=3; independent of encoder depth')
     p.add_argument('--decoder-memory', choices=['none','received'], default=None)
+    p.add_argument('--decoder-refinement', choices=['none','progressive'], default=None)
     p.add_argument('--decoder-neighbors',type=int,default=None)
     p.add_argument('--xyz-decoder',choices=['additive','block_center','context_center','residual_center','symbol_skip'],default=None)
     p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
@@ -93,6 +95,8 @@ def add_parser(sub):
     p.add_argument('--views-per-step', type=int, default=2)
     p.add_argument('--validate-every', type=int, default=100)
     p.add_argument('--validation-blocks', type=int, default=8, help='bootstrap diagnostic only')
+    p.add_argument('--validation-region-size', type=int, default=None,
+                   help='optional fixed Morton-region size, divisible by block-size; validation-blocks counts regions, preserving heldout points across block sizes')
     p.add_argument('--validation-views', type=int, default=4)
     p.add_argument('--validation-trials', type=int, default=2)
     p.add_argument('--patience', type=int, default=8, help='render-validation checks without improvement; 0 disables')
@@ -100,6 +104,24 @@ def add_parser(sub):
     p.add_argument('--save-every', type=int, default=1000)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--cpu-threads', type=int, default=4)
+
+
+def bootstrap_split(point_count, block_size, count, region_size=None):
+    """Fixed point regions for context-size experiments, no holdout leakage."""
+    total = (point_count+block_size-1)//block_size
+    if region_size is None:
+        validation = sorted(set(np.linspace(0,total-1,min(count,total),dtype=int).tolist()))
+        training = [i for i in range(total) if i not in validation] or list(range(total))
+        return training, validation
+    if region_size < block_size or region_size % block_size:
+        raise ValueError('validation-region-size must be a positive multiple of block-size')
+    regions = point_count//region_size
+    if regions <= count:
+        raise ValueError('fixed-region validation requires more complete regions than validation-blocks')
+    selected = np.linspace(0,regions-1,count,dtype=int).tolist()
+    ratio = region_size//block_size
+    validation = [r*ratio+j for r in selected for j in range(ratio)]
+    return [i for i in range(total) if i not in validation], validation
 
 
 def train(args):
@@ -174,6 +196,8 @@ def train(args):
             raise ValueError('initializer decoder depth mismatch; start from random weights')
         if args.decoder_memory is not None and args.decoder_memory!=model.cfg.decoder_memory:
             raise ValueError('initializer decoder memory mismatch; start from random weights')
+        if args.decoder_refinement is not None and args.decoder_refinement!=model.cfg.decoder_refinement:
+            raise ValueError('initializer decoder refinement mismatch; start from random weights')
         if args.xyz_decoder is not None and args.xyz_decoder != model.cfg.xyz_decoder:
             raise ValueError('initializer XYZ decoder mismatch; start from random weights')
         if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
@@ -189,6 +213,7 @@ def train(args):
                           decoder_neighbors=16 if args.decoder_neighbors is None else args.decoder_neighbors,
                           decoder_depth=4 if args.decoder_depth is None else args.decoder_depth,
                           decoder_memory=args.decoder_memory or 'none',
+                          decoder_refinement=args.decoder_refinement or 'none',
                           xyz_decoder=args.xyz_decoder or 'additive',
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
@@ -217,8 +242,8 @@ def train(args):
             f,_ = to_features(raw[start:start+model.cfg.block_size].to(device),geometry,model)
             blocks.append(f.to(cache_device))
             ids.append(order[start:start+len(f)].to(cache_device))
-    validation_indices = sorted(set(np.linspace(0,len(blocks)-1,min(args.validation_blocks,len(blocks)),dtype=int).tolist()))
-    training_indices = [i for i in range(len(blocks)) if i not in validation_indices] or list(range(len(blocks)))
+    training_indices, validation_indices = bootstrap_split(len(raw), model.cfg.block_size, args.validation_blocks,
+                                                          args.validation_region_size)
     groups = [pad_sequence(blocks[i:i+args.blocks_per_batch],batch_first=True) for i in range(0,len(blocks),args.blocks_per_batch)]
     group_ids = [pad_sequence(ids[i:i+args.blocks_per_batch],batch_first=True,padding_value=-1) for i in range(0,len(blocks),args.blocks_per_batch)]
     cameras = val_cameras = reference = None
@@ -244,6 +269,7 @@ def train(args):
                   train_view_names=[str(getattr(c,'image_name',i)) for i,c in enumerate(cameras or [])],
                   validation_view_names=[str(getattr(c,'image_name',i)) for i,c in enumerate(val_cameras or [])],
                   bootstrap_validation_blocks=validation_indices,
+                  bootstrap_validation_points=sum(len(blocks[i]) for i in validation_indices),
                   bootstrap_validation_overlap=not bool(set(range(len(blocks)))-set(validation_indices)),
                   scope='scene-trained codec; held-out camera validation, NOT unseen-scene or final test evidence',
                   target='original full PLY rendered images; photographs are evaluation references only',
@@ -304,12 +330,17 @@ def train(args):
     if model.cfg.decoder_attention=='transformer_trunk':
         record['decoder_attention_design']='received-only full attention within each codec block; pre-norm residual Transformer main path; no kNN, slot IDs, pooling or gated output bypass'
         record['xyz_decoder_design']='separately normalized shallow/middle/deep Transformer features -> concatenation -> nonlinear XYZ readout; no source coordinates'
-        record['decoder_xyz_taps']=[i+1 for i in model.learned.dec_trunk.tap_indices]
+        record['decoder_xyz_taps']=[i+1 for i in getattr(model.learned.dec_trunk,'tap_indices',())]
         record['decoder_memory_design'] = ('per-layer cross-attention to fixed received payload embeddings; zero-start output projections; memory is not detached; no new symbols or localization token'
                                             if model.cfg.decoder_memory=='received' else 'none')
         record['context_design']='encoder retains gated fine/x4/x16 context; receiver replaced by block Transformer trunk'
         record['context_gate_initialization']='encoder only: tanh(0.1); no receiver Context gate'
         record['receiver_context']='full attention over received tokens within codec block; no source geometry, slot embedding or hard neighbors'
+        if model.cfg.decoder_refinement == 'progressive':
+            record['xyz_decoder_design']='first-layer learned XYZ then per-point additive refinement after each subsequent Transformer layer; same received embedding at every refinement; predicted absolute/centered XYZ features and soft predicted squared-distance attention bias; no detach or extra transmission'
+            record['decoder_attention_design']='full block attention; learned per-head softplus distance precision in normalized bbox coordinates, no hard kNN'
+            record['decoder_refinement_stages']=model.cfg.decoder_depth
+            record['refinement_initialization']='initial XYZ output std=.02,bias=.5; delta output std=.002,bias=0; learnable log_precision=0; engineering initialization, NOT extra loss weights'
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     if args.bootstrap_tier is not None:
         print(f'Fixed bootstrap/validation q{args.bootstrap_tier}: {model.cfg.rates[args.bootstrap_tier]} complex symbols/G; {record["channel_protocol"]}.',flush=True)
@@ -348,6 +379,8 @@ def train(args):
                 losses = []
                 measurements = []
                 symbols, points = 0, 0
+                xyz_squared_sum, xyz_coordinates = 0., 0
+                stage_squared_sums = {}
                 for trial in range(args.validation_trials if spatial_test else 1):
                     for i in validation_indices:
                         f = blocks[i].to(device)
@@ -355,10 +388,16 @@ def train(args):
                         if spatial_test:
                             symbols += int(torch.tensor(model.cfg.rates,device=q.device)[q].sum())
                             points += len(q)
-                        pred = model(f,f[:,:3],q,args.snr,args.channel)
+                        with capture_xyz_stages(model) as stages:
+                            pred = model(f,f[:,:3],q,args.snr,args.channel)
+                        for depth, xyz in enumerate(stages):
+                            error = (xyz.reshape(-1,3)-f[:,:3]).double()*geometry.span.to(f).double()
+                            stage_squared_sums[depth] = stage_squared_sums.get(depth,0.)+float(error.square().sum())
                         value, diagnostics = initialization_loss(pred,f)
                         if spatial_test:
                             delta=(pred[:,:3]-f[:,:3]).double()*geometry.span.to(pred).double()
+                            xyz_squared_sum += float(delta.square().sum())
+                            xyz_coordinates += delta.numel()
                             common=delta.mean(0,keepdim=True)
                             diagnostics.update(block_xyz_common_mse=float(common.square().mean()),
                                                block_xyz_relative_mse=float((delta-common).square().mean()))
@@ -369,7 +408,10 @@ def train(args):
                     entry.update({key:sum(r[key] for r in measurements)/len(measurements) for key in measurements[0]})
                     entry.update(position_side_stream_bits=0,validation_blocks=len(validation_indices),
                                  validation_trials=args.validation_trials,
+                                 xyz_pooled_world_rmse=math.sqrt(xyz_squared_sum/xyz_coordinates),
                                  symbols_per_gaussian=symbols/points)
+                    if stage_squared_sums:
+                        entry['xyz_stage_pooled_world_rmse'] = [math.sqrt(stage_squared_sums[d]/xyz_coordinates) for d in sorted(stage_squared_sums)]
                 values.append(entry)
             model.train()
             append_json(out/'bootstrap_validation.jsonl',{'step':step,'objective':args.bootstrap_objective,

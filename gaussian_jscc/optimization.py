@@ -45,6 +45,10 @@ def parameter_group(name):
         part = name.split('.')[1]
         if part == 'dec_trunk':
             sub = name.split('.')[2]
+            if sub == 'refiners':
+                return 'xyz_refinement_layer_' + name.split('.')[3]
+            if sub == 'initial_xyz':
+                return 'xyz_initial_head'
             if sub == 'memory_reads':
                 return 'decoder_memory_layer_' + name.split('.')[3]
             if sub in ('xyz_readout','xyz_norms'):
