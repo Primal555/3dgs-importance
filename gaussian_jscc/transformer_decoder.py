@@ -34,10 +34,10 @@ class BlockSelfAttention(nn.Module):
 
 
 class ReceivedTransformerDecoder(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, input_dim=None):
         super().__init__()
         h = cfg.hidden
-        self.input = nn.Sequential(nn.Linear(4*cfg.rates[-1], h), nn.GELU(), nn.Linear(h, h))
+        self.input = nn.Sequential(nn.Linear(4*cfg.rates[-1] if input_dim is None else input_dim, h), nn.GELU(), nn.Linear(h, h))
         self.blocks = nn.ModuleList(BlockSelfAttention(h, cfg.attention_heads) for _ in range(cfg.decoder_depth))
         # Distinct shallow/middle/deep post-block features; no pre-trunk XYZ bypass.
         self.tap_indices = (0, (cfg.decoder_depth-1)//2, cfg.decoder_depth-1)

@@ -48,8 +48,19 @@ class CodecConfig:
     # Explicit diagnostic alternative; learned remains the unchanged default.
     position_delivery: str = 'learned'
     position_bits: int = 12
+    # Opt-in four-module experiment. Zero preserves existing codec identity.
+    representation_dim: int = 0
+    communication_depth: int = 2
 
     def __post_init__(self):
+        if not isinstance(self.representation_dim, int) or self.representation_dim < 0:
+            raise ValueError('representation_dim must be a nonnegative integer')
+        if not isinstance(self.communication_depth, int) or self.communication_depth < 1:
+            raise ValueError('communication_depth must be positive')
+        if self.representation_dim and (self.context_mode != 'multiscale_self' or
+                self.decoder_attention != 'transformer_trunk' or self.decoder_refinement != 'none' or
+                self.decoder_memory != 'none' or self.position_delivery != 'learned'):
+            raise ValueError('separated representation requires multiscale_self, plain transformer_trunk and learned XYZ')
         if self.decoder_refinement not in ('none', 'progressive'):
             raise ValueError('unknown decoder refinement')
         if self.decoder_refinement != 'none' and (self.decoder_attention != 'transformer_trunk' or self.decoder_memory != 'none'):
@@ -122,6 +133,9 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if not self.representation_dim:
+            result.pop('representation_dim')
+            result.pop('communication_depth')
         if self.decoder_refinement == 'none':
             result.pop('decoder_refinement')
         if self.decoder_memory == 'none':
@@ -310,7 +324,10 @@ class GaussianCodec(nn.Module):
         self.cfg = cfg
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
-        if cfg.context_mode == 'multiscale_self':
+        if cfg.representation_dim:
+            from .representation_codec import RepresentationCommunicationCore
+            self.learned = RepresentationCommunicationCore(cfg)
+        elif cfg.context_mode == 'multiscale_self':
             from .multiscale_codec import MultiScaleSelfCore
             self.learned = MultiScaleSelfCore(cfg)
         elif cfg.architecture in ('learned_split', 'learned_split_logcov'):
@@ -326,6 +343,23 @@ class GaussianCodec(nn.Module):
     def encode(self, features, xyz, q, snr):
         validate_tiers(q, len(features))
         return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
+
+    def reconstruct_clean(self, features, active=None):
+        """Internal representation reconstruction, NOT a transmitted payload."""
+        if not self.cfg.representation_dim:
+            raise ValueError('clean representation path requires a separated codec')
+        single = features.ndim == 2
+        if single:
+            features = features[None]
+            active = None if active is None else active[None]
+        if active is None:
+            active = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device)
+        if features.ndim != 3 or features.shape[-1] != self.cfg.attr_dim+3:
+            raise ValueError('clean features must be [N,D] or [B,N,D] with codec feature dimension')
+        if active.shape != features.shape[:2] or active.dtype != torch.bool or active.device != features.device:
+            raise ValueError('clean active mask must be boolean and match feature slots/device')
+        result = self.learned.clean(features, active)
+        return result[0] if single else result
 
     def decode(self, symbols, q, snr, return_seed=False, delivered_xyz=None):
         validate_tiers(q, len(q))

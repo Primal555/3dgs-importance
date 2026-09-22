@@ -120,6 +120,8 @@ def main():
     add_parsers(sub)
     from .learned_train import add_parser as add_learned_parser
     add_learned_parser(sub)
+    from .representation_train import add_parser as add_representation_parser
+    add_representation_parser(sub)
     from .plots import add_parser as add_plot_parser
     add_plot_parser(sub)
     from .benchmark import add_parser as add_benchmark_parser
