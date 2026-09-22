@@ -45,6 +45,8 @@ def parameter_group(name):
         part = name.split('.')[1]
         if part == 'dec_trunk':
             sub = name.split('.')[2]
+            if sub == 'memory_reads':
+                return 'decoder_memory_layer_' + name.split('.')[3]
             if sub in ('xyz_readout','xyz_norms'):
                 return 'xyz_multidepth_head'
             if sub == 'heads':

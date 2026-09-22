@@ -267,6 +267,8 @@ Receiver feature-neighbor Transformer experiment: [architecture and protocol](do
 
 Transformer **main-path** decoder with multi-depth XYZ readout: [design, local results and background launch](docs/transformer_trunk_decoder.md), `scripts/test_transformer_trunk_q3.sh`. Full attention within each codec block; fixed q3/noiseless, unchanged encoder/logcov/objective. Local two-seed runs improve total objective and held-out XYZ but worsen fitted XYZ; not yet a demonstrated render-quality improvement.
 
+Optional **per-layer received-memory rereading**: [design and matched evaluation](docs/received_memory_decoder.md), `scripts/test_received_memory_q3.sh`. Each decoder layer cross-attends to the same received-payload embeddings before self-attention; no localization token, extra transmission or loss change. The original trunk remains available unchanged.
+
 Fixed-q3 noiseless diagnostic (32 complex symbols, bootstrap only): [protocol and background launch](docs/q3_noiseless_bootstrap.md), `scripts/test_q3_noiseless_bootstrap.sh`.
 
 Encoder-only geometric-neighbor Transformer experiment: [design and background launch](docs/point_transformer_logcov.md), `scripts/test_point_transformer_logcov.sh`. Receiver, logcov objective and per-Gaussian symbol budgets remain unchanged.

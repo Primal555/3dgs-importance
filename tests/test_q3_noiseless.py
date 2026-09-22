@@ -19,6 +19,7 @@ from test_render_first import synthetic_render
 class Q3NoiselessTests(unittest.TestCase):
     xyz_decoder='additive'
     decoder_attention='window'
+    decoder_memory='none'
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
@@ -43,6 +44,7 @@ class Q3NoiselessTests(unittest.TestCase):
                   '--context-mode','multiscale_self','--encoder-attention','geometric_point',
                   '--xyz-decoder',self.xyz_decoder,
                   '--decoder-attention',self.decoder_attention,
+                  '--decoder-memory',self.decoder_memory,
                   '--bootstrap-tier','3','--channel','none','--ply',str(ply),'--out',str(root/'run'),
                   '--device','cpu','--bootstrap-objective','spatial-response','--bootstrap-steps','5',
                   '--render-steps','0','--joint-steps','0','--hidden','16','--depth','1',
@@ -58,6 +60,7 @@ class Q3NoiselessTests(unittest.TestCase):
             self.assertEqual(model.cfg.encoder_attention,'geometric_point')
             self.assertEqual(model.cfg.xyz_decoder,self.xyz_decoder)
             self.assertEqual(model.cfg.decoder_attention,self.decoder_attention)
+            self.assertEqual(model.cfg.decoder_memory,self.decoder_memory)
             if self.decoder_attention=='transformer_trunk':
                 record=json.loads((root/'run/training.json').read_text())
                 self.assertEqual(record['decoder_xyz_taps'],[1,2,4])
@@ -93,6 +96,10 @@ class Q3NoiselessTests(unittest.TestCase):
             if self.decoder_attention!='window':
                 bad=argv+['--init',str(root/'run/codec.pt'),'--decoder-attention','window','--out',str(root/'mismatch')]
                 with patch('sys.argv',bad),self.assertRaisesRegex(ValueError,'decoder attention mismatch'):
+                    main()
+            if self.decoder_memory!='none':
+                bad=argv+['--init',str(root/'run/codec.pt'),'--decoder-memory','none','--out',str(root/'memory_mismatch')]
+                with patch('sys.argv',bad),self.assertRaisesRegex(ValueError,'decoder memory mismatch'):
                     main()
 
 

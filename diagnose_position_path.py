@@ -145,6 +145,7 @@ def run(args):
                 self_only_warning=('not applicable: Transformer trunk has no own/context output split' if trunk else
                                    'remove only final XYZ Context correction; latent still contains encoder Context; context_center and residual_center retain pooled decoder Context in their center paths'),
                 decoder_attention=model.cfg.decoder_attention,
+                decoder_memory=model.cfg.decoder_memory,
                 xyz_decoder=model.cfg.xyz_decoder,
                 aggregation='point-weighted SSE/RMSE; radius statistics are equal-block mean of medians',
                 summary=summary)

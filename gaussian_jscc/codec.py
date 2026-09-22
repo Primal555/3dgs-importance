@@ -25,6 +25,7 @@ class CodecConfig:
     decoder_attention: str = 'window'
     decoder_neighbors: int = 16
     decoder_depth: int = 4
+    decoder_memory: str = 'none'
     xyz_decoder: str = 'additive'
     loss_profile: str = "learned_v1"
     position_head: str = "learned_affine"
@@ -48,6 +49,10 @@ class CodecConfig:
     position_bits: int = 12
 
     def __post_init__(self):
+        if self.decoder_memory not in ('none', 'received'):
+            raise ValueError('unknown decoder memory')
+        if self.decoder_memory != 'none' and self.decoder_attention != 'transformer_trunk':
+            raise ValueError('received memory requires transformer_trunk')
         if self.decoder_attention not in ('window','feature_point','transformer_trunk'):
             raise ValueError('unknown decoder attention')
         if self.decoder_attention!='window' and self.context_mode!='multiscale_self':
@@ -112,6 +117,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.decoder_memory == 'none':
+            result.pop('decoder_memory')  # Preserve baseline checkpoint/packet hashes.
         if self.decoder_attention!='transformer_trunk' and self.decoder_depth==4:
             result.pop('decoder_depth')
         if self.decoder_attention=='window' and self.decoder_neighbors==16:
