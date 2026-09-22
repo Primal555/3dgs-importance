@@ -83,11 +83,8 @@ def run(args):
         raise ValueError('invalid held-out block indices')
     captures={}
     trunk=model.cfg.decoder_attention=='transformer_trunk'
-    localized=model.cfg.decoder_localization=='token_translation'
     hooks=[] if trunk else [model.learned.heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(own=o)),
                             model.learned.context_heads['xyz'].register_forward_hook(lambda m,i,o:captures.update(context=o))]
-    if localized:
-        hooks.append(model.learned.dec_trunk.localization.register_forward_hook(lambda m,i,o:captures.update(translation=o)))
     if model.cfg.xyz_decoder in ('block_center','context_center','residual_center'):
         hooks.append(model.learned.dec_xyz_center.register_forward_hook(lambda m,i,o:captures.update(center=o)))
     if model.cfg.xyz_decoder=='symbol_skip':
@@ -118,8 +115,6 @@ def run(args):
             for j,(index,source) in enumerate(zip(indices,sources)):
                 n=len(source);radii=source[:,4:7].amax(-1).exp()
                 paths=[('full',decoded[j,:n,:3])]
-                if localized:
-                    paths.append(('without_translation',decoded[j,:n,:3]-captures['translation'][j]))
                 if not trunk:
                     paths.append(('self_only',own[j,:n]))
                 for label,pred in paths:
@@ -128,8 +123,6 @@ def run(args):
                     row.update(block=index,split='heldout' if index in held else 'training_pool',path=label)
                     corr=correction[j,:n].cpu()*geometry.span
                     row['context_correction_rmse_world']=None if trunk else float(corr.square().mean().sqrt())
-                    if localized:
-                        row['translation_rmse_world']=float((captures['translation'][j].cpu()*geometry.span).square().mean().sqrt())
                     rows.append(row)
             print(f'Diagnosed {min(offset+len(indices),len(selected))}/{len(selected)} blocks',flush=True)
     finally:
@@ -138,7 +131,7 @@ def run(args):
     if file_hash(args.checkpoint)!=before:
         raise RuntimeError('checkpoint changed during diagnosis')
     summary={}
-    for path in ('full','self_only','without_translation'):
+    for path in ('full','self_only'):
         for split in ('all','heldout','training_pool'):
             part=[r for r in rows if r['path']==path and (split=='all' or r['split']==split)]
             if part:
@@ -152,7 +145,6 @@ def run(args):
                 self_only_warning=('not applicable: Transformer trunk has no own/context output split' if trunk else
                                    'remove only final XYZ Context correction; latent still contains encoder Context; context_center and residual_center retain pooled decoder Context in their center paths'),
                 decoder_attention=model.cfg.decoder_attention,
-                decoder_localization=model.cfg.decoder_localization,
                 xyz_decoder=model.cfg.xyz_decoder,
                 aggregation='point-weighted SSE/RMSE; radius statistics are equal-block mean of medians',
                 summary=summary)

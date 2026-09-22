@@ -19,7 +19,6 @@ from test_render_first import synthetic_render
 class Q3NoiselessTests(unittest.TestCase):
     xyz_decoder='additive'
     decoder_attention='window'
-    decoder_localization='none'
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
@@ -44,7 +43,6 @@ class Q3NoiselessTests(unittest.TestCase):
                   '--context-mode','multiscale_self','--encoder-attention','geometric_point',
                   '--xyz-decoder',self.xyz_decoder,
                   '--decoder-attention',self.decoder_attention,
-                  '--decoder-localization',self.decoder_localization,
                   '--bootstrap-tier','3','--channel','none','--ply',str(ply),'--out',str(root/'run'),
                   '--device','cpu','--bootstrap-objective','spatial-response','--bootstrap-steps','5',
                   '--render-steps','0','--joint-steps','0','--hidden','16','--depth','1',
@@ -60,7 +58,6 @@ class Q3NoiselessTests(unittest.TestCase):
             self.assertEqual(model.cfg.encoder_attention,'geometric_point')
             self.assertEqual(model.cfg.xyz_decoder,self.xyz_decoder)
             self.assertEqual(model.cfg.decoder_attention,self.decoder_attention)
-            self.assertEqual(model.cfg.decoder_localization,self.decoder_localization)
             if self.decoder_attention=='transformer_trunk':
                 record=json.loads((root/'run/training.json').read_text())
                 self.assertEqual(record['decoder_xyz_taps'],[1,2,4])

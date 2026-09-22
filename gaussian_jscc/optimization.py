@@ -45,8 +45,6 @@ def parameter_group(name):
         part = name.split('.')[1]
         if part == 'dec_trunk':
             sub = name.split('.')[2]
-            if sub == 'localization':
-                return 'block_localization'
             if sub in ('xyz_readout','xyz_norms'):
                 return 'xyz_multidepth_head'
             if sub == 'heads':
