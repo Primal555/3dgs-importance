@@ -51,8 +51,14 @@ class CodecConfig:
     # Opt-in four-module experiment. Zero preserves existing codec identity.
     representation_dim: int = 0
     communication_depth: int = 2
+    # Nonzero selects independent center/attribute clean autoencoders.
+    center_latent_dim: int = 0
 
     def __post_init__(self):
+        if not isinstance(self.center_latent_dim, int) or self.center_latent_dim < 0:
+            raise ValueError('center_latent_dim must be a nonnegative integer')
+        if self.center_latent_dim and not 0 < self.center_latent_dim < self.representation_dim:
+            raise ValueError('center latent must leave a positive independent attribute latent')
         if not isinstance(self.representation_dim, int) or self.representation_dim < 0:
             raise ValueError('representation_dim must be a nonnegative integer')
         if not isinstance(self.communication_depth, int) or self.communication_depth < 1:
@@ -133,6 +139,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if not self.center_latent_dim:
+            result.pop('center_latent_dim')
         if not self.representation_dim:
             result.pop('representation_dim')
             result.pop('communication_depth')
@@ -324,7 +332,10 @@ class GaussianCodec(nn.Module):
         self.cfg = cfg
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
-        if cfg.representation_dim:
+        if cfg.center_latent_dim:
+            from .center_attribute_codec import CenterAttributeCore
+            self.learned = CenterAttributeCore(cfg)
+        elif cfg.representation_dim:
             from .representation_codec import RepresentationCommunicationCore
             self.learned = RepresentationCommunicationCore(cfg)
         elif cfg.context_mode == 'multiscale_self':

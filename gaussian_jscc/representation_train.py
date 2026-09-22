@@ -275,7 +275,7 @@ def train(args):
         model.load_state_dict(resumed['model'])
     elif args.init:
         model = load_checkpoint(args.init, device)
-        if not model.cfg.representation_dim or model.cfg.sh_degree != degree:
+        if not model.cfg.representation_dim or model.cfg.center_latent_dim or model.cfg.sh_degree != degree:
             raise ValueError('initializer must be a separated codec with matching SH degree')
         print('Weights/statistics initialization only: optimizer and schedule start fresh; checkpoint architecture wins.', flush=True)
     else:

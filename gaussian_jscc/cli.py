@@ -122,6 +122,8 @@ def main():
     add_learned_parser(sub)
     from .representation_train import add_parser as add_representation_parser
     add_representation_parser(sub)
+    from .center_attribute_train import add_parser as add_center_attribute_parser
+    add_center_attribute_parser(sub)
     from .plots import add_parser as add_plot_parser
     add_plot_parser(sub)
     from .benchmark import add_parser as add_benchmark_parser
