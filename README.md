@@ -24,6 +24,10 @@ neighbor interventions, frozen-layer coordinate probes, and matched random-start
 decoder attention training. Run `scripts/test_center_interaction.sh CHECKPOINT OUT`;
 the original codec checkpoint is never trained or overwritten by the diagnostics.
 
+The [5000-step self-only versus lightweight center comparison](docs/center_self_vs_light.md)
+runs `scripts/test_center_self_vs_light.sh`: random-start center-only training of both
+decoders, with overlaid raw/smoothed loss curves, CSV, render PSNR and coordinate metrics.
+
 The opt-in **representation-first / communication-second experiment** is available
 as `python -m gaussian_jscc train-representation`. It separates four independently
 parameterized modules, validates both the clean and communicated reconstruction,

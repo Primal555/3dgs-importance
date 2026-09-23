@@ -12,7 +12,7 @@ from gaussian_jscc.multiscale_codec import MultiScaleSelfCore
 from gaussian_jscc.center_attribute_train import train, make_batches, render_step
 from gaussian_jscc.data import write_ply
 from gaussian_jscc.transport import save_checkpoint, load_checkpoint
-from scripts.compare_center_decoders import summarize
+from scripts.compare_center_decoders import summarize, case_settings, comparison_cases
 
 
 class CenterDecoderComparisonTests(unittest.TestCase):
@@ -113,6 +113,35 @@ class CenterDecoderComparisonTests(unittest.TestCase):
             rows[0]['stats']['sampled_blocks'][0] = -1
             path.write_text('\n'.join(json.dumps(r) for r in rows))
             with self.assertRaisesRegex(ValueError, 'paired audit failed'):
+                summarize(root)
+
+    def test_self_light_protocol_and_loss_overlay(self):
+        # Added with the server-only experiment; not executed locally in that change.
+        self.assertEqual(comparison_cases('self_light'), ('self_only', 'historical_light'))
+        self.assertEqual(case_settings('self_only', 'affine')['center_attention_scope'], 'self')
+        self.assertEqual(case_settings('historical_light', 'affine')['center_readout_norm'], 'layernorm')
+        raw, _, _, _ = setup(40)
+        with tempfile.TemporaryDirectory() as tmp, patch('gaussian_jscc.center_attribute_train.plot_run'):
+            root = Path(tmp)
+            write_ply(root/'source.ply', raw, 0)
+            (root/'experiment.json').write_text(json.dumps({'comparison': 'self_light', 'readout_norm': 'affine'}))
+            for case in comparison_cases('self_light'):
+                options = ['--center-probe-blocks', '2', '--min-center-steps', '999']
+                for key, value in case_settings(case, 'affine').items():
+                    options.extend(['--'+key.replace('_', '-'), value])
+                train(args_for(root/'source.ply', root/case, options))
+            report = summarize(root)
+            self.assertTrue(report['audit_passed'])
+            self.assertTrue(report['not_parameter_matched'])
+            self.assertEqual(set(report['results']), {'self_only', 'historical_light'})
+            self.assertTrue((root/'loss_comparison.png').is_file())
+            self.assertEqual(len((root/'loss_comparison.csv').read_text().splitlines()), 7)
+            # Wrong protocol must not be hidden by excluding architecture args from audit.
+            path = root/'self_only/training.json'
+            info = json.loads(path.read_text(encoding='utf-8'))
+            info['arguments']['center_attention_scope'] = 'block'
+            path.write_text(json.dumps(info), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'unexpected center_attention_scope'):
                 summarize(root)
 
 
