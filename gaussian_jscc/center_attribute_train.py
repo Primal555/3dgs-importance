@@ -36,6 +36,8 @@ def add_parser(sub):
     p.add_argument('--center-decoder-kind', choices=['transformer', 'historical_light'], default='transformer')
     p.add_argument('--center-readout-norm', choices=['layernorm', 'affine'], default='layernorm',
                    help='XYZ tap readout only; affine preserves feature mean/scale, internal Pre-LN unchanged')
+    p.add_argument('--center-attention-scope', choices=['block', 'self'], default='block',
+                   help='center decoder only; self retains V/output projections but disables cross-token attention')
     p.add_argument('--center-probe-blocks', type=int, default=0,
                    help='fixed training-block diagnostics and sampled-block audit; zero disables')
     for name, default in dict(center_steps=5000, attribute_steps=1000, joint_steps=1000,
@@ -165,6 +167,8 @@ def train(args):
             args.center_probe_blocks = 0
         if not hasattr(args, 'center_readout_norm'):
             args.center_readout_norm = 'layernorm'
+        if not hasattr(args, 'center_attention_scope'):
+            args.center_attention_scope = 'block'
         print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
     check_args(args)
     seed_all(args.seed)
@@ -181,12 +185,13 @@ def train(args):
         sh_degree=degree, hidden=args.hidden, depth=args.depth, decoder_depth=args.decoder_depth,
         attention_heads=args.attention_heads, block_size=args.block_size,
         representation_dim=args.latent_dim, center_latent_dim=args.center_latent_dim,
-        center_decoder_kind=args.center_decoder_kind, center_readout_norm=args.center_readout_norm)
+        center_decoder_kind=args.center_decoder_kind, center_readout_norm=args.center_readout_norm,
+        center_attention_scope=args.center_attention_scope)
     if not cfg.center_latent_dim:
         raise ValueError('this trainer requires positive center-latent-dim')
     model = GaussianCodec(cfg).to(device)
     print(f'Center decoder: {args.center_decoder_kind}; XYZ readout: {args.center_readout_norm}; '
-          'internal Transformer normalization unchanged.', flush=True)
+          f'attention scope: {args.center_attention_scope}; internal Transformer normalization unchanged.', flush=True)
     if resumed:
         if fingerprint != resumed['fingerprint'] or cfg.to_dict() != resumed['config']:
             raise ValueError('resume scene or configuration differs')
@@ -222,6 +227,7 @@ def train(args):
         'fitted_probe_blocks': probes,
         'center_decoder_kind': args.center_decoder_kind,
         'center_readout_norm': args.center_readout_norm,
+        'center_attention_scope': args.center_attention_scope,
         'center_decoder_parameters': sum(p.numel() for p in model.learned.center_decoder.parameters()),
         'center_encoder_parameters': sum(p.numel() for p in model.learned.center_encoder.parameters()),
         'center_loss': 'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator',

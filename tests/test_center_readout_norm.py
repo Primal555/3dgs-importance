@@ -114,6 +114,7 @@ class CenterReadoutNormTests(unittest.TestCase):
                 if mode == 'layernorm':
                     state = torch.load(path, weights_only=True)
                     del state['arguments']['center_readout_norm']
+                    state['arguments'].pop('center_attention_scope', None)
                     torch.save(state, path)
                 args = args_for(root/'source.ply', root/'resume')
                 args.resume = str(path)

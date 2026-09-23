@@ -16,7 +16,7 @@ class BlockSelfAttention(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.ff = nn.Sequential(nn.Linear(hidden, 4*hidden), nn.GELU(), nn.Linear(4*hidden, hidden))
 
-    def forward(self, x, active, bias=None):
+    def forward(self, x, active, bias=None, self_only=False):
         if x.shape[1] == 0:
             return x
         x = x.masked_fill(~active[..., None], 0)
@@ -28,7 +28,18 @@ class BlockSelfAttention(nn.Module):
         padding = ~safe
         if bias is not None:
             padding = torch.zeros_like(safe, dtype=x.dtype).masked_fill(~safe, float('-inf'))
-        update = self.attention(h, h, h, key_padding_mask=padding, attn_mask=bias, need_weights=False)[0]
+        if self_only:
+            if bias is not None:
+                raise ValueError('self-only attention cannot also accept attention bias')
+            # Exact diagonal-attention algebra: softmax over one key is 1.
+            # Keep V/out projections, FFN, Pre-LN and residuals. Q/K remain in
+            # the state for matched initialization but have zero influence.
+            width = h.shape[-1]
+            value = torch.nn.functional.linear(h, self.attention.in_proj_weight[2*width:],
+                                                self.attention.in_proj_bias[2*width:])
+            update = self.attention.out_proj(value)
+        else:
+            update = self.attention(h, h, h, key_padding_mask=padding, attn_mask=bias, need_weights=False)[0]
         x = (x + update).masked_fill(~active[..., None], 0)
         return (x + self.ff(self.norm2(x))).masked_fill(~active[..., None], 0)
 

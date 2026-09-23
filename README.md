@@ -19,6 +19,11 @@ center readout LayerNorm statistics with a learned per-channel affine transform.
 Run `scripts/test_center_affine_readout.sh` for 5000 center-only steps from random weights,
 with render diagnostics every 500 steps; internal Transformer Pre-LN is unchanged.
 
+[Center interaction diagnostics](docs/center_interaction_diagnostics.md) combine fixed-target
+neighbor interventions, frozen-layer coordinate probes, and matched random-start block/self-only
+decoder attention training. Run `scripts/test_center_interaction.sh CHECKPOINT OUT`;
+the original codec checkpoint is never trained or overwritten by the diagnostics.
+
 The opt-in **representation-first / communication-second experiment** is available
 as `python -m gaussian_jscc train-representation`. It separates four independently
 parameterized modules, validates both the clean and communicated reconstruction,

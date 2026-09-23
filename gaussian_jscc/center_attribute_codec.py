@@ -49,6 +49,7 @@ class CenterDecoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         h = cfg.hidden
+        self.self_only = cfg.center_attention_scope == 'self'
         self.input = mlp(cfg.center_latent_dim, h)
         self.blocks = nn.ModuleList(BlockSelfAttention(h, cfg.attention_heads) for _ in range(cfg.decoder_depth))
         self.tap_indices = (0, (cfg.decoder_depth-1)//2, cfg.decoder_depth-1)
@@ -62,7 +63,7 @@ class CenterDecoder(nn.Module):
         h = self.input(z.masked_fill(~active[..., None], 0)).masked_fill(~active[..., None], 0)
         taps = []
         for index, block in enumerate(self.blocks):
-            h = block(h, active)
+            h = block(h, active, self_only=self.self_only)
             if index in self.tap_indices:
                 taps.append(self.norms[len(taps)](h))
         return self.readout(torch.cat(taps, -1)).masked_fill(~active[..., None], 0)

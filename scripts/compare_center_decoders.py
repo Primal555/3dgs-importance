@@ -9,6 +9,7 @@ import time
 
 PROJECT = Path(__file__).resolve().parents[1]
 CASES = ('transformer', 'historical_light')
+INTERACTION_CASES = ('block_attention', 'self_only')
 
 
 def read_rows(path):
@@ -17,10 +18,17 @@ def read_rows(path):
 
 def summarize(root):
     import torch
+    experiment = json.loads((root/'experiment.json').read_text(encoding='utf-8')) if (root/'experiment.json').exists() else {}
+    interaction = experiment.get('comparison') == 'interaction'
+    cases = INTERACTION_CASES if interaction else CASES
     results, histories, audits = {}, {}, {}
-    for case in CASES:
+    for case in cases:
         directory = root/case
         info = json.loads((directory/'training.json').read_text(encoding='utf-8'))
+        if interaction:
+            expected_scope = 'self' if case == 'self_only' else 'block'
+            if info['arguments'].get('center_attention_scope', 'block') != expected_scope or info['arguments'].get('center_decoder_kind', 'transformer') != 'transformer':
+                raise ValueError(f'{case} does not use the expected Transformer attention scope')
         summary = json.loads((directory/'summary.json').read_text(encoding='utf-8'))
         loss = read_rows(directory/'loss.jsonl')
         validation = read_rows(directory/'validation.jsonl')
@@ -32,12 +40,12 @@ def summarize(root):
         state = torch.load(directory/'codec_0.pt', map_location='cpu', weights_only=True)['state_dict']
         shared = hashlib.sha256()
         for name, value in sorted(state.items()):
-            if not name.startswith('learned.center_decoder.'):
+            if interaction or not name.startswith('learned.center_decoder.'):
                 shared.update(name.encode())
                 shared.update(value.cpu().contiguous().numpy().tobytes())
         audits[case] = {'sampled_blocks_sha256': batch_hash, 'shared_initial_weights_sha256': shared.hexdigest(),
                        'shared_arguments': {k: v for k, v in info['arguments'].items()
-                                            if k not in ('out', 'resume', 'center_decoder_kind')},
+                                            if k not in ('out', 'resume', 'center_attention_scope' if interaction else 'center_decoder_kind')},
                        'fingerprint': info['fingerprint'], 'fitted_blocks': info['fitted_blocks'],
                        'heldout_blocks': info['heldout_blocks'], 'fitted_probe_blocks': info['fitted_probe_blocks'],
                        'validation_views': info['validation_views']}
@@ -49,12 +57,17 @@ def summarize(root):
             'last': validation[-1], 'selected': selected,
             'selection': 'center-only source PSNR' if selected['render'] else 'heldout world RMSE'}
         histories[case] = (loss, validation)
-    if audits[CASES[0]] != audits[CASES[1]]:
+    if audits[cases[0]] != audits[cases[1]]:
         raise ValueError('paired audit failed: initialization, sampling, scene or split differs')
     report = {'protocol': 'same random shared initialization and sampled blocks; same center distance loss and LR; decoder-only change',
               'not_parameter_matched': True, 'historical_source': '97ef4cc gaussian_jscc/multiscale_codec.py XYZ decoder branch',
               'adaptation': 'clean center latent replaces JSCC packet; no tier/SNR condition; attributes and noise excluded',
               'audit_passed': True, 'audits': audits, 'results': results}
+    if interaction:
+        report.update(protocol='same complete random initial tensors and sampled blocks; decoder cross-token attention only',
+                      not_parameter_matched=False, historical_source=None,
+                      adaptation='self-only keeps V/output projections, Pre-LN, FFN and residuals; Q/K inactive; encoder Context unchanged',
+                      effective_capacity_matched=False)
     (root/'comparison.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     import matplotlib
     matplotlib.use('Agg')
@@ -109,6 +122,8 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--lr', type=float, default=2e-4)
     p.add_argument('--resolution', type=int, default=2)
+    p.add_argument('--comparison', choices=['decoder', 'interaction'], default='decoder')
+    p.add_argument('--readout-norm', choices=['layernorm', 'affine'], default='layernorm')
     p.add_argument('--summarize-only', action='store_true')
     args = p.parse_args()
     root = Path(args.out).resolve()
@@ -117,16 +132,22 @@ def main():
         return
     if not args.ply or min(args.steps, args.validate_every, args.render_every, args.blocks_per_batch, args.hidden, args.block_size) < 1:
         p.error('PLY and positive step/batch/model counts required')
+    if args.comparison == 'decoder' and args.readout_norm != 'layernorm':
+        p.error('historical lightweight comparison has no configurable tap norm')
     if root.exists() and any(x.name not in ('console.log', 'run.pid') for x in root.iterdir()):
         raise FileExistsError('choose a new output directory; existing experiments are never overwritten')
     root.mkdir(parents=True, exist_ok=True)
     (root/'experiment.json').write_text(json.dumps(vars(args), indent=2), encoding='utf-8')
-    for case in CASES:
+    cases = INTERACTION_CASES if args.comparison == 'interaction' else CASES
+    for case in cases:
         case_out = root/case
         case_out.mkdir()
         command = [sys.executable, '-u', '-m', 'gaussian_jscc', 'train-center-attributes',
             '--ply', str(Path(args.ply).resolve()), '--out', str(case_out), '--device', args.device,
-            '--center-decoder-kind', case, '--center-steps', str(args.steps),
+            '--center-decoder-kind', 'transformer' if args.comparison == 'interaction' else case,
+            '--center-readout-norm', args.readout_norm,
+            '--center-attention-scope', 'self' if case == 'self_only' else 'block',
+            '--center-steps', str(args.steps),
             '--min-center-steps', str(args.steps+1), '--attribute-steps', '0', '--joint-steps', '0',
             '--center-lr', str(args.lr), '--blocks-per-batch', str(args.blocks_per_batch),
             '--hidden', str(args.hidden), '--block-size', str(args.block_size),
