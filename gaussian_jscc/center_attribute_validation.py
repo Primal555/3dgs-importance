@@ -212,3 +212,26 @@ def plot_run(out):
         fig.tight_layout()
         fig.savefig(charts/'attribute_validation.png', dpi=150)
         plt.close(fig)
+    guarded = [r for r in losses if r.get('stats', {}).get('step_guard')]
+    if guarded:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        x = [r['step'] for r in guarded]
+        g = [r['stats']['step_guard'] for r in guarded]
+        axes[0].plot(x, [a['scale'] for a in g], linewidth=.6)
+        axes[0].set_title('Accepted step scale (0 = skipped)')
+        for key in ('loss_before', 'loss_after'):
+            axes[1].plot(x, [a[key] for a in g], linewidth=.6, label=key)
+        axes[1].set_title('Same-batch original distance loss')
+        axes[1].legend()
+        rejected, fractions = 0, []
+        for i, entry in enumerate(g):
+            rejected += not entry['accepted']
+            fractions.append(rejected/(i+1))
+        axes[2].plot(x, fractions)
+        axes[2].set_title('Cumulative rejected-step fraction')
+        for axis in axes:
+            axis.set_xlabel('Training step')
+            axis.grid(alpha=.2)
+        fig.tight_layout()
+        fig.savefig(charts/'center_step_guard.png', dpi=150)
+        plt.close(fig)

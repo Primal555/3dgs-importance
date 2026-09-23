@@ -38,6 +38,11 @@ def add_parser(sub):
                    help='XYZ tap readout only; affine preserves feature mean/scale, internal Pre-LN unchanged')
     p.add_argument('--center-attention-scope', choices=['block', 'self'], default='block',
                    help='center decoder only; self retains V/output projections but disables cross-token attention')
+    p.add_argument('--center-position-layout', choices=['absolute', 'centroid_residual'], default='absolute')
+    p.add_argument('--center-step-guard', action='store_true',
+                   help='same-training-batch loss backtracking of center Adam updates only')
+    p.add_argument('--center-max-backtracks', type=int, default=4,
+                   help='after full proposal, try 1/2, 1/4, ...; reject and restore Adam if all fail')
     p.add_argument('--center-probe-blocks', type=int, default=0,
                    help='fixed training-block diagnostics and sampled-block audit; zero disables')
     p.add_argument('--center-drift-every', type=int, default=0,
@@ -83,7 +88,7 @@ def check_args(args):
     for name in positive:
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f'{name} must be positive and finite')
-    for name in ('center_max_gap_db', 'clip_norm', 'min_center_steps', 'min_attribute_steps', 'min_joint_steps', 'center_probe_blocks', 'center_drift_every'):
+    for name in ('center_max_gap_db', 'clip_norm', 'min_center_steps', 'min_attribute_steps', 'min_joint_steps', 'center_probe_blocks', 'center_drift_every', 'center_max_backtracks'):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f'{name} must be nonnegative and finite')
     if args.center_drift_every and not args.center_probe_blocks:
@@ -179,6 +184,10 @@ def train(args):
             args.center_attention_scope = 'block'
         if not hasattr(args, 'center_drift_every'):
             args.center_drift_every = 0
+        for name, default in dict(center_position_layout='absolute', center_step_guard=False,
+                                  center_max_backtracks=4).items():
+            if not hasattr(args, name):
+                setattr(args, name, default)
         print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
     check_args(args)
     seed_all(args.seed)
@@ -196,12 +205,13 @@ def train(args):
         attention_heads=args.attention_heads, block_size=args.block_size,
         representation_dim=args.latent_dim, center_latent_dim=args.center_latent_dim,
         center_decoder_kind=args.center_decoder_kind, center_readout_norm=args.center_readout_norm,
-        center_attention_scope=args.center_attention_scope)
+        center_attention_scope=args.center_attention_scope, center_position_layout=args.center_position_layout)
     if not cfg.center_latent_dim:
         raise ValueError('this trainer requires positive center-latent-dim')
     model = GaussianCodec(cfg).to(device)
     print(f'Center decoder: {args.center_decoder_kind}; XYZ readout: {args.center_readout_norm}; '
-          f'attention scope: {args.center_attention_scope}; internal Transformer normalization unchanged.', flush=True)
+          f'attention scope: {args.center_attention_scope}; layout: {args.center_position_layout}; '
+          f'step guard: {args.center_step_guard}; internal Transformer normalization unchanged.', flush=True)
     if resumed:
         if fingerprint != resumed['fingerprint'] or cfg.to_dict() != resumed['config']:
             raise ValueError('resume scene or configuration differs')
@@ -239,6 +249,10 @@ def train(args):
         'center_readout_norm': args.center_readout_norm,
         'center_attention_scope': args.center_attention_scope,
         'center_drift_every': args.center_drift_every,
+        'center_position_layout': args.center_position_layout,
+        'center_step_guard': args.center_step_guard,
+        'center_parameter_separation': 'independent common/local encoders and decoders, local outputs zero-mean; '
+            'original distance loss still couples their output gradients' if args.center_position_layout == 'centroid_residual' else None,
         'center_decoder_parameters': sum(p.numel() for p in model.learned.center_decoder.parameters()),
         'center_encoder_parameters': sum(p.numel() for p in model.learned.center_encoder.parameters()),
         'center_loss': 'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator',
@@ -248,7 +262,8 @@ def train(args):
         'joint_loss': 'source-render image MSE only; no parameter auxiliary',
         'communication': 'not implemented/trained in this clean-only experiment; latent dimensions are not channel uses',
         'position_delivery': 'learned only; source/12bit positions used exclusively in labelled validation diagnostics',
-        'lr_schedule': 'constant explicit branch LRs; fresh Adam at each phase',
+        'lr_schedule': 'constant explicit base LRs; fresh Adam at each phase; '
+            'optional center guard scales only the current Adam proposal, without plateau LR scheduling',
         'training_views': [str(c.image_name) for c in train_cameras],
         'validation_views': [str(c.image_name) for c in cameras],
         'scope': 'scene-specific; global statistics use whole PLY; A/B exclude heldout blocks; C trains all Gaussians but not heldout cameras',
@@ -381,7 +396,14 @@ def train(args):
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.clip_norm, error_if_nonfinite=True)
             before = {name: [p.detach().clone() for p in params] for name, params in modules.items()} if profile else {}
             xyz_before = drift.capture(keep_latents=True) if drift_due else None
-            optimizer.step()
+            if phase == 'center' and args.center_step_guard:
+                from .center_step_guard import guarded_step
+                def same_batch_loss():
+                    candidate = model.learned.centers(f[..., :3], active)
+                    return center_loss(candidate[active], f[..., :3][active], geometry, args.center_smoothing)
+                stats['step_guard'] = guarded_step(optimizer, same_batch_loss, loss.detach(), args.center_max_backtracks)
+            else:
+                optimizer.step()
             if not torch.stack([torch.isfinite(p).all() for p in model.parameters()]).all():
                 raise FloatingPointError('nonfinite parameters; recover previous training_state.pt')
             state['step'] += 1
@@ -402,7 +424,10 @@ def train(args):
                 row['module_updates'] = {name: norm([p.detach()-v for p, v in zip(params, before[name])]) for name, params in modules.items()}
                 if drift_due:
                     drift.after_step(state['step'], xyz_before, gradients, row['module_updates'], row['lrs'], clip)
-                print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, sec={row["seconds"]:.2f}', flush=True)
+                guard = stats.get('step_guard')
+                suffix = f', post_loss={guard["loss_after"]:.6g}, step_scale={guard["scale"]:g}' if guard else ''
+                print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, '
+                      f'sec={row["seconds"]:.2f}{suffix}', flush=True)
             append_json(out/'loss.jsonl', row)
             images_due = state['step'] % args.render_every == 0 or state['phase_step'] == maximum
             due = state['step'] % args.validate_every == 0 or images_due
@@ -471,6 +496,18 @@ def train(args):
     save_checkpoint(out/'codec.pt', model, selected_step, {**record, 'phase': state['phase'],
         'selection': 'best validation checkpoint of last executed phase', 'status': state['status']})
     summary = {**state, 'export_selected_step': selected_step, 'render_evaluated': bool(cameras), 'output': str(out)}
+    if args.center_step_guard:
+        entries = [json.loads(line).get('stats', {}).get('step_guard')
+                   for line in (out/'loss.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+        entries = [entry for entry in entries if entry is not None]
+        summary['center_step_guard'] = {
+            'attempted_updates': len(entries),
+            'accepted_updates': sum(entry['accepted'] for entry in entries),
+            'reduced_updates': sum(0 < entry['scale'] < 1 for entry in entries),
+            'skipped_updates': sum(not entry['accepted'] for entry in entries),
+            'mean_scale_including_skips': sum(entry['scale'] for entry in entries)/max(len(entries), 1),
+            'scope': 'same-batch nonincrease only; no guarantee of heldout or render improvement',
+        }
     (out/'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     plot_run(out)
     print(json.dumps({'completed': state['completed'], 'status': state['status'], 'output': str(out)}), flush=True)

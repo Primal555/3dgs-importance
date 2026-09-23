@@ -245,8 +245,10 @@ def run(args):
     device = device_for(args.device)
     saved = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
     model = load_checkpoint(args.checkpoint, device).requires_grad_(False)
-    if not model.cfg.center_latent_dim or model.cfg.center_decoder_kind != 'transformer':
-        raise ValueError('requires independent Transformer center checkpoint')
+    if (not model.cfg.center_latent_dim or model.cfg.center_decoder_kind != 'transformer'
+            or model.cfg.center_position_layout != 'absolute'):
+        raise ValueError('layer interaction probes require absolute-layout independent Transformer centers; '
+                         'use center-drift diagnostics for centroid_residual')
     before = model_id(model)
     info = saved['training']
     if not all(k in info for k in ('geometry', 'fitted_blocks', 'heldout_blocks', 'fingerprint')):

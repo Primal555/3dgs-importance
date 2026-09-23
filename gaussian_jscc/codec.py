@@ -56,8 +56,14 @@ class CodecConfig:
     center_decoder_kind: str = 'transformer'
     center_readout_norm: str = 'layernorm'
     center_attention_scope: str = 'block'
+    center_position_layout: str = 'absolute'
 
     def __post_init__(self):
+        if self.center_position_layout not in ('absolute', 'centroid_residual'):
+            raise ValueError('unknown center_position_layout')
+        if self.center_position_layout != 'absolute' and (
+                self.center_latent_dim < 2 or self.center_decoder_kind != 'transformer'):
+            raise ValueError('centroid_residual requires independent Transformer centers with at least 2 latent features')
         if self.center_attention_scope not in ('block', 'self'):
             raise ValueError('unknown center_attention_scope')
         if self.center_attention_scope != 'block' and (not self.center_latent_dim or self.center_decoder_kind != 'transformer'):
@@ -162,6 +168,8 @@ class CodecConfig:
             result.pop('center_readout_norm')
         if self.center_attention_scope == 'block':
             result.pop('center_attention_scope')
+        if self.center_position_layout == 'absolute':
+            result.pop('center_position_layout')
         if not self.representation_dim:
             result.pop('representation_dim')
             result.pop('communication_depth')
