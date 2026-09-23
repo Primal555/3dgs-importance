@@ -14,6 +14,11 @@ current Transformer with the historical lightweight window-context XYZ decoder,
 using matched random shared weights, minibatches and center-only objectives.
 Run `scripts/test_center_decoder_comparison.sh`; the normal decoder default is unchanged.
 
+The [affine XYZ readout experiment](docs/center_affine_readout.md) replaces only
+center readout LayerNorm statistics with a learned per-channel affine transform.
+Run `scripts/test_center_affine_readout.sh` for 5000 center-only steps from random weights,
+with render diagnostics every 500 steps; internal Transformer Pre-LN is unchanged.
+
 The opt-in **representation-first / communication-second experiment** is available
 as `python -m gaussian_jscc train-representation`. It separates four independently
 parameterized modules, validates both the clean and communicated reconstruction,

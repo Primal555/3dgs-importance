@@ -29,6 +29,22 @@ class PointEncoder(nn.Module):
         return z.masked_fill(~active[..., None], 0)
 
 
+class FeatureAffine(nn.Module):
+    """LayerNorm's learned affine parameters without input-dependent statistics.
+
+    Same parameter names, shapes and deterministic initialization as LayerNorm;
+    unlike LayerNorm this operation retains token feature mean and magnitude.
+    It is not a normalization or an XYZ bypass.
+    """
+    def __init__(self, hidden):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden))
+        self.bias = nn.Parameter(torch.zeros(hidden))
+
+    def forward(self, x):
+        return x*self.weight+self.bias
+
+
 class CenterDecoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -36,7 +52,8 @@ class CenterDecoder(nn.Module):
         self.input = mlp(cfg.center_latent_dim, h)
         self.blocks = nn.ModuleList(BlockSelfAttention(h, cfg.attention_heads) for _ in range(cfg.decoder_depth))
         self.tap_indices = (0, (cfg.decoder_depth-1)//2, cfg.decoder_depth-1)
-        self.norms = nn.ModuleList(nn.LayerNorm(h) for _ in self.tap_indices)
+        readout_transform = nn.LayerNorm if cfg.center_readout_norm == 'layernorm' else FeatureAffine
+        self.norms = nn.ModuleList(readout_transform(h) for _ in self.tap_indices)
         self.readout = nn.Sequential(nn.Linear(3*h, h), nn.GELU(), nn.Linear(h, 3))
         nn.init.normal_(self.readout[-1].weight, std=.02)
         nn.init.constant_(self.readout[-1].bias, .5)

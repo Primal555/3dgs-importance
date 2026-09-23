@@ -54,8 +54,13 @@ class CodecConfig:
     # Nonzero selects independent center/attribute clean autoencoders.
     center_latent_dim: int = 0
     center_decoder_kind: str = 'transformer'
+    center_readout_norm: str = 'layernorm'
 
     def __post_init__(self):
+        if self.center_readout_norm not in ('layernorm', 'affine'):
+            raise ValueError('unknown center_readout_norm')
+        if self.center_readout_norm != 'layernorm' and (not self.center_latent_dim or self.center_decoder_kind != 'transformer'):
+            raise ValueError('affine center readout requires independent Transformer center decoder')
         if self.center_decoder_kind not in ('transformer', 'historical_light'):
             raise ValueError('unknown center_decoder_kind')
         if self.center_decoder_kind != 'transformer' and not self.center_latent_dim:
@@ -148,6 +153,8 @@ class CodecConfig:
             result.pop('center_latent_dim')
         if self.center_decoder_kind == 'transformer':
             result.pop('center_decoder_kind')
+        if self.center_readout_norm == 'layernorm':
+            result.pop('center_readout_norm')
         if not self.representation_dim:
             result.pop('representation_dim')
             result.pop('communication_depth')
