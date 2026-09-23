@@ -5,8 +5,9 @@
 The [center-first / attribute adaptation / joint-render experiment](docs/center_attribute_training.md)
 is available as `python -m gaussian_jscc train-center-attributes` or
 `scripts/test_center_attribute_codec.sh`. It separates center and attribute
-networks, temporarily freezes centers during attribute adaptation, then unfreezes
-both for image-MSE refinement. This experiment is clean-only, not a JSCC result.
+networks, freezes centers during minibatch logcov/local-response attribute reconstruction
+(no scene rasterization), then unfreezes both for image-MSE refinement.
+This experiment is clean-only, not a JSCC result.
 
 The opt-in **representation-first / communication-second experiment** is available
 as `python -m gaussian_jscc train-representation`. It separates four independently

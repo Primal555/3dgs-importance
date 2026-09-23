@@ -15,6 +15,7 @@ from torch.nn.utils.rnn import pad_sequence
 from .codec import CodecConfig, GaussianCodec
 from .data import read_ply, Geometry, morton_order, fit_feature_statistics, to_features, to_scene
 from .center_attribute_codec import center_loss
+from .attribute_objective import attribute_objective
 from .center_attribute_validation import validate, plot_run
 from .learned_train import bootstrap_split
 from .representation_train import norm, rng_state, restore_rng, write_state
@@ -36,7 +37,7 @@ def add_parser(sub):
             min_center_steps=500, min_attribute_steps=200, min_joint_steps=200,
             transition_patience=3, stop_patience=5, hidden=96, depth=2, decoder_depth=4,
             attention_heads=4, latent_dim=64, center_latent_dim=32, block_size=256,
-            blocks_per_batch=32, render_blocks_per_batch=64, views_per_step=1,
+            blocks_per_batch=32, render_blocks_per_batch=64, views_per_step=1, attribute_views=4,
             validate_every=100, render_every=500, save_every=500, profile_every=10,
             validation_blocks=16, validation_views=4, validation_region_size=512,
             resolution=2, seed=42, cpu_threads=4).items():
@@ -47,6 +48,8 @@ def add_parser(sub):
             clip_norm=0.).items():
         p.add_argument('--'+name.replace('_', '-'), type=float, default=default)
     p.add_argument('--render-backward', choices=['replay', 'direct'], default='replay')
+    p.add_argument('--center-max-world-rmse', type=float,
+                   help='explicit CPU/no-camera diagnostic gate into B; NOT a render-quality substitute')
     p.add_argument('--images', default='images')
     p.add_argument('--white-background', action='store_true')
 
@@ -58,12 +61,16 @@ def check_args(args):
         raise ValueError('random-start center phase must have positive budget; later budgets cannot be negative')
     if args.joint_steps and not args.attribute_steps:
         raise ValueError('joint training requires attribute adaptation first')
-    if (args.attribute_steps or args.joint_steps) and not args.source:
-        raise ValueError('attribute/joint phases require source cameras and actual image rendering')
+    if args.joint_steps and not args.source:
+        raise ValueError('joint phase requires source cameras and actual image rendering')
+    if args.attribute_steps and not args.source and args.center_max_world_rmse is None:
+        raise ValueError('without cameras, attribute phase requires explicit --center-max-world-rmse diagnostic gate')
+    if args.center_max_world_rmse is not None and (not math.isfinite(args.center_max_world_rmse) or args.center_max_world_rmse < 0):
+        raise ValueError('center-max-world-rmse must be nonnegative and finite')
     positive = ('center_lr', 'attribute_lr', 'joint_center_lr', 'joint_attribute_lr', 'center_smoothing',
                 'blocks_per_batch', 'render_blocks_per_batch', 'views_per_step', 'validate_every',
                 'render_every', 'save_every', 'profile_every', 'validation_blocks', 'validation_views',
-                'transition_patience', 'stop_patience', 'cpu_threads')
+                'transition_patience', 'stop_patience', 'cpu_threads', 'attribute_views')
     for name in positive:
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f'{name} must be positive and finite')
@@ -109,7 +116,9 @@ def render_step(model, batches, geometry, task, mode='replay', profile=False):
 
 
 def center_ready(validation, args):
-    return validation['render'] is not None and validation['render']['center_gap_db'] <= args.center_max_gap_db
+    if validation['render'] is not None:
+        return validation['render']['center_gap_db'] <= args.center_max_gap_db
+    return args.center_max_world_rmse is not None and validation['centers']['world_rmse'] <= args.center_max_world_rmse
 
 
 def attribute_ready(initial, best, args):
@@ -141,8 +150,9 @@ def train(args):
     from .rendering import load_cameras, RenderReference
     resumed = torch.load(args.resume, map_location='cpu', weights_only=True) if args.resume else None
     if resumed:
-        if resumed.get('format') != 'center_attribute_training_v1':
-            raise ValueError('not a center/attribute training state')
+        if resumed.get('format') != 'center_attribute_training_v2':
+            raise ValueError('resume requires center_attribute_training_v2 (local attribute loss); '
+                             'v1 used render-MSE in B and must resume with commit fdbbc35, not silently change objectives')
         args = SimpleNamespace(**resumed['arguments'])
         print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
     check_args(args)
@@ -195,20 +205,23 @@ def train(args):
     record = {'arguments': arguments, 'config': cfg.to_dict(), 'fingerprint': fingerprint,
         'geometry': geometry.to_dict(), 'fitted_blocks': fitted, 'heldout_blocks': heldout,
         'center_loss': 'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator',
-        'attribute_joint_loss': 'source-render image MSE only; no weighted parameter auxiliary',
+        'attribute_loss': '(physical logcov matrix MSE + centered local black/white RGB response MSE)/2; '
+                          'equal mean is an engineering choice; no XYZ term, no rasterization',
+        'attribute_validation': 'fixed heldout blocks, fixed directions seed+73019; not scene rendering',
+        'joint_loss': 'source-render image MSE only; no parameter auxiliary',
         'communication': 'not implemented/trained in this clean-only experiment; latent dimensions are not channel uses',
         'position_delivery': 'learned only; source/12bit positions used exclusively in labelled validation diagnostics',
         'lr_schedule': 'constant explicit branch LRs; fresh Adam at each phase',
         'training_views': [str(c.image_name) for c in train_cameras],
         'validation_views': [str(c.image_name) for c in cameras],
-        'scope': 'scene-specific; global statistics use whole source PLY; B/C train all Gaussians but not heldout cameras',
+        'scope': 'scene-specific; global statistics use whole PLY; A/B exclude heldout blocks; C trains all Gaussians but not heldout cameras',
         'gates': 'engineering criteria, not proven optimal; budgets are caps, not mandatory phase lengths'}
     if not resumed:
         (out/'training.json').write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding='utf-8')
     state = resumed['progress'] if resumed else {
         'phase': 'center', 'phase_step': 0, 'phase_index': 0, 'step': 0, 'status': 'running',
         'phase_initialized': False, 'end_reason': None,
-        'best': {}, 'best_steps': {}, 'stale': 0, 'initial_attribute_mse': None,
+        'best': {}, 'best_steps': {}, 'stale': 0, 'initial_attribute_loss': None,
         'last_validation': None, 'completed': {p: 0 for p in PHASES}}
     optimizer_state = resumed['optimizer'] if resumed else None
     if resumed:
@@ -223,7 +236,7 @@ def train(args):
             save_checkpoint(out/'codec_last.pt', model, state['step'], {**record, 'phase': state['phase']})
         names = ('loss.jsonl', 'validation.jsonl', 'transitions.jsonl')
         counts = {name: len((out/name).read_text(encoding='utf-8').splitlines()) if (out/name).exists() else 0 for name in names}
-        write_state(out/'training_state.pt', {'format': 'center_attribute_training_v1', 'arguments': arguments,
+        write_state(out/'training_state.pt', {'format': 'center_attribute_training_v2', 'arguments': arguments,
             'config': cfg.to_dict(), 'fingerprint': fingerprint, 'model': model.state_dict(),
             'optimizer': optimizer.state_dict() if optimizer else None, 'progress': state,
             'rng': rng_state(), 'log_counts': counts})
@@ -231,8 +244,12 @@ def train(args):
     def observe(images=False):
         result = validate(model, blocks, heldout, batches, raw, geometry, cameras, reference, args, state, out, images)
         phase = state['phase']
-        score = (-result['render']['center_only']['source_psnr'] if result['render'] else result['centers']['world_rmse']) \
-            if phase == 'center' else result['render']['full']['source_mse']
+        if phase == 'center':
+            score = -result['render']['center_only']['source_psnr'] if result['render'] else result['centers']['world_rmse']
+        elif phase == 'attribute':
+            score = result['attributes']['loss']
+        else:
+            score = result['render']['full']['source_mse']
         if not math.isfinite(score):
             raise FloatingPointError('nonfinite validation score')
         previous = state['best'].get(phase, float('inf'))
@@ -247,8 +264,8 @@ def train(args):
             state['plateau_anchor'], state['stale'] = score, 0
         else:
             state['stale'] += 1
-        if phase == 'attribute' and state['initial_attribute_mse'] is None:
-            state['initial_attribute_mse'] = score
+        if phase == 'attribute' and state['initial_attribute_loss'] is None:
+            state['initial_attribute_loss'] = score
         state['last_validation'] = result
         return result
 
@@ -276,17 +293,30 @@ def train(args):
             started = time.perf_counter()
             profile = state['phase_step'] == 0 or (state['step']+1) % args.profile_every == 0
             model.zero_grad(set_to_none=True)
-            if phase == 'center':
+            contributions = {}
+            if phase in ('center', 'attribute'):
                 selected = [fitted[i] for i in torch.randint(len(fitted), (args.blocks_per_batch,)).tolist()]
                 group = [blocks[i] for i in selected]
                 f = pad_sequence(group, batch_first=True).to(device)
                 active = torch.arange(f.shape[1], device=device)[None] < torch.tensor([len(x) for x in group], device=device)[:, None]
-                pred_xyz = model.learned.centers(f[..., :3], active)
-                loss = center_loss(pred_xyz[active], f[..., :3][active], geometry, args.center_smoothing)
+                if phase == 'center':
+                    pred_xyz = model.learned.centers(f[..., :3], active)
+                    loss = center_loss(pred_xyz[active], f[..., :3][active], geometry, args.center_smoothing)
+                    stats = {}
+                else:
+                    pred = model.reconstruct_clean(f, active)
+                    loss, stats, contributions = attribute_objective(pred[active], f[active], geometry, model, args.attribute_views)
                 if not torch.isfinite(loss):
-                    raise FloatingPointError('nonfinite center loss')
+                    raise FloatingPointError(f'nonfinite {phase} loss')
+                component_gradients = {}
+                if profile and contributions:
+                    parameters = [p for p in model.parameters() if p.requires_grad]
+                    for name, term in contributions.items():
+                        grads = torch.autograd.grad(term, parameters, retain_graph=True, allow_unused=True)
+                        lookup = {id(p): g for p, g in zip(parameters, grads)}
+                        component_gradients[name] = {module: norm([lookup.get(id(p)) for p in params])
+                            for module, params in model.learned.module_parameters().items()}
                 loss.backward()
-                stats = {}
             else:
                 ids = torch.randperm(len(train_cameras))[:min(args.views_per_step, len(train_cameras))].tolist()
                 task = MultiViewRenderTask([train_cameras[i] for i in ids], reference, degree, args.white_background)
@@ -310,11 +340,15 @@ def train(args):
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             row = {'step': state['step'], 'phase': phase, 'phase_step': state['phase_step'],
-                'loss': float(loss.detach()), 'objective': 'world_center_distance' if phase == 'center' else 'image_mse',
+                'loss': float(loss.detach()), 'objective': {'center': 'world_center_distance',
+                    'attribute': 'local_attribute_response', 'joint': 'image_mse'}[phase],
+                'terms': {name: float(term.detach()) for name, term in contributions.items()},
                 'grad_norm': total, 'module_grad_norms': gradients, 'clip_factor': clip,
                 'lrs': {g['name']: g['lr'] for g in optimizer.param_groups},
                 'seconds': time.perf_counter()-started, 'stats': stats}
             if profile:
+                if contributions:
+                    row['objective_module_grad_norms'] = component_gradients
                 row['module_updates'] = {name: norm([p.detach()-v for p, v in zip(params, before[name])]) for name, params in modules.items()}
                 print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, sec={row["seconds"]:.2f}', flush=True)
             append_json(out/'loss.jsonl', row)
@@ -324,9 +358,10 @@ def train(args):
             if due:
                 result = observe(images=images_due)
                 if phase == 'center' and state['phase_step'] >= args.min_center_steps and center_ready(result, args):
-                    switch, reason = True, 'center_render_gate'
+                    switch = True
+                    reason = 'center_render_gate' if result['render'] else 'center_world_rmse_diagnostic_gate'
                 elif phase == 'attribute' and state['phase_step'] >= args.min_attribute_steps:
-                    ready, _ = attribute_ready(state['initial_attribute_mse'], state['best'][phase], args)
+                    ready, _ = attribute_ready(state['initial_attribute_loss'], state['best'][phase], args)
                     if ready and state['stale'] >= args.transition_patience:
                         switch, reason = True, 'attribute_improved_then_plateaued'
                 elif phase == 'joint' and state['phase_step'] >= args.min_joint_steps and state['stale'] >= args.stop_patience:
@@ -353,11 +388,14 @@ def train(args):
         if phase == 'center' and args.attribute_steps:
             # The best center score was measured against the same fixed 12bit reference.
             r = state['last_validation']['render']
-            passed = r is not None and r['quantized12']['source_psnr']+state['best'][phase] <= args.center_max_gap_db
+            passed = (r['quantized12']['source_psnr']+state['best'][phase] <= args.center_max_gap_db) if r else \
+                (args.center_max_world_rmse is not None and state['best'][phase] <= args.center_max_world_rmse)
         if phase == 'attribute' and args.joint_steps:
-            passed, gain = attribute_ready(state['initial_attribute_mse'], state['best'][phase], args)
+            passed, gain = attribute_ready(state['initial_attribute_loss'], state['best'][phase], args)
         append_json(out/'transitions.jsonl', {'step': state['step'], 'phase': phase,
             'reason': reason, 'passed': passed, 'selected_step': state['best_steps'][phase],
+            'selection_metric': {'center': 'center_only_psnr_or_world_rmse',
+                                 'attribute': 'heldout_local_attribute_loss', 'joint': 'full_render_mse'}[phase],
             'attribute_relative_improvement': gain})
         state['phase_index'] += 1
         state['phase_step'] = 0

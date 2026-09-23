@@ -4,6 +4,7 @@ import math
 import torch
 from .data import to_scene
 from .center_attribute_codec import center_loss
+from .attribute_objective import attribute_objective
 from .render_validation import append_json
 from .render_objective import image_metrics
 
@@ -26,6 +27,25 @@ def validate_centers(model, blocks, indices, geometry, args):
     return {'center_loss': total/count, 'world_rmse': math.sqrt(squared/(count*3)),
             'distance_p50_world': float(distances.median()),
             'distance_p95_world': float(torch.quantile(distances, .95)), 'points': count}
+
+
+@torch.no_grad()
+def validate_attributes(model, blocks, indices, geometry, args):
+    device = next(model.parameters()).device
+    generator = torch.Generator().manual_seed(args.seed+73019)
+    directions = torch.randn(args.attribute_views, 3, generator=generator).to(device)
+    totals, count = {}, 0
+    for index in indices:
+        f = blocks[index].to(device)[None]
+        pred = model.reconstruct_clean(f)[0]
+        loss, stats, _ = attribute_objective(pred, f[0], geometry, model,
+                                            args.attribute_views, directions)
+        n = f.shape[1]
+        for key, value in {'loss': float(loss), **stats}.items():
+            totals[key] = totals.get(key, 0.)+value*n
+        count += n
+    return {**{key: value/count for key, value in totals.items()},
+            'points': count, 'blocks': len(indices), 'direction_seed': args.seed+73019}
 
 
 def save_panel(directory, images):
@@ -96,15 +116,19 @@ def validate(model, blocks, heldout, batches, raw, geometry, cameras, reference,
         with preserved_rng(next(model.parameters()).device):
             model.eval()
             centers = validate_centers(model, blocks, heldout, geometry, args)
+            attributes = validate_attributes(model, blocks, heldout, geometry, args) if state['phase'] != 'center' else None
+            render_due = state['phase'] != 'attribute' or images or state['phase_step'] == 0
             rendered = validate_render(model, batches, raw, geometry, cameras, reference, args,
-                                       state['step'], out, images) if cameras else None
+                                       state['step'], out, images) if cameras and render_due else None
     finally:
         model.train(was_training)
     result = {'step': state['step'], 'phase': state['phase'], 'phase_step': state['phase_step'],
-              'centers': centers, 'render': rendered,
-              'block_scope': 'heldout in center phase only; attribute/joint rendering uses all scene Gaussians'}
+              'centers': centers, 'attributes': attributes, 'render': rendered,
+              'block_scope': 'heldout in A/B; C rendering trains all Gaussians; render views remain heldout'}
     append_json(Path(out)/'validation.jsonl', result)
     text = f'validation {state["step"]} {state["phase"]}: center world RMSE={centers["world_rmse"]:.6g}'
+    if attributes:
+        text += f'; attribute loss={attributes["loss"]:.6g}'
     if rendered:
         text += (f'; full PSNR={rendered["full"]["source_psnr"]:.3f}, '
                  f'center-only={rendered["center_only"]["source_psnr"]:.3f}, '
@@ -131,7 +155,12 @@ def plot_run(out):
             rows = [r for r in losses if r['phase'] == phase]
             x = [r['step'] for r in rows]
             axes[0, col].plot(x, [r['loss'] for r in rows])
-            axes[0, col].set_title(phase+(' / world-center distance' if phase == 'center' else ' / image MSE'))
+            label = {'center': 'world-center distance', 'attribute': 'local attribute loss', 'joint': 'image MSE'}[phase]
+            axes[0, col].set_title(phase+' / '+label)
+            if phase == 'attribute':
+                for term in ('shape', 'appearance'):
+                    axes[0, col].plot(x, [r.get('terms', {}).get(term, float('nan')) for r in rows], label=term+' weighted')
+                axes[0, col].legend(fontsize=7)
             for module in rows[0]['module_grad_norms']:
                 axes[1, col].plot(x, [r['module_grad_norms'][module] for r in rows], label=module)
             axes[1, col].set_yscale('symlog', linthresh=.01)
@@ -146,7 +175,7 @@ def plot_run(out):
     for phase in ('center', 'attribute', 'joint'):
         rows = [r for r in validation if r['phase'] == phase]
         axes[0].plot([r['step'] for r in rows], [r['centers']['world_rmse'] for r in rows], label=phase)
-    axes[0].set_title('Center world RMSE (blocks trained after phase A)')
+    axes[0].set_title('Center world RMSE (blocks trained only in C)')
     rendered = [r for r in validation if r['render']]
     for col, metric in ((1, 'source_psnr'), (2, 'source_ssim')):
         for route in ('full', 'center_only', 'quantized12'):
@@ -159,3 +188,21 @@ def plot_run(out):
     fig.tight_layout()
     fig.savefig(charts/'validation.png', dpi=150)
     plt.close(fig)
+    rows = [r for r in validation if r.get('attributes')]
+    if rows:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        for phase in ('attribute', 'joint'):
+            selected = [r for r in rows if r['phase'] == phase]
+            x = [r['step'] for r in selected]
+            axes[0].plot(x, [r['attributes']['loss'] for r in selected], label=phase)
+            for term in ('attribute_logcov_mse', 'attribute_response_mse'):
+                axes[1].plot(x, [r['attributes'][term] for r in selected], label=phase+'/'+term)
+        axes[0].set_title('Fixed-block attribute validation loss')
+        axes[1].set_title('Unweighted components (different scales)')
+        for axis in axes:
+            axis.legend(fontsize=6)
+            axis.grid(alpha=.2)
+            axis.set_xlabel('Global step; blocks heldout only in A/B')
+        fig.tight_layout()
+        fig.savefig(charts/'attribute_validation.png', dpi=150)
+        plt.close(fig)
