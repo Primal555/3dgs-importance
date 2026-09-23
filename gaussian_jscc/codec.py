@@ -53,8 +53,13 @@ class CodecConfig:
     communication_depth: int = 2
     # Nonzero selects independent center/attribute clean autoencoders.
     center_latent_dim: int = 0
+    center_decoder_kind: str = 'transformer'
 
     def __post_init__(self):
+        if self.center_decoder_kind not in ('transformer', 'historical_light'):
+            raise ValueError('unknown center_decoder_kind')
+        if self.center_decoder_kind != 'transformer' and not self.center_latent_dim:
+            raise ValueError('historical_light requires independent center/attribute codec')
         if not isinstance(self.center_latent_dim, int) or self.center_latent_dim < 0:
             raise ValueError('center_latent_dim must be a nonnegative integer')
         if self.center_latent_dim and not 0 < self.center_latent_dim < self.representation_dim:
@@ -141,6 +146,8 @@ class CodecConfig:
         result = asdict(self)
         if not self.center_latent_dim:
             result.pop('center_latent_dim')
+        if self.center_decoder_kind == 'transformer':
+            result.pop('center_decoder_kind')
         if not self.representation_dim:
             result.pop('representation_dim')
             result.pop('communication_depth')

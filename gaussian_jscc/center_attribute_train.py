@@ -33,6 +33,9 @@ def add_parser(sub):
     for name in ('ply', 'source', 'out', 'resume'):
         p.add_argument('--'+name)
     p.add_argument('--device', default='cuda')
+    p.add_argument('--center-decoder-kind', choices=['transformer', 'historical_light'], default='transformer')
+    p.add_argument('--center-probe-blocks', type=int, default=0,
+                   help='fixed training-block diagnostics and sampled-block audit; zero disables')
     for name, default in dict(center_steps=5000, attribute_steps=1000, joint_steps=1000,
             min_center_steps=500, min_attribute_steps=200, min_joint_steps=200,
             transition_patience=3, stop_patience=5, hidden=96, depth=2, decoder_depth=4,
@@ -74,7 +77,7 @@ def check_args(args):
     for name in positive:
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f'{name} must be positive and finite')
-    for name in ('center_max_gap_db', 'clip_norm', 'min_center_steps', 'min_attribute_steps', 'min_joint_steps'):
+    for name in ('center_max_gap_db', 'clip_norm', 'min_center_steps', 'min_attribute_steps', 'min_joint_steps', 'center_probe_blocks'):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f'{name} must be nonnegative and finite')
     for name in ('attribute_min_improvement', 'validation_relative_improvement'):
@@ -154,6 +157,10 @@ def train(args):
             raise ValueError('resume requires center_attribute_training_v2 (local attribute loss); '
                              'v1 used render-MSE in B and must resume with commit fdbbc35, not silently change objectives')
         args = SimpleNamespace(**resumed['arguments'])
+        if not hasattr(args, 'center_decoder_kind'):
+            args.center_decoder_kind = 'transformer'
+        if not hasattr(args, 'center_probe_blocks'):
+            args.center_probe_blocks = 0
         print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
     check_args(args)
     seed_all(args.seed)
@@ -169,7 +176,8 @@ def train(args):
         encoder_attention='geometric_point', decoder_attention='transformer_trunk',
         sh_degree=degree, hidden=args.hidden, depth=args.depth, decoder_depth=args.decoder_depth,
         attention_heads=args.attention_heads, block_size=args.block_size,
-        representation_dim=args.latent_dim, center_latent_dim=args.center_latent_dim)
+        representation_dim=args.latent_dim, center_latent_dim=args.center_latent_dim,
+        center_decoder_kind=args.center_decoder_kind)
     if not cfg.center_latent_dim:
         raise ValueError('this trainer requires positive center-latent-dim')
     model = GaussianCodec(cfg).to(device)
@@ -186,6 +194,7 @@ def train(args):
     with torch.no_grad():
         blocks = [to_features(chunk.to(device), geometry, model)[0].cpu() for chunk in raw.split(cfg.block_size)]
     fitted, heldout = bootstrap_split(len(raw), cfg.block_size, args.validation_blocks, args.validation_region_size)
+    probes = [fitted[i] for i in spaced_indices(len(fitted), min(len(fitted), args.center_probe_blocks))] if args.center_probe_blocks else []
     batches = make_batches(blocks, args.render_blocks_per_batch)
     cameras, train_cameras, reference = [], [], None
     if args.source:
@@ -204,6 +213,10 @@ def train(args):
         arguments['source'] = str(Path(args.source).resolve())
     record = {'arguments': arguments, 'config': cfg.to_dict(), 'fingerprint': fingerprint,
         'geometry': geometry.to_dict(), 'fitted_blocks': fitted, 'heldout_blocks': heldout,
+        'fitted_probe_blocks': probes,
+        'center_decoder_kind': args.center_decoder_kind,
+        'center_decoder_parameters': sum(p.numel() for p in model.learned.center_decoder.parameters()),
+        'center_encoder_parameters': sum(p.numel() for p in model.learned.center_encoder.parameters()),
         'center_loss': 'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator',
         'attribute_loss': '(physical logcov matrix MSE + centered local black/white RGB response MSE)/2; '
                           'equal mean is an engineering choice; no XYZ term, no rasterization',
@@ -242,7 +255,7 @@ def train(args):
             'rng': rng_state(), 'log_counts': counts})
 
     def observe(images=False):
-        result = validate(model, blocks, heldout, batches, raw, geometry, cameras, reference, args, state, out, images)
+        result = validate(model, blocks, heldout, batches, raw, geometry, cameras, reference, args, state, out, images, probes)
         phase = state['phase']
         if phase == 'center':
             score = -result['render']['center_only']['source_psnr'] if result['render'] else result['centers']['world_rmse']
@@ -303,6 +316,8 @@ def train(args):
                     pred_xyz = model.learned.centers(f[..., :3], active)
                     loss = center_loss(pred_xyz[active], f[..., :3][active], geometry, args.center_smoothing)
                     stats = {}
+                    if args.center_probe_blocks:
+                        stats['sampled_blocks'] = selected
                 else:
                     pred = model.reconstruct_clean(f, active)
                     loss, stats, contributions = attribute_objective(pred[active], f[active], geometry, model, args.attribute_views)

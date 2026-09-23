@@ -4,6 +4,7 @@ Center sees XYZ only. Attribute decoder conditions on DECODED XYZ, never teacher
 XYZ. No source-XYZ skip, side channel, shared weights or shape-scaled XYZ loss.
 The clean latents are not claimed to be a communication payload.
 """
+import math
 import torch
 from torch import nn
 from .multiscale_codec import MultiScaleContext
@@ -50,6 +51,36 @@ class CenterDecoder(nn.Module):
         return self.readout(torch.cat(taps, -1)).masked_fill(~active[..., None], 0)
 
 
+class HistoricalLightCenterDecoder(nn.Module):
+    """XYZ branch of 97ef4cc MultiScaleSelfCore, adapted to clean center latent.
+
+    MLP own-point readout + gated window/x4/x16 Context, including old slot
+    encodings. This is NOT attention-free MLP, nor a reproduction of the old
+    mixed-attribute JSCC system: only its receiver XYZ architecture is reused.
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        self.input = mlp(cfg.center_latent_dim, cfg.hidden)
+        self.context = MultiScaleContext(cfg, False)
+        self.gate = nn.Parameter(torch.tensor(.1))
+        self.head = nn.Linear(cfg.hidden, 3)
+        self.context_head = nn.Linear(cfg.hidden, 3)
+        nn.init.normal_(self.head.weight, std=.02)
+        nn.init.constant_(self.head.bias, .5)
+        nn.init.normal_(self.context_head.weight, std=.02)
+        nn.init.zeros_(self.context_head.bias)
+
+    def forward(self, z, active):
+        h = self.input(z.masked_fill(~active[..., None], 0)).masked_fill(~active[..., None], 0)
+        pos = torch.arange(z.shape[1], device=z.device, dtype=z.dtype)[:, None]
+        frequency = torch.exp(torch.arange(0, h.shape[-1], 2, device=z.device, dtype=z.dtype)*(-math.log(10000)/h.shape[-1]))
+        encoding = z.new_zeros(z.shape[1], h.shape[-1])
+        encoding[:, 0::2] = torch.sin(pos*frequency)
+        encoding[:, 1::2] = torch.cos(pos*frequency[:encoding[:, 1::2].shape[-1]])
+        context = self.context((h+encoding[None]).masked_fill(~active[..., None], 0), active)
+        return (self.head(h)+self.gate.tanh()*self.context_head(context)).masked_fill(~active[..., None], 0)
+
+
 class AttributeDecoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -81,6 +112,13 @@ class CenterAttributeCore(nn.Module):
         self.center_decoder = CenterDecoder(cfg)
         self.attribute_encoder = PointEncoder(cfg, cfg.attr_dim, cfg.representation_dim-cfg.center_latent_dim)
         self.attribute_decoder = AttributeDecoder(cfg)
+        if cfg.center_decoder_kind == 'historical_light':
+            # Keep the original shared encoder/attribute initialization AND RNG
+            # stream. The temporary trunk above is discarded, never optimized.
+            with torch.random.fork_rng(devices=[]):
+                light = HistoricalLightCenterDecoder(cfg)
+            light.input.load_state_dict(self.center_decoder.input.state_dict())
+            self.center_decoder = light
 
     def centers(self, xyz, active):
         return self.center_decoder(self.center_encoder(xyz*2-1, xyz, active), active)

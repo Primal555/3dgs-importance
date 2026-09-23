@@ -9,6 +9,11 @@ networks, freezes centers during minibatch logcov/local-response attribute recon
 (no scene rasterization), then unfreezes both for image-MSE refinement.
 This experiment is clean-only, not a JSCC result.
 
+An opt-in [center-decoder comparison](docs/center_decoder_comparison.md) pairs the
+current Transformer with the historical lightweight window-context XYZ decoder,
+using matched random shared weights, minibatches and center-only objectives.
+Run `scripts/test_center_decoder_comparison.sh`; the normal decoder default is unchanged.
+
 The opt-in **representation-first / communication-second experiment** is available
 as `python -m gaussian_jscc train-representation`. It separates four independently
 parameterized modules, validates both the clean and communicated reconstruction,

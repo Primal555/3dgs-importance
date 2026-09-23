@@ -13,6 +13,7 @@ from .render_objective import image_metrics
 def validate_centers(model, blocks, indices, geometry, args):
     device = next(model.parameters()).device
     total, squared, distance, count = 0., 0., [], 0
+    block_rows = []
     for index in indices:
         f = blocks[index].to(device)[None]
         active = torch.ones(f.shape[:2], device=device, dtype=torch.bool)
@@ -21,12 +22,16 @@ def validate_centers(model, blocks, indices, geometry, args):
         total += float(center_loss(xyz, f[0, :, :3], geometry, args.center_smoothing))*n
         delta = (xyz.double()-f[0, :, :3].double())*geometry.span.to(device).double()
         squared += float(delta.square().sum())
+        block_rows.append({'block': int(index), 'points': n, 'sse': float(delta.square().sum()),
+                           'world_rmse': float(delta.square().mean().sqrt())})
         distance.append(delta.norm(dim=-1).cpu())
         count += n
     distances = torch.cat(distance)
     return {'center_loss': total/count, 'world_rmse': math.sqrt(squared/(count*3)),
             'distance_p50_world': float(distances.median()),
-            'distance_p95_world': float(torch.quantile(distances, .95)), 'points': count}
+            'distance_p95_world': float(torch.quantile(distances, .95)), 'points': count,
+            'blocks': block_rows,
+            'largest_two_blocks_sse_fraction': sum(sorted([r['sse'] for r in block_rows], reverse=True)[:2])/max(squared, 1e-30)}
 
 
 @torch.no_grad()
@@ -109,13 +114,14 @@ def validate_render(model, batches, raw, geometry, cameras, reference, args, ste
     return result
 
 
-def validate(model, blocks, heldout, batches, raw, geometry, cameras, reference, args, state, out, images=False):
+def validate(model, blocks, heldout, batches, raw, geometry, cameras, reference, args, state, out, images=False, fitted_probe=()):
     from .optimization import preserved_rng
     was_training = model.training
     try:
         with preserved_rng(next(model.parameters()).device):
             model.eval()
             centers = validate_centers(model, blocks, heldout, geometry, args)
+            fitted_centers = validate_centers(model, blocks, fitted_probe, geometry, args) if fitted_probe else None
             attributes = validate_attributes(model, blocks, heldout, geometry, args) if state['phase'] != 'center' else None
             render_due = state['phase'] != 'attribute' or images or state['phase_step'] == 0
             rendered = validate_render(model, batches, raw, geometry, cameras, reference, args,
@@ -123,7 +129,7 @@ def validate(model, blocks, heldout, batches, raw, geometry, cameras, reference,
     finally:
         model.train(was_training)
     result = {'step': state['step'], 'phase': state['phase'], 'phase_step': state['phase_step'],
-              'centers': centers, 'attributes': attributes, 'render': rendered,
+              'centers': centers, 'fitted_centers': fitted_centers, 'attributes': attributes, 'render': rendered,
               'block_scope': 'heldout in A/B; C rendering trains all Gaussians; render views remain heldout'}
     append_json(Path(out)/'validation.jsonl', result)
     text = f'validation {state["step"]} {state["phase"]}: center world RMSE={centers["world_rmse"]:.6g}'
