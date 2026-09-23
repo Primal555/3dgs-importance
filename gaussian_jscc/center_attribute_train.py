@@ -40,6 +40,8 @@ def add_parser(sub):
                    help='center decoder only; self retains V/output projections but disables cross-token attention')
     p.add_argument('--center-probe-blocks', type=int, default=0,
                    help='fixed training-block diagnostics and sampled-block audit; zero disables')
+    p.add_argument('--center-drift-every', type=int, default=0,
+                   help='opt-in fixed-point before/after optimizer XYZ diagnostics; zero disables')
     for name, default in dict(center_steps=5000, attribute_steps=1000, joint_steps=1000,
             min_center_steps=500, min_attribute_steps=200, min_joint_steps=200,
             transition_patience=3, stop_patience=5, hidden=96, depth=2, decoder_depth=4,
@@ -81,9 +83,11 @@ def check_args(args):
     for name in positive:
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f'{name} must be positive and finite')
-    for name in ('center_max_gap_db', 'clip_norm', 'min_center_steps', 'min_attribute_steps', 'min_joint_steps', 'center_probe_blocks'):
+    for name in ('center_max_gap_db', 'clip_norm', 'min_center_steps', 'min_attribute_steps', 'min_joint_steps', 'center_probe_blocks', 'center_drift_every'):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(f'{name} must be nonnegative and finite')
+    if args.center_drift_every and not args.center_probe_blocks:
+        raise ValueError('--center-drift-every requires positive --center-probe-blocks')
     for name in ('attribute_min_improvement', 'validation_relative_improvement'):
         if not math.isfinite(getattr(args, name)) or not 0 <= getattr(args, name) < 1:
             raise ValueError(f'{name} must be in [0,1)')
@@ -149,6 +153,10 @@ def archive_tail(out, counts, step):
             if child.is_dir() and child.name.isdigit() and int(child.name) > step:
                 (archive/'images').mkdir(parents=True, exist_ok=True)
                 shutil.move(str(child), str(archive/'images'/child.name))
+    for path in (out/'center_drift').glob('xyz_*.pt'):
+        if int(path.stem.split('_')[1]) > step:
+            (archive/'center_drift').mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(archive/'center_drift'/path.name))
 
 
 def train(args):
@@ -169,6 +177,8 @@ def train(args):
             args.center_readout_norm = 'layernorm'
         if not hasattr(args, 'center_attention_scope'):
             args.center_attention_scope = 'block'
+        if not hasattr(args, 'center_drift_every'):
+            args.center_drift_every = 0
         print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
     check_args(args)
     seed_all(args.seed)
@@ -228,6 +238,7 @@ def train(args):
         'center_decoder_kind': args.center_decoder_kind,
         'center_readout_norm': args.center_readout_norm,
         'center_attention_scope': args.center_attention_scope,
+        'center_drift_every': args.center_drift_every,
         'center_decoder_parameters': sum(p.numel() for p in model.learned.center_decoder.parameters()),
         'center_encoder_parameters': sum(p.numel() for p in model.learned.center_encoder.parameters()),
         'center_loss': 'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator',
@@ -256,11 +267,17 @@ def train(args):
             shutil.copy2(out/f'codec_selected_{phase}_{step}.pt', out/f'codec_best_{phase}.pt')
         restore_rng(resumed['rng'])
 
+    drift = None
+    if args.center_drift_every:
+        from .center_drift import CenterDrift
+        drift = CenterDrift(model, blocks, probes, heldout, geometry, out, args.blocks_per_batch)
+
     def save(optimizer, boundary=False):
         if not boundary:
             save_checkpoint(out/f'codec_{state["step"]}.pt', model, state['step'], {**record, 'phase': state['phase']})
             save_checkpoint(out/'codec_last.pt', model, state['step'], {**record, 'phase': state['phase']})
-        names = ('loss.jsonl', 'validation.jsonl', 'transitions.jsonl')
+        names = ('loss.jsonl', 'validation.jsonl', 'transitions.jsonl',
+                 'center_drift_validation.jsonl', 'center_drift_updates.jsonl')
         counts = {name: len((out/name).read_text(encoding='utf-8').splitlines()) if (out/name).exists() else 0 for name in names}
         write_state(out/'training_state.pt', {'format': 'center_attribute_training_v2', 'arguments': arguments,
             'config': cfg.to_dict(), 'fingerprint': fingerprint, 'model': model.state_dict(),
@@ -270,6 +287,8 @@ def train(args):
     def observe(images=False):
         result = validate(model, blocks, heldout, batches, raw, geometry, cameras, reference, args, state, out, images, probes)
         phase = state['phase']
+        if drift is not None and phase == 'center':
+            drift.observe(state['step'])
         if phase == 'center':
             score = -result['render']['center_only']['source_psnr'] if result['render'] else result['centers']['world_rmse']
         elif phase == 'attribute':
@@ -317,7 +336,9 @@ def train(args):
         reason = state['end_reason'] or 'budget_cap'
         while state['phase_step'] < maximum and not state['end_reason']:
             started = time.perf_counter()
-            profile = state['phase_step'] == 0 or (state['step']+1) % args.profile_every == 0
+            drift_due = drift is not None and phase == 'center' and (
+                state['phase_step'] == 0 or (state['step']+1) % args.center_drift_every == 0)
+            profile = state['phase_step'] == 0 or (state['step']+1) % args.profile_every == 0 or drift_due
             model.zero_grad(set_to_none=True)
             contributions = {}
             if phase in ('center', 'attribute'):
@@ -359,6 +380,7 @@ def train(args):
             if args.clip_norm:
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.clip_norm, error_if_nonfinite=True)
             before = {name: [p.detach().clone() for p in params] for name, params in modules.items()} if profile else {}
+            xyz_before = drift.capture(keep_latents=True) if drift_due else None
             optimizer.step()
             if not torch.stack([torch.isfinite(p).all() for p in model.parameters()]).all():
                 raise FloatingPointError('nonfinite parameters; recover previous training_state.pt')
@@ -378,6 +400,8 @@ def train(args):
                 if contributions:
                     row['objective_module_grad_norms'] = component_gradients
                 row['module_updates'] = {name: norm([p.detach()-v for p, v in zip(params, before[name])]) for name, params in modules.items()}
+                if drift_due:
+                    drift.after_step(state['step'], xyz_before, gradients, row['module_updates'], row['lrs'], clip)
                 print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, sec={row["seconds"]:.2f}', flush=True)
             append_json(out/'loss.jsonl', row)
             images_due = state['step'] % args.render_every == 0 or state['phase_step'] == maximum
@@ -407,6 +431,10 @@ def train(args):
         if state['last_validation']['step'] != state['step']:
             observe(images=True)
         save(optimizer)
+        if phase == 'center' and drift is not None:
+            # Retain matching LAST weights + Adam before best-weight selection
+            # and final state saves replace the optimizer with None.
+            shutil.copy2(out/'training_state.pt', out/'training_state_last_center.pt')
         selected = load_checkpoint(out/f'codec_best_{phase}.pt', device)
         model.load_state_dict(selected.state_dict())
         del selected
