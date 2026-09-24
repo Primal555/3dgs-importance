@@ -19,7 +19,8 @@ def validate_centers(model, blocks, indices, geometry, args):
         active = torch.ones(f.shape[:2], device=device, dtype=torch.bool)
         xyz = model.learned.centers(f[..., :3], active)[0]
         n = f.shape[1]
-        total += float(center_loss(xyz, f[0, :, :3], geometry, args.center_smoothing))*n
+        total += float(center_loss(xyz, f[0, :, :3], geometry, args.center_smoothing,
+                                   kind=getattr(args, 'center_loss', 'distance')))*n
         delta = (xyz.double()-f[0, :, :3].double())*geometry.span.to(device).double()
         squared += float(delta.square().sum())
         block_rows.append({'block': int(index), 'points': n, 'sse': float(delta.square().sum()),
@@ -27,7 +28,9 @@ def validate_centers(model, blocks, indices, geometry, args):
         distance.append(delta.norm(dim=-1).cpu())
         count += n
     distances = torch.cat(distance)
-    return {'center_loss': total/count, 'world_rmse': math.sqrt(squared/(count*3)),
+    return {'center_loss': total/count, 'center_loss_kind': getattr(args, 'center_loss', 'distance'),
+            'world_mse': squared/(count*3), 'mean_world_distance': float(distances.mean()),
+            'world_rmse': math.sqrt(squared/(count*3)),
             'distance_p50_world': float(distances.median()),
             'distance_p95_world': float(torch.quantile(distances, .95)), 'points': count,
             'blocks': block_rows,
@@ -161,7 +164,8 @@ def plot_run(out):
             rows = [r for r in losses if r['phase'] == phase]
             x = [r['step'] for r in rows]
             axes[0, col].plot(x, [r['loss'] for r in rows])
-            label = {'center': 'world-center distance', 'attribute': 'local attribute loss', 'joint': 'image MSE'}[phase]
+            center_label = 'world-coordinate MSE' if rows[0].get('objective') == 'world_center_mse' else 'world-center distance'
+            label = {'center': center_label, 'attribute': 'local attribute loss', 'joint': 'image MSE'}[phase]
             axes[0, col].set_title(phase+' / '+label)
             if phase == 'attribute':
                 for term in ('shape', 'appearance'):
@@ -203,7 +207,7 @@ def plot_run(out):
         axes[0, 0].set_title('Joint accepted step scale (0 = rejected)')
         for key in ('loss_before', 'loss_after'):
             axes[0, 1].plot(x, [g[key] for g in guards], linewidth=.6, label=key)
-        axes[0, 1].set_title('Same-training-batch distance loss')
+        axes[0, 1].set_title('Same-training-batch center objective')
         axes[0, 1].legend()
         for key, label in (('accepted', 'rejected'), ('momentum_restarted', 'momentum restart')):
             total, values = 0, []

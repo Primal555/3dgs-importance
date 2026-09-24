@@ -5,7 +5,7 @@ from torch.nn.utils.rnn import pad_sequence
 from .center_attribute_codec import center_loss
 
 
-def accumulate_center_gradients(model, blocks, selections, geometry, smoothing, device):
+def accumulate_center_gradients(model, blocks, selections, geometry, smoothing, device, loss_kind='distance'):
     """Caller zeros gradients once and steps once after all microbatches.
 
     Weights use actual valid point counts (including partial blocks), not a
@@ -24,7 +24,10 @@ def accumulate_center_gradients(model, blocks, selections, geometry, smoothing, 
         active = torch.arange(f.shape[1], device=device)[None] < torch.tensor(
             [len(x) for x in group], device=device)[:, None]
         pred = model.learned.centers(f[..., :3], active)
-        loss = center_loss(pred[active], f[..., :3][active], geometry, smoothing)
+        if loss_kind == 'distance':
+            loss = center_loss(pred[active], f[..., :3][active], geometry, smoothing)
+        else:
+            loss = center_loss(pred[active], f[..., :3][active], geometry, smoothing, kind=loss_kind)
         if not bool(torch.isfinite(loss)):
             # No optimizer step has happened; never use partially accumulated gradients.
             model.zero_grad(set_to_none=True)

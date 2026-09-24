@@ -15,6 +15,7 @@ echo "GPU: $CUDA_VISIBLE_DEVICES; RANDOM start; per-point absolute XYZ; no block
 echo "Baseline: 52edc1c; self-only decoder; affine readout; 32 center latent dimensions"
 echo "5000 center steps; continuous Adam; no loss approval or momentum restart"
 echo "Microbatches/update: ${CENTER_ACCUMULATION_STEPS:-1}; 32 blocks each; update count remains 5000"
+echo "Center loss: ${CENTER_LOSS:-distance}; world-space coordinates"
 echo "LR: 1e-4 for first half, cosine to 2e-5; proposal-size protection: 100-step median x3"
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-center-attributes \
   --ply "$PLY" --source "$SCENE" --out "$OUT" --device cuda \
@@ -28,4 +29,5 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-center-attributes \
   --center-update-policy soft --center-update-window 100 --center-update-warmup 100 \
   --center-update-multiplier 3 --center-lr-schedule late_cosine \
   --center-lr-decay-start 0.5 --center-lr-end-ratio 0.2 \
-  --center-accumulation-steps "${CENTER_ACCUMULATION_STEPS:-1}"
+  --center-accumulation-steps "${CENTER_ACCUMULATION_STEPS:-1}" \
+  --center-loss "${CENTER_LOSS:-distance}"

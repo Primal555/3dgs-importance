@@ -46,6 +46,8 @@ def add_parser(sub):
     p.add_argument('--center-update-policy', choices=['adam', 'soft'], default='adam')
     p.add_argument('--center-accumulation-steps', type=int, default=1,
                    help='microbatches per center optimizer update; center-steps still counts updates')
+    p.add_argument('--center-loss', choices=['distance', 'mse'], default='distance',
+                   help='world-space smooth Euclidean distance or coordinate MSE (sum squared XYZ / 3N)')
     p.add_argument('--center-update-window', type=int, default=100)
     p.add_argument('--center-update-warmup', type=int, default=100)
     p.add_argument('--center-update-multiplier', type=float, default=3.)
@@ -215,6 +217,7 @@ def train(args):
                                  center_guard_warn_after=50, center_guard_stop_after=200,
                                  center_update_policy='adam', center_update_window=100,
                                  center_accumulation_steps=1,
+                                 center_loss='distance',
                                  center_update_warmup=100, center_update_multiplier=3.,
                                  center_lr_schedule='constant', center_lr_decay_start=.5,
                                  center_lr_end_ratio=.2).items():
@@ -246,6 +249,9 @@ def train(args):
     print('Position: per-point absolute XYZ; no block-centroid branch. '
           f'Joint directional step guard: {args.center_step_guard}.', flush=True)
     print(f'Center update: {args.center_update_policy}; LR schedule: {args.center_lr_schedule}.', flush=True)
+    loss_description = ('mean squared error over valid points AND XYZ axes' if args.center_loss == 'mse'
+                        else 'mean smooth Euclidean distance over valid points')
+    print(f'Center loss: {args.center_loss}; world coordinates; {loss_description}.', flush=True)
     print(f'Center budget: {args.center_steps} optimizer updates; '
           f'{args.center_accumulation_steps} microbatches/update, '
           f'{args.blocks_per_batch} blocks/microbatch. LR is not multiplied by accumulation.', flush=True)
@@ -291,7 +297,10 @@ def train(args):
         'center_guard_mode': 'pointwise_joint_directional' if args.center_step_guard else None,
         'center_decoder_parameters': sum(p.numel() for p in model.learned.center_decoder.parameters()),
         'center_encoder_parameters': sum(p.numel() for p in model.learned.center_encoder.parameters()),
-        'center_loss': 'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator',
+        'center_loss_kind': args.center_loss,
+        'center_loss': ('sum(||XYZ_pred-XYZ_source||_world^2)/(3*N); no smoothing or bbox denominator'
+                        if args.center_loss == 'mse' else
+                        'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator'),
         'attribute_loss': '(physical logcov matrix MSE + centered local black/white RGB response MSE)/2; '
                           'equal mean is an engineering choice; no XYZ term, no rasterization',
         'attribute_validation': 'fixed heldout blocks, fixed directions seed+73019; not scene rendering',
@@ -410,7 +419,7 @@ def train(args):
                 selections = [[fitted[i] for i in torch.randint(len(fitted), (args.blocks_per_batch,)).tolist()]
                               for _ in range(args.center_accumulation_steps)]
                 loss, accumulated = accumulate_center_gradients(model, blocks, selections, geometry,
-                                                                 args.center_smoothing, device)
+                                                                 args.center_smoothing, device, args.center_loss)
                 stats = {'accumulation': accumulated}
                 if args.center_probe_blocks:
                     stats['sampled_blocks'] = [i for chosen in selections for i in chosen]
@@ -422,7 +431,8 @@ def train(args):
                 active = torch.arange(f.shape[1], device=device)[None] < torch.tensor([len(x) for x in group], device=device)[:, None]
                 if phase == 'center':
                     pred_xyz = model.learned.centers(f[..., :3], active)
-                    loss = center_loss(pred_xyz[active], f[..., :3][active], geometry, args.center_smoothing)
+                    loss = center_loss(pred_xyz[active], f[..., :3][active], geometry, args.center_smoothing,
+                                       kind=args.center_loss)
                     stats = {}
                     stats['accumulation'] = {'microbatches': 1, 'valid_points': sum(len(x) for x in group),
                         'points_per_microbatch': [sum(len(x) for x in group)],
@@ -462,7 +472,8 @@ def train(args):
                 from .center_step_guard import directional_guarded_step, update_rejection_streak
                 def same_batch_loss():
                     candidate = model.learned.centers(f[..., :3], active)
-                    return center_loss(candidate[active], f[..., :3][active], geometry, args.center_smoothing)
+                    return center_loss(candidate[active], f[..., :3][active], geometry, args.center_smoothing,
+                                       kind=args.center_loss)
                 guard = directional_guarded_step(optimizer, same_batch_loss, loss.detach(), args.center_max_backtracks)
                 guard['mode'] = 'pointwise_joint_directional'
                 warned, guard_stopped = update_rejection_streak(state, guard,
@@ -508,7 +519,7 @@ def train(args):
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             row = {'step': state['step'], 'phase': phase, 'phase_step': state['phase_step'],
-                'loss': float(loss.detach()), 'objective': {'center': 'world_center_distance',
+                'loss': float(loss.detach()), 'objective': {'center': 'world_center_'+args.center_loss,
                     'attribute': 'local_attribute_response', 'joint': 'image_mse'}[phase],
                 'terms': {name: float(term.detach()) for name, term in contributions.items()},
                 'grad_norm': total, 'module_grad_norms': gradients, 'clip_factor': clip,

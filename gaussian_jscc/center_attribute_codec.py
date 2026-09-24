@@ -163,15 +163,22 @@ class CenterAttributeCore(nn.Module):
     decode = encode
 
 
-def center_loss(pred_xyz, source_xyz, geometry, smoothing):
-    """Mean world-center smooth distance, with no covariance/scene denominator.
+def center_loss(pred_xyz, source_xyz, geometry, smoothing, kind='distance'):
+    """World-coordinate distance or MSE; no covariance/scene denominator.
 
-    Output-space world XYZ gradient <= 1/N; parameter gradients are not bounded.
-    smoothing is a disclosed world-unit engineering parameter, not an axis size.
+    Distance has world XYZ gradient <= 1/N; MSE gradient grows with error.
+    Parameter gradients are not bounded for either objective. Smoothing applies
+    only to distance and is a disclosed world-unit engineering parameter.
     """
     import math
+    if kind not in ('distance', 'mse'):
+        raise ValueError('center loss must be distance or mse')
+    delta = (pred_xyz.double()-source_xyz.detach().double())*geometry.span.to(pred_xyz).double()
+    if kind == 'mse':
+        # World-space coordinate MSE: sum squared XYZ errors / (3 * N).
+        # No root, smoothing, shape weighting, or scene-size denominator.
+        return delta.square().mean().to(pred_xyz.dtype)
     if not math.isfinite(smoothing) or smoothing <= 0:
         raise ValueError('center smoothing must be finite and positive')
-    delta = (pred_xyz.double()-source_xyz.detach().double())*geometry.span.to(pred_xyz).double()
     square = delta.square().sum(-1)
     return (square/((square+smoothing*smoothing).sqrt()+smoothing)).mean().to(pred_xyz.dtype)
