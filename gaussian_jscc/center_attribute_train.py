@@ -36,6 +36,9 @@ def add_parser(sub):
                    help='explicitly fork a center checkpoint into --out and append optimizer updates')
     p.add_argument('--continuation-lr', type=float, default=2e-5)
     p.add_argument('--continuation-end-lr', type=float, default=1e-5)
+    p.add_argument('--after-center-run', help='start B/C from best center checkpoint of a completed center-only run')
+    p.add_argument('--later-phase-policy', choices=['gates', 'budget'], default='gates',
+                   help='budget explicitly runs all requested B/C steps without quality/plateau early exits')
     p.add_argument('--device', default='cuda')
     p.add_argument('--center-decoder-kind', choices=['transformer', 'historical_light'], default='transformer')
     p.add_argument('--center-readout-norm', choices=['layernorm', 'affine'], default='layernorm',
@@ -199,7 +202,14 @@ def train(args):
     from .cli import seed_all, device_for
     from .allocation import scene_fingerprint
     from .rendering import load_cameras, RenderReference
-    resumed = torch.load(args.resume, map_location='cpu', weights_only=True) if args.resume else None
+    later_start = bool(getattr(args, 'after_center_run', None))
+    if later_start and (args.resume or getattr(args, 'extend_center_steps', 0) or not args.out):
+        raise ValueError('--after-center-run requires NEW --out and cannot combine with resume/extend')
+    if later_start:
+        from .center_later_phases import prepare_later_phases
+        resumed = prepare_later_phases(args)
+    else:
+        resumed = torch.load(args.resume, map_location='cpu', weights_only=True) if args.resume else None
     extending = bool(getattr(args, 'extend_center_steps', 0))
     if extending:
         if resumed is None or not args.out:
@@ -235,8 +245,9 @@ def train(args):
                                  center_lr_end_ratio=.2).items():
             if not hasattr(args, key):
                 setattr(args, key, default)
-        print('Center continuation: new budget/LR; model, Adam, RNG and soft history retained.'
-              if extending else 'Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
+        print('Start B/C from selected BEST center weights; fresh Adam; center gate explicitly bypassed.'
+              if later_start else ('Center continuation: new budget/LR; model, Adam, RNG and soft history retained.'
+              if extending else 'Exact resume: stored arguments, model, optimizer and RNG win.'), flush=True)
     check_args(args)
     seed_all(args.seed)
     device = device_for(args.device)
@@ -331,8 +342,10 @@ def train(args):
         'training_views': [str(c.image_name) for c in train_cameras],
         'validation_views': [str(c.image_name) for c in cameras],
         'scope': 'scene-specific; global statistics use whole PLY; A/B exclude heldout blocks; C trains all Gaussians but not heldout cameras',
-        'gates': 'engineering criteria, not proven optimal; budgets are caps, not mandatory phase lengths'}
-    if not resumed or extending:
+        'gates': ('B/C full budgets explicitly requested; quality/plateau gates bypassed'
+                  if getattr(args, 'later_phase_policy', 'gates') == 'budget' else
+                  'engineering criteria, not proven optimal; budgets are caps, not mandatory phase lengths')}
+    if not resumed or extending or later_start:
         (out/'training.json').write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding='utf-8')
     state = resumed['progress'] if resumed else {
         'phase': 'center', 'phase_step': 0, 'phase_index': 0, 'step': 0, 'status': 'running',
@@ -366,7 +379,7 @@ def train(args):
     def observe(images=False):
         result = validate(model, blocks, heldout, batches, raw, geometry, cameras, reference, args, state, out, images, probes)
         phase = state['phase']
-        if drift is not None and phase == 'center':
+        if drift is not None:
             drift.observe(state['step'])
         if phase == 'center':
             score = -result['render']['center_only']['source_psnr'] if result['render'] else result['centers']['world_rmse']
@@ -409,7 +422,7 @@ def train(args):
         if not state['phase_initialized']:
             state['stale'] = 0
             state['plateau_anchor'] = float('inf')
-            observe(images=state['step'] == 0)
+            observe(images=True)
             state['phase_initialized'] = True
             save(optimizer, boundary=state['step'] > 0)
         reason = state['end_reason'] or 'budget_cap'
@@ -566,11 +579,11 @@ def train(args):
                 if phase == 'center' and state['phase_step'] >= args.min_center_steps and center_ready(result, args):
                     switch = True
                     reason = 'center_render_gate' if result['render'] else 'center_world_rmse_diagnostic_gate'
-                elif phase == 'attribute' and state['phase_step'] >= args.min_attribute_steps:
+                elif phase == 'attribute' and getattr(args, 'later_phase_policy', 'gates') == 'gates' and state['phase_step'] >= args.min_attribute_steps:
                     ready, _ = attribute_ready(state['initial_attribute_loss'], state['best'][phase], args)
                     if ready and state['stale'] >= args.transition_patience:
                         switch, reason = True, 'attribute_improved_then_plateaued'
-                elif phase == 'joint' and state['phase_step'] >= args.min_joint_steps and state['stale'] >= args.stop_patience:
+                elif phase == 'joint' and getattr(args, 'later_phase_policy', 'gates') == 'gates' and state['phase_step'] >= args.min_joint_steps and state['stale'] >= args.stop_patience:
                     switch, reason = True, 'joint_validation_plateau'
                 if images_due:
                     plot_run(out)
@@ -603,7 +616,7 @@ def train(args):
             r = state['last_validation']['render']
             passed = (r['quantized12']['source_psnr']+state['best'][phase] <= args.center_max_gap_db) if r else \
                 (args.center_max_world_rmse is not None and state['best'][phase] <= args.center_max_world_rmse)
-        if phase == 'attribute' and args.joint_steps:
+        if phase == 'attribute' and args.joint_steps and getattr(args, 'later_phase_policy', 'gates') == 'gates':
             passed, gain = attribute_ready(state['initial_attribute_loss'], state['best'][phase], args)
         if state['status'] == 'guard_stalled':
             passed = False
