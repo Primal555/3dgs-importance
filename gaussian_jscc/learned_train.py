@@ -14,7 +14,7 @@ from .render_objective import bootstrap_loss, MultiViewRenderTask, split_cameras
 from .render_validation import append_json, validate_render
 from .training import full_scene_step
 from .transport import load_checkpoint, save_checkpoint
-from .position_delivery import training_position_cost
+from .position_delivery import training_position_cost, PositionCostMeter
 
 
 def add_parser(sub):
@@ -32,6 +32,8 @@ def add_parser(sub):
     p.add_argument('--position-delivery', choices=['learned','float32','quantized'], default='learned',
                    help='explicit modes replace XYZ output with a charged reliable side stream; attributes still use JSCC')
     p.add_argument('--position-bits', type=int, default=12, help='quantized XYZ bits per axis (1..16)')
+    p.add_argument('--position-compression', choices=['none','delta_zlib'], default='none',
+                   help='lossless integer delta/byte-plane/zlib side stream; does not change attributes')
     p.add_argument('--position-net-bits-per-use', type=float, default=2.,
                    help='assumed digital net information bits/complex use for training charts; not a tested FEC')
     p.add_argument('--bootstrap-steps', '--steps', dest='bootstrap_steps', type=int, default=0,
@@ -113,7 +115,8 @@ def train(args):
         model = load_checkpoint(args.init,device).train()
         if model.cfg.architecture != 'learned_joint' or model.cfg.sh_degree != degree:
             raise ValueError('requires matching learned_joint weights; omit --init for old architectures')
-        if model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits:
+        if (model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits
+                or model.cfg.position_compression != args.position_compression):
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
         print('Loaded learned_joint weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
         print('Architecture, rates and feature statistics come from the checkpoint; position-delivery flags must match it.',flush=True)
@@ -122,7 +125,8 @@ def train(args):
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
-                          position_delivery=args.position_delivery,position_bits=args.position_bits)
+                          position_delivery=args.position_delivery,position_bits=args.position_bits,
+                          position_compression=args.position_compression)
         model = GaussianCodec(cfg).to(device)
         model.attr_mean.copy_(original[:,3:].mean(0).to(device))
         model.attr_std.copy_(original[:,3:].std(0,unbiased=False).clamp_min(.01).to(device))
@@ -142,6 +146,7 @@ def train(args):
     order = torch.from_numpy(morton_order(geometry.quantize(original[:,:3]).numpy()).astype(np.int64))
     raw = original[order]
     del original
+    position_meter = PositionCostMeter(model.cfg, geometry.normalize(raw[:, :3]))
     cache_device = device if args.training_data_device == 'cuda' else torch.device('cpu')
     blocks, ids = [], []
     with torch.no_grad():
@@ -219,7 +224,8 @@ def train(args):
         return validate_render(model,groups,group_ids,raw,geometry,val_cameras,reference,args.snr,
                                args.channel,args.validation_trials,args.seed,out,step,phase,
                                mask=mask if phase == 'joint' else None,white_background=args.white_background,beta=args.beta,
-                               position_net_bits_per_use=args.position_net_bits_per_use)
+                               position_net_bits_per_use=args.position_net_bits_per_use,
+                               position_meter=position_meter)
 
     def save(suffix,phase,step):
         if phase == 'joint':
@@ -280,7 +286,9 @@ def train(args):
                     stats.update(details,**task.stats)
                     stats['symbols_per_source_gaussian'] = sum(float(torch.tensor(model.cfg.rates,device=q.device)[q].sum()) for q in qs)/len(raw)
                     stats.update(training_position_cost(model.cfg,details['retained_gaussians'],len(raw),
-                                 stats['symbols_per_source_gaussian']*len(raw),args.position_net_bits_per_use))
+                                 stats['symbols_per_source_gaussian']*len(raw),args.position_net_bits_per_use,
+                                 position_meter.stream_bytes(torch.cat([
+                                     q[gi.to(q.device)>=0].cpu() for q,gi in zip(qs,group_ids)]))))
                 else:
                     loss,details = discrete_joint_step(model,mask,groups,group_ids,geometry,args.snr,args.channel,
                                                        task,beta=args.beta,auxiliary_weight=0.,samples=args.mask_samples,

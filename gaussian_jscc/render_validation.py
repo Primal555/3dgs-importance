@@ -5,7 +5,7 @@ import torch
 from .learned_training import decode_batches, hard_layout
 from .optimization import preserved_rng
 from .render_objective import image_metrics
-from .position_delivery import training_position_cost
+from .position_delivery import training_position_cost, PositionCostMeter
 
 
 def append_json(path, row):
@@ -31,12 +31,14 @@ def save_panel(path, photo, reference, decoded):
 @torch.no_grad()
 def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                     snr, channel, trials, seed, out, step, phase, mask=None,
-                    white_background=False, beta=0., position_net_bits_per_use=2.):
+                    white_background=False, beta=0., position_net_bits_per_use=2., position_meter=None):
     from .cli import seed_all
     from .rendering import render
     device = next(model.parameters()).device
     was_training = model.training
     entries = []
+    if position_meter is None:
+        position_meter = PositionCostMeter(model.cfg, geometry.normalize(raw[:, :3]))
     # Uniform/mixed codec conditions stay visible even when a learned mask is
     # enabled. The mask is an additional, separately scored deployment layout.
     layouts = (1,2,3,None) + (('mask',) if mask is not None else ())
@@ -86,7 +88,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                          'tier_counts':torch.bincount(flat_q,minlength=4).tolist(),
                          'views':observations}
                 entry.update(training_position_cost(model.cfg,int((flat_q>0).sum()),len(raw),
-                                                    int(lengths.sum()),position_net_bits_per_use))
+                                                    int(lengths.sum()),position_net_bits_per_use,
+                                                    position_meter.stream_bytes(flat_q)))
                 entries.append(entry)
     finally:
         model.train(was_training)

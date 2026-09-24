@@ -167,7 +167,7 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
                  receiver_context='local received features; no source or predicted XYZ inputs',
                  grouping='fixed source-row intervals; q0 holes retained in syntax',
                  power_normalization='smooth per-row RMS; mean complex energy <= 1')
-    stats.update(position_cost(model.cfg, int((q > 0).sum())),
+    stats.update(position_cost(model.cfg, int((q > 0).sum()), coordinate_bits//8),
                  position_channel_uses=coordinate_uses,
                  position_stream_assumption='reliably delivered; no FEC or coordinate packet errors simulated',
                  position_coding=model.cfg.position_delivery,

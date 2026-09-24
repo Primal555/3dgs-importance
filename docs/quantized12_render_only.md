@@ -1,4 +1,7 @@
-# 固定保留的纯渲染训练线
+# 保留的12bit纯渲染对照线
+
+当前推荐入口已升级为 [16bit量化＋无损压缩](quantized16_compressed.md)。
+本文和 `train_quantized12_render_only.sh` 保留为12bit定长对照，不会自动改成16bit。
 
 当前主线已恢复为这条线。核心源码回到 `9f2810e`，保留后来添加的专用启动脚本。
 后续局部响应预训练、学习中心及多层 Transformer 实验已从当前跟踪源码中移除，
@@ -20,7 +23,7 @@
 ## 专用入口
 
 `scripts/train_quantized12_render_only.sh` 独立调用 CLI，不经过两阶段脚本。
-其参数兼容历史 `9f2810e` 的 CLI，是当前 main 的推荐实验入口。锁定：
+其参数兼容历史 `9f2810e` 的 CLI，是保留的12bit对照入口。锁定：
 
 - bootstrap=0、joint=0：只优化源 PLY 多视角渲染 RGB MSE；
 - 每轴12 bit XYZ 可靠侧流；属性仍用 JSCC；

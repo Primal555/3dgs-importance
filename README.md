@@ -2,17 +2,19 @@
 
 ## Gaussian JSCC codec extension
 
-### Active research baseline: reliable XYZ + render-only attribute JSCC
+### Active research baseline: compressed 16-bit XYZ + render-only attribute JSCC
 
-Mainline has been restored to **9f2810e** (2026-09-18), with its dedicated
-`scripts/train_quantized12_render_only.sh` launcher retained. Use this launcher
-for the current experiments: reliable 12-bit-per-axis coordinates, attribute JSCC,
+Mainline has been restored to **9f2810e** (2026-09-18). The active launcher is now
+`scripts/train_quantized16_render_only.sh`: reliable 16-bit-per-axis coordinates
+with lossless delta/byte-plane/zlib coding, attribute JSCC,
 source-scene multiview RGB MSE only, LR 1e-4, replay, no attribute bootstrap or
 learned-center training. Coordinates remain quantized, not lossless float XYZ.
-The side stream currently assumes reliable delivery and charges its bit cost;
-no FEC or new lossless coordinate compression has been added.
+The side stream assumes reliable delivery and charges its actual compressed bit
+cost; no FEC is simulated. Compression is lossless over quantized coordinates,
+not original floats, and does not imply lower training VRAM.
 
-See [current baseline and launch instructions](docs/quantized12_render_only.md).
+See [current 16-bit baseline](docs/quantized16_compressed.md) and the preserved
+[12-bit comparison launcher](docs/quantized12_render_only.md).
 Later learned-center/Transformer/two-stage experiments remain in Git at
 `archive/learned-center-before-digital-xyz-20260924` (`e5d17e4`). Experimental
 output directories are not changed. Those newer checkpoints require their

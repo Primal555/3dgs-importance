@@ -39,8 +39,13 @@ class CodecConfig:
     # Explicit diagnostic alternative; learned remains the unchanged default.
     position_delivery: str = 'learned'
     position_bits: int = 12
+    position_compression: str = 'none'
 
     def __post_init__(self):
+        if self.position_compression not in ('none', 'delta_zlib'):
+            raise ValueError('position_compression must be none or delta_zlib')
+        if self.position_compression != 'none' and self.position_delivery != 'quantized':
+            raise ValueError('coordinate compression requires quantized position delivery')
         if self.position_delivery not in ('learned', 'float32', 'quantized'):
             raise ValueError('position_delivery must be learned, float32 or quantized')
         if not isinstance(self.position_bits, int) or not 1 <= self.position_bits <= 16:
@@ -81,6 +86,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.position_compression == 'none':
+            result.pop('position_compression')  # Preserve historical model hashes.
         if self.position_delivery == 'learned' and self.position_bits == 12:
             # Preserve existing v4 shared-model hashes exactly.
             result.pop('position_delivery')

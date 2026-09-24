@@ -90,6 +90,16 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('--render-steps 20000',result.stdout)
         self.assertIn('NOT exact resume',result.stdout)
 
+    def test_quantized16_compressed_launcher(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'old12.pt','RENDER_STEPS':'10000'},
+                           script='scripts/train_quantized16_render_only.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for argument in ('--position-bits 16','--position-compression delta_zlib',
+                         '--position-delivery quantized','--render-steps 10000',
+                         '--render-lr 0.0001','--bootstrap-steps 0','--joint-steps 0'):
+            self.assertIn(argument,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+
 
 if __name__=='__main__':
     unittest.main()
