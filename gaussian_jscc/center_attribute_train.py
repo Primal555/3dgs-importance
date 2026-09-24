@@ -32,6 +32,10 @@ def add_parser(sub):
     p.set_defaults(func=train)
     for name in ('ply', 'source', 'out', 'resume'):
         p.add_argument('--'+name)
+    p.add_argument('--extend-center-steps', type=int, default=0,
+                   help='explicitly fork a center checkpoint into --out and append optimizer updates')
+    p.add_argument('--continuation-lr', type=float, default=2e-5)
+    p.add_argument('--continuation-end-lr', type=float, default=1e-5)
     p.add_argument('--device', default='cuda')
     p.add_argument('--center-decoder-kind', choices=['transformer', 'historical_light'], default='transformer')
     p.add_argument('--center-readout-norm', choices=['layernorm', 'affine'], default='layernorm',
@@ -196,6 +200,14 @@ def train(args):
     from .allocation import scene_fingerprint
     from .rendering import load_cameras, RenderReference
     resumed = torch.load(args.resume, map_location='cpu', weights_only=True) if args.resume else None
+    extending = bool(getattr(args, 'extend_center_steps', 0))
+    if extending:
+        if resumed is None or not args.out:
+            raise ValueError('--extend-center-steps requires --resume and a NEW --out')
+        from .center_continuation import prepare_continuation
+        resumed = prepare_continuation(resumed, args.resume, args.out,
+                                      args.extend_center_steps, args.continuation_lr,
+                                      args.continuation_end_lr)
     if resumed:
         if resumed.get('config', {}).get('center_position_layout', 'absolute') != 'absolute':
             raise ValueError('explicit block-centroid checkpoints cannot resume into pointwise absolute XYZ; start a new run')
@@ -223,7 +235,8 @@ def train(args):
                                  center_lr_end_ratio=.2).items():
             if not hasattr(args, key):
                 setattr(args, key, default)
-        print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
+        print('Center continuation: new budget/LR; model, Adam, RNG and soft history retained.'
+              if extending else 'Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
     check_args(args)
     seed_all(args.seed)
     device = device_for(args.device)
@@ -319,7 +332,7 @@ def train(args):
         'validation_views': [str(c.image_name) for c in cameras],
         'scope': 'scene-specific; global statistics use whole PLY; A/B exclude heldout blocks; C trains all Gaussians but not heldout cameras',
         'gates': 'engineering criteria, not proven optimal; budgets are caps, not mandatory phase lengths'}
-    if not resumed:
+    if not resumed or extending:
         (out/'training.json').write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding='utf-8')
     state = resumed['progress'] if resumed else {
         'phase': 'center', 'phase_step': 0, 'phase_index': 0, 'step': 0, 'status': 'running',
@@ -404,7 +417,8 @@ def train(args):
             started = time.perf_counter()
             if phase == 'center' and args.center_lr_schedule == 'late_cosine':
                 from .center_soft_update import scheduled_center_lr
-                lr = scheduled_center_lr(args.center_lr, state['phase_step']+1, maximum,
+                offset = getattr(args, 'center_lr_offset', 0)
+                lr = scheduled_center_lr(args.center_lr, state['phase_step']+1-offset, maximum-offset,
                                          args.center_lr_decay_start, args.center_lr_end_ratio)
                 for group in optimizer.param_groups:
                     group['lr'] = lr
