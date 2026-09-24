@@ -37,6 +37,7 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
     device = next(model.parameters()).device
     was_training = model.training
     entries = []
+    paired_noise = model.cfg.prefix_mode == 'progressive'
     if position_meter is None:
         position_meter = PositionCostMeter(model.cfg, geometry.normalize(raw[:, :3]))
     # Uniform/mixed codec conditions stay visible even when a learned mask is
@@ -56,8 +57,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                 lengths = torch.tensor(model.cfg.rates)[flat_q]
                 observations, xyz_errors, trial_scores = [], [], []
                 for trial in range(trials):
-                    seed_all(seed+20000+index*1000+trial)
-                    scene = decode_batches(model,groups,qs,snr,channel,geometry)
+                    seed_all(seed+20000+(0 if paired_noise else index*1000)+trial)
+                    scene = decode_batches(model,groups,qs,snr,channel,geometry,paired_noise=paired_noise)
                     if len(scene):
                         xyz_errors.append(float((scene[:,:3]-raw[flat_q>0,:3].to(device)).square().mean().sqrt()))
                     view_scores = []
@@ -99,10 +100,21 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
     selected = entries[-1] if mask is not None else None
     score = selected['source_mse']+beta*selected['symbols_per_source_gaussian']/model.cfg.rates[-1] if selected else codec_score
     result = {'step':step,'phase':phase,'score':score,
+              'prefix_mode':model.cfg.prefix_mode,'paired_prefix_noise':paired_noise,
               'score_definition':'hard_mask_source_mse_plus_normalized_payload' if selected else 'mean_layout_source_mse',
               'codec_score':codec_score,'snr':snr,'channel':channel,'trials':trials,
               'validation_views':len(cameras),'layouts':entries,
               'metrics_note':'unclipped MSE/PSNR; displayed-RGB SSIM; no projection/parameter loss; payload excludes metadata'}
+    if paired_noise:
+        # Empirical improvements, not a monotonicity constraint or a loss term.
+        result['prefix_gains'] = []
+        for lower, upper in zip(entries[:2], entries[1:3]):
+            delta = [a['source_mse']-b['source_mse'] for a,b in zip(lower['views'],upper['views'])]
+            result['prefix_gains'].append({
+                'from':lower['layout'],'to':upper['layout'],
+                'source_psnr_gain_db':upper['source_psnr']-lower['source_psnr'],
+                'source_mse_reduction':sum(delta)/len(delta),
+                'paired_view_trial_improved_fraction':sum(d>0 for d in delta)/len(delta)})
     append_json(Path(out)/'validation.jsonl',result)
     print(f'validation step={step}: source MSE={codec_score:.6f}; '+', '.join(
         f'q{e["layout"]} PSNR={e["source_psnr"]:.2f}' for e in entries),flush=True)

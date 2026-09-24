@@ -40,8 +40,12 @@ class CodecConfig:
     position_delivery: str = 'learned'
     position_bits: int = 12
     position_compression: str = 'none'
+    # Absent in historical checkpoints: preserve their adaptive code semantics.
+    prefix_mode: str = 'adaptive'
 
     def __post_init__(self):
+        if self.prefix_mode not in ('adaptive', 'progressive'):
+            raise ValueError('prefix_mode must be adaptive or progressive')
         if self.position_compression not in ('none', 'delta_zlib'):
             raise ValueError('position_compression must be none or delta_zlib')
         if self.position_compression != 'none' and self.position_delivery != 'quantized':
@@ -86,6 +90,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.prefix_mode == 'adaptive':
+            result.pop('prefix_mode')  # Preserve historical weights/packet hashes.
         if self.position_compression == 'none':
             result.pop('position_compression')  # Preserve historical model hashes.
         if self.position_delivery == 'learned' and self.position_bits == 12:
@@ -271,6 +277,16 @@ class GaussianCodec(nn.Module):
         validate_tiers(q, len(features))
         return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
 
+    def encode_full(self, features, xyz, retained, snr):
+        """Encode once; use pack(full, q, rates) for any q with this keep mask.
+
+        Returns dense [N, 2*max_rate] real/imag slots, not a transmitted payload.
+        Changing the retained set or SNR requires re-encoding.
+        """
+        if retained.shape != features.shape[:1] or retained.dtype != torch.bool:
+            raise ValueError('retained must be a bool vector with one entry per Gaussian')
+        return self.learned.encode_full(features[None], xyz[None], retained[None], snr)[0]
+
     def decode(self, symbols, q, snr, return_seed=False, delivered_xyz=None):
         validate_tiers(q, len(q))
         result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr)[0]
@@ -303,7 +319,7 @@ class GaussianCodec(nn.Module):
         return tuple(x[0] for x in self.forward_tier_batches(
             features[None], xyz[None], choices[None], snr, kind))
 
-    def forward_tier_batches(self, features, xyz, choices, snr, kind="awgn"):
+    def forward_tier_batches(self, features, xyz, choices, snr, kind="awgn", paired_noise=False):
         if choices.shape != (*features.shape[:2], 4) or features.ndim != 3:
             raise ValueError("batched choices must have shape [B,N,4]")
         if choices.requires_grad or not torch.equal(choices, F.one_hot(choices.argmax(-1), 4).to(choices)):
@@ -311,8 +327,14 @@ class GaussianCodec(nn.Module):
         q = choices.argmax(-1)
         latent = self.learned.encode(features, xyz, q, snr)
         mask = prefix_mask(q.flatten(), self.cfg.rates).reshape_as(latent)
-        noisy = channel(latent[mask].reshape(-1, 2), snr, kind)
-        received = latent.new_zeros(latent.shape).masked_scatter(mask, noisy.flatten())
+        if paired_noise:
+            # Validation-only coupling: assign noise to fixed point/symbol slots
+            # BEFORE selection, so changing q cannot shift later points' noise.
+            # Unreceived slots are masked out, not transmitted or charged.
+            received = channel(latent.reshape(-1, 2), snr, kind).reshape_as(latent) * mask
+        else:
+            noisy = channel(latent[mask].reshape(-1, 2), snr, kind)
+            received = latent.new_zeros(latent.shape).masked_scatter(mask, noisy.flatten())
         result = self.learned.decode(received, q, snr)
         from .position_delivery import delivered_positions
         result = self.apply_position_delivery(result, q, delivered_positions(features[..., :3], q, self.cfg))

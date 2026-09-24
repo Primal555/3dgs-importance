@@ -2,6 +2,17 @@
 
 ## Gaussian JSCC codec extension
 
+### New experiment: encode once, deliver progressively
+
+`scripts/train_progressive16_render_only.sh` keeps the reliable compressed
+16-bit XYZ and render-only shared lightweight codec, but uses truly nested
+**8 + 8 + 16** attribute symbol layers. SNR conditioning stays; positive tiers
+select symbols instead of rewriting the encoder representation. Each layer has
+independent power normalization. Validation reports paired-noise prefix gains
+alongside the usual PSNR, images and training diagnostics, all in one folder.
+See [design, compatibility and background server launch](docs/progressive_attribute_jscc.md).
+The earlier adaptive-prefix launcher below remains available as the control.
+
 ### Active research baseline: compressed 16-bit XYZ + render-only attribute JSCC
 
 Mainline has been restored to **9f2810e** (2026-09-18). The active launcher is now

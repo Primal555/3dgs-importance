@@ -19,7 +19,7 @@ case "$INITIALIZATION" in
   checkpoint)
     [[ -n "${INIT:-}" && -f "$INIT" ]] || { echo 'checkpoint mode requires an existing INIT file.' >&2; exit 1; }
     EXTRA+=(--init "$INIT")
-    echo 'Requires 16-bit delta_zlib checkpoint. Fresh Adam; NOT exact resume.' ;;
+    echo 'Requires matching 16-bit delta_zlib checkpoint AND prefix mode. Fresh Adam; NOT exact resume.' ;;
   *) echo 'INITIALIZATION must be random or checkpoint.' >&2; exit 1 ;;
 esac
 printf 'XYZ: 16-bit quantization + lossless delta_zlib; source floats are NOT lossless.\nInitialization: %s\nGPU: %s\nOutput: %s\n' "$INITIALIZATION" "$CUDA_VISIBLE_DEVICES" "$OUT"
@@ -27,6 +27,7 @@ echo 'Compression size is measured once per retention mask; first validation may
 exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --ply "$PLY" --source "$SCENE" --out "$OUT" "${EXTRA[@]}" \
   --device cuda --snr 10 --channel awgn \
+  --prefix-mode "${PREFIX_MODE:-adaptive}" \
   --position-delivery quantized --position-bits 16 --position-compression delta_zlib \
   --position-net-bits-per-use 2 \
   --bootstrap-steps 0 --render-steps "${RENDER_STEPS:-5000}" --joint-steps 0 \

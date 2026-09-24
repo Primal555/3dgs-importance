@@ -93,10 +93,10 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
 
 
 @torch.no_grad()
-def decode_batches(model, feature_batches, q_batches, snr, kind, geometry):
+def decode_batches(model, feature_batches, q_batches, snr, kind, geometry, paired_noise=False):
     device = next(model.parameters()).device
     return torch.cat([codec_batch(model, f.to(device), q.to(device), snr, kind, geometry, 0,
-                                 compute_auxiliary=False)[0]
+                                 compute_auxiliary=False, paired_noise=paired_noise)[0]
                       for f, q in zip(feature_batches, q_batches)])
 
 

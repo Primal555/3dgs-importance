@@ -97,6 +97,24 @@ def plot_render_training(training_dir, output_dir=None):
                 ax.annotate(f'{r[key]:.2f}',(i,r[key]),xytext=(0,3),textcoords='offset points',ha='center')
             ax.margins(y=.15)
         charts += _finish(fig,out/'last_layout_comparison')
+        gains = [{**g,'step':r['step'],'phase':r['phase']} for r in records
+                 for g in r.get('prefix_gains',[])]
+        if gains:
+            _write_csv(out/'prefix_gains.csv',gains,list(gains[0]))
+            fig,axes=plt.subplots(1,2,figsize=(12,4.5))
+            fig.suptitle('Progressive prefixes | paired views and symbol noise')
+            for lower,upper,color in [('1','2','#2F6B9A'),('2','3','#D96C2F')]:
+                subset=[g for g in gains if g['from']==lower and g['to']==upper]
+                for ax,key in zip(axes,('source_psnr_gain_db','paired_view_trial_improved_fraction')):
+                    ax.plot([g['step'] for g in subset],[g[key] for g in subset],
+                            marker='o',linestyle='-' if len(subset)>=8 else 'none',
+                            color=color,label=f'q{lower} -> q{upper}')
+                    ax.set_xlabel('Optimization step')
+                    ax.legend()
+            axes[0].axhline(0,color='#59636E',linestyle='--')
+            axes[0].set_ylabel('Source-render PSNR gain (dB); positive is better')
+            axes[1].set(ylabel='Fraction of paired observations with lower MSE',ylim=(-.02,1.02))
+            charts += _finish(fig,out/'prefix_gains')
     return _manifest(out,'render_first_training',root,charts,[
         'Bootstrap is initialization, not communication fidelity; do not compare its scale to image MSE.',
         'Validation noise/views/layouts are fixed; sparse histories use markers only.',

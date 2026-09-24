@@ -29,6 +29,8 @@ def add_parser(sub):
     p.add_argument('--device', default='cuda')
     p.add_argument('--snr', type=float, default=10.)
     p.add_argument('--channel', choices=['awgn', 'none'], default='awgn')
+    p.add_argument('--prefix-mode', choices=['adaptive','progressive'], default='adaptive',
+                   help='progressive: shared SNR-conditioned codeword, independent layer power, q selects a prefix')
     p.add_argument('--position-delivery', choices=['learned','float32','quantized'], default='learned',
                    help='explicit modes replace XYZ output with a charged reliable side stream; attributes still use JSCC')
     p.add_argument('--position-bits', type=int, default=12, help='quantized XYZ bits per axis (1..16)')
@@ -115,6 +117,8 @@ def train(args):
         model = load_checkpoint(args.init,device).train()
         if model.cfg.architecture != 'learned_joint' or model.cfg.sh_degree != degree:
             raise ValueError('requires matching learned_joint weights; omit --init for old architectures')
+        if model.cfg.prefix_mode != args.prefix_mode:
+            raise ValueError('initializer prefix_mode must match --prefix-mode; start a new random run to change coding semantics')
         if (model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits
                 or model.cfg.position_compression != args.position_compression):
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
@@ -126,7 +130,7 @@ def train(args):
                           planes=False,rates=tuple(args.rates),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
                           position_delivery=args.position_delivery,position_bits=args.position_bits,
-                          position_compression=args.position_compression)
+                          position_compression=args.position_compression,prefix_mode=args.prefix_mode)
         model = GaussianCodec(cfg).to(device)
         model.attr_mean.copy_(original[:,3:].mean(0).to(device))
         model.attr_std.copy_(original[:,3:].std(0,unbiased=False).clamp_min(.01).to(device))
@@ -191,6 +195,11 @@ def train(args):
                   metadata='reliable global bbox + per-row tier syntax unchanged; chart payload excludes metadata',
                   clipping='none by default; any threshold is an explicit empirical hyperparameter')
     record.update(position_delivery=model.cfg.position_delivery,
+                  prefix_mode=model.cfg.prefix_mode,
+                  incremental_complex_symbols=[b-a for a,b in zip(model.cfg.rates[:-1],model.cfg.rates[1:])],
+                  layout_schedule='repeat q1, q2, q3, per-Gaussian mixed; one render objective per update',
+                  validation_noise=('paired full-slot noise across layouts' if model.cfg.prefix_mode == 'progressive'
+                                    else 'independent fixed noise per layout'),
                   position_protocol=('XYZ learned from JSCC payload; no coordinate side stream'
                                      if model.cfg.position_delivery == 'learned' else
                                      'normalized XYZ for q>0 only; reliable side stream; no learned XYZ residual'),
@@ -200,6 +209,7 @@ def train(args):
     print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
           f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
+    print(f'Prefix mode: {model.cfg.prefix_mode}; incremental symbols={record["incremental_complex_symbols"]}',flush=True)
 
     @torch.no_grad()
     def validate_bootstrap(step):

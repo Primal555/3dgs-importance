@@ -1,8 +1,9 @@
-"""Fully learned shared JSCC payload; no analytic coordinate side channel.
+"""Shared attribute/JSCC backbone with adaptive or truly progressive prefixes.
 
 Encoder grids use source XYZ. Decoder windows use ONLY received feature slots,
 q, SNR and packet-local sequence offsets. No reconstructed-coordinate grid,
 point-ID table, reference waveform, systematic repetition or XYZ sub-budget.
+Explicit XYZ delivery is handled by GaussianCodec, outside this core.
 """
 import math
 import torch
@@ -68,9 +69,7 @@ class LearnedCore(nn.Module):
         snr_col = torch.full((*q.shape, 1), float(snr)/20, device=q.device, dtype=dtype)
         return self.tier(q) + self.snr(snr_col)
 
-    def encode(self, features, xyz, q, snr):
-        active = q > 0
-        condition = self.condition(q, snr, features.dtype)
+    def _encode_features(self, features, xyz, active, condition):
         pieces = (features[..., :3]*2-1, features[..., 3:4], features[..., 4:7],
                   features[..., 7:11], features[..., 11:])
         h = self.fuse(torch.cat([layer(value) for layer, value in zip(self.embeddings, pieces)], -1))
@@ -78,7 +77,33 @@ class LearnedCore(nn.Module):
         plan = self.enc_blocks[0].grid.geometry_plan(xyz, active.to(features))
         for block in self.enc_blocks:
             h = block(h, xyz, condition, active.to(features), plan) * active[..., None]
-        z = self.symbol_head(self.enc_norm(h))
+        return self.symbol_head(self.enc_norm(h))
+
+    def encode_full(self, features, xyz, active, snr):
+        """One progressive codeword per point, independent of positive tiers.
+
+        Normalize each incremental layer separately. Adding/removing a suffix
+        cannot alter a previously transmitted symbol or its power scaling.
+        """
+        if self.cfg.prefix_mode != 'progressive':
+            raise ValueError('encode_full requires progressive prefix_mode')
+        snr_col = features.new_full((*active.shape, 1), float(snr)/20)
+        condition = self.snr(snr_col)  # No target tier, including neighbors' tiers.
+        z = self._encode_features(features, xyz, active, condition)
+        layers = []
+        for start, end in zip(self.cfg.rates[:-1], self.cfg.rates[1:]):
+            layer = z[..., 2*start:2*end]
+            energy = layer.square().sum(-1, keepdim=True) / (end-start)
+            layers.append(layer / (energy + self.cfg.power_floor).sqrt())
+        return torch.cat(layers, -1) * active[..., None]
+
+    def encode(self, features, xyz, q, snr):
+        active = q > 0
+        if self.cfg.prefix_mode == 'progressive':
+            z = self.encode_full(features, xyz, active, snr)
+            return z * prefix_mask(q.flatten(), self.cfg.rates).reshape_as(z)
+        condition = self.condition(q, snr, features.dtype)
+        z = self._encode_features(features, xyz, active, condition)
         mask = prefix_mask(q.flatten(), self.cfg.rates).reshape_as(z)
         z = z * mask
         energy = z.square().sum(-1, keepdim=True) / (mask.sum(-1, keepdim=True)/2).clamp_min(1)

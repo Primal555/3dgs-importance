@@ -19,7 +19,7 @@ class LauncherTests(unittest.TestCase):
             (folder/'sparse').mkdir()
             (folder/'codec.pt').touch()
             env=os.environ.copy()
-            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES'):
+            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES','PREFIX_MODE'):
                 env.pop(key,None)
             env.update(PYTHON_BIN='/bin/echo',PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
             env.update(overrides or {})
@@ -99,6 +99,17 @@ class LauncherTests(unittest.TestCase):
                          '--render-lr 0.0001','--bootstrap-steps 0','--joint-steps 0'):
             self.assertIn(argument,result.stdout)
         self.assertNotIn('--init ',result.stdout)
+
+    def test_progressive_launcher_locks_prefix_mode_and_preserves_baseline(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'old.pt','PREFIX_MODE':'adaptive',
+                            'RENDER_STEPS':'10000'},script='scripts/train_progressive16_render_only.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for argument in ('--prefix-mode progressive','--position-bits 16','--position-compression delta_zlib',
+                         '--render-steps 10000','--rates 0 8 16 32','--render-lr 0.0001',
+                         '--blocks-per-batch 64','--render-backward replay','--bootstrap-steps 0','--joint-steps 0'):
+            self.assertIn(argument,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+        self.assertNotEqual(self.launch(script='scripts/train_progressive16_render_only.sh').returncode,0)
 
 
 if __name__=='__main__':
