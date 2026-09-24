@@ -5,7 +5,6 @@ XYZ. No source-XYZ skip, side channel, shared weights or shape-scaled XYZ loss.
 The clean latents are not claimed to be a communication payload.
 """
 import math
-from dataclasses import replace
 import torch
 from torch import nn
 from .multiscale_codec import MultiScaleContext
@@ -70,62 +69,6 @@ class CenterDecoder(nn.Module):
         return self.readout(torch.cat(taps, -1)).masked_fill(~active[..., None], 0)
 
 
-def masked_point_mean(values, active):
-    clean = values.masked_fill(~active[..., None], 0)
-    return clean.sum(1, keepdim=True)/active.sum(1, keepdim=True).clamp_min(1)[..., None]
-
-
-class DecoupledCenterEncoder(nn.Module):
-    """Disjoint learned centroid/local paths, same total per-point latent size.
-
-    Source block centering happens ONLY at the encoder. Neither the source
-    centroid nor an identity XYZ skip is passed to the decoder.
-    """
-    def __init__(self, cfg):
-        super().__init__()
-        self.common_dim = cfg.center_latent_dim//2
-        self.common = PointEncoder(cfg, 3, self.common_dim)
-        self.local = PointEncoder(cfg, 3, cfg.center_latent_dim-self.common_dim)
-
-    def forward(self, values, xyz, active):
-        xyz = xyz.masked_fill(~active[..., None], 0)
-        centered = (xyz-masked_point_mean(xyz, active)).masked_fill(~active[..., None], 0)
-        common = self.common(xyz*2-1, xyz, active)
-        local = self.local(centered*2, centered, active)
-        return torch.cat((common, local), -1)
-
-
-class DecoupledCenterDecoder(nn.Module):
-    """Learned block centroid + strictly zero-mean predicted local residuals.
-
-    Separate parameters prevent local updates from moving the block mean.
-    This is output/parameter separation, not loss-gradient independence.
-    """
-    def __init__(self, cfg):
-        super().__init__()
-        self.common_dim = cfg.center_latent_dim//2
-        self.common = mlp(self.common_dim, cfg.hidden, 3)
-        nn.init.normal_(self.common[-1].weight, std=.02)
-        nn.init.constant_(self.common[-1].bias, .5)
-        self.local = CenterDecoder(replace(cfg, center_position_layout='absolute',
-                                          center_latent_dim=cfg.center_latent_dim-self.common_dim))
-        # A final constant local bias is annihilated by centering; remove that
-        # redundant parameter instead of pretending it can learn translation.
-        self.local.readout[-1].bias = None
-
-    def components(self, z, active):
-        z = z.masked_fill(~active[..., None], 0)
-        centroid = self.common(masked_point_mean(z[..., :self.common_dim], active))
-        centroid = centroid.masked_fill(~active.any(1)[:, None, None], 0)
-        residual = self.local(z[..., self.common_dim:], active)
-        residual = (residual-masked_point_mean(residual, active)).masked_fill(~active[..., None], 0)
-        return centroid, residual
-
-    def forward(self, z, active):
-        centroid, residual = self.components(z, active)
-        return (centroid+residual).masked_fill(~active[..., None], 0)
-
-
 class HistoricalLightCenterDecoder(nn.Module):
     """XYZ branch of 97ef4cc MultiScaleSelfCore, adapted to clean center latent.
 
@@ -187,9 +130,6 @@ class CenterAttributeCore(nn.Module):
         self.center_decoder = CenterDecoder(cfg)
         self.attribute_encoder = PointEncoder(cfg, cfg.attr_dim, cfg.representation_dim-cfg.center_latent_dim)
         self.attribute_decoder = AttributeDecoder(cfg)
-        if cfg.center_position_layout == 'centroid_residual':
-            self.center_encoder = DecoupledCenterEncoder(cfg)
-            self.center_decoder = DecoupledCenterDecoder(cfg)
         if cfg.center_decoder_kind == 'historical_light':
             # Keep the original shared encoder/attribute initialization AND RNG
             # stream. The temporary trunk above is discarded, never optimized.
@@ -215,14 +155,7 @@ class CenterAttributeCore(nn.Module):
             module.requires_grad_(phase == 'joint' or name.startswith('center') == (phase == 'center'))
 
     def module_parameters(self):
-        result = {}
-        for name, module in self.named_children():
-            if isinstance(module, (DecoupledCenterEncoder, DecoupledCenterDecoder)):
-                for branch in ('common', 'local'):
-                    result[name+'.'+branch] = list(getattr(module, branch).parameters())
-            else:
-                result[name] = list(module.parameters())
-        return result
+        return {name: list(module.parameters()) for name, module in self.named_children()}
 
     def encode(self, *args, **kwargs):
         raise ValueError('center-attribute experiment is clean-only; no trained communication adapter/payload')
