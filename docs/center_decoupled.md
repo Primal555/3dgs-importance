@@ -1,4 +1,10 @@
-# Learned centroid + zero-mean local positions, with guarded center updates
+# Learned centroid + zero-mean local positions, with branch guard v2
+
+The server wrapper now selects the corrected **branch_directional_v2** update
+mechanism. Network structure, latent widths and position loss are unchanged
+from the first decoupled experiment. Old `--center-guard-mode joint` behavior
+remains available for explicit replay of earlier configurations, not as the
+recommended server experiment.
 
 ## Experiment scope
 
@@ -47,28 +53,52 @@ this is not a parameter-matched architecture ablation. Halving the local feature
 width, common-centroid errors affecting a whole block, small centered inputs and
 block boundary discontinuities are risks to examine, not assumed solved.
 
-## Update guard
+## Corrected update guard
 
-`--center-step-guard --center-max-backtracks 4` applies **only during center
-training**, from the first step:
+`--center-step-guard --center-guard-mode branch --center-max-backtracks 8`
+applies **only during center training**, from the first step:
 
-- Compute the original distance loss and gradient once on the sampled training
-  batch. Make one Adam proposal, saving original parameters and optimizer state.
-- Evaluate the same loss on that same batch at proposal scales
-  **1, 1/2, 1/4, 1/8, 1/16**, accepting the first finite non-increasing loss.
-- No extra backward pass or rendering is required, but each attempted scale
-  costs an additional center forward pass. There is no universal speed guarantee.
-- An accepted reduced step keeps Adam's new moments/counter exactly once, as
-  if that iteration used the scaled LR. The next base LR remains 1e-4.
-- If all proposals fail, restore parameters **and** Adam moments/counter.
-  The attempted-training-step counter advances and the skipped update is logged.
-  Exceptions also restore the candidate state before being re-raised.
+1. Propose a common-branch Adam update, leaving local parameters and their
+   optimizer counters untouched. Check `gradient dot parameter_update < 0`.
+2. An uphill/zero/nonfinite direction is not blindly shrunk. Restore the
+   pre-candidate state, clear **only active first moments**, retain second
+   moments/counters, and rebuild a candidate from the current gradient.
+3. For a descent direction try **1, 1/2, ..., 1/256**, accepting the first finite
+   **strictly lower** original loss on the same training batch. If the original
+   direction passes its dot-product check but all scales fail, also try the
+   first-moment-restart candidate. At most two directions are considered.
+4. After common acceptance/rejection, recompute the same original objective
+   and the **fresh local gradient at the actual new parameters**. Propose and
+   accept/reject the local branch independently. No stale local gradient and
+   no all-or-nothing veto from a failed common branch.
 
-There is no added permanent LR decay schedule or arbitrary coordinate-motion
-threshold. Acceptance protects the current batch, **not other blocks or PSNR**.
-Frequent rejection is a diagnostic signal, not a claim that training succeeded.
-The guard is scoped to the current deterministic center networks (no dropout or
-running-stat buffers); do not reuse it unchanged for stochastic objectives.
+An accepted update advances that branch's moments/counters **once**, regardless
+of retries. Partial acceptance scales the current proposal, not the next base
+LR. If both candidate directions fail, restore that branch's weights, second
+moments and counters, but leave its first moments cleared for the next batch.
+This intentional rejection-state change avoids repeatedly restoring the same
+known bad momentum. Exceptions instead restore the **entire outer iteration**,
+including an already accepted common step, for consistent checkpoint recovery.
+
+The base LR stays 1e-4; there is no permanent LR decay or new coordinate-motion
+threshold. No heldout loss, image, or rendering enters acceptance. Each trial
+costs a center forward pass; the second branch additionally needs a fresh
+gradient computation. This version is not claimed to be as fast as the old
+single-update code. It remains scoped to the current deterministic networks
+(no dropout/running-stat buffers), not arbitrary stochastic training.
+
+`--center-guard-warn-after 50 --center-guard-stop-after 200` are disclosed
+engineering safeguards: warn every 50 consecutive rejected attempts for a
+branch; stop if **either** branch reaches 200. Accepted steps reset only that
+branch's streak. Streaks persist across exact resume. Stopping saves last
+weights/Adam, metrics, images and a summary with **status `guard_stalled`**;
+later phases are not run. It is not declared convergence. A branch could be
+nearly converged while another is still learning, so this conservative stop is
+a request to inspect diagnostics, not proof of a broken network.
+
+Strict float-loss equality is rejected, not counted as learning. On each
+accepted branch step, current-batch loss must decrease; no guarantee is made
+about other blocks or PSNR.
 
 ## Server launch
 
@@ -78,7 +108,7 @@ Replace GPU 2 with a currently available card:
 cd /data/home/zhangyueheng/projects/3dgs-importance || exit 1
 conda activate maskgs
 git -c http.version=HTTP/1.1 -c submodule.recurse=false pull --ff-only --no-recurse-submodules origin main
-OUT="$PWD/output/truck_center_decoupled_$(date +%Y%m%d_%H%M%S)"
+OUT="$PWD/output/truck_center_decoupled_v2_$(date +%Y%m%d_%H%M%S)"
 CUDA_VISIBLE_DEVICES=2 nohup bash scripts/test_center_decoupled.sh "$OUT" > "${OUT}.launcher.log" 2>&1 &
 echo $! > "${OUT}.pid"
 tail -f "${OUT}.launcher.log"
@@ -97,14 +127,19 @@ log/PID are only background-process conveniences. No old checkpoint is loaded.
   split into global mean, block mean and pointwise residual. Rejections produce
   zero accepted movement; read the guard record to distinguish this from a
   genuinely small proposal.
-- `loss.jsonl` stores `stats.step_guard`: before/after loss, all tried scales and
-  losses, accepted flag, scale and effective LRs. The usual `loss` is pre-update.
+- `loss.jsonl` stores `stats.step_guard.branches.common/local`: candidate
+  directional derivatives, momentum restarts, all trial scales/losses, accepted
+  flags, each branch's actual gradient norm/effective LRs and rejection streaks.
+  Top-level `scale` is only the mean of the two branch scales, **not** a global
+  effective LR. The usual `loss` is before either branch update.
 - Separate common/local encoder/decoder parameter gradient/update norms are
   recorded, without double-counting shared parameters (there are none here).
-- `charts/center_step_guard.png` shows accepted scales, before/after same-batch
-  loss and cumulative skipped fraction. `summary.json` counts accepted, reduced,
-  skipped updates. `training_state_last_center.pt` retains matching last Adam
-  state before best-weight export.
+- `charts/center_step_guard.png` shows separate branch scales and skipped
+  fractions plus before/after same-batch loss. `center_momentum_restarts.png`
+  shows restart fractions and original directional derivatives. `summary.json`
+  counts accepted/reduced/skipped/restarted updates per branch.
+  `training_state_last_center.pt` retains matching last Adam state before
+  best-weight export, including on stall.
 
 This experiment combines structural separation and update control. It can test
 whether the combination helps, but cannot attribute all improvement to either
