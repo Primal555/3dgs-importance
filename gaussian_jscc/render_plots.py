@@ -30,9 +30,7 @@ def plot_render_training(training_dir, output_dir=None):
         if phase=='joint':
             _trace(ax,subset,'image_mse','Image MSE','#D96C2F','--')
             _trace(ax,subset,'rate_loss','Payload penalty','#59636E',':')
-        local = phase=='bootstrap' and subset[0].get('bootstrap_objective')=='local-response'
-        ylabel = ('Isolated response RGB MSE' if local else 'Normalized-feature SmoothL1') if phase=='bootstrap' else 'RGB MSE + rate (joint only)'
-        ax.set(title=phase + (' | local response' if local else ''),xlabel='Optimization step',ylabel=ylabel)
+        ax.set(title=phase,xlabel='Optimization step',ylabel='Normalized-feature SmoothL1' if phase=='bootstrap' else 'RGB MSE + rate (joint only)')
         if ax.get_legend_handles_labels()[0]:
             ax.legend()
     charts += _finish(fig,out/'training_objectives')

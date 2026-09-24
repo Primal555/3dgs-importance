@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from .codec import CodecConfig, GaussianCodec, channel
-from .data import Geometry, prepare, to_features, to_raw, to_scene
+from .data import Geometry, prepare, to_features, to_raw
 from .position_delivery import encode_positions, decode_positions, position_cost
 
 
@@ -40,7 +40,7 @@ def save_checkpoint(path, model, step, training=None):
 def load_checkpoint(path, device):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("version") != 4:
-        raise ValueError("Only learned_joint/learned_split/learned_split_logcov checkpoint v4 is supported")
+        raise ValueError("Only learned_joint checkpoint v4 is supported; use historical Git for old codecs")
     cfg = CodecConfig.from_dict(saved["config"])
     model = GaussianCodec(cfg)
     model.load_state_dict(saved["state_dict"], strict=True)
@@ -180,13 +180,11 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
 
 
 @torch.no_grad()
-def receive(model, packet, return_position_seed=False, native_scene=False):
+def receive(model, packet, return_position_seed=False):
     """Decode a packet, optionally exposing the decoder bootstrap XYZ.
 
     The optional seed is a diagnostic derived from the same received symbols;
     it is neither added to the packet nor used by normal deployment decoding.
-    native_scene=True retains covariance for direct rendering with logcov models;
-    default output remains standard PLY fields for existing callers.
     """
     packet = Path(packet)
     header, q = decode_metadata((packet / "metadata.bin").read_bytes())
@@ -226,13 +224,10 @@ def receive(model, packet, return_position_seed=False, native_scene=False):
         else:
             pred = decoded
             pred=pred[qb>0]
-        convert = to_scene if native_scene else to_raw
-        rows.append(convert(pred, geometry, model).cpu())
+        rows.append(to_raw(pred, geometry, model).cpu())
         i += count
         j += length
-    # Public receive() returns legacy PLY fields, including for logcov codecs.
-    width = 3+model.cfg.attr_dim if native_scene else 11+3*(model.cfg.sh_degree+1)**2
-    recovered = torch.cat(rows) if rows else torch.empty((0, width))
+    recovered = torch.cat(rows) if rows else torch.empty((0, 3 + model.cfg.attr_dim))
     if return_position_seed:
         seeds = torch.cat(position_seeds) if position_seeds else torch.empty((0, 3))
         return recovered, seeds

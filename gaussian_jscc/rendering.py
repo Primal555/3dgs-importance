@@ -43,13 +43,8 @@ HYBRID_VARIANT_DEFINITIONS = {
 
 def hybrid_parameter_scenes(received, reference, position_seed=None):
     """Build row-aligned scenes that isolate position and attribute errors."""
-    from .covariance import is_covariance_scene, scene_sh_start
-    if received.ndim != 2 or reference.ndim != 2 or len(received) != len(reference):
-        raise ValueError("received and reference must be row-aligned [N,D] Gaussian tensors")
-    is_covariance_scene(received)
-    is_covariance_scene(reference)
-    if received.shape[1]-scene_sh_start(received) != reference.shape[1]-scene_sh_start(reference):
-        raise ValueError('received and reference must have the same SH degree')
+    if received.shape != reference.shape or received.ndim != 2 or received.shape[1] < 4:
+        raise ValueError("received and reference must be matching [N,D] Gaussian tensors")
     if position_seed is not None and position_seed.shape != (len(reference), 3):
         raise ValueError("position_seed must be a matching [N,3] tensor")
     scenes = {"reference": reference}
@@ -83,7 +78,6 @@ def load_cameras(source, resolution=2, white_background=False, images="images", 
 
 def render(raw, camera, degree, white_background=False):
     from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-    from .covariance import is_covariance_scene, scene_sh_start
 
     bg = raw.new_full((3,), float(white_background))
     if not len(raw):
@@ -94,20 +88,15 @@ def render(raw, camera, degree, white_background=False):
         bg=bg, scale_modifier=1., viewmatrix=camera.world_view_transform.to(raw.device),
         projmatrix=camera.full_proj_transform.to(raw.device), sh_degree=degree,
         campos=camera.camera_center.to(raw.device), prefiltered=False, debug=False)
-    start = scene_sh_start(raw)
-    dc = raw[:, start:start+3].reshape(-1, 1, 3)
-    rest = raw[:, start+3:].reshape(len(raw), 3, (degree + 1) ** 2 - 1).transpose(1, 2)
+    dc = raw[:, 11:14].reshape(-1, 1, 3)
+    rest = raw[:, 14:].reshape(len(raw), 3, (degree + 1) ** 2 - 1).transpose(1, 2)
     sh = torch.cat((dc, rest), 1).contiguous()
-    if is_covariance_scene(raw):
-        shape = dict(scales=None, rotations=None, cov3D_precomp=raw[:, 4:10].contiguous())
-    else:
-        shape = dict(scales=raw[:, 4:7].clamp(-20, 10).exp().contiguous(),
-                     rotations=torch.nn.functional.normalize(raw[:, 7:11], dim=-1).contiguous(),
-                     cov3D_precomp=None)
     image, _ = GaussianRasterizer(raster_settings=settings)(
         means3D=raw[:, :3].contiguous(), means2D=torch.zeros_like(raw[:, :3]),
         shs=sh, colors_precomp=None, opacities=raw[:, 3:4].sigmoid().contiguous(),
-        **shape)
+        scales=raw[:, 4:7].clamp(-20, 10).exp().contiguous(),
+        rotations=torch.nn.functional.normalize(raw[:, 7:11], dim=-1).contiguous(),
+        cov3D_precomp=None)
     return image
 
 

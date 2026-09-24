@@ -5,76 +5,11 @@ import numpy as np
 import torch
 
 
-class ValidationLRSchedule:
-    """Phase-local plateau schedule; patience counts bad validation checks.
-
-    Defaults are explicit engineering choices, not loss-derived constants.
-    No training-step loss or cross-phase metric enters this scheduler.
-    """
-    def __init__(self, optimizer, mode='plateau', factor=.5, patience=3,
-                 threshold=.005, min_lr=1e-6):
-        if mode not in ('plateau', 'constant'):
-            raise ValueError('unknown learning-rate schedule')
-        if not 0 < factor < 1 or patience < 1 or not 0 <= threshold < 1:
-            raise ValueError('invalid LR factor/patience/relative threshold')
-        if not np.isfinite(min_lr) or min_lr <= 0:
-            raise ValueError('minimum LR must be positive and finite')
-        if mode == 'plateau' and min_lr > min(g['lr'] for g in optimizer.param_groups):
-            raise ValueError('minimum LR exceeds phase starting LR')
-        self.optimizer = optimizer
-        self.scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=factor, patience=patience-1,
-            threshold=threshold, threshold_mode='rel', min_lr=min_lr, eps=0.)
-            if mode == 'plateau' else None)
-
-    def observe(self, score):
-        score = float(score)
-        if not np.isfinite(score):
-            raise ValueError('nonfinite validation metric for LR schedule')
-        before = [g['lr'] for g in self.optimizer.param_groups]
-        if self.scheduler is not None:
-            self.scheduler.step(score)
-        after = [g['lr'] for g in self.optimizer.param_groups]
-        return {'metric': score, 'lr_before': before, 'lr_after': after,
-                'reduced': any(b > a for b, a in zip(before, after)),
-                'bad_checks': self.scheduler.num_bad_epochs if self.scheduler else 0}
-
-
 def parameter_group(name):
     if name.startswith('learned.'):
         part = name.split('.')[1]
-        if part == 'dec_trunk':
-            sub = name.split('.')[2]
-            if sub == 'refiners':
-                return 'xyz_refinement_layer_' + name.split('.')[3]
-            if sub == 'initial_xyz':
-                return 'xyz_initial_head'
-            if sub == 'memory_reads':
-                return 'decoder_memory_layer_' + name.split('.')[3]
-            if sub in ('xyz_readout','xyz_norms'):
-                return 'xyz_multidepth_head'
-            if sub == 'heads':
-                return 'covariance_head' if name.split('.')[3]=='logcov' else 'attribute_heads'
-            if sub == 'blocks':
-                return 'decoder_transformer_layer_'+name.split('.')[3]
-            return 'decoder_trunk_input_output'
-        if part == 'dec_xyz_center':
-            return 'xyz_center_head'
-        if part == 'dec_xyz_symbols':
-            return 'xyz_symbol_head'
-        if part == 'context_heads':
-            head = name.split('.')[2]
-            return ('xyz_context_head' if head == 'xyz' else
-                    'covariance_context_head' if head == 'logcov' else 'attribute_context_heads')
         if part == 'heads':
-            if name.split('.')[2] == 'logcov':
-                return 'covariance_head'
             return 'xyz_head' if name.split('.')[2] == 'xyz' else 'attribute_heads'
-        if part.startswith(('enc_geometry', 'enc_appearance', 'dec_geometry', 'dec_appearance')):
-            prefix, stream = part.split('_')[:2]
-            return stream + ('_encoder' if prefix == 'enc' else '_decoder')
-        if part in ('enc_exchange', 'dec_exchange'):
-            return 'encoder_exchange' if part == 'enc_exchange' else 'decoder_exchange'
         if part.startswith('dec'):
             return 'shared_decoder'
         if part in ('tier', 'snr'):

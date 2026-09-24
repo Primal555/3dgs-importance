@@ -119,21 +119,19 @@ class PositionDeliveryTests(unittest.TestCase):
         _,g,f,base=setup(16)
         batches=[(f.reshape(2,8,-1),torch.tensor([[1,0,2,3,1,2,3,0],[3,2,1,3,0,2,1,2]]))]
         first=explicit_model(base)
-        models=[first,copy.deepcopy(first),copy.deepcopy(first)]
+        second=copy.deepcopy(first)
         cameras=render_fixture.RenderFirstTests().cameras()
         losses=[]
         with patch('gaussian_jscc.rendering.render',side_effect=synthetic_render):
-            for mode,model in zip(('replay','checkpoint','direct'),models):
+            for mode,model in [('replay',first),('checkpoint',second)]:
                 torch.manual_seed(6)
                 task=MultiViewRenderTask(cameras,Reference(),0)
                 loss,_=full_scene_step(model,batches,g,10,'awgn',task,attr_weight=0,mode=mode)
                 losses.append(loss)
-        for loss,other in zip(losses[1:],models[1:]):
-            torch.testing.assert_close(losses[0],loss)
-            for (name,p),(_,v) in zip(first.named_parameters(),other.named_parameters()):
-                self.assertEqual(p.grad is None,v.grad is None)
-                if p.grad is not None:
-                    torch.testing.assert_close(p.grad,v.grad,atol=2e-6,rtol=2e-4,msg=name)
+        torch.testing.assert_close(*losses)
+        for (name,p),(_,v) in zip(first.named_parameters(),second.named_parameters()):
+            if p.grad is not None:
+                torch.testing.assert_close(p.grad,v.grad,atol=2e-6,rtol=2e-4,msg=name)
         self.assertGreater(float(first.learned.heads['dc'].weight.grad.norm()),0)
         self.assertIsNone(first.learned.heads['xyz'].weight.grad)
 

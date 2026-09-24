@@ -2,45 +2,25 @@
 
 ## Gaussian JSCC codec extension
 
-The [center-first / attribute adaptation / joint-render experiment](docs/center_attribute_training.md)
-is available as `python -m gaussian_jscc train-center-attributes` or
-`scripts/test_center_attribute_codec.sh`. It separates center and attribute
-networks, freezes centers during minibatch logcov/local-response attribute reconstruction
-(no scene rasterization), then unfreezes both for image-MSE refinement.
-This experiment is clean-only, not a JSCC result.
+### Active research baseline: reliable XYZ + render-only attribute JSCC
 
-An opt-in [center-decoder comparison](docs/center_decoder_comparison.md) pairs the
-current Transformer with the historical lightweight window-context XYZ decoder,
-using matched random shared weights, minibatches and center-only objectives.
-Run `scripts/test_center_decoder_comparison.sh`; the normal decoder default is unchanged.
+Mainline has been restored to **9f2810e** (2026-09-18), with its dedicated
+`scripts/train_quantized12_render_only.sh` launcher retained. Use this launcher
+for the current experiments: reliable 12-bit-per-axis coordinates, attribute JSCC,
+source-scene multiview RGB MSE only, LR 1e-4, replay, no attribute bootstrap or
+learned-center training. Coordinates remain quantized, not lossless float XYZ.
+The side stream currently assumes reliable delivery and charges its bit cost;
+no FEC or new lossless coordinate compression has been added.
 
-The [affine XYZ readout experiment](docs/center_affine_readout.md) replaces only
-center readout LayerNorm statistics with a learned per-channel affine transform.
-Run `scripts/test_center_affine_readout.sh` for 5000 center-only steps from random weights,
-with render diagnostics every 500 steps; internal Transformer Pre-LN is unchanged.
+See [current baseline and launch instructions](docs/quantized12_render_only.md).
+Later learned-center/Transformer/two-stage experiments remain in Git at
+`archive/learned-center-before-digital-xyz-20260924` (`e5d17e4`). Experimental
+output directories are not changed. Those newer checkpoints require their
+matching historical code; do not load them into this restored baseline.
 
-[Center interaction diagnostics](docs/center_interaction_diagnostics.md) combine fixed-target
-neighbor interventions, frozen-layer coordinate probes, and matched random-start block/self-only
-decoder attention training. Run `scripts/test_center_interaction.sh CHECKPOINT OUT`;
-the original codec checkpoint is never trained or overwritten by the diagnostics.
+### Other historical command-line modes
 
-The [5000-step self-only versus lightweight center comparison](docs/center_self_vs_light.md)
-runs `scripts/test_center_self_vs_light.sh`: random-start center-only training of both
-decoders, with overlaid raw/smoothed loss curves, CSV, render PSNR and coordinate metrics.
-
-The opt-in **representation-first / communication-second experiment** is available
-as `python -m gaussian_jscc train-representation`. It separates four independently
-parameterized modules, validates both the clean and communicated reconstruction,
-and supports frozen-representation adapter warmup followed by joint training.
-See [the experiment design and launch commands](docs/representation_communication.md).
-An opt-in [teacher-axis position-supervision test](docs/teacher_axis_experiment.md)
-uses `scripts/test_teacher_axis_representation.sh`; it keeps the architecture and
-attribute objectives, trains only the clean representation, and saves renders every 500 steps.
-`scripts/test_representation_codec.sh` starts from random weights with clean
-representation training only by default; subsequent communication stages require
-explicit quality gates. This does not replace the existing research baseline.
-
-The default codec is **fully learned joint JSCC**: XYZ and attributes share
+The generic CLI default remains **fully learned joint JSCC**: XYZ and attributes share
 a learned variable-length payload; the receiver jointly decodes local noisy
 features without source/predicted-coordinate grids. Each Gaussian has its own
 q0/q1/q2/q3 decision. There is no handcrafted coordinate reference, repetition,
@@ -65,58 +45,7 @@ random initializations with learned XYZ, reliable float32 XYZ, or reliable
 quantized XYZ. Extra coordinate bits are counted; this is not an equal-total-rate
 comparison and does not simulate error correction for that side stream.
 
-The preserved **quantized-12-bit, render-only** baseline remains available:
-`CUDA_VISIBLE_DEVICES=2 bash scripts/train_quantized12_render_only.sh`
-(choose a free GPU). It fixes LR=1e-4, all training views, zero bootstrap/joint
-steps and defaults to 5000 steps. See [historical snapshot and continuation commands](docs/quantized12_render_only.md).
-It retains replay backward and constant LR for historical comparisons.
-
-For the optional two-stage experiment, use
-`CUDA_VISIBLE_DEVICES=2 bash scripts/test_local_response.sh` (choose a free GPU).
-It starts from random weights with 12-bit/axis reliable XYZ, trains isolated
-Gaussian responses for 2000 steps, then full-scene rendering for 300 steps.
-Both learning rates are fixed at 2e-4 by default (`LR_SCHEDULE=constant`).
-Validation plateau decay remains explicit opt-in, not enabled for this experiment.
-The latest two-stage launcher uses **replay backward for full-scene rendering**;
-it recomputes codec batches with matching channel RNG to limit activation memory.
-Local-response pretraining uses ordinary backward without recomputation.
-Direct backward remains opt-in and exceeded memory in the full Truck experiment.
-There is no mixed mechanism or automatic fallback. LR events and per-step CUDA
-peak memory are logged. See
-[local-response objective, limitations and logs](docs/local_response_pretraining.md).
-This replaces attribute-wise weighted losses in pretraining, not the final
-scene-rendering objective; it does not yet establish improved rendering quality.
-
 The independent `benchmark_codec.py` and packet-only receiver remain available.
-An opt-in **geometry/appearance split codec** is now available with
-`--architecture learned_split`: sender-relative local attention, separate
-geometry/appearance decoder streams, and the same shared per-Gaussian payload.
-Run `CUDA_VISIBLE_DEVICES=2 bash scripts/test_split_codec_bootstrap.sh` on a free
-GPU for random bootstrap training followed by render history every 500 steps.
-Training files and evaluation results now share one experiment directory:
-render history lives in `EXPERIMENT/render_history/`. The offline evaluator also
-uses this location when `--out` is omitted, without overwriting existing results.
-This is experimental, not a demonstrated PSNR improvement. See
-[design, local checks and server commands](docs/split_codec_experiment.md).
-
-The opt-in `learned_split_logcov` experiment replaces separate scale/quaternion
-prediction with a symmetric log-covariance head and Frobenius shape supervision.
-Training renders its matrix exponential directly with `cov3D_precomp`; only
-no-gradient PLY export decomposes covariance into scales/rotation. Launch with
-`CUDA_VISIBLE_DEVICES=2 bash scripts/test_logcov_codec_bootstrap.sh` on a free GPU.
-Random start, individual 8/16/32-symbol tiers, no coordinate side stream, and
-nested `render_history/` are preserved. See
-[loss, representation boundaries, diagnostics and commands](docs/logcov_codec_experiment.md).
-
-For a separate **bootstrap-only learned XYZ experiment**, use
-`CUDA_VISIBLE_DEVICES=2 bash scripts/test_learned_xyz_bootstrap.sh`.
-It starts randomly, sends no per-point coordinate side stream, and jointly
-supervises XYZ/attributes with multiscale spatial responses; no camera loading
-or scene-render training runs. See [experimental loss, diagnostics and commands](docs/learned_xyz_bootstrap.md).
-To inspect saved bootstrap checkpoints every 500 steps without further training,
-use [offline render history evaluation](docs/bootstrap_render_history.md)
-(`evaluate_bootstrap_history.py`): fixed-camera images, source/photo PSNR/SSIM,
-PNG/SVG curves and CSV/JSON metrics, with read-only checkpoint verification.
 Training and evaluation export PNG/SVG charts, machine-readable logs and CSV data.
 The implementation adapts ROI-JSCC prefix transport and FCGS-inspired sender
 aggregation; upstream MaskGaussian scene training is unchanged.
@@ -292,29 +221,6 @@ bash scripts/run_baseline_comparison.sh \
 
 The GPU still performs all training and rendering. `--data_device cpu` only
 keeps source camera images in CPU memory to reduce VRAM use.
-
-## Experimental multiscale logcov JSCC
-
-Frozen noiseless baseline: branch `baseline/q3-noiseless-v1` at `1eccfc2`; [archive and full-scene position-path diagnosis](docs/q3_noiseless_baseline_and_position_diagnosis.md).
-
-Received-only block-center XYZ decoder experiment: [design, diagnostics and launch](docs/block_center_q3.md), `scripts/test_block_center_q3.sh`. Keeps q3/noiseless, logcov outputs and bootstrap loss unchanged.
-
-**Local screening first:** [matched decoder comparisons and current limitations](docs/xyz_decoder_local_screen.md). No tested decoder revision has passed the conservative multi-seed screen; do not treat the experimental launcher as a recommendation for long server training.
-
-Receiver feature-neighbor Transformer experiment: [architecture and protocol](docs/decoder_feature_transformer.md), `scripts/test_decoder_point_q3.sh`. Builds neighborhoods solely from received features, retaining the source-free receiver and unchanged payload/loss.
-
-Transformer **main-path** decoder with multi-depth XYZ readout: [design, local results and background launch](docs/transformer_trunk_decoder.md), `scripts/test_transformer_trunk_q3.sh`. Full attention within each codec block; fixed q3/noiseless, unchanged encoder/logcov/objective. Local two-seed runs improve total objective and held-out XYZ but worsen fitted XYZ; not yet a demonstrated render-quality improvement.
-
-Optional **per-layer received-memory rereading**: [design and matched evaluation](docs/received_memory_decoder.md), `scripts/test_received_memory_q3.sh`. Each decoder layer cross-attends to the same received-payload embeddings before self-attention; no localization token, extra transmission or loss change. The original trunk remains available unchanged.
-
-Fixed-q3 noiseless diagnostic (32 complex symbols, bootstrap only): [protocol and background launch](docs/q3_noiseless_bootstrap.md), `scripts/test_q3_noiseless_bootstrap.sh`.
-
-Encoder-only geometric-neighbor Transformer experiment: [design and background launch](docs/point_transformer_logcov.md), `scripts/test_point_transformer_logcov.sh`. Receiver, logcov objective and per-Gaussian symbol budgets remain unchanged.
-
-`scripts/test_multiscale_logcov_bootstrap.sh` runs the pointwise-self-path plus
-multiscale-context experiment. It preserves the existing logcov output,
-bootstrap objective and individual Gaussian symbol budgets; no render-training
-phase or coordinate side stream is added. See [design and launch instructions](docs/multiscale_logcov_codec.md).
 
 ## LICENSE
 

@@ -19,15 +19,6 @@ class CodecConfig:
     block_size: int = 256
     morton_bits: int = 16
     architecture: str = "learned_joint"
-    context_mode: str = 'window'
-    encoder_attention: str = 'window'
-    encoder_neighbors: int = 16
-    decoder_attention: str = 'window'
-    decoder_neighbors: int = 16
-    decoder_depth: int = 4
-    decoder_memory: str = 'none'
-    decoder_refinement: str = 'none'
-    xyz_decoder: str = 'additive'
     loss_profile: str = "learned_v1"
     position_head: str = "learned_affine"
     individual_tiers: bool = True
@@ -48,84 +39,20 @@ class CodecConfig:
     # Explicit diagnostic alternative; learned remains the unchanged default.
     position_delivery: str = 'learned'
     position_bits: int = 12
-    # Opt-in four-module experiment. Zero preserves existing codec identity.
-    representation_dim: int = 0
-    communication_depth: int = 2
-    # Nonzero selects independent center/attribute clean autoencoders.
-    center_latent_dim: int = 0
-    center_decoder_kind: str = 'transformer'
-    center_readout_norm: str = 'layernorm'
-    center_attention_scope: str = 'block'
 
     def __post_init__(self):
-        if self.center_attention_scope not in ('block', 'self'):
-            raise ValueError('unknown center_attention_scope')
-        if self.center_attention_scope != 'block' and (not self.center_latent_dim or self.center_decoder_kind != 'transformer'):
-            raise ValueError('self-only attention requires independent Transformer center decoder')
-        if self.center_readout_norm not in ('layernorm', 'affine'):
-            raise ValueError('unknown center_readout_norm')
-        if self.center_readout_norm != 'layernorm' and (not self.center_latent_dim or self.center_decoder_kind != 'transformer'):
-            raise ValueError('affine center readout requires independent Transformer center decoder')
-        if self.center_decoder_kind not in ('transformer', 'historical_light'):
-            raise ValueError('unknown center_decoder_kind')
-        if self.center_decoder_kind != 'transformer' and not self.center_latent_dim:
-            raise ValueError('historical_light requires independent center/attribute codec')
-        if not isinstance(self.center_latent_dim, int) or self.center_latent_dim < 0:
-            raise ValueError('center_latent_dim must be a nonnegative integer')
-        if self.center_latent_dim and not 0 < self.center_latent_dim < self.representation_dim:
-            raise ValueError('center latent must leave a positive independent attribute latent')
-        if not isinstance(self.representation_dim, int) or self.representation_dim < 0:
-            raise ValueError('representation_dim must be a nonnegative integer')
-        if not isinstance(self.communication_depth, int) or self.communication_depth < 1:
-            raise ValueError('communication_depth must be positive')
-        if self.representation_dim and (self.context_mode != 'multiscale_self' or
-                self.decoder_attention != 'transformer_trunk' or self.decoder_refinement != 'none' or
-                self.decoder_memory != 'none' or self.position_delivery != 'learned'):
-            raise ValueError('separated representation requires multiscale_self, plain transformer_trunk and learned XYZ')
-        if self.decoder_refinement not in ('none', 'progressive'):
-            raise ValueError('unknown decoder refinement')
-        if self.decoder_refinement != 'none' and (self.decoder_attention != 'transformer_trunk' or self.decoder_memory != 'none'):
-            raise ValueError('progressive refinement requires transformer_trunk and decoder_memory=none')
-        if self.decoder_memory not in ('none', 'received'):
-            raise ValueError('unknown decoder memory')
-        if self.decoder_memory != 'none' and self.decoder_attention != 'transformer_trunk':
-            raise ValueError('received memory requires transformer_trunk')
-        if self.decoder_attention not in ('window','feature_point','transformer_trunk'):
-            raise ValueError('unknown decoder attention')
-        if self.decoder_attention!='window' and self.context_mode!='multiscale_self':
-            raise ValueError('experimental decoder requires multiscale_self context')
-        if not isinstance(self.decoder_depth,int) or self.decoder_depth < 3:
-            raise ValueError('decoder_depth must be an integer >=3 for distinct XYZ readout depths')
-        if self.decoder_attention=='transformer_trunk' and self.xyz_decoder!='additive':
-            raise ValueError('transformer_trunk uses its own multi-depth XYZ readout; requires xyz_decoder=additive')
-        if not isinstance(self.decoder_neighbors,int) or self.decoder_neighbors<1:
-            raise ValueError('decoder_neighbors must be a positive integer')
-        if self.xyz_decoder not in ('additive','block_center','context_center','residual_center','symbol_skip'):
-            raise ValueError('unknown XYZ decoder')
-        if self.xyz_decoder != 'additive' and self.context_mode != 'multiscale_self':
-            raise ValueError('experimental XYZ decoders require multiscale_self context')
-        if self.encoder_attention not in ('window','geometric_point'):
-            raise ValueError('unknown encoder attention')
-        if self.encoder_attention == 'geometric_point' and self.context_mode != 'multiscale_self':
-            raise ValueError('geometric_point requires multiscale_self context')
-        if not isinstance(self.encoder_neighbors,int) or self.encoder_neighbors < 1:
-            raise ValueError('encoder_neighbors must be a positive integer')
-        if self.context_mode not in ('window','multiscale_self'):
-            raise ValueError('unknown context mode')
-        if self.context_mode == 'multiscale_self' and (self.architecture != 'learned_split_logcov' or self.position_delivery != 'learned'):
-            raise ValueError('multiscale_self requires learned_split_logcov and learned XYZ')
         if self.position_delivery not in ('learned', 'float32', 'quantized'):
             raise ValueError('position_delivery must be learned, float32 or quantized')
         if not isinstance(self.position_bits, int) or not 1 <= self.position_bits <= 16:
             raise ValueError('position_bits must be an integer in 1..16')
         self.rates, self.levels = tuple(self.rates), tuple(self.levels)
         self.geometry_rates = tuple(self.geometry_rates)
-        if self.architecture not in ('learned_joint', 'learned_split', 'learned_split_logcov'):
-            raise ValueError('Supported architectures: learned_joint, learned_split, learned_split_logcov')
+        if self.architecture != 'learned_joint':
+            raise ValueError('Only learned_joint is supported; use the historical Git revision for old codecs')
         if self.loss_profile != 'learned_v1' or self.position_head != 'learned_affine':
-            raise ValueError('learned codecs require learned_v1 and learned_affine')
+            raise ValueError('learned_joint requires learned_v1 and learned_affine')
         if not self.individual_tiers or self.geometry_rates or self.geometry_floor != 1e-4:
-            raise ValueError('learned codecs require individual tiers and no geometry sub-budget')
+            raise ValueError('learned_joint requires individual tiers and no geometry sub-budget')
         if len(self.rates) != 4 or self.rates[0] != 0 or any(
             a >= b for a,b in zip(self.rates,self.rates[1:])
         ) or any(int(r) != r for r in self.rates):
@@ -150,36 +77,10 @@ class CodecConfig:
 
     @property
     def attr_dim(self):
-        return (7 if self.architecture == 'learned_split_logcov' else 8) + 3 * (self.sh_degree + 1) ** 2
+        return 8 + 3 * (self.sh_degree + 1) ** 2
 
     def to_dict(self):
         result = asdict(self)
-        if not self.center_latent_dim:
-            result.pop('center_latent_dim')
-        if self.center_decoder_kind == 'transformer':
-            result.pop('center_decoder_kind')
-        if self.center_readout_norm == 'layernorm':
-            result.pop('center_readout_norm')
-        if self.center_attention_scope == 'block':
-            result.pop('center_attention_scope')
-        if not self.representation_dim:
-            result.pop('representation_dim')
-            result.pop('communication_depth')
-        if self.decoder_refinement == 'none':
-            result.pop('decoder_refinement')
-        if self.decoder_memory == 'none':
-            result.pop('decoder_memory')  # Preserve baseline checkpoint/packet hashes.
-        if self.decoder_attention!='transformer_trunk' and self.decoder_depth==4:
-            result.pop('decoder_depth')
-        if self.decoder_attention=='window' and self.decoder_neighbors==16:
-            result.pop('decoder_attention');result.pop('decoder_neighbors')
-        if self.xyz_decoder == 'additive':
-            result.pop('xyz_decoder')  # Existing checkpoint/packet hashes unchanged.
-        if self.encoder_attention == 'window' and self.encoder_neighbors == 16:
-            result.pop('encoder_attention')
-            result.pop('encoder_neighbors')  # Preserve existing model hashes.
-        if self.context_mode == 'window':
-            result.pop('context_mode')  # Preserve old checkpoint/packet hashes.
         if self.position_delivery == 'learned' and self.position_bits == 12:
             # Preserve existing v4 shared-model hashes exactly.
             result.pop('position_delivery')
@@ -188,8 +89,8 @@ class CodecConfig:
 
     @classmethod
     def from_dict(cls, values):
-        if values.get('architecture') not in ('learned_joint', 'learned_split', 'learned_split_logcov'):
-            raise ValueError('Supported checkpoints: learned_joint, learned_split, learned_split_logcov')
+        if values.get('architecture') != 'learned_joint':
+            raise ValueError('Only learned_joint checkpoints are supported; use historical Git for old codecs')
         return cls(**values)
 
 
@@ -346,27 +247,14 @@ class ContextBlock(nn.Module):
 
 
 class GaussianCodec(nn.Module):
-    """Shared transport for learned_joint and the opt-in learned_split experiment."""
+    """One learned architecture. Historical implementations live in Git history."""
     def __init__(self, cfg):
         super().__init__()
         from .learned_codec import LearnedCore
         self.cfg = cfg
         self.register_buffer("attr_mean", torch.zeros(cfg.attr_dim))
         self.register_buffer("attr_std", torch.ones(cfg.attr_dim))
-        if cfg.center_latent_dim:
-            from .center_attribute_codec import CenterAttributeCore
-            self.learned = CenterAttributeCore(cfg)
-        elif cfg.representation_dim:
-            from .representation_codec import RepresentationCommunicationCore
-            self.learned = RepresentationCommunicationCore(cfg)
-        elif cfg.context_mode == 'multiscale_self':
-            from .multiscale_codec import MultiScaleSelfCore
-            self.learned = MultiScaleSelfCore(cfg)
-        elif cfg.architecture in ('learned_split', 'learned_split_logcov'):
-            from .split_codec import SplitLearnedCore
-            self.learned = SplitLearnedCore(cfg)
-        else:
-            self.learned = LearnedCore(cfg)
+        self.learned = LearnedCore(cfg)
         if cfg.position_delivery != 'learned':
             # Keep identical initialization/RNG for the paired experiment, but
             # do not train the bypassed XYZ head or claim its gradients improve.
@@ -375,23 +263,6 @@ class GaussianCodec(nn.Module):
     def encode(self, features, xyz, q, snr):
         validate_tiers(q, len(features))
         return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
-
-    def reconstruct_clean(self, features, active=None):
-        """Internal representation reconstruction, NOT a transmitted payload."""
-        if not self.cfg.representation_dim:
-            raise ValueError('clean representation path requires a separated codec')
-        single = features.ndim == 2
-        if single:
-            features = features[None]
-            active = None if active is None else active[None]
-        if active is None:
-            active = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device)
-        if features.ndim != 3 or features.shape[-1] != self.cfg.attr_dim+3:
-            raise ValueError('clean features must be [N,D] or [B,N,D] with codec feature dimension')
-        if active.shape != features.shape[:2] or active.dtype != torch.bool or active.device != features.device:
-            raise ValueError('clean active mask must be boolean and match feature slots/device')
-        result = self.learned.clean(features, active)
-        return result[0] if single else result
 
     def decode(self, symbols, q, snr, return_seed=False, delivered_xyz=None):
         validate_tiers(q, len(q))

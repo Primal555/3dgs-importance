@@ -8,67 +8,6 @@ import unittest
 
 
 class LauncherTests(unittest.TestCase):
-    def test_received_memory_launcher(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','DECODER_MEMORY':'none','INIT':'missing.pt'},
-                           script='scripts/test_received_memory_q3.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--decoder-memory received','--decoder-attention transformer_trunk',
-                     '--bootstrap-tier 3','--channel none','--render-steps 0',
-                     '--bootstrap-steps 10000','--lr 0.0002','/run/render_history'):
-            self.assertIn(flag,result.stdout)
-        self.assertNotIn('--init ',result.stdout)
-
-    def test_transformer_trunk_launcher(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','DECODER_ATTENTION':'window',
-                            'XYZ_DECODER':'block_center','DECODER_DEPTH':'6','INIT':'missing.pt'},
-                           script='scripts/test_transformer_trunk_q3.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--decoder-attention transformer_trunk','--decoder-depth 6',
-                     '--xyz-decoder additive','--bootstrap-tier 3','--channel none',
-                     '--render-steps 0','--bootstrap-steps 10000','--save-every 500',
-                     '--lr 0.0002','--clip-mode none','/run/render_history'):
-            self.assertIn(flag,result.stdout)
-        self.assertNotIn('--init ',result.stdout)
-
-    def test_received_point_launcher_keeps_q3_noiseless_bootstrap(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','DECODER_ATTENTION':'window','XYZ_DECODER':'block_center'},
-                           script='scripts/test_decoder_point_q3.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--decoder-attention feature_point','--decoder-neighbors 16',
-                     '--xyz-decoder block_center','--bootstrap-tier 3','--channel none',
-                     '--render-steps 0','--bootstrap-steps 10000','/run/render_history'):
-            self.assertIn(flag,result.stdout)
-
-    def test_block_center_keeps_full_payload_noiseless_protocol(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','XYZ_DECODER':'additive'},
-                           script='scripts/test_block_center_q3.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--xyz-decoder block_center','--bootstrap-tier 3','--channel none',
-                     '--bootstrap-steps 10000','--lr 0.0002','--clip-mode none','/run/render_history'):
-            self.assertIn(flag,result.stdout)
-
-    def test_fixed_q3_noiseless_launcher_overrides_conflicting_environment(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','CHANNEL':'awgn','BOOTSTRAP_TIER':'1',
-                            'INIT':'missing.pt','VALIDATION_TRIALS':'2'},
-                           script='scripts/test_q3_noiseless_bootstrap.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--bootstrap-tier 3','--tier 3','--bootstrap-steps 10000',
-                     '--encoder-attention geometric_point','--rates 0 8 16 32','--render-steps 0',
-                     '--channel none','--trials 1','/run/render_history'):
-            self.assertIn(flag,result.stdout)
-        self.assertEqual(result.stdout.count('--channel none'),2)
-        self.assertNotIn('--init ',result.stdout)
-
-    def test_multiscale_logcov_keeps_bootstrap_only_and_nested_history(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt','RENDER_STEPS':'1000'},
-                           script='scripts/test_multiscale_logcov_bootstrap.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--context-mode multiscale_self','--architecture learned_split_logcov',
-                     '--bootstrap-objective spatial-response','--render-steps 0','--joint-steps 0',
-                     '--rates 0 8 16 32','--lr 0.0002','--clip-mode none','/run/render_history'):
-            self.assertIn(flag,result.stdout)
-        self.assertNotIn('--init ',result.stdout)
-
     def launch(self, overrides=None, script='scripts/test_render_first.sh'):
         bash = 'C:/softwares/Git/bin/bash.exe' if os.name=='nt' else shutil.which('bash')
         if not bash or not Path(bash).exists():
@@ -80,9 +19,7 @@ class LauncherTests(unittest.TestCase):
             (folder/'sparse').mkdir()
             (folder/'codec.pt').touch()
             env=os.environ.copy()
-            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES',
-                        'LR','RENDER_LR','LR_SCHEDULE','RENDER_BACKWARD','BLOCKS_PER_BATCH','BOOTSTRAP_TIER','XYZ_DECODER',
-                        'DECODER_ATTENTION','DECODER_NEIGHBORS','DECODER_DEPTH','DECODER_MEMORY'):
+            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES'):
                 env.pop(key,None)
             env.update(PYTHON_BIN='/bin/echo',PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
             env.update(overrides or {})
@@ -119,87 +56,6 @@ class LauncherTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('Set CUDA_VISIBLE_DEVICES',result.stderr)
 
-    def test_pure_render_baseline_requires_gpu(self):
-        result=self.launch(script='scripts/train_quantized12_render_only.sh')
-        self.assertNotEqual(result.returncode,0)
-        self.assertIn('Set CUDA_VISIBLE_DEVICES',result.stderr)
-
-    def test_pure_render_baseline_ignores_two_stage_environment(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'1','BOOTSTRAP_STEPS':'2000',
-                            'BOOTSTRAP_OBJECTIVE':'local-response','JOINT_STEPS':'100',
-                            'RENDER_LR':'0.00001','TRAIN_VIEWS':'12','POSITION_DELIVERY':'learned',
-                            'POSITION_BITS':'8','CLIP_MODE':'global','INIT':'missing.pt'},
-                           script='scripts/train_quantized12_render_only.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--bootstrap-steps 0','--joint-steps 0','--render-steps 5000',
-                     '--position-delivery quantized','--position-bits 12','--render-lr 0.0001',
-                     '--train-views 0','--clip-mode none','--blocks-per-batch 64'):
-            self.assertIn(flag,result.stdout)
-        self.assertNotIn('--init ',result.stdout)
-        self.assertNotIn('local-response',result.stdout)
-
-    def test_pure_render_weight_continuation_is_explicit(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'1','INITIALIZATION':'checkpoint',
-                            'INIT':'fixture','RENDER_STEPS':'4000'},
-                           script='scripts/train_quantized12_render_only.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertIn('--init ',result.stdout)
-        self.assertIn('--render-steps 4000',result.stdout)
-        self.assertIn('NOT exact resume',result.stdout)
-        rejected=self.launch({'CUDA_VISIBLE_DEVICES':'1','INITIALIZATION':'checkpoint'},
-                             script='scripts/train_quantized12_render_only.sh')
-        self.assertNotEqual(rejected.returncode,0)
-
-    def test_local_response_two_stage_launcher(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'nonexistent.pt'},
-                           script='scripts/test_local_response.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--bootstrap-steps 2000','--render-steps 300',
-                     '--bootstrap-objective local-response','--position-delivery quantized',
-                     '--position-bits 12','--lr 0.0002','--render-lr 0.0002','--joint-steps 0',
-                     '--render-backward replay','--lr-schedule constant','--lr-patience 3'):
-            self.assertIn(flag,result.stdout)
-        self.assertNotIn('--init ',result.stdout)
-        self.assertNotEqual(self.launch(script='scripts/test_local_response.sh').returncode,0)
-
-    def test_render_continuation_from_bootstrap(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INITIALIZATION':'checkpoint',
-                            'INIT':'fixture','BOOTSTRAP_STEPS':'0','RENDER_STEPS':'1000',
-                            'POSITION_DELIVERY':'quantized','POSITION_BITS':'12',
-                            'BLOCKS_PER_BATCH':'64','JOINT_STEPS':'0'},
-                           script='scripts/train_codec_learned.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--init ', '--bootstrap-steps 0','--render-steps 1000',
-                     '--position-delivery quantized','--position-bits 12',
-                     '--blocks-per-batch 64','--render-backward replay',
-                     '--lr 0.0002','--render-lr 0.0002','--lr-schedule constant'):
-            self.assertIn(flag,result.stdout)
-
-    def test_direct_remains_explicit_opt_in(self):
-        result=self.launch({'RENDER_BACKWARD':'direct'},script='scripts/train_codec_learned.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertIn('--render-backward direct',result.stdout)
-
-    def test_lr_settings_can_be_overridden(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','LR_PATIENCE':'5',
-                            'LR_FACTOR':'0.3','MIN_LR':'0.000002'},script='scripts/test_local_response.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--lr-patience 5','--lr-factor 0.3','--min-lr 0.000002'):
-            self.assertIn(flag,result.stdout)
-
-    def test_learned_xyz_isolated_bootstrap(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt',
-                            'INITIALIZATION':'checkpoint','POSITION_DELIVERY':'quantized',
-                            'RENDER_STEPS':'1000','JOINT_STEPS':'100','LR_SCHEDULE':'plateau'},
-                           script='scripts/test_learned_xyz_bootstrap.sh')
-        self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--position-delivery learned','--bootstrap-objective spatial-response',
-                     '--bootstrap-steps 5000','--render-steps 0','--joint-steps 0',
-                     '--lr 0.0002','--lr-schedule constant','--clip-mode none','--spatial-fine-weight 1'):
-            self.assertIn(flag,result.stdout)
-        self.assertNotIn('--init ',result.stdout)
-        self.assertNotIn('--source ',result.stdout)
-
     def test_position_comparison_forces_three_random_render_only_runs(self):
         result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INITIALIZATION':'checkpoint',
                             'INIT':'nonexistent.pt','BOOTSTRAP_STEPS':'2000','JOINT_STEPS':'100'},
@@ -212,51 +68,27 @@ class LauncherTests(unittest.TestCase):
         for mode in ('learned','float32','quantized'):
             self.assertIn('--position-delivery '+mode,result.stdout)
 
-    def test_split_codec_random_bootstrap_then_fixed_render_history(self):
-        result = self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt',
-                              'ARCHITECTURE':'learned_joint','POSITION_DELIVERY':'quantized',
-                              'BOOTSTRAP_STEPS':'1000','SAVE_EVERY':'500'},
-                             script='scripts/test_split_codec_bootstrap.sh')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        for flag in ('--architecture learned_split','--position-delivery learned',
-                     '--bootstrap-steps 1000','--render-steps 0','--lr 0.0002',
-                     'evaluate_bootstrap_history.py','--start 500 --stop 1000 --every 500',
-                     '--resolution 4','--channel awgn'):
-            self.assertIn(flag, result.stdout)
-        self.assertNotIn('--init ', result.stdout)
-        self.assertIn('/run/render_history', result.stdout)
-        self.assertNotIn('/run_render_history', result.stdout)
-
-    def test_split_codec_requires_gpu_and_valid_history_steps(self):
-        result = self.launch(script='scripts/test_split_codec_bootstrap.sh')
-        self.assertNotEqual(result.returncode, 0)
-        result = self.launch({'CUDA_VISIBLE_DEVICES':'2','BOOTSTRAP_STEPS':'650'},
-                             script='scripts/test_split_codec_bootstrap.sh')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('positive multiple', result.stderr)
-
-    def test_logcov_launcher_is_random_and_evaluates_inside_experiment(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'missing.pt',
-                            'ARCHITECTURE':'learned_joint','POSITION_DELIVERY':'quantized',
-                            'BOOTSTRAP_STEPS':'1000','SAVE_EVERY':'500'},
-                           script='scripts/test_logcov_codec_bootstrap.sh')
+    def test_restored_quantized_baseline_locked_parameters(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2', 'INIT':'obsolete.pt',
+                            'BOOTSTRAP_STEPS':'5000', 'JOINT_STEPS':'1000',
+                            'RENDER_LR':'0.002', 'POSITION_DELIVERY':'learned'},
+                           script='scripts/train_quantized12_render_only.sh')
         self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--architecture learned_split_logcov','--position-delivery learned',
-                     '--bootstrap-steps 1000','--render-steps 0','--lr 0.0002',
-                     '--clip-mode none','--channel awgn','--snr 10',
-                     '--start 500 --stop 1000 --every 500','/run/render_history'):
-            self.assertIn(flag,result.stdout)
+        for argument in ('--position-delivery quantized', '--position-bits 12',
+                         '--bootstrap-steps 0', '--joint-steps 0', '--render-lr 0.0001',
+                         '--render-backward replay', '--rates 0 8 16 32',
+                         '--snr 10', '--channel awgn', '--clip-mode none'):
+            self.assertIn(argument,result.stdout)
         self.assertNotIn('--init ',result.stdout)
 
-    def test_point_transformer_launcher_preserves_experiment_contract(self):
-        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','BOOTSTRAP_STEPS':'1000'},
-                           script='scripts/test_point_transformer_logcov.sh')
+    def test_restored_quantized_checkpoint_and_steps_override(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INITIALIZATION':'checkpoint',
+                            'INIT':'fixture','RENDER_STEPS':'20000'},
+                           script='scripts/train_quantized12_render_only.sh')
         self.assertEqual(result.returncode,0,result.stderr)
-        for flag in ('--encoder-attention geometric_point','--encoder-neighbors 16',
-                     '--context-mode multiscale_self','--architecture learned_split_logcov',
-                     '--lr 0.0002','--render-steps 0','--joint-steps 0','/run/render_history'):
-            self.assertIn(flag,result.stdout)
-        self.assertNotIn('--init ',result.stdout)
+        self.assertIn('--init ',result.stdout)
+        self.assertIn('--render-steps 20000',result.stdout)
+        self.assertIn('NOT exact resume',result.stdout)
 
 
 if __name__=='__main__':

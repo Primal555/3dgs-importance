@@ -1,9 +1,8 @@
-"""Batched full-scene training with direct or recomputed codec backward.
+"""Batched full-scene training with bounded codec activation memory.
 
 Replay applies the chain rule at the reconstructed-scene tensor. It does not
 subsample Gaussians, cache stale predictions, or change the render objective.
 Only one batch's codec activations is live during replay backward.
-Direct keeps all codec graphs, streams camera gradients, and never re-encodes.
 """
 
 import time
@@ -12,7 +11,7 @@ import torch
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .data import to_scene
+from .data import to_raw
 from .losses import reconstruction_loss
 
 
@@ -41,7 +40,7 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
     keep = q > 0
     pred, seed, target = pred[keep], seed[keep], features[keep]
     if len(pred) == 0:
-        result = (to_scene(pred, geometry, model), pred.sum())
+        result = (to_raw(pred, geometry, model), pred.sum())
         return (*result, {'geometry': pred.sum()}) if return_metrics else result
     if compute_auxiliary:
         auxiliary, terms = reconstruction_loss(pred, target, geometry, model, seed, seed_weight, return_terms=True)
@@ -49,7 +48,7 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
         # Render-only training must not even evaluate the historical parameter
         # objective (zero times an invalid auxiliary could still produce NaN).
         auxiliary, terms = pred.sum() * 0, {}
-    result = (to_scene(pred, geometry, model), auxiliary)
+    result = (to_raw(pred, geometry, model), auxiliary)
     return (*result, {key: value.mean() for key, value in terms.items()}) if return_metrics else result
 
 
@@ -67,8 +66,8 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
     not mutate .grad, parameters, or RNG. Summed observations are full-scene
     parameter gradients (the render objective here is its exact VJP surrogate).
     """
-    if mode not in ("direct", "replay", "checkpoint"):
-        raise ValueError("render backward must be direct, replay or checkpoint")
+    if mode not in ("replay", "checkpoint"):
+        raise ValueError("render backward must be replay or checkpoint")
     if gradient_observer is not None and mode != "replay":
         raise ValueError("gradient observer requires replay")
     device = next(model.parameters()).device
@@ -92,10 +91,8 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
                           else torch.get_rng_state())
             with torch.no_grad():
                 raw, aux, metrics = forward(features, q)
-        elif mode == "checkpoint":
-            raw, aux, metrics = checkpoint(forward, features, q, use_reentrant=False, preserve_rng_state=True)
         else:
-            raw, aux, metrics = forward(features, q)
+            raw, aux, metrics = checkpoint(forward, features, q, use_reentrant=False, preserve_rng_state=True)
         rows.append(raw)
         counts.append(len(raw))
         auxiliary.append(aux * len(raw))
@@ -104,23 +101,31 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
     total_count = sum(counts)
     if total_count == 0:
         raise ValueError("cannot render an all-dropped scene")
-    codec_scene = torch.cat(rows)
+    scene = torch.cat(rows)
     del rows
-    # Split at the scene tensor, but retain the ORIGINAL codec graph in direct
-    # mode. Streaming camera backward then needs only one rasterizer graph.
-    scene = codec_scene.detach().requires_grad_(True) if mode != "checkpoint" else codec_scene
+    if mode == "replay":
+        scene.requires_grad_(True)
     aux_loss = torch.stack(auxiliary).sum() / total_count
     timer.mark("codec_forward_seconds")
-    streamed = mode != 'checkpoint' and hasattr(distortion_fn, 'backward_scene')
+    streamed = mode == 'replay' and hasattr(distortion_fn, 'backward_scene')
     # A multiview task can accumulate dL/d(scene) one camera at a time, freeing
-    # each rasterizer graph before the next camera. Direct never replays codec.
+    # each rasterizer graph before the next camera. The codec is replayed once.
     distortion = distortion_fn.backward_scene(scene) if streamed else distortion_fn(scene)
     loss = distortion + attr_weight * aux_loss
     if not torch.isfinite(loss):
         raise RuntimeError("nonfinite render loss")
     timer.mark("render_forward_seconds")
 
-    def replay_backward():
+    if mode == "checkpoint":
+        loss.backward()
+        timer.mark("combined_backward_seconds")
+    else:
+        if not streamed:
+            distortion.backward()
+        upstream = scene.grad.detach()
+        if not torch.isfinite(upstream).all():
+            raise RuntimeError('nonfinite rendered-scene gradient; no optimizer step performed')
+        timer.mark("render_backward_seconds")
         # Restore the caller's RNG after replay: recomputation must not consume
         # another set of channel draws or change subsequent tier sampling.
         devices = [device.index if device.index is not None else torch.cuda.current_device()] \
@@ -146,31 +151,9 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
                 objective.backward()
                 offset += count
         timer.mark("codec_replay_backward_seconds")
-
-    if mode == "checkpoint":
-        loss.backward()
-        timer.mark("combined_backward_seconds")
-    else:
-        if not streamed:
-            distortion.backward()
-        upstream = scene.grad.detach()
-        if not torch.isfinite(upstream).all():
-            raise RuntimeError('nonfinite rendered-scene gradient; no optimizer step performed')
-        timer.mark("render_backward_seconds")
-        if mode == "direct":
-            outputs, gradients = [codec_scene], [upstream]
-            if attr_weight != 0:
-                outputs.append(attr_weight * aux_loss)
-                gradients.append(None)
-            torch.autograd.backward(outputs, gradients)
-            timer.mark("codec_backward_seconds")
-        else:
-            replay_backward()
-
     values = {"render_loss": float(distortion.detach()), "aux_loss": float(aux_loss.detach()),
-              "retained_gaussians": total_count, "codec_batches": len(batches),
-              "render_backward": mode, **timer.values}
-    if mode != 'checkpoint':
+              "retained_gaussians": total_count, "codec_batches": len(batches), **timer.values}
+    if mode == 'replay':
         values['scene_gradient_norms'] = {'xyz': float(upstream[:, :3].norm()),
                                          'attributes': float(upstream[:, 3:].norm())}
     values.update({f"{key}_loss": float(value / total_count) for key, value in metric_sums.items()})

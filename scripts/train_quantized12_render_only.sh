@@ -36,7 +36,6 @@ exec "$PYTHON_BIN" -u -m gaussian_jscc train-learned \
   --bootstrap-steps 0 --render-steps "${RENDER_STEPS:-5000}" --joint-steps 0 \
   --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-64}" \
   --rates 0 8 16 32 --lr 0.0001 --render-lr 0.0001 --drop 0 --clip-mode none \
-  --lr-schedule constant \
   --render-backward replay --training-data-device cpu --resolution 2 \
   --train-views 0 --views-per-step 2 \
   --validate-every "${VALIDATE_EVERY:-500}" --validation-views 4 --validation-trials 2 \

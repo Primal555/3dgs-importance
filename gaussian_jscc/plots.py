@@ -138,67 +138,6 @@ def plot_training(training_dir, output_dir=None):
     charts = []
     plt = _plt()
 
-    if rows[0].get('objective') in ('spatial_response_v1', 'spatial_response_v2', 'spatial_response_v3', 'spatial_logcov_v1'):
-        validation_rows = _read_jsonl(training_dir / 'bootstrap_validation.jsonl')
-        entries = [dict(entry,step=r['step']) for r in validation_rows for entry in r['layouts']]
-        fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-        fig.suptitle('Learned XYZ bootstrap: fixed validation blocks\nBlock/trial means; no coordinate side stream or scene rendering')
-        fields = (('loss','Spatial response loss'),('xyz_nrmse_bbox','XYZ RMSE / bbox diagonal'),
-                  ('xyz_distance_p95_world','Mean block P95 point distance (world units)'),
-                  ('spatial_appearance_response','Appearance response error'))
-        for axis, (key,label) in zip(axes.flat,fields):
-            for tier,color,style in zip(('1','2','3','mixed'),
-                                        (TIER_COLORS[1],TIER_COLORS[2],TIER_COLORS[3],REFERENCE),
-                                        ('-','--','-.',':')):
-                group = [r for r in entries if r['layout']==tier]
-                axis.plot([r['step'] for r in group],_numeric(group,key),style,color=color,label='q'+tier)
-            axis.set(xlabel='Bootstrap step',ylabel=label)
-            axis.legend(fontsize=8)
-        charts += _finish(fig,out/'bootstrap_position_validation')
-        _write_csv(out/'bootstrap_position_validation.csv',entries,
-                   ['step','layout','loss','xyz_rmse_world','xyz_nrmse_bbox',
-                    'xyz_distance_p50_world','xyz_distance_p95_world','spatial_geometry_response',
-                    'spatial_appearance_response','symbols_per_gaussian','position_side_stream_bits',
-                    'spatial_position_response','spatial_native_shape_response','spatial_logcov_shape_mse',
-                    'decoded_anisotropy_p50','source_anisotropy_p50','decoded_near_sphere_fraction',
-                    'spatial_coarse_position_response','spatial_fine_position_response',
-                    'spatial_fine_weight','spatial_fine_contribution',
-                    'max_axis_ratio_p05','max_axis_ratio_p50','max_axis_ratio_p95',
-                    'max_axis_ratio_gt10_fraction','max_axis_ratio_lt0_1_fraction',
-                    'decoded_max_axis_p50_world','source_max_axis_p50_world',
-                    'xyz_distance_over_source_radius_p50','decoded_alpha_p50',
-                    'block_xyz_common_mse','block_xyz_relative_mse'])
-        if any('block_xyz_common_mse' in r for r in entries):
-            fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-            fig.suptitle('XYZ error decomposition: fixed validation blocks\nEqual block/trial means, world units squared; diagnostic only')
-            for axis, key, label in zip(axes, ('block_xyz_common_mse','block_xyz_relative_mse'),
-                                        ('Common translation MSE','Within-block relative MSE')):
-                for tier in ('1','2','3','mixed'):
-                    group = [r for r in entries if r['layout']==tier]
-                    if group:
-                        axis.plot([r['step'] for r in group],_numeric(group,key),label='q'+tier)
-                axis.set(xlabel='Bootstrap step',ylabel=label)
-                axis.legend(fontsize=8)
-            charts += _finish(fig,out/'bootstrap_xyz_decomposition')
-        if rows[0].get('objective') == 'spatial_logcov_v1':
-            fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-            fig.suptitle('Log-covariance: fixed-block shape diagnostics (not render quality)')
-            fields = (('spatial_logcov_shape_mse','Physical log-covariance Frobenius MSE / 9'),
-                      ('decoded_anisotropy_p50','Decoded max/min axis ratio: mean block median'),
-                      ('decoded_near_sphere_fraction','Decoded max/min axis ratio < 1.5: fraction'),
-                      ('max_axis_ratio_p50','Decoded/source max radius: mean block median'))
-            for axis, (key, label) in zip(axes.flat, fields):
-                for tier in ('1','2','3','mixed'):
-                    group = [r for r in entries if r['layout']==tier]
-                    axis.plot([r['step'] for r in group],_numeric(group,key),label='q'+tier)
-                if key == 'decoded_anisotropy_p50':
-                    teacher = [r for r in entries if r['layout']=='3']
-                    axis.plot([r['step'] for r in teacher],_numeric(teacher,'source_anisotropy_p50'),
-                              '--',color=REFERENCE,label='Source')
-                axis.set(xlabel='Bootstrap step',ylabel=label)
-                axis.legend(fontsize=8)
-            charts += _finish(fig,out/'bootstrap_logcov_shape')
-
     segments = _phase_segments(rows)
     fig, axes = plt.subplots(2, len(segments), figsize=(6 * len(segments), 7), squeeze=False)
     fig.suptitle("Training objectives by phase\nIndependent axes; smoothing stays within each phase", fontsize=12)
@@ -274,18 +213,6 @@ def plot_training(training_dir, output_dir=None):
                                  [r['updates'][group]['relative_update'] for r in selected], linewidth=.8)
             axes[1,col].set(xlabel='Step', ylabel='Relative parameter update', yscale='symlog')
         charts += _finish(fig, out / 'training_gradient_groups')
-
-    gate_rows = [r for r in rows if r.get('context_gates')]
-    if gate_rows:
-        fig,axis = plt.subplots(figsize=(9,4))
-        for key in gate_rows[0]['context_gates']:
-            axis.plot([r['step'] for r in gate_rows],[r['context_gates'][key] for r in gate_rows],label=key)
-        axis.set(title='Learned context gates | not loss weights or importance scores',
-                 xlabel='Optimization step',ylabel='tanh(gate)',ylim=(-1.05,1.05))
-        axis.legend()
-        charts += _finish(fig,out/'training_context_gates')
-        flattened = [dict(step=r['step'],**r['context_gates']) for r in gate_rows]
-        _write_csv(out/'training_context_gates.csv',flattened,list(flattened[0]))
 
     position_path = training_dir / 'position_evaluation.json'
     if position_path.exists():

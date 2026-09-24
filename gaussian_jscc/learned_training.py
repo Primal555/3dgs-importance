@@ -29,8 +29,8 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
     Rate is the exact expected payload cost, averaged over SOURCE primitives.
     beta is a Lagrange penalty, NOT a guarantee of a hard total-symbol cap.
     """
-    if model.cfg.architecture not in ('learned_joint', 'learned_split', 'learned_split_logcov') or samples < 2:
-        raise ValueError('requires learned_joint/learned_split and >=2 independent mask samples')
+    if model.cfg.architecture != 'learned_joint' or samples < 2:
+        raise ValueError('requires learned_joint and >=2 independent mask samples')
     device = next(model.parameters()).device
     log_probs, costs, all_stats, expectations, compositions = [], [], [], [], []
     source_count = sum(int((ids >= 0).sum()) for ids in id_batches)
