@@ -38,6 +38,11 @@ def add_parser(sub):
                    help='XYZ tap readout only; affine preserves feature mean/scale, internal Pre-LN unchanged')
     p.add_argument('--center-attention-scope', choices=['block', 'self'], default='block',
                    help='center decoder only; self retains V/output projections but disables cross-token attention')
+    p.add_argument('--center-step-guard', action='store_true',
+                   help='joint encoder/decoder Adam direction check and same-batch step backtracking; center phase only')
+    p.add_argument('--center-max-backtracks', type=int, default=8)
+    p.add_argument('--center-guard-warn-after', type=int, default=50)
+    p.add_argument('--center-guard-stop-after', type=int, default=200)
     p.add_argument('--center-probe-blocks', type=int, default=0,
                    help='fixed training-block diagnostics and sampled-block audit; zero disables')
     p.add_argument('--center-drift-every', type=int, default=0,
@@ -64,6 +69,10 @@ def add_parser(sub):
 
 
 def check_args(args):
+    if args.center_max_backtracks < 0:
+        raise ValueError('center-max-backtracks must be nonnegative')
+    if not 1 <= args.center_guard_warn_after <= args.center_guard_stop_after:
+        raise ValueError('require 1 <= guard-warn-after <= guard-stop-after')
     if not args.ply or not args.out:
         raise ValueError('--ply and --out are required')
     if args.center_steps < 1 or min(args.attribute_steps, args.joint_steps) < 0:
@@ -165,6 +174,8 @@ def train(args):
     from .rendering import load_cameras, RenderReference
     resumed = torch.load(args.resume, map_location='cpu', weights_only=True) if args.resume else None
     if resumed:
+        if resumed.get('config', {}).get('center_position_layout', 'absolute') != 'absolute':
+            raise ValueError('explicit block-centroid checkpoints cannot resume into pointwise absolute XYZ; start a new run')
         if resumed.get('format') != 'center_attribute_training_v2':
             raise ValueError('resume requires center_attribute_training_v2 (local attribute loss); '
                              'v1 used render-MSE in B and must resume with commit fdbbc35, not silently change objectives')
@@ -179,6 +190,10 @@ def train(args):
             args.center_attention_scope = 'block'
         if not hasattr(args, 'center_drift_every'):
             args.center_drift_every = 0
+        for key, default in dict(center_step_guard=False, center_max_backtracks=8,
+                                 center_guard_warn_after=50, center_guard_stop_after=200).items():
+            if not hasattr(args, key):
+                setattr(args, key, default)
         print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
     check_args(args)
     seed_all(args.seed)
@@ -202,6 +217,8 @@ def train(args):
     model = GaussianCodec(cfg).to(device)
     print(f'Center decoder: {args.center_decoder_kind}; XYZ readout: {args.center_readout_norm}; '
           f'attention scope: {args.center_attention_scope}; internal Transformer normalization unchanged.', flush=True)
+    print('Position: per-point absolute XYZ; no block-centroid branch. '
+          f'Joint directional step guard: {args.center_step_guard}.', flush=True)
     if resumed:
         if fingerprint != resumed['fingerprint'] or cfg.to_dict() != resumed['config']:
             raise ValueError('resume scene or configuration differs')
@@ -239,6 +256,9 @@ def train(args):
         'center_readout_norm': args.center_readout_norm,
         'center_attention_scope': args.center_attention_scope,
         'center_drift_every': args.center_drift_every,
+        'position_structure': 'pointwise absolute XYZ, restored from 52edc1c; no centroid/residual split',
+        'center_step_guard': args.center_step_guard,
+        'center_guard_mode': 'pointwise_joint_directional' if args.center_step_guard else None,
         'center_decoder_parameters': sum(p.numel() for p in model.learned.center_decoder.parameters()),
         'center_encoder_parameters': sum(p.numel() for p in model.learned.center_encoder.parameters()),
         'center_loss': 'mean(sqrt(||XYZ_pred-XYZ_source||_world^2 + tau^2)-tau); no axis/bbox denominator',
@@ -336,6 +356,7 @@ def train(args):
         reason = state['end_reason'] or 'budget_cap'
         while state['phase_step'] < maximum and not state['end_reason']:
             started = time.perf_counter()
+            guard_stopped = False
             drift_due = drift is not None and phase == 'center' and (
                 state['phase_step'] == 0 or (state['step']+1) % args.center_drift_every == 0)
             profile = state['phase_step'] == 0 or (state['step']+1) % args.profile_every == 0 or drift_due
@@ -381,7 +402,23 @@ def train(args):
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.clip_norm, error_if_nonfinite=True)
             before = {name: [p.detach().clone() for p in params] for name, params in modules.items()} if profile else {}
             xyz_before = drift.capture(keep_latents=True) if drift_due else None
-            optimizer.step()
+            if phase == 'center' and args.center_step_guard:
+                from .center_step_guard import directional_guarded_step, update_rejection_streak
+                def same_batch_loss():
+                    candidate = model.learned.centers(f[..., :3], active)
+                    return center_loss(candidate[active], f[..., :3][active], geometry, args.center_smoothing)
+                guard = directional_guarded_step(optimizer, same_batch_loss, loss.detach(), args.center_max_backtracks)
+                guard['mode'] = 'pointwise_joint_directional'
+                warned, guard_stopped = update_rejection_streak(state, guard,
+                    args.center_guard_warn_after, args.center_guard_stop_after)
+                guard['rejection_streak'] = state['guard_rejection_streak']
+                stats['step_guard'] = guard
+                if warned:
+                    print(f'WARNING: {guard["rejection_streak"]} consecutive rejected center updates.', flush=True)
+                if guard_stopped:
+                    print('STOP: center guard stalled; saving diagnostics, not claiming convergence.', flush=True)
+            else:
+                optimizer.step()
             if not torch.stack([torch.isfinite(p).all() for p in model.parameters()]).all():
                 raise FloatingPointError('nonfinite parameters; recover previous training_state.pt')
             state['step'] += 1
@@ -402,13 +439,17 @@ def train(args):
                 row['module_updates'] = {name: norm([p.detach()-v for p, v in zip(params, before[name])]) for name, params in modules.items()}
                 if drift_due:
                     drift.after_step(state['step'], xyz_before, gradients, row['module_updates'], row['lrs'], clip)
-                print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, sec={row["seconds"]:.2f}', flush=True)
+                guard = stats.get('step_guard')
+                suffix = (f', post_loss={guard["loss_after"]:.6g}, step_scale={guard["scale"]:g}, '
+                          f'momentum_restart={guard["momentum_restarted"]}') if guard else ''
+                print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, '
+                      f'sec={row["seconds"]:.2f}{suffix}', flush=True)
             append_json(out/'loss.jsonl', row)
             images_due = state['step'] % args.render_every == 0 or state['phase_step'] == maximum
-            due = state['step'] % args.validate_every == 0 or images_due
+            due = state['step'] % args.validate_every == 0 or images_due or guard_stopped
             switch = False
             if due:
-                result = observe(images=images_due)
+                result = observe(images=images_due or guard_stopped)
                 if phase == 'center' and state['phase_step'] >= args.min_center_steps and center_ready(result, args):
                     switch = True
                     reason = 'center_render_gate' if result['render'] else 'center_world_rmse_diagnostic_gate'
@@ -420,18 +461,21 @@ def train(args):
                     switch, reason = True, 'joint_validation_plateau'
                 if images_due:
                     plot_run(out)
-            if switch or state['phase_step'] == maximum:
+            if guard_stopped:
+                state['status'] = 'guard_stalled'
+                reason = 'center_guard_stalled'
+            if switch or state['phase_step'] == maximum or guard_stopped:
                 state['end_reason'] = reason
             if due or state['step'] % args.save_every == 0:
                 save(optimizer)
-            if switch:
+            if switch or guard_stopped:
                 break
         # Choose by fixed validation, not the last noisy minibatch. Save exact
         # latest recovery state before rolling weights back to the selected model.
         if state['last_validation']['step'] != state['step']:
             observe(images=True)
         save(optimizer)
-        if phase == 'center' and drift is not None:
+        if phase == 'center' and (drift is not None or args.center_step_guard):
             # Retain matching LAST weights + Adam before best-weight selection
             # and final state saves replace the optimizer with None.
             shutil.copy2(out/'training_state.pt', out/'training_state_last_center.pt')
@@ -448,6 +492,8 @@ def train(args):
                 (args.center_max_world_rmse is not None and state['best'][phase] <= args.center_max_world_rmse)
         if phase == 'attribute' and args.joint_steps:
             passed, gain = attribute_ready(state['initial_attribute_loss'], state['best'][phase], args)
+        if state['status'] == 'guard_stalled':
+            passed = False
         append_json(out/'transitions.jsonl', {'step': state['step'], 'phase': phase,
             'reason': reason, 'passed': passed, 'selected_step': state['best_steps'][phase],
             'selection_metric': {'center': 'center_only_psnr_or_world_rmse',
@@ -457,7 +503,9 @@ def train(args):
         state['phase_step'] = 0
         state['phase_initialized'] = False
         state['end_reason'] = None
-        if not passed:
+        if state['status'] == 'guard_stalled':
+            print('Center guard stalled; later phases were not run.', flush=True)
+        elif not passed:
             state['status'] = 'gate_stopped'
             print(f'STOP: {phase} quality gate failed; later phases were not run.', flush=True)
         elif state['phase_index'] == len(PHASES):
@@ -471,6 +519,11 @@ def train(args):
     save_checkpoint(out/'codec.pt', model, selected_step, {**record, 'phase': state['phase'],
         'selection': 'best validation checkpoint of last executed phase', 'status': state['status']})
     summary = {**state, 'export_selected_step': selected_step, 'render_evaluated': bool(cameras), 'output': str(out)}
+    if args.center_step_guard:
+        from .center_step_guard import guard_summary
+        path = out/'loss.jsonl'
+        summary['center_step_guard'] = guard_summary(
+            [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else [])
     (out/'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     plot_run(out)
     print(json.dumps({'completed': state['completed'], 'status': state['status'], 'output': str(out)}), flush=True)

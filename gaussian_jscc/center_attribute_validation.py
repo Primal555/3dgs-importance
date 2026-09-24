@@ -194,6 +194,34 @@ def plot_run(out):
     fig.tight_layout()
     fig.savefig(charts/'validation.png', dpi=150)
     plt.close(fig)
+    guarded = [r for r in losses if r.get('stats', {}).get('step_guard')]
+    if guarded:
+        x = [r['step'] for r in guarded]
+        guards = [r['stats']['step_guard'] for r in guarded]
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        axes[0, 0].plot(x, [g['scale'] for g in guards], linewidth=.6)
+        axes[0, 0].set_title('Joint accepted step scale (0 = rejected)')
+        for key in ('loss_before', 'loss_after'):
+            axes[0, 1].plot(x, [g[key] for g in guards], linewidth=.6, label=key)
+        axes[0, 1].set_title('Same-training-batch distance loss')
+        axes[0, 1].legend()
+        for key, label in (('accepted', 'rejected'), ('momentum_restarted', 'momentum restart')):
+            total, values = 0, []
+            for i, g in enumerate(guards):
+                total += (not g[key]) if key == 'accepted' else g[key]
+                values.append(total/(i+1))
+            axes[1, 0].plot(x, values, label=label)
+        axes[1, 0].set_title('Cumulative fraction')
+        axes[1, 0].legend()
+        axes[1, 1].plot(x, [g['attempts'][0]['directional_derivative'] for g in guards], linewidth=.6)
+        axes[1, 1].axhline(0, color='black', linewidth=.5)
+        axes[1, 1].set_title('Original Adam direction: negative = downhill')
+        for axis in axes.flat:
+            axis.set_xlabel('Training step')
+            axis.grid(alpha=.2)
+        fig.tight_layout()
+        fig.savefig(charts/'center_step_guard.png', dpi=150)
+        plt.close(fig)
     rows = [r for r in validation if r.get('attributes')]
     if rows:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
