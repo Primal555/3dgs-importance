@@ -132,7 +132,7 @@ def plot_training(training_dir, output_dir=None):
     out = Path(output_dir) if output_dir else training_dir / "charts"
     out.mkdir(parents=True, exist_ok=True)
     rows = _read_jsonl(training_dir / "loss.jsonl")
-    if rows[0].get('objective') == 'render_mse_v1':
+    if rows[0].get('objective') == 'render_mse_v1' or rows[0].get('training_family') == 'render_mse_v1':
         from .render_plots import plot_render_training
         return plot_render_training(training_dir, output_dir)
     charts = []

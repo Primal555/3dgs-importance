@@ -2,6 +2,16 @@
 
 ## Gaussian JSCC codec extension
 
+### Two-stage option: cheap attribute response pretraining, then scene rendering
+
+`scripts/train_progressive16_two_stage.sh` restores the September 19 isolated
+Gaussian response objective on the current progressive/16-bit codec. Default:
+5000 attribute updates + 5000 full-scene render updates, constant LR 1e-4 in
+both phases. XYZ stays fixed; no mask optimization or learned-center path.
+Both phases save scene PSNR/images and separate local-response diagnostics.
+See [training and background launch](docs/progressive_two_stage.md) and the
+[measured historical stage plateaus](docs/two_stage_history_20260919.md).
+
 ### New experiment: encode once, deliver progressively
 
 `scripts/train_progressive16_render_only.sh` keeps the reliable compressed

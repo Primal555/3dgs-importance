@@ -30,7 +30,9 @@ def plot_render_training(training_dir, output_dir=None):
         if phase=='joint':
             _trace(ax,subset,'image_mse','Image MSE','#D96C2F','--')
             _trace(ax,subset,'rate_loss','Payload penalty','#59636E',':')
-        ax.set(title=phase,xlabel='Optimization step',ylabel='Normalized-feature SmoothL1' if phase=='bootstrap' else 'RGB MSE + rate (joint only)')
+        label = ('Isolated Gaussian RGB response MSE' if subset[0].get('bootstrap_objective')=='local-response'
+                 else 'Normalized-feature SmoothL1') if phase=='bootstrap' else 'RGB MSE + rate (joint only)'
+        ax.set(title=phase,xlabel='Optimization step',ylabel=label)
         if ax.get_legend_handles_labels()[0]:
             ax.legend()
     charts += _finish(fig,out/'training_objectives')
@@ -48,6 +50,19 @@ def plot_render_training(training_dir, output_dir=None):
         else:
             ax.text(.5,.5,'Not recorded',transform=ax.transAxes,ha='center')
     charts += _finish(fig,out/'optimization')
+    bootstrap = root/'bootstrap_validation.jsonl'
+    if bootstrap.exists():
+        checks = _read_jsonl(bootstrap)
+        fig,ax = plt.subplots(figsize=(7,4))
+        for tier in ('1','2','3','mixed'):
+            points = [(r['step'], e.get('loss',e.get('feature_loss'))) for r in checks
+                      for e in r['layouts'] if e['layout']==tier]
+            ax.plot([p[0] for p in points],[p[1] for p in points],label='q'+tier,marker='o',markersize=3,
+                    linestyle='-' if len(points)>=8 else 'none')
+        ax.set(title='Attribute initialization: held-out block objective',xlabel='Optimization step',
+               ylabel='Local response MSE' if checks[0].get('objective')=='local-response' else 'Feature loss')
+        ax.legend()
+        charts += _finish(fig,out/'bootstrap_validation')
     validation = root/'validation.jsonl'
     if validation.exists():
         records = _read_jsonl(validation)

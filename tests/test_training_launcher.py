@@ -111,6 +111,22 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('--init ',result.stdout)
         self.assertNotEqual(self.launch(script='scripts/train_progressive16_render_only.sh').returncode,0)
 
+    def test_progressive_two_stage_defaults_and_step_overrides(self):
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'obsolete.pt'},
+                           script='scripts/train_progressive16_two_stage.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for argument in ('--prefix-mode progressive','--position-bits 16','--position-compression delta_zlib',
+                         '--bootstrap-steps 5000','--bootstrap-objective local-response','--local-response-views 4',
+                         '--render-steps 5000','--joint-steps 0','--lr 0.0001','--render-lr 0.0001',
+                         '--render-backward replay','--blocks-per-batch 64','--validate-every 500'):
+            self.assertIn(argument,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+        result=self.launch({'CUDA_VISIBLE_DEVICES':'2','BOOTSTRAP_STEPS':'3000','RENDER_STEPS':'2000',
+                            'LR':'0.0002','RENDER_LR':'0.0001'},script='scripts/train_progressive16_two_stage.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for argument in ('--bootstrap-steps 3000','--render-steps 2000','--lr 0.0002','--render-lr 0.0001'):
+            self.assertIn(argument,result.stdout)
+
 
 if __name__=='__main__':
     unittest.main()
