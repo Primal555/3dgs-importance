@@ -44,6 +44,8 @@ def add_parser(sub):
     p.add_argument('--center-guard-warn-after', type=int, default=50)
     p.add_argument('--center-guard-stop-after', type=int, default=200)
     p.add_argument('--center-update-policy', choices=['adam', 'soft'], default='adam')
+    p.add_argument('--center-accumulation-steps', type=int, default=1,
+                   help='microbatches per center optimizer update; center-steps still counts updates')
     p.add_argument('--center-update-window', type=int, default=100)
     p.add_argument('--center-update-warmup', type=int, default=100)
     p.add_argument('--center-update-multiplier', type=float, default=3.)
@@ -76,6 +78,10 @@ def add_parser(sub):
 
 
 def check_args(args):
+    if args.center_accumulation_steps < 1:
+        raise ValueError('center-accumulation-steps must be positive')
+    if args.center_step_guard and args.center_accumulation_steps != 1:
+        raise ValueError('gradient accumulation requires continuous updates, not the legacy loss-rejection guard')
     if args.center_step_guard and args.center_update_policy != 'adam':
         raise ValueError('soft continuous updates cannot be combined with the legacy rejection guard')
     if not 1 <= args.center_update_warmup <= args.center_update_window:
@@ -208,6 +214,7 @@ def train(args):
         for key, default in dict(center_step_guard=False, center_max_backtracks=8,
                                  center_guard_warn_after=50, center_guard_stop_after=200,
                                  center_update_policy='adam', center_update_window=100,
+                                 center_accumulation_steps=1,
                                  center_update_warmup=100, center_update_multiplier=3.,
                                  center_lr_schedule='constant', center_lr_decay_start=.5,
                                  center_lr_end_ratio=.2).items():
@@ -239,6 +246,9 @@ def train(args):
     print('Position: per-point absolute XYZ; no block-centroid branch. '
           f'Joint directional step guard: {args.center_step_guard}.', flush=True)
     print(f'Center update: {args.center_update_policy}; LR schedule: {args.center_lr_schedule}.', flush=True)
+    print(f'Center budget: {args.center_steps} optimizer updates; '
+          f'{args.center_accumulation_steps} microbatches/update, '
+          f'{args.blocks_per_batch} blocks/microbatch. LR is not multiplied by accumulation.', flush=True)
     if resumed:
         if fingerprint != resumed['fingerprint'] or cfg.to_dict() != resumed['config']:
             raise ValueError('resume scene or configuration differs')
@@ -292,6 +302,10 @@ def train(args):
                         'decay_start': args.center_lr_decay_start, 'end_ratio': args.center_lr_end_ratio,
                         'later_phases': 'constant explicit LRs; fresh Adam at each phase'},
         'center_update_policy': args.center_update_policy,
+        'center_accumulation': {'microbatches_per_update': args.center_accumulation_steps,
+            'blocks_per_microbatch': args.blocks_per_batch,
+            'step_unit': 'optimizer updates, not microbatches',
+            'reduction': 'mean over all valid sampled points; duplicates count as observations'},
         'training_views': [str(c.image_name) for c in train_cameras],
         'validation_views': [str(c.image_name) for c in cameras],
         'scope': 'scene-specific; global statistics use whole PLY; A/B exclude heldout blocks; C trains all Gaussians but not heldout cameras',
@@ -391,7 +405,17 @@ def train(args):
             profile = state['phase_step'] == 0 or (state['step']+1) % args.profile_every == 0 or drift_due
             model.zero_grad(set_to_none=True)
             contributions = {}
-            if phase in ('center', 'attribute'):
+            if phase == 'center' and args.center_accumulation_steps > 1:
+                from .center_accumulation import accumulate_center_gradients
+                selections = [[fitted[i] for i in torch.randint(len(fitted), (args.blocks_per_batch,)).tolist()]
+                              for _ in range(args.center_accumulation_steps)]
+                loss, accumulated = accumulate_center_gradients(model, blocks, selections, geometry,
+                                                                 args.center_smoothing, device)
+                stats = {'accumulation': accumulated}
+                if args.center_probe_blocks:
+                    stats['sampled_blocks'] = [i for chosen in selections for i in chosen]
+                    stats['sampled_microbatches'] = selections
+            elif phase in ('center', 'attribute'):
                 selected = [fitted[i] for i in torch.randint(len(fitted), (args.blocks_per_batch,)).tolist()]
                 group = [blocks[i] for i in selected]
                 f = pad_sequence(group, batch_first=True).to(device)
@@ -400,6 +424,9 @@ def train(args):
                     pred_xyz = model.learned.centers(f[..., :3], active)
                     loss = center_loss(pred_xyz[active], f[..., :3][active], geometry, args.center_smoothing)
                     stats = {}
+                    stats['accumulation'] = {'microbatches': 1, 'valid_points': sum(len(x) for x in group),
+                        'points_per_microbatch': [sum(len(x) for x in group)],
+                        'sampled_block_count': len(selected)}
                     if args.center_probe_blocks:
                         stats['sampled_blocks'] = selected
                 else:
@@ -468,6 +495,16 @@ def train(args):
             state['step'] += 1
             state['phase_step'] += 1
             state['completed'][phase] = state['phase_step']
+            if phase == 'center':
+                work = state.setdefault('center_work', {'update_attempts': 0, 'optimizer_updates': 0,
+                    'microbatches': 0, 'sampled_blocks': 0, 'processed_points': 0,
+                    'counted_from_global_step': state['step']})
+                work['update_attempts'] += 1
+                work['optimizer_updates'] += stats.get('step_guard', {}).get('accepted', True)
+                work['microbatches'] += stats['accumulation']['microbatches']
+                work['sampled_blocks'] += stats['accumulation']['sampled_block_count']
+                work['processed_points'] += stats['accumulation']['valid_points']
+                stats['cumulative_center_work'] = dict(work)
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             row = {'step': state['step'], 'phase': phase, 'phase_step': state['phase_step'],
@@ -490,6 +527,9 @@ def train(args):
                     suffix = f', lr={optimizer.param_groups[0]["lr"]:.3g}' + ''.join(
                         f', {name}_scale={info["scale"]:.3g}'
                         for name, info in stats['soft_update']['groups'].items())
+                if phase == 'center':
+                    suffix += (f', accum={stats["accumulation"]["microbatches"]}'
+                               f', points/update={stats["accumulation"]["valid_points"]}')
                 print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, '
                       f'sec={row["seconds"]:.2f}{suffix}', flush=True)
             append_json(out/'loss.jsonl', row)

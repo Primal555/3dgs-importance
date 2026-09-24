@@ -247,6 +247,23 @@ def plot_run(out):
         fig.tight_layout()
         fig.savefig(charts/'center_soft_updates.png', dpi=150)
         plt.close(fig)
+    effort = [r for r in losses if r.get('stats', {}).get('cumulative_center_work')]
+    if effort:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        points = {r['step']: r['stats']['cumulative_center_work']['processed_points'] for r in effort}
+        points[effort[0]['step']-1] = 0
+        axes[0].plot([points[r['step']] for r in effort], [r['loss'] for r in effort], linewidth=.6)
+        axes[0].set_title('Center loss vs sampled points (including repeats)')
+        checked = [r for r in validation if r['phase'] == 'center' and r['step'] in points and r['render']]
+        axes[1].plot([points[r['step']] for r in checked],
+                     [r['render']['center_only']['source_psnr'] for r in checked], marker='o')
+        axes[1].set_title('Center-only PSNR vs sampled points')
+        for axis in axes:
+            axis.set_xlabel('Cumulative sampled points (not unique points)')
+            axis.grid(alpha=.2)
+        fig.tight_layout()
+        fig.savefig(charts/'center_training_effort.png', dpi=150)
+        plt.close(fig)
     rows = [r for r in validation if r.get('attributes')]
     if rows:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
