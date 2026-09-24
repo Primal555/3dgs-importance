@@ -43,6 +43,13 @@ def add_parser(sub):
     p.add_argument('--center-max-backtracks', type=int, default=8)
     p.add_argument('--center-guard-warn-after', type=int, default=50)
     p.add_argument('--center-guard-stop-after', type=int, default=200)
+    p.add_argument('--center-update-policy', choices=['adam', 'soft'], default='adam')
+    p.add_argument('--center-update-window', type=int, default=100)
+    p.add_argument('--center-update-warmup', type=int, default=100)
+    p.add_argument('--center-update-multiplier', type=float, default=3.)
+    p.add_argument('--center-lr-schedule', choices=['constant', 'late_cosine'], default='constant')
+    p.add_argument('--center-lr-decay-start', type=float, default=.5)
+    p.add_argument('--center-lr-end-ratio', type=float, default=.2)
     p.add_argument('--center-probe-blocks', type=int, default=0,
                    help='fixed training-block diagnostics and sampled-block audit; zero disables')
     p.add_argument('--center-drift-every', type=int, default=0,
@@ -69,6 +76,14 @@ def add_parser(sub):
 
 
 def check_args(args):
+    if args.center_step_guard and args.center_update_policy != 'adam':
+        raise ValueError('soft continuous updates cannot be combined with the legacy rejection guard')
+    if not 1 <= args.center_update_warmup <= args.center_update_window:
+        raise ValueError('require 1 <= update-warmup <= update-window')
+    if not math.isfinite(args.center_update_multiplier) or args.center_update_multiplier < 1:
+        raise ValueError('update-multiplier must be finite and >= 1')
+    if not 0 <= args.center_lr_decay_start < 1 or not 0 < args.center_lr_end_ratio <= 1:
+        raise ValueError('invalid center LR schedule')
     if args.center_max_backtracks < 0:
         raise ValueError('center-max-backtracks must be nonnegative')
     if not 1 <= args.center_guard_warn_after <= args.center_guard_stop_after:
@@ -191,7 +206,11 @@ def train(args):
         if not hasattr(args, 'center_drift_every'):
             args.center_drift_every = 0
         for key, default in dict(center_step_guard=False, center_max_backtracks=8,
-                                 center_guard_warn_after=50, center_guard_stop_after=200).items():
+                                 center_guard_warn_after=50, center_guard_stop_after=200,
+                                 center_update_policy='adam', center_update_window=100,
+                                 center_update_warmup=100, center_update_multiplier=3.,
+                                 center_lr_schedule='constant', center_lr_decay_start=.5,
+                                 center_lr_end_ratio=.2).items():
             if not hasattr(args, key):
                 setattr(args, key, default)
         print('Exact resume: stored arguments, model, optimizer and RNG win.', flush=True)
@@ -219,6 +238,7 @@ def train(args):
           f'attention scope: {args.center_attention_scope}; internal Transformer normalization unchanged.', flush=True)
     print('Position: per-point absolute XYZ; no block-centroid branch. '
           f'Joint directional step guard: {args.center_step_guard}.', flush=True)
+    print(f'Center update: {args.center_update_policy}; LR schedule: {args.center_lr_schedule}.', flush=True)
     if resumed:
         if fingerprint != resumed['fingerprint'] or cfg.to_dict() != resumed['config']:
             raise ValueError('resume scene or configuration differs')
@@ -268,7 +288,10 @@ def train(args):
         'joint_loss': 'source-render image MSE only; no parameter auxiliary',
         'communication': 'not implemented/trained in this clean-only experiment; latent dimensions are not channel uses',
         'position_delivery': 'learned only; source/12bit positions used exclusively in labelled validation diagnostics',
-        'lr_schedule': 'constant explicit branch LRs; fresh Adam at each phase',
+        'lr_schedule': {'center': args.center_lr_schedule, 'base': args.center_lr,
+                        'decay_start': args.center_lr_decay_start, 'end_ratio': args.center_lr_end_ratio,
+                        'later_phases': 'constant explicit LRs; fresh Adam at each phase'},
+        'center_update_policy': args.center_update_policy,
         'training_views': [str(c.image_name) for c in train_cameras],
         'validation_views': [str(c.image_name) for c in cameras],
         'scope': 'scene-specific; global statistics use whole PLY; A/B exclude heldout blocks; C trains all Gaussians but not heldout cameras',
@@ -356,6 +379,12 @@ def train(args):
         reason = state['end_reason'] or 'budget_cap'
         while state['phase_step'] < maximum and not state['end_reason']:
             started = time.perf_counter()
+            if phase == 'center' and args.center_lr_schedule == 'late_cosine':
+                from .center_soft_update import scheduled_center_lr
+                lr = scheduled_center_lr(args.center_lr, state['phase_step']+1, maximum,
+                                         args.center_lr_decay_start, args.center_lr_end_ratio)
+                for group in optimizer.param_groups:
+                    group['lr'] = lr
             guard_stopped = False
             drift_due = drift is not None and phase == 'center' and (
                 state['phase_step'] == 0 or (state['step']+1) % args.center_drift_every == 0)
@@ -417,6 +446,21 @@ def train(args):
                     print(f'WARNING: {guard["rejection_streak"]} consecutive rejected center updates.', flush=True)
                 if guard_stopped:
                     print('STOP: center guard stalled; saving diagnostics, not claiming convergence.', flush=True)
+            elif phase == 'center' and args.center_update_policy == 'soft':
+                from .center_soft_update import soft_adam_step
+                history = state.setdefault('center_update_history', {})
+                stats['soft_update'] = soft_adam_step(optimizer, history,
+                    window=args.center_update_window, warmup=args.center_update_warmup,
+                    multiplier=args.center_update_multiplier)
+                counts = state.setdefault('center_update_counts', {})
+                for name, info in stats['soft_update']['groups'].items():
+                    c = counts.setdefault(name, {'steps': 0, 'limited': 0, 'small_scale': 0, 'zero': 0})
+                    c['steps'] += 1
+                    c['limited'] += info['limited']
+                    c['small_scale'] += info['scale'] < .25
+                    c['zero'] += info['zero_update']
+                    if c['steps'] % 100 == 0 and (c['small_scale']/c['steps'] > .1 or c['zero']/c['steps'] > .1):
+                        print(f'WARNING: {name} update protection may be too strong: {c}.', flush=True)
             else:
                 optimizer.step()
             if not torch.stack([torch.isfinite(p).all() for p in model.parameters()]).all():
@@ -442,6 +486,10 @@ def train(args):
                 guard = stats.get('step_guard')
                 suffix = (f', post_loss={guard["loss_after"]:.6g}, step_scale={guard["scale"]:g}, '
                           f'momentum_restart={guard["momentum_restarted"]}') if guard else ''
+                if 'soft_update' in stats:
+                    suffix = f', lr={optimizer.param_groups[0]["lr"]:.3g}' + ''.join(
+                        f', {name}_scale={info["scale"]:.3g}'
+                        for name, info in stats['soft_update']['groups'].items())
                 print(f'{phase} {state["phase_step"]}/{maximum}: loss={row["loss"]:.6g}, grad={total:.4g}, '
                       f'sec={row["seconds"]:.2f}{suffix}', flush=True)
             append_json(out/'loss.jsonl', row)
@@ -475,7 +523,7 @@ def train(args):
         if state['last_validation']['step'] != state['step']:
             observe(images=True)
         save(optimizer)
-        if phase == 'center' and (drift is not None or args.center_step_guard):
+        if phase == 'center' and (drift is not None or args.center_step_guard or args.center_update_policy == 'soft'):
             # Retain matching LAST weights + Adam before best-weight selection
             # and final state saves replace the optimizer with None.
             shutil.copy2(out/'training_state.pt', out/'training_state_last_center.pt')

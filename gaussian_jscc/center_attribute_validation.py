@@ -222,6 +222,31 @@ def plot_run(out):
         fig.tight_layout()
         fig.savefig(charts/'center_step_guard.png', dpi=150)
         plt.close(fig)
+    soft = [r for r in losses if r.get('stats', {}).get('soft_update')]
+    if soft:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        x = [r['step'] for r in soft]
+        for name in soft[0]['stats']['soft_update']['groups']:
+            entries = [r['stats']['soft_update']['groups'][name] for r in soft]
+            axes[0, 0].plot(x, [e['lr'] for e in entries], label=name)
+            axes[0, 1].plot(x, [e['scale'] for e in entries], linewidth=.6, label=name)
+            for key in ('relative_proposal', 'relative_actual_update'):
+                axes[1, 0].plot(x, [e[key] for e in entries], linewidth=.6, label=name+'/'+key)
+            for key in ('limited', 'zero_update'):
+                count, fraction = 0, []
+                for i, e in enumerate(entries):
+                    count += e[key]
+                    fraction.append(count/(i+1))
+                axes[1, 1].plot(x, fraction, label=name+'/'+key)
+        for axis, title in zip(axes.flat, ('Scheduled LR', 'Proposal scale (no loss approval)',
+                                         'Update norm / parameter norm', 'Cumulative fraction')):
+            axis.set_title(title)
+            axis.set_xlabel('Center step')
+            axis.grid(alpha=.2)
+            axis.legend(fontsize=6)
+        fig.tight_layout()
+        fig.savefig(charts/'center_soft_updates.png', dpi=150)
+        plt.close(fig)
     rows = [r for r in validation if r.get('attributes')]
     if rows:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))

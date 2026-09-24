@@ -1,5 +1,9 @@
 # Pointwise absolute XYZ + joint directional backtracking
 
+**Retired as the default experiment:** use [continuous updates](center_absolute_soft.md).
+The old script name now forwards to the continuous-update script; the description
+below documents the previous strict-guard experiment, not the new default.
+
 ## Restored baseline
 
 Git reverts `ebc89d0` and `85c45ff` restore the center architecture from
