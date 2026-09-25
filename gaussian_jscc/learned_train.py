@@ -25,7 +25,9 @@ def add_parser(sub):
         p.add_argument('--'+key, required=True)
     p.add_argument('--init', help='learned_joint weights/statistics; fresh optimizer, NOT exact resume')
     p.add_argument('--allocation-init', help='matching route2.pt; requires --init and --joint-steps')
-    p.add_argument('--existence-prior', help='.npy probabilities in original input PLY row order')
+    p.add_argument('--existence-prior', help='auto/ply: PLY mask logits; none; or .npy in original PLY row order')
+    p.add_argument('--mask-only-steps', type=int, default=0,
+                   help='first N joint updates learn allocation with codec frozen; included in joint-steps')
     p.add_argument('--source')
     p.add_argument('--device', default='cuda')
     p.add_argument('--snr', type=float, default=10.)
@@ -60,7 +62,7 @@ def add_parser(sub):
     p.add_argument('--render-lr', type=float, default=1e-5, help='render and joint codec learning rate')
     p.add_argument('--mask-lr', type=float, default=1e-3)
     p.add_argument('--mask-samples', type=int, default=2)
-    p.add_argument('--beta', type=float, default=.001, help='joint-only normalized payload penalty; not a hard cap')
+    p.add_argument('--beta', type=float, default=.001, help='joint-only normalized payload+XYZ+tier-map proxy penalty; not a hard cap')
     p.add_argument('--drop', type=float, default=0., help='optional random q0 in mixed codec layouts')
     p.add_argument('--power-floor', type=float, default=.01)
     p.add_argument('--clip-mode', choices=['none','global','branch'], default='none')
@@ -114,6 +116,8 @@ def train(args):
         raise ValueError('allocation-init requires init and joint-steps')
     if args.existence_prior and (not args.joint_steps or args.allocation_init):
         raise ValueError('existence-prior requires joint-steps and no allocation-init')
+    if not 0 <= args.mask_only_steps <= args.joint_steps:
+        raise ValueError('mask-only-steps must lie in 0..joint-steps')
     out = Path(args.out)
     if out.exists():
         raise FileExistsError(f'Use a new output directory: {out}')
@@ -145,13 +149,13 @@ def train(args):
         model.attr_std.copy_(original[:,3:].std(0,unbiased=False).clamp_min(.01).to(device))
         if not args.bootstrap_steps:
             print('Training from random weights without bootstrap: valid, but render gradients may be poorly conditioned.',flush=True)
-    if args.joint_steps and model.cfg.position_delivery != 'learned':
-        raise ValueError('position delivery ablation disables joint mask training: its rate penalty must include XYZ cost first')
+    from .allocation_diagnostics import load_existence_prior, AllocationCostMeter, record_allocation, prior_ranked_tiers
+    prior, prior_info = None, {'source':'allocation checkpoint' if args.allocation_init else 'none'}
     if args.allocation_init:
         from .route2 import load_mask
         mask = load_mask(args.allocation_init,original,model,device).train()
     else:
-        prior = np.load(args.existence_prior,allow_pickle=False) if args.existence_prior else None
+        prior, prior_info = load_existence_prior(args.existence_prior,args.ply,len(original))
         mask = GaussianTierMask(len(original),existence_prior=prior,tier_count=len(model.cfg.rates)).to(device) if args.joint_steps else None
     schedule = layout_schedule(model.cfg.rates)
     tier_count = len(model.cfg.rates)
@@ -160,6 +164,7 @@ def train(args):
     raw = original[order]
     del original
     position_meter = PositionCostMeter(model.cfg, geometry.normalize(raw[:, :3]))
+    allocation_meter = AllocationCostMeter(model.cfg,position_meter,len(raw),args.position_net_bits_per_use) if mask is not None else None
     cache_device = device if args.training_data_device == 'cuda' else torch.device('cpu')
     blocks, ids = [], []
     with torch.no_grad():
@@ -184,6 +189,11 @@ def train(args):
     optimizer = torch.optim.Adam(model.parameters(),lr=args.lr)
     mask_optimizer = torch.optim.Adam(mask.parameters(),lr=args.mask_lr) if mask is not None else None
     out.mkdir(parents=True,exist_ok=False)
+    if mask is not None:
+        (out/'existence_prior.json').write_text(json.dumps(prior_info,indent=2),encoding='utf-8')
+        if prior is not None:
+            np.save(out/'existence_prior.npy',prior.numpy(),allow_pickle=False)
+        print(f'Existence prior: {prior_info}. Not a fixed tier rule.',flush=True)
     record = {k:v for k,v in vars(args).items() if k != 'func'}
     record.update(objective='render_mse_v1',codec_config=model.cfg.to_dict(),fixed_snr=True,
                   initialization={'mode':'checkpoint' if args.init else 'random',
@@ -205,9 +215,9 @@ def train(args):
                   bootstrap_objective_origin=('d74bf75 / 37e4d35 historical local-response implementation'
                                               if args.bootstrap_objective=='local-response' else 'normalized-feature SmoothL1'),
                   phase_transition='retain codec weights; clear Adam moments; set render_lr; position delivery unchanged',
-                  mask_gradient='REINFORCE image MSE; exact expected normalized payload penalty',
-                  budget='per-Gaussian payload; optional Lagrange penalty, NOT a hard cap',
-                  metadata='reliable global bbox + packed per-row tier IDs; training rate excludes metadata',
+                  mask_gradient='REINFORCE image MSE + measured XYZ/tier side cost; exact expected payload gradient',
+                  budget='payload + XYZ + compressed tier-map proxy; beta is a Lagrange penalty, NOT a hard cap',
+                  metadata='reliable bbox/tier syntax; joint charges compressed tier-map proxy but excludes packet JSON/bbox/model-ID framing',
                   clipping='none by default; any threshold is an explicit empirical hyperparameter')
     record.update(position_delivery=model.cfg.position_delivery,
                   prefix_mode=model.cfg.prefix_mode,
@@ -224,6 +234,10 @@ def train(args):
                                      'normalized XYZ for q>0 only; reliable side stream; no learned XYZ residual'),
                   comparison='same JSCC payload, NOT equal total rate when side stream is enabled',
                   position_net_bits_per_use=args.position_net_bits_per_use)
+    if allocation_meter is not None:
+        record.update(allocation_rate_normalizer=allocation_meter.normalizer,existence_prior_info=prior_info,
+                      allocation_estimator_caveat='scene-level REINFORCE can have high variance for very many points; not per-point oracle gains',
+                      mask_only_steps=args.mask_only_steps)
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
@@ -263,11 +277,18 @@ def train(args):
             return sum(v['loss'] for v in values)/len(values)
 
     def validation(step,phase):
+        extra = None
+        if phase == 'joint':
+            q,_ = record_allocation(out,step,mask,args.snr,model.cfg.rates,prior)
+            if prior is not None:
+                ranked = prior_ranked_tiers(prior,q)
+                extra = {'prior_ranked':[torch.where(gi>=0,ranked[gi.cpu().clamp_min(0)].to(gi.device),0) for gi in group_ids]}
         return validate_render(model,groups,group_ids,raw,geometry,val_cameras,reference,args.snr,
                                args.channel,args.validation_trials,args.seed,out,step,phase,
                                mask=mask if phase == 'joint' else None,white_background=args.white_background,beta=args.beta,
                                position_net_bits_per_use=args.position_net_bits_per_use,
-                               position_meter=position_meter)
+                               position_meter=position_meter,allocation_meter=allocation_meter if phase == 'joint' else None,
+                               extra_layouts=extra)
 
     def save(suffix,phase,step):
         if phase == 'joint':
@@ -345,7 +366,9 @@ def train(args):
                 else:
                     loss,details = discrete_joint_step(model,mask,groups,group_ids,geometry,args.snr,args.channel,
                                                        task,beta=args.beta,auxiliary_weight=0.,samples=args.mask_samples,
-                                                       mode=args.render_backward)
+                                                       mode=args.render_backward,rate_meter=allocation_meter,
+                                                       train_codec=local_step>args.mask_only_steps,
+                                                       paired_noise=model.cfg.prefix_mode=='progressive')
                     stats.update(details)
                     stats['layout'] = 'learned_mask'
                 stats.update(image_mse=stats['render_loss'],training_view_indices=view_ids,
@@ -358,7 +381,8 @@ def train(args):
                     raise RuntimeError('nonfinite mask gradient; no optimizer steps performed')
                 stats['mask_grad_norm'] = float(mask_norm)
                 mask_optimizer.step()
-            optimizer.step()
+            if phase != 'joint' or local_step > args.mask_only_steps:
+                optimizer.step()
             updates = update_stats(model,before)
             update_norm = math.sqrt(sum(v['update_norm']**2 for v in updates.values()))
             row = {'step':step,'phase_step':local_step,'phase':phase,'training_family':'render_mse_v1','objective':
@@ -371,6 +395,10 @@ def train(args):
                 print(f'{phase} {local_step}/{maximum}: q={stats["layout"]}, symbols={stats["uniform_complex_symbols"]}, '
                       f'loss={row["loss"]:.6f}, grad={float(norm):.4g}, '
                       f'update={update_norm:.4g}, sec={row["step_seconds"]:.2f}',flush=True)
+                if phase == 'joint':
+                    print(f'  mask_grad={stats["mask_grad_norm"]:.4g}, codec_updated={stats["codec_updated"]}, '
+                          f'image_mse={stats["render_loss"]:.6g}, rate_penalty={stats["rate_loss"]:.6g}, '
+                          f'sampled_counts={stats["sampled_tier_counts"]}',flush=True)
             if step%args.save_every == 0:
                 save(f'_{step}',phase,step)
             if local_step%args.validate_every == 0 or local_step == maximum:

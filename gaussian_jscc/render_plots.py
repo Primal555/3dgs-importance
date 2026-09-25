@@ -22,6 +22,52 @@ def _layout_label(entry):
     return label
 
 
+def plot_allocation_history(root, out):
+    path = root/'allocation_history.jsonl'
+    if not path.exists():
+        return []
+    records = _read_jsonl(path)
+    if not records:
+        return []
+    plt = _plt()
+    steps = [r['step'] for r in records]
+    rates = records[-1]['rates']
+    fig,axes = plt.subplots(1,3,figsize=(17,4.5))
+    rows = []
+    for i,rate in enumerate(rates):
+        label = f'q{i}: {rate} symbols'
+        axes[0].plot(steps,[r['hard_tier_shares'][i] for r in records],label=label)
+        axes[1].plot(steps,[r['hard_tier_counts'][i] for r in records],label=label)
+        axes[1].plot(steps,[r['expected_tier_counts'][i] for r in records],linestyle='--',alpha=.6)
+        for r in records:
+            rows.append({'step':r['step'],'tier':i,'symbols':rate,'hard_count':r['hard_tier_counts'][i],
+                         'hard_share':r['hard_tier_shares'][i],'expected_count':r['expected_tier_counts'][i]})
+    axes[0].set(title='Hard deployment shares',ylim=(0,1),xlabel='Optimization step')
+    axes[1].set(title='Point counts: solid hard, dashed expected',xlabel='Optimization step')
+    axes[2].plot(steps,[r['mean_max_probability'] for r in records],label='Mean max probability')
+    axes[2].plot(steps,[r['mean_entropy_nats'] for r in records],label='Mean entropy (nats)')
+    axes[2].set(title='Decision confidence (not image quality)',xlabel='Optimization step')
+    for ax in axes:
+        ax.legend(fontsize=8)
+    fig.suptitle('Learned per-Gaussian categorical allocation | q0 sends no Gaussian payload/XYZ')
+    charts = _finish(fig,out/'allocation_history')
+    _write_csv(out/'allocation_history.csv',rows,list(rows[0]))
+    last=records[-1]
+    if 'existence_decile_tier_counts' in last:
+        import numpy as np
+        table=np.asarray(last['existence_decile_tier_counts'],dtype=float)
+        shares=table/np.maximum(1,table.sum(1,keepdims=True))
+        fig,ax=plt.subplots(figsize=(8,5))
+        im=ax.imshow(shares,vmin=0,vmax=1,aspect='auto',cmap='Blues',origin='lower')
+        ax.set(xticks=range(len(rates)),xticklabels=[f'q{i}' for i in range(len(rates))],
+               yticks=range(10),yticklabels=[f'{i/10:.1f}-{(i+1)/10:.1f}' for i in range(10)],
+               xlabel='Learned hard tier',ylabel='Original existence probability interval',
+               title='Existence prior vs learned allocation | row-normalized counts')
+        fig.colorbar(im,ax=ax,label='Fraction within existence interval')
+        charts += _finish(fig,out/'existence_vs_allocation')
+    return charts
+
+
 def plot_rate_sweep(records, out):
     """Measured uniform prefixes only; mixed layouts are NOT intermediate rates.
 
@@ -99,7 +145,7 @@ def plot_render_training(training_dir, output_dir=None):
             _trace(ax,subset,'loss','Objective','#2F6B9A')
         if phase=='joint':
             _trace(ax,subset,'image_mse','Image MSE','#D96C2F','--')
-            _trace(ax,subset,'rate_loss','Payload penalty','#59636E',':')
+            _trace(ax,subset,'rate_loss','Communication cost penalty','#59636E',':')
         label = ('Isolated Gaussian RGB response MSE' if subset[0].get('bootstrap_objective')=='local-response'
                  else 'Normalized-feature SmoothL1') if phase=='bootstrap' else 'RGB MSE + rate (joint only)'
         ax.set(title=phase,xlabel='Optimization step',ylabel=label)
@@ -206,6 +252,7 @@ def plot_render_training(training_dir, output_dir=None):
             axes[1].set(ylabel='Fraction of paired observations with lower MSE',ylim=(-.02,1.02))
             charts += _finish(fig,out/'prefix_gains')
         charts += plot_rate_sweep(records,out)
+    charts += plot_allocation_history(root,out)
     return _manifest(out,'render_first_training',root,charts,[
         'Bootstrap is initialization, not communication fidelity; do not compare its scale to image MSE.',
         'Validation noise/views/layouts are fixed; sparse histories use markers only.',

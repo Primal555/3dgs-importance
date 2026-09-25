@@ -1,5 +1,9 @@
 # 四档 mask 与 codec 联合训练
 
+固定16 bit坐标＋三档渐进属性＋不传档的完整新实验见
+[progressive_mask_full.md](progressive_mask_full.md)。入口为
+`scripts/train_progressive16_mask_full.sh`，保留逐点概率表，不新增档位预测网络。
+
 联合训练已统一到 `train-learned --joint-steps N`。`train-route2` 及旧的 Gumbel-ST 训练循环已移除。
 
 ## 当前含义
@@ -18,7 +22,10 @@ mask 使用硬采样的 REINFORCE 梯度、独立样本的 leave-one-out 基线�
 mask 的任务奖励同样来自完整原场景渲染的图像误差；删点不能通过移除某一行的参数误差获得虚假收益。
 
 `--mask-samples` 默认 2；样本数增加会增加全场景开销。场景级策略梯度的方差仍需观察，不能仅凭梯度非零认定重要性学习有效。
-`--beta` 是期望 payload 开销的拉格朗日权重，不是严格的总符号数上限。
+`--beta` 是通信成本的拉格朗日权重，不是严格的总符号数上限。
+当前训练还计入实际压缩的坐标流及压缩档位表代理成本，后两项通过策略梯度优化；
+完整包头成本在最终传输评估中统计。`--existence-prior auto` 可直接读取同一PLY中的
+MaskGaussian logits；不存在时会明确报告，不会拿opacity冒充历史存在概率。
 
 完整连续训练：
 

@@ -1,4 +1,5 @@
 """Training utilities for learned_joint, including honest discrete mask actions."""
+from contextlib import contextmanager
 import torch
 from torch.nn import functional as F
 from .training import full_scene_step, codec_batch
@@ -18,7 +19,8 @@ def policy_objective(log_probabilities, costs):
 
 
 def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr, kind,
-                        distortion_fn, beta=.001, auxiliary_weight=0., samples=2, mode='replay'):
+                        distortion_fn, beta=.001, auxiliary_weight=0., samples=2, mode='replay',
+                        rate_meter=None, train_codec=True, paired_noise=False):
     """Codec gets conditional backprop; categorical masks get REINFORCE.
 
     distortion_fn(decoded_rows, retained_original_ids) returns a render task
@@ -26,13 +28,35 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
     not merely compare attributes of the remaining rows.
     Auxiliary losses regularize codec parameters only; dropping points cannot
     lower the mask's reward by deleting their auxiliary losses.
-    Rate is the exact expected payload cost, averaged over SOURCE primitives.
+    Payload rate has an exact expectation. With a rate_meter, measured discrete
+    XYZ/tier-stream cost enters the score-function reward, NOT a detached-only
+    logging term. Both are averaged over SOURCE primitives.
     beta is a Lagrange penalty, NOT a guarantee of a hard total-symbol cap.
     """
     if model.cfg.architecture != 'learned_joint' or samples < 2:
         raise ValueError('requires learned_joint and >=2 independent mask samples')
     device = next(model.parameters()).device
-    log_probs, costs, all_stats, expectations, compositions = [], [], [], [], []
+    # Independent mask draws, common full-slot channel noise conditional on the
+    # step. RNG isolation prevents channel draws from affecting mask sampling.
+    noise_seed = int(torch.randint(2**31-1,()).item()) if paired_noise else None
+    @contextmanager
+    def noise_context():
+        if not paired_noise:
+            yield
+            return
+        devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type=='cuda' else []
+        with torch.random.fork_rng(devices=devices):
+            state = torch.Generator(device=device).manual_seed(noise_seed).get_state()
+            if device.type=='cuda':
+                torch.cuda.set_rng_state(state,device)
+            else:
+                torch.set_rng_state(state)
+            yield
+
+    def paired_forward(f,q):
+        return codec_batch(model,f,q,snr,kind,geometry,0,return_metrics=True,
+                           compute_auxiliary=auxiliary_weight!=0,paired_noise=True)
+    log_probs, costs, all_stats, expectations, compositions, side_costs = [], [], [], [], [], []
     source_count = sum(int((ids >= 0).sum()) for ids in id_batches)
     for _ in range(samples):
         batches, retained, sample_logs, rates = [], [], [], []
@@ -54,7 +78,15 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
         compositions.append(counts)
         log_probs.append(torch.stack(sample_logs).sum())
         expectations.append(torch.stack(rates).sum()/source_count)
-        if len(ids):
+        flat_q = torch.cat([q[gi.to(q.device)>=0].cpu() for (_,q),gi in zip(batches,id_batches)])
+        side_costs.append(rate_meter.details(flat_q)['allocation_side_uses_per_source_gaussian'] if rate_meter else 0.)
+        if len(ids) and not train_codec:
+            with noise_context():
+                scene = decode_batches(model, feature_batches, [q for _,q in batches], snr, kind, geometry,paired_noise=paired_noise)
+            with torch.no_grad():
+                cost = distortion_fn(scene, ids)
+            stats = {'retained_gaussians': len(ids), 'render_loss': float(cost)/samples}
+        elif len(ids):
             def distortion(scene):
                 return distortion_fn(scene, ids)/samples
             if hasattr(distortion_fn, 'backward_scene'):
@@ -63,8 +95,10 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
                     scene.grad.div_(samples)
                     return cost/samples
                 distortion.backward_scene = backward_scene
-            _, stats = full_scene_step(model, batches, geometry, snr, kind, distortion,
-                                       attr_weight=auxiliary_weight/samples, mode=mode)
+            with noise_context():
+                _, stats = full_scene_step(model, batches, geometry, snr, kind, distortion,
+                                           attr_weight=auxiliary_weight/samples, mode=mode,
+                                           batch_forward=paired_forward if paired_noise else None)
             cost = next(model.parameters()).new_tensor(stats['render_loss']*samples)
         else:
             # No fabricated q0 XYZ enters the renderer. Empty-scene task loss
@@ -75,16 +109,23 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
             stats = {'retained_gaussians': 0, 'render_loss': float(cost)/samples}
         costs.append(cost)
         all_stats.append(stats)
-    policy = policy_objective(log_probs, costs)
+    normalizer = rate_meter.normalizer if rate_meter else model.cfg.rates[-1]
+    rewards = [c + beta*s/normalizer for c,s in zip(costs,side_costs)]
+    policy = policy_objective(log_probs, rewards)
     mean_rate = torch.stack(expectations).mean()
-    rate_loss = beta*mean_rate/model.cfg.rates[-1]
+    rate_loss = beta*mean_rate/normalizer
     (policy+rate_loss).backward()
+    total_rate_loss = rate_loss.detach()+beta*sum(side_costs)/samples/normalizer
     mean_aux = sum(v.get('aux_loss', 0) for v in all_stats)/samples
-    return torch.stack(costs).mean()+rate_loss.detach()+auxiliary_weight*mean_aux, {
+    return torch.stack(costs).mean()+total_rate_loss+auxiliary_weight*mean_aux, {
         'mask_estimator': 'independent-sample leave-one-out REINFORCE',
         'policy_surrogate': float(policy.detach()), 'sample_task_costs': [float(c) for c in costs],
         'expected_symbols_per_gaussian': float(mean_rate.detach()),
-        'rate_loss': float(rate_loss.detach()), 'mask_samples': samples,
+        'rate_loss': float(total_rate_loss), 'mask_samples': samples,
+        'sample_side_uses_per_gaussian': side_costs, 'rate_normalizer': normalizer,
+        'sample_policy_costs': [float(r) for r in rewards], 'codec_updated': train_codec,
+        'paired_mask_channel_noise': paired_noise,
+        'expected_payload_plus_sampled_side_uses_per_gaussian': float(mean_rate.detach())+sum(side_costs)/samples,
         'retained_counts': [v['retained_gaussians'] for v in all_stats],
         'sampled_tier_counts': torch.stack(compositions).mean(0).cpu().tolist(),
         'scene_gradient_norms_by_sample': [v.get('scene_gradient_norms') for v in all_stats],

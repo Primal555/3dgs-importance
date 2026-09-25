@@ -31,7 +31,8 @@ def save_panel(path, photo, reference, decoded):
 @torch.no_grad()
 def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                     snr, channel, trials, seed, out, step, phase, mask=None,
-                    white_background=False, beta=0., position_net_bits_per_use=2., position_meter=None):
+                    white_background=False, beta=0., position_net_bits_per_use=2., position_meter=None,
+                    allocation_meter=None, extra_layouts=None):
     from .cli import seed_all
     from .rendering import render
     device = next(model.parameters()).device
@@ -43,7 +44,10 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
     # Uniform/mixed codec conditions stay visible even when a learned mask is
     # enabled. The mask is an additional, separately scored deployment layout.
     codec_layouts = layout_schedule(model.cfg.rates)
-    layouts = codec_layouts + (('mask',) if mask is not None else ())
+    extra_layouts = extra_layouts or {}
+    if any(not name.replace('_','').isalnum() or name in ('mask','mixed') or name.isdigit() for name in extra_layouts):
+        raise ValueError('extra layout names must be safe distinct diagnostic labels')
+    layouts = codec_layouts + (('mask',) if mask is not None else ()) + tuple(extra_layouts)
     tier_count = len(model.cfg.rates)
     try:
         with preserved_rng(device):
@@ -51,7 +55,7 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
             for index, tier in enumerate(layouts):
                 label = 'mixed' if tier is None else str(tier)
                 seed_all(seed+10000+index*1000)
-                qs = [torch.where(ids.to(device)>=0,
+                qs = extra_layouts[tier] if tier in extra_layouts else [torch.where(ids.to(device)>=0,
                                   mask.scores(ids.clamp_min(0).to(device),snr).argmax(-1),0)
                       if tier == 'mask' else hard_layout(ids,tier,0.,tier_count) for ids in group_ids]
                 # Layout is fixed across trials. Padding is never a source row.
@@ -94,19 +98,26 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                 entry.update(training_position_cost(model.cfg,int((flat_q>0).sum()),len(raw),
                                                     int(lengths.sum()),position_net_bits_per_use,
                                                     position_meter.stream_bytes(flat_q)))
+                if allocation_meter is not None:
+                    entry.update(allocation_meter.details(flat_q))
                 entries.append(entry)
     finally:
         model.train(was_training)
     codec_score = sum(e['source_mse'] for e in entries[:len(codec_layouts)])/len(codec_layouts)
     # Joint checkpoint selection evaluates ACTUAL hard deployment, not the
     # expected soft allocation rate used in score-function training.
-    selected = entries[-1] if mask is not None else None
-    score = selected['source_mse']+beta*selected['symbols_per_source_gaussian']/model.cfg.rates[-1] if selected else codec_score
+    selected = next((e for e in entries if e['layout']=='mask'),None)
+    if selected:
+        rate = selected['allocation_uses_per_source_gaussian'] if allocation_meter else selected['symbols_per_source_gaussian']
+        score = selected['source_mse']+beta*rate/(allocation_meter.normalizer if allocation_meter else model.cfg.rates[-1])
+    else:
+        score = codec_score
     result = {'step':step,'phase':phase,'score':score,
               'rates':list(model.cfg.rates),
               'tier_id_bits':max(1,(tier_count-1).bit_length()),
               'prefix_mode':model.cfg.prefix_mode,'paired_prefix_noise':paired_noise,
-              'score_definition':'hard_mask_source_mse_plus_normalized_payload' if selected else 'mean_layout_source_mse',
+              'score_definition':('hard_mask_source_mse_plus_normalized_payload_and_side_proxy' if allocation_meter
+                                  else 'hard_mask_source_mse_plus_normalized_payload') if selected else 'mean_layout_source_mse',
               'codec_score':codec_score,'snr':snr,'channel':channel,'trials':trials,
               'validation_views':len(cameras),'layouts':entries,
               'metrics_note':'unclipped MSE/PSNR; displayed-RGB SSIM; no projection/parameter loss; payload excludes metadata'}
