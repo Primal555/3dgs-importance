@@ -43,7 +43,7 @@ def send(args):
         mask = load_mask(args.allocation, raw, model, device_for(args.device))
         q = hard_tiers(mask, args.snr)
     else:
-        q = load_tiers(args.rate_map, len(raw), args.uniform_tier)
+        q = load_tiers(args.rate_map, len(raw), args.uniform_tier,len(model.cfg.rates))
     stats = transmit(model, raw, q, args.snr, args.channel, args.seed, args.out,
                      args.metadata_code_rate, args.metadata_modulation_bits)
     print(json.dumps(stats, indent=2))
@@ -65,8 +65,11 @@ def evaluate(args):
         raise ValueError("SH degree mismatch")
     if args.source and not args.device.startswith("cuda"):
         raise ValueError("render evaluation requires CUDA")
-    if (args.rate_map or args.allocation) and args.tiers != [1, 2, 3]:
+    if (args.rate_map or args.allocation) and args.tiers is not None:
         raise ValueError("--rate-map/--allocation uses its own tiers; omit --tiers")
+    tiers = args.tiers if args.tiers is not None else list(range(1,len(model.cfg.rates)))
+    if any(not 1 <= q < len(model.cfg.rates) for q in tiers):
+        raise ValueError('requested tier outside checkpoint rate table')
     learned = None
     if args.allocation:
         from .route2 import load_mask, hard_tiers
@@ -80,10 +83,10 @@ def evaluate(args):
         cameras = load_cameras(args.source, args.resolution, args.white_background, args.images, "test")
         reference = raw.to(args.device)
     results = []
-    options = [None] if args.rate_map or learned is not None else args.tiers
+    options = [None] if args.rate_map or learned is not None else tiers
     for tier in options:
         for snr in args.snrs:
-            q = hard_tiers(learned, snr) if learned is not None else load_tiers(args.rate_map, len(raw), tier)
+            q = hard_tiers(learned, snr) if learned is not None else load_tiers(args.rate_map, len(raw), tier,len(model.cfg.rates))
             ordered, _, oq = prepare(raw, model.cfg.morton_bits, q)
             target = ordered[oq > 0]
             for trial in range(args.trials):
@@ -132,7 +135,7 @@ def main():
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--rate-map")
     group.add_argument("--allocation", help="matching route2.pt; choose hard q at this SNR")
-    group.add_argument("--uniform-tier", type=int, choices=[1, 2, 3])
+    group.add_argument("--uniform-tier", type=int, help='positive tier index in the checkpoint rate table')
     p.add_argument("--snr", type=float, default=10)
     send_parser = p
     p = sub.add_parser("decode")
@@ -149,7 +152,7 @@ def main():
     group = p.add_mutually_exclusive_group()
     group.add_argument("--rate-map")
     group.add_argument("--allocation", help="matching route2.pt; recompute hard q for every SNR")
-    p.add_argument("--tiers", type=int, nargs="+", choices=[1, 2, 3], default=[1, 2, 3])
+    p.add_argument("--tiers", type=int, nargs="+", help='default: all positive checkpoint tiers')
     p.add_argument("--snrs", type=float, nargs="+", default=[0, 5, 10, 15, 20])
     p.add_argument("--trials", type=int, default=1)
     p.add_argument("--save-ply", action="store_true")

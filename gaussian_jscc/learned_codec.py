@@ -48,7 +48,7 @@ class LearnedCore(nn.Module):
         # Separate embeddings, NOT independently budgeted channel branches.
         self.embeddings = nn.ModuleList(nn.Linear(size, h) for size in (3, 1, 3, 4, cfg.attr_dim-8))
         self.fuse = nn.Sequential(nn.Linear(5*h, h), nn.GELU(), nn.Linear(h, h))
-        self.tier = nn.Embedding(4, h)
+        self.tier = nn.Embedding(len(cfg.rates), h)
         self.snr = nn.Sequential(nn.Linear(1, h), nn.GELU(), nn.Linear(h, h))
         self.enc_blocks = nn.ModuleList(ContextBlock(cfg) for _ in range(cfg.depth))
         self.enc_norm = nn.LayerNorm(h)

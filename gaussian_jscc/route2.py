@@ -23,7 +23,7 @@ def load_mask(path, raw, model, device):
         raise ValueError("route2 checkpoint does not match this PLY and row order")
     if saved["codec_id"] != model_id(model) or tuple(saved["rates"]) != model.cfg.rates:
         raise ValueError("route2 checkpoint requires its matching codec checkpoint")
-    mask = GaussianTierMask(saved["count"], snr_conditioned=saved["snr_conditioned"])
+    mask = GaussianTierMask(saved["count"], snr_conditioned=saved["snr_conditioned"], tier_count=len(model.cfg.rates))
     mask.load_state_dict(saved["state_dict"])
     return mask.to(device).eval()
 
@@ -56,7 +56,7 @@ def export_mask(args):
             "decision": "argmax; no hard total-budget guarantee",
             "scene_fingerprint": scene_fingerprint(raw), "codec_id": model_id(model),
             "rates": list(model.cfg.rates),
-            "tier_counts": np.bincount(tiers, minlength=4).tolist(),
+            "tier_counts": np.bincount(tiers, minlength=len(model.cfg.rates)).tolist(),
             "expected_payload_symbols": float(expected_rate(probabilities.double(), model.cfg.rates).sum()),
             "hard_payload_symbols": int(np.asarray(model.cfg.rates)[tiers].sum())}
     (out / "allocation.json").write_text(json.dumps(info, indent=2), encoding="utf-8")

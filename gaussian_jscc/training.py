@@ -35,7 +35,7 @@ class PhaseTimer:
 
 def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_metrics=False,
                 compute_auxiliary=True, paired_noise=False):
-    choices = F.one_hot(q, 4).to(features.dtype)
+    choices = F.one_hot(q, len(model.cfg.rates)).to(features.dtype)
     pred, seed, _ = model.forward_tier_batches(features, features[..., :3], choices, snr, kind,
                                              paired_noise=paired_noise)
     keep = q > 0

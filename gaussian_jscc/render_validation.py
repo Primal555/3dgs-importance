@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import torch
-from .learned_training import decode_batches, hard_layout
+from .learned_training import decode_batches, hard_layout, layout_schedule
 from .optimization import preserved_rng
 from .render_objective import image_metrics
 from .position_delivery import training_position_cost, PositionCostMeter
@@ -42,7 +42,9 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
         position_meter = PositionCostMeter(model.cfg, geometry.normalize(raw[:, :3]))
     # Uniform/mixed codec conditions stay visible even when a learned mask is
     # enabled. The mask is an additional, separately scored deployment layout.
-    layouts = (1,2,3,None) + (('mask',) if mask is not None else ())
+    codec_layouts = layout_schedule(model.cfg.rates)
+    layouts = codec_layouts + (('mask',) if mask is not None else ())
+    tier_count = len(model.cfg.rates)
     try:
         with preserved_rng(device):
             model.eval()
@@ -51,7 +53,7 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                 seed_all(seed+10000+index*1000)
                 qs = [torch.where(ids.to(device)>=0,
                                   mask.scores(ids.clamp_min(0).to(device),snr).argmax(-1),0)
-                      if tier == 'mask' else hard_layout(ids,tier,0.) for ids in group_ids]
+                      if tier == 'mask' else hard_layout(ids,tier,0.,tier_count) for ids in group_ids]
                 # Layout is fixed across trials. Padding is never a source row.
                 flat_q = torch.cat([q[ids.to(q.device)>=0].cpu() for q,ids in zip(qs,group_ids)])
                 lengths = torch.tensor(model.cfg.rates)[flat_q]
@@ -86,7 +88,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                          'noise_trial_mse_std':float(torch.tensor(trial_scores).std(unbiased=False)),
                          'xyz_rmse_retained':sum(xyz_errors)/len(xyz_errors) if xyz_errors else None,
                          'symbols_per_source_gaussian':float(lengths.float().mean()),
-                         'tier_counts':torch.bincount(flat_q,minlength=4).tolist(),
+                         'uniform_complex_symbols':model.cfg.rates[tier] if isinstance(tier,int) else None,
+                         'tier_counts':torch.bincount(flat_q,minlength=tier_count).tolist(),
                          'views':observations}
                 entry.update(training_position_cost(model.cfg,int((flat_q>0).sum()),len(raw),
                                                     int(lengths.sum()),position_net_bits_per_use,
@@ -94,12 +97,14 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                 entries.append(entry)
     finally:
         model.train(was_training)
-    codec_score = sum(e['source_mse'] for e in entries[:4])/4
+    codec_score = sum(e['source_mse'] for e in entries[:len(codec_layouts)])/len(codec_layouts)
     # Joint checkpoint selection evaluates ACTUAL hard deployment, not the
     # expected soft allocation rate used in score-function training.
     selected = entries[-1] if mask is not None else None
     score = selected['source_mse']+beta*selected['symbols_per_source_gaussian']/model.cfg.rates[-1] if selected else codec_score
     result = {'step':step,'phase':phase,'score':score,
+              'rates':list(model.cfg.rates),
+              'tier_id_bits':max(1,(tier_count-1).bit_length()),
               'prefix_mode':model.cfg.prefix_mode,'paired_prefix_noise':paired_noise,
               'score_definition':'hard_mask_source_mse_plus_normalized_payload' if selected else 'mean_layout_source_mse',
               'codec_score':codec_score,'snr':snr,'channel':channel,'trials':trials,
@@ -108,14 +113,20 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
     if paired_noise:
         # Empirical improvements, not a monotonicity constraint or a loss term.
         result['prefix_gains'] = []
-        for lower, upper in zip(entries[:2], entries[1:3]):
+        positive = entries[:tier_count-1]
+        for lower, upper in zip(positive, positive[1:]):
             delta = [a['source_mse']-b['source_mse'] for a,b in zip(lower['views'],upper['views'])]
+            extra = upper['symbols_per_source_gaussian']-lower['symbols_per_source_gaussian']
             result['prefix_gains'].append({
                 'from':lower['layout'],'to':upper['layout'],
+                'from_complex_symbols':lower['symbols_per_source_gaussian'],
+                'to_complex_symbols':upper['symbols_per_source_gaussian'],
+                'extra_complex_symbols_per_gaussian':extra,
                 'source_psnr_gain_db':upper['source_psnr']-lower['source_psnr'],
                 'source_mse_reduction':sum(delta)/len(delta),
+                'source_mse_reduction_per_extra_symbol':sum(delta)/len(delta)/extra,
                 'paired_view_trial_improved_fraction':sum(d>0 for d in delta)/len(delta)})
     append_json(Path(out)/'validation.jsonl',result)
     print(f'validation step={step}: source MSE={codec_score:.6f}; '+', '.join(
-        f'q{e["layout"]} PSNR={e["source_psnr"]:.2f}' for e in entries),flush=True)
+        f'q{e["layout"]} ({e["symbols_per_source_gaussian"]:g} symbols/G) PSNR={e["source_psnr"]:.2f}' for e in entries),flush=True)
     return result

@@ -11,6 +11,76 @@ from pathlib import Path
 from .plots import _read_jsonl, _plt, _finish, _save, _manifest, _write_csv, _trace
 
 
+def _layout_key(label):
+    return (0,int(label)) if label.isdigit() else (1,label)
+
+
+def _layout_label(entry):
+    label = 'q'+entry['layout']
+    if entry['layout'].isdigit() and entry.get('symbols_per_source_gaussian') is not None:
+        label += f' / {entry["symbols_per_source_gaussian"]:g} symbols'
+    return label
+
+
+def plot_rate_sweep(records, out):
+    """Measured uniform prefixes only; mixed layouts are NOT intermediate rates.
+
+    Connecting segments aid reading, not claims about untrained cutoffs. All
+    checkpoints keep their data in CSV; figures include latest phase endpoints.
+    """
+    plt = _plt()
+    indexed = {}
+    endpoints = {}
+    for record in records:
+        endpoints[record['phase']] = record
+        for e in record['layouts']:
+            if not e['layout'].isdigit():
+                continue
+            indexed[record['step'],e['layout']] = {
+                'step':record['step'],'phase':record['phase'],'tier':e['layout'],
+                'complex_symbols_per_gaussian':e['symbols_per_source_gaussian'],
+                **{key:e.get(key) for key in ('source_mse','source_psnr','source_ssim',
+                   'photo_psnr','photo_ssim','payload_plus_position_uses_per_source_gaussian')},
+                'snr':record['snr'],'channel':record['channel'],
+                'validation_views':record['validation_views'],'trials':record['trials']}
+    rows = sorted(indexed.values(),key=lambda r:(r['step'],r['complex_symbols_per_gaussian']))
+    if not rows:
+        return []
+    _write_csv(out/'rate_distortion.csv',rows,list(rows[0]))
+    fig,axes = plt.subplots(1,3,figsize=(16,4.5))
+    for phase,record in endpoints.items():
+        subset = sorted((e for e in record['layouts'] if e['layout'].isdigit()),
+                        key=lambda e:e['symbols_per_source_gaussian'])
+        for ax,key in zip(axes,('source_psnr','source_mse','source_ssim')):
+            ax.plot([e['symbols_per_source_gaussian'] for e in subset],[e[key] for e in subset],
+                    marker='o',label=f'{phase}: step {record["step"]}')
+    for ax,title in zip(axes,('PSNR vs Source PLY (dB)','MSE vs Source PLY (lower better)','SSIM vs Source PLY')):
+        ax.set(title=title,xlabel='Attribute payload: complex symbols / Gaussian')
+        ax.set_xticks(sorted(set(r['complex_symbols_per_gaussian'] for r in rows)))
+        ax.legend(fontsize=8)
+    fig.suptitle('Learned prefix rate-distortion | phase endpoints; measured cutoffs only')
+    charts = _finish(fig,out/'rate_distortion')
+    last = records[-1]
+    gains = last.get('prefix_gains',[])
+    if gains:
+        fig,axes=plt.subplots(1,2,figsize=(13,4.5))
+        labels=[f'{g.get("from_complex_symbols",g["from"]):g} -> {g.get("to_complex_symbols",g["to"]):g}'
+                if 'from_complex_symbols' in g else f'q{g["from"]} -> q{g["to"]}' for g in gains]
+        for ax,key,title in zip(axes,('source_mse_reduction_per_extra_symbol','source_psnr_gain_db'),
+                               ('MSE reduction / additional complex symbol per Gaussian','PSNR gain (dB)')):
+            values=[g.get(key) for g in gains]
+            if any(v is None for v in values):
+                ax.text(.5,.5,'Not recorded in this run',transform=ax.transAxes,ha='center')
+            else:
+                ax.bar(labels,values,color='#2F6B9A')
+                ax.tick_params(axis='x',labelrotation=35)
+            ax.axhline(0,color='#59636E',linestyle='--')
+            ax.set(title=title,xlabel='Adjacent measured prefix lengths')
+        fig.suptitle(f'Incremental benefit | step {last["step"]}; paired views/noise, not a monotonicity guarantee')
+        charts += _finish(fig,out/'rate_marginal_gain')
+    return charts
+
+
 def plot_render_training(training_dir, output_dir=None):
     root = Path(training_dir)
     out = Path(output_dir) if output_dir else root/'charts'
@@ -54,7 +124,7 @@ def plot_render_training(training_dir, output_dir=None):
     if bootstrap.exists():
         checks = _read_jsonl(bootstrap)
         fig,ax = plt.subplots(figsize=(7,4))
-        for tier in ('1','2','3','mixed'):
+        for tier in sorted({e['layout'] for r in checks for e in r['layouts']},key=_layout_key):
             points = [(r['step'], e.get('loss',e.get('feature_loss'))) for r in checks
                       for e in r['layouts'] if e['layout']==tier]
             ax.plot([p[0] for p in points],[p[1] for p in points],label='q'+tier,marker='o',markersize=3,
@@ -85,20 +155,22 @@ def plot_render_training(training_dir, output_dir=None):
                 'Photo PSNR (dB)','Photo SSIM','XYZ RMSE: diagnostic only, scene units')
         styles={'1':('#2F6B9A','o'),'2':('#D8A72E','s'),'3':('#D96C2F','^'),
                 'mixed':('#737A36','D'),'mask':('#59636E','x')}
-        for label,(color,marker) in styles.items():
+        labels=sorted({r['layout'] for r in flattened},key=_layout_key)
+        for index,label in enumerate(labels):
+            color,marker=styles.get(label,(plt.get_cmap('tab20')(index%20),('o','s','^','D','v','P','X','<')[index%8]))
             subset=sorted([r for r in flattened if r['layout']==label],key=lambda r:r['step'])
             if not subset:
                 continue
             for ax,key,title in zip(axes.flat,keys,titles):
                 points=[r for r in subset if r.get(key) is not None]
                 ax.plot([r['step'] for r in points],[r[key] for r in points],color=color,marker=marker,
-                        linestyle='-' if len(points)>=8 else 'none',markersize=4,label='q'+label)
+                        linestyle='-' if len(points)>=8 else 'none',markersize=4,label=_layout_label(subset[0]))
                 ax.set(title=title,xlabel='Optimization step')
         for ax,key in ((axes[1,0],'reference_photo_psnr'),(axes[1,1],'reference_photo_ssim')):
             ax.axhline(flattened[0][key],color='#59636E',linestyle='--',label='Source PLY vs photo')
         handles,labels=axes[1,0].get_legend_handles_labels()
-        fig.legend(handles,labels,loc='lower center',ncol=len(labels),fontsize=9)
-        fig.tight_layout(rect=(0,.055,1,.96))
+        fig.legend(handles,labels,loc='lower center',ncol=min(5,len(labels)),fontsize=8)
+        fig.tight_layout(rect=(0,.10,1,.96))
         charts += _save(fig,out/'validation_quality')
         plt.close(fig)
         latest=records[-1]['layouts']
@@ -106,7 +178,8 @@ def plot_render_training(training_dir, output_dir=None):
         fig.suptitle(f'Last validation, step {records[-1]["step"]} | not necessarily best checkpoint')
         for ax,key,title in zip(axes,('symbols_per_source_gaussian','source_psnr'),
                                 ('Payload complex symbols / source Gaussian','Source-render PSNR (dB)')):
-            ax.bar(['q'+r['layout'] for r in latest],[r[key] for r in latest],color='#2F6B9A')
+            ax.bar([_layout_label(r) for r in latest],[r[key] for r in latest],color='#2F6B9A')
+            ax.tick_params(axis='x',labelrotation=45)
             ax.set_title(title)
             for i,r in enumerate(latest):
                 ax.annotate(f'{r[key]:.2f}',(i,r[key]),xytext=(0,3),textcoords='offset points',ha='center')
@@ -118,7 +191,9 @@ def plot_render_training(training_dir, output_dir=None):
             _write_csv(out/'prefix_gains.csv',gains,list(gains[0]))
             fig,axes=plt.subplots(1,2,figsize=(12,4.5))
             fig.suptitle('Progressive prefixes | paired views and symbol noise')
-            for lower,upper,color in [('1','2','#2F6B9A'),('2','3','#D96C2F')]:
+            pairs=list(dict.fromkeys((g['from'],g['to']) for g in gains))
+            for index,(lower,upper) in enumerate(pairs):
+                color=plt.get_cmap('tab10')(index%10)
                 subset=[g for g in gains if g['from']==lower and g['to']==upper]
                 for ax,key in zip(axes,('source_psnr_gain_db','paired_view_trial_improved_fraction')):
                     ax.plot([g['step'] for g in subset],[g[key] for g in subset],
@@ -130,6 +205,7 @@ def plot_render_training(training_dir, output_dir=None):
             axes[0].set_ylabel('Source-render PSNR gain (dB); positive is better')
             axes[1].set(ylabel='Fraction of paired observations with lower MSE',ylim=(-.02,1.02))
             charts += _finish(fig,out/'prefix_gains')
+        charts += plot_rate_sweep(records,out)
     return _manifest(out,'render_first_training',root,charts,[
         'Bootstrap is initialization, not communication fidelity; do not compare its scale to image MSE.',
         'Validation noise/views/layouts are fixed; sparse histories use markers only.',

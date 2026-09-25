@@ -62,10 +62,11 @@ class CodecConfig:
             raise ValueError('learned_joint requires learned_v1 and learned_affine')
         if not self.individual_tiers or self.geometry_rates or self.geometry_floor != 1e-4:
             raise ValueError('learned_joint requires individual tiers and no geometry sub-budget')
-        if len(self.rates) != 4 or self.rates[0] != 0 or any(
+        if not 2 <= len(self.rates) <= 256 or self.rates[0] != 0 or any(
             a >= b for a,b in zip(self.rates,self.rates[1:])
         ) or any(int(r) != r for r in self.rates):
-            raise ValueError('rates must be four increasing integer complex lengths starting at zero')
+            raise ValueError('rates must be 2..256 increasing integer complex lengths starting at zero')
+        self.rates = tuple(int(r) for r in self.rates)
         if not 0 <= self.sh_degree <= 3:
             raise ValueError('supported SH degrees: 0..3')
         if not 1 <= self.morton_bits <= 16 or self.block_size < 1:
@@ -107,15 +108,15 @@ class CodecConfig:
         return cls(**values)
 
 
-def validate_tiers(q, n):
+def validate_tiers(q, n, tier_count=4):
     if q.ndim != 1 or len(q) != n or q.dtype != torch.long:
         raise ValueError("q must be an int64 vector with one entry per Gaussian")
-    if n and ((q < 0).any() or (q > 3).any()):
-        raise ValueError("tiers must lie in 0..3")
+    if n and ((q < 0).any() or (q >= tier_count).any()):
+        raise ValueError(f"tiers must lie in 0..{tier_count-1}")
 
 
 def prefix_mask(q, rates):
-    validate_tiers(q, len(q))
+    validate_tiers(q, len(q), len(rates))
     lengths = torch.as_tensor(rates, device=q.device, dtype=torch.long)[q]
     return torch.arange(2 * rates[-1], device=q.device)[None] < 2 * lengths[:, None]
 
@@ -274,7 +275,7 @@ class GaussianCodec(nn.Module):
             self.learned.heads['xyz'].requires_grad_(False)
 
     def encode(self, features, xyz, q, snr):
-        validate_tiers(q, len(features))
+        validate_tiers(q, len(features), len(self.cfg.rates))
         return pack(self.learned.encode(features[None], xyz[None], q[None], snr)[0], q, self.cfg.rates)
 
     def encode_full(self, features, xyz, retained, snr):
@@ -288,7 +289,7 @@ class GaussianCodec(nn.Module):
         return self.learned.encode_full(features[None], xyz[None], retained[None], snr)[0]
 
     def decode(self, symbols, q, snr, return_seed=False, delivered_xyz=None):
-        validate_tiers(q, len(q))
+        validate_tiers(q, len(q), len(self.cfg.rates))
         result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr)[0]
         result = self.apply_position_delivery(result, q, delivered_xyz)
         # Optional benchmark diagnostic is final XYZ, not a bootstrap decoder.
@@ -314,15 +315,15 @@ class GaussianCodec(nn.Module):
         return torch.cat((side, result[..., 3:]), -1)
 
     def forward_tiers(self, features, xyz, choices, snr, kind="awgn"):
-        if choices.shape != (len(features), 4):
-            raise ValueError("choices must have shape [N,4]")
+        if choices.shape != (len(features), len(self.cfg.rates)):
+            raise ValueError("choices must have shape [N, number of tiers]")
         return tuple(x[0] for x in self.forward_tier_batches(
             features[None], xyz[None], choices[None], snr, kind))
 
     def forward_tier_batches(self, features, xyz, choices, snr, kind="awgn", paired_noise=False):
-        if choices.shape != (*features.shape[:2], 4) or features.ndim != 3:
-            raise ValueError("batched choices must have shape [B,N,4]")
-        if choices.requires_grad or not torch.equal(choices, F.one_hot(choices.argmax(-1), 4).to(choices)):
+        if choices.shape != (*features.shape[:2], len(self.cfg.rates)) or features.ndim != 3:
+            raise ValueError("batched choices must have shape [B,N, number of tiers]")
+        if choices.requires_grad or not torch.equal(choices, F.one_hot(choices.argmax(-1), len(self.cfg.rates)).to(choices)):
             raise ValueError('Use hard actions and score-function mask gradients, not ST choices')
         q = choices.argmax(-1)
         latent = self.learned.encode(features, xyz, q, snr)

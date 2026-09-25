@@ -1,0 +1,222 @@
+"""Dense rate-table regressions. CPU autograd/transport; synthetic rendering only."""
+import copy
+import csv
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+import torch
+from torch.nn import functional as F
+
+from test_learned_joint import setup
+from test_render_first import synthetic_render, Reference
+import test_render_first as render_fixture
+import test_training_launcher as launcher_fixture
+from gaussian_jscc.codec import CodecConfig, GaussianCodec, pack, prefix_mask
+from gaussian_jscc.learned_training import layout_schedule, hard_layout
+from gaussian_jscc.render_validation import validate_render
+from gaussian_jscc.render_plots import plot_render_training
+from gaussian_jscc.transport import (save_checkpoint, load_checkpoint, model_id, transmit, receive,
+                                     pack_tiers, unpack_tiers, encode_metadata, decode_metadata)
+from gaussian_jscc.data import prepare, to_features, to_raw, write_ply, load_tiers
+from gaussian_jscc.training import full_scene_step
+from gaussian_jscc.render_objective import MultiViewRenderTask
+
+
+RATES = (0,4,8,12,16,20,24,28,32)
+
+
+def dense(n=18):
+    raw,g,f,old = setup(n)
+    cfg = CodecConfig(**dict(old.cfg.to_dict(),rates=RATES,prefix_mode='progressive',
+                            position_delivery='quantized',position_bits=16,position_compression='delta_zlib'))
+    model = GaussianCodec(cfg)
+    model.attr_mean.copy_(old.attr_mean)
+    model.attr_std.copy_(old.attr_std)
+    return raw,g,f,model
+
+
+class DensePrefixTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(1)
+
+    def test_config_schedule_and_all_tier_sampling(self):
+        for rates in ((0,4),RATES,tuple(range(256))):
+            self.assertEqual(CodecConfig(rates=rates).rates,rates)
+        for rates in ((),(0,),(1,4),(0,4,4),(0,4.5),tuple(range(257))):
+            with self.assertRaises(ValueError):
+                CodecConfig(rates=rates)
+        self.assertEqual(layout_schedule(RATES),tuple(range(1,9))+(None,))
+        ids=torch.arange(10000)
+        ids[-1]=-1
+        q=hard_layout(ids,tier_count=9,drop=0)
+        self.assertEqual(set(q[:-1].tolist()),set(range(1,9)))
+        self.assertEqual(int(q[-1]),0)
+        with self.assertRaises(ValueError):
+            hard_layout(ids,9,tier_count=9)
+        self.assertEqual(int(load_tiers(None,1,8,tier_count=9)[0]),8)
+
+    def test_encode_once_all_prefixes_and_gradient_support(self):
+        _,_,f,model=dense(9)
+        full=model.encode_full(f,f[:,:3],torch.ones(9,dtype=torch.bool),10)
+        self.assertEqual(model.learned.tier.num_embeddings,9)
+        for tier in range(1,9):
+            q=torch.full((9,),tier)
+            torch.testing.assert_close(model.encode(f,f[:,:3],q,10),pack(full,q,RATES),rtol=0,atol=0)
+            model.zero_grad(set_to_none=True)
+            model(f,f[:,:3],q,10,'none')[:,3:].square().mean().backward()
+            grad=model.learned.symbol_head.weight.grad
+            cutoff=2*RATES[tier]
+            self.assertGreater(float(grad[:cutoff].norm()),0)
+            self.assertTrue((grad[cutoff:]==0).all())
+        mixed=torch.tensor([1,8,3,7,2,6,5,4,8])
+        torch.testing.assert_close(model.encode(f,f[:,:3],mixed,10),pack(full,mixed,RATES),rtol=0,atol=0)
+        with self.assertRaises(ValueError):
+            model.encode(f,f[:,:3],torch.full((9,),9),10)
+
+    def test_bitpacking_all_widths_and_legacy_bytes(self):
+        q=np.array([0,1,2,3,3,2,1,0,2],dtype=np.int64)
+        self.assertEqual(pack_tiers(q),bytes([228,27,2]))
+        for bits in range(1,9):
+            for n in (0,1,7,19):
+                values=np.arange(n,dtype=np.int64)%(2**bits)
+                np.testing.assert_array_equal(unpack_tiers(pack_tiers(values,bits),n,bits),values)
+        with self.assertRaises(ValueError):
+            pack_tiers(np.array([4]),2)
+        header={'source_count':9,'count':8,'config':{'rates':list(RATES)}}
+        data=encode_metadata(header,np.arange(9))
+        decoded,q=decode_metadata(data)
+        self.assertEqual(decoded['tier_id_bits'],4)
+        self.assertTrue(torch.equal(q,torch.arange(9)))
+        with self.assertRaises(ValueError):
+            encode_metadata(header,np.full(9,9))
+
+    def test_checkpoint_and_packet_preserve_high_tiers(self):
+        raw,_,_,model=dense(19)
+        q=torch.arange(len(raw))%9
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            save_checkpoint(root/'codec.pt',model,123)
+            loaded=load_checkpoint(root/'codec.pt','cpu')
+            self.assertEqual(model_id(model),model_id(loaded))
+            stats=transmit(model,raw,q,10,'none',42,root/'packet')
+            self.assertEqual(stats['tier_id_bits'],4)
+            self.assertEqual(stats['tier_map_uncompressed_bytes'],10)
+            self.assertEqual(len(stats['tier_counts']),9)
+            self.assertEqual(stats['payload_complex_symbols'],int(torch.tensor(RATES)[q].sum()))
+            actual=receive(loaded,root/'packet')
+            ordered,g,oq=prepare(raw,16,q)
+            expected=[]
+            for start in range(0,len(raw),model.cfg.block_size):
+                f,_=to_features(ordered[start:start+model.cfg.block_size],g,model)
+                qb=oq[start:start+len(f)]
+                expected.append(to_raw(model(f,f[:,:3],qb,10,'none')[qb>0],g,model))
+            torch.testing.assert_close(actual,torch.cat(expected))
+
+    def test_replay_and_checkpoint_dense_mixed_match(self):
+        _,g,f,model=dense(16)
+        batches=[(f[:8][None],torch.arange(1,9)[None]),
+                 (f[8:][None],torch.tensor([[8,0,6,5,4,3,2,1]]))]
+        outputs=[]
+        with patch('gaussian_jscc.rendering.render',side_effect=synthetic_render):
+            for mode in ('replay','checkpoint'):
+                m=copy.deepcopy(model)
+                torch.manual_seed(17)
+                task=MultiViewRenderTask(render_fixture.RenderFirstTests().cameras(),Reference(),0)
+                loss,_=full_scene_step(m,batches,g,10,'awgn',task,attr_weight=0,mode=mode)
+                outputs.append((loss,{n:p.grad for n,p in m.named_parameters()}))
+        torch.testing.assert_close(outputs[0][0],outputs[1][0])
+        for name,grad in outputs[0][1].items():
+            if grad is not None:
+                torch.testing.assert_close(grad,outputs[1][1][name],atol=2e-6,rtol=2e-4)
+
+    def test_paired_noise_and_validation_cover_all_prefixes(self):
+        raw,g,f,model=dense(16)
+        received=[]
+        original=model.learned.decode
+        def capture(z,q,snr):
+            received.append(z.detach().clone())
+            return original(z,q,snr)
+        with patch.object(model.learned,'decode',side_effect=capture):
+            for tier in range(1,9):
+                torch.manual_seed(123)
+                q=torch.full((2,8),tier)
+                model.forward_tier_batches(f.reshape(2,8,-1),f[:,:3].reshape(2,8,3),
+                                           F.one_hot(q,9).float(),10,'awgn',paired_noise=True)
+        for i,z in enumerate(received):
+            cutoff=2*RATES[i+1]
+            torch.testing.assert_close(z[...,:cutoff],received[-1][...,:cutoff],rtol=0,atol=0)
+        with tempfile.TemporaryDirectory() as folder,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render):
+            state=torch.get_rng_state().clone()
+            result=validate_render(model,[f.reshape(2,8,-1)],[torch.arange(16).reshape(2,8)],
+                                   raw,g,render_fixture.RenderFirstTests().cameras(),Reference(),10,'awgn',2,42,folder,0,'initial')
+            self.assertTrue(torch.equal(state,torch.get_rng_state()))
+            self.assertEqual(len(result['layouts']),9)
+            self.assertEqual(len(result['prefix_gains']),7)
+            self.assertEqual([e['uniform_complex_symbols'] for e in result['layouts']],list(RATES[1:])+[None])
+            self.assertEqual(len(list((Path(folder)/'validation_images'/'000000').glob('*.png'))),18)
+            self.assertAlmostEqual(result['score'],sum(e['source_mse'] for e in result['layouts'])/9)
+            for gain in result['prefix_gains']:
+                self.assertEqual(gain['extra_complex_symbols_per_gaussian'],4)
+                self.assertAlmostEqual(gain['source_mse_reduction_per_extra_symbol'],gain['source_mse_reduction']/4)
+
+    def test_two_phase_cli_charts_all_tiers_and_initializer_guard(self):
+        from gaussian_jscc.cli import main
+        raw,_,_,_=dense(24)
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            write_ply(root/'input.ply',raw,0)
+            argv=['gaussian_jscc','train-learned','--ply',str(root/'input.ply'),'--out',str(root/'run'),
+                  '--source','mock','--device','cuda','--bootstrap-steps','9','--bootstrap-objective','local-response',
+                  '--render-steps','9','--validation-views','1','--validation-trials','1',
+                  '--validate-every','9','--save-every','9','--blocks-per-batch','2',
+                  '--hidden','16','--depth','1','--grid-dim','4','--levels','2','--block-size','8',
+                  '--decoder-window','4','--prefix-mode','progressive','--position-delivery','quantized',
+                  '--position-bits','16','--position-compression','delta_zlib','--rates',*map(str,RATES)]
+            with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
+                 patch('gaussian_jscc.rendering.load_cameras',return_value=render_fixture.RenderFirstTests().cameras()*2), \
+                 patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
+                 patch('gaussian_jscc.plots.safe_plot') as plots:
+                main()
+                self.assertGreaterEqual(plots.call_count,3)
+            rows=[json.loads(line) for line in (root/'run'/'loss.jsonl').read_text().splitlines()]
+            expected=[str(q) for q in range(1,9)]+['mixed']
+            self.assertEqual([r['layout'] for r in rows],expected*2)
+            self.assertEqual(set(rows[-1]['layout_updates_this_phase'].values()),{1})
+            self.assertTrue(all(np.isfinite(r['loss']) and r['grad_norm']>0 for r in rows))
+            plot_render_training(root/'run')
+            for stem in ('rate_distortion','rate_marginal_gain','validation_quality','bootstrap_validation','prefix_gains'):
+                self.assertTrue((root/'run'/'charts'/f'{stem}.png').exists())
+            with (root/'run'/'charts'/'rate_distortion.csv').open() as stream:
+                points=list(csv.DictReader(stream))
+            self.assertEqual(len(points),24)
+            self.assertEqual({float(r['complex_symbols_per_gaussian']) for r in points},set(RATES[1:]))
+            argv[argv.index(str(root/'run'))]=str(root/'mismatch')
+            argv=argv[:argv.index('--rates')]+['--rates','0','8','16','32','--init',str(root/'run'/'codec.pt')]
+            with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')):
+                with self.assertRaisesRegex(ValueError,'initializer rates'):
+                    main()
+
+    def test_dense_launcher_defaults_and_overrides(self):
+        helper=launcher_fixture.LauncherTests()
+        result=helper.launch({'CUDA_VISIBLE_DEVICES':'2','INIT':'old.pt'},
+                             script='scripts/train_progressive16_rate_sweep.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for arg in ('--rates 0 4 8 12 16 20 24 28 32','--bootstrap-steps 11250','--render-steps 11250',
+                    '--validate-every 500','--render-backward replay','--prefix-mode progressive'):
+            self.assertIn(arg,result.stdout)
+        self.assertNotIn('--init ',result.stdout)
+        result=helper.launch({'CUDA_VISIBLE_DEVICES':'3','BOOTSTRAP_STEPS':'5000','RENDER_STEPS':'5000',
+                              'VALIDATION_VIEWS':'8','VALIDATION_TRIALS':'3'},
+                             script='scripts/train_progressive16_rate_sweep.sh')
+        self.assertEqual(result.returncode,0,result.stderr)
+        for arg in ('--bootstrap-steps 5000','--render-steps 5000','--validation-views 8','--validation-trials 3'):
+            self.assertIn(arg,result.stdout)
+
+
+if __name__=='__main__':
+    unittest.main()

@@ -72,8 +72,10 @@ def benchmark_codec(args):
         raise ValueError("hybrid ablation requires --source")
     if len(set(args.channels)) != len(args.channels):
         raise ValueError("channels must be unique")
-    if any(tier not in (1, 2, 3) for tier in args.tiers):
-        raise ValueError("codec isolation supports only positive tiers 1, 2 and 3")
+    if args.tiers is None:
+        args.tiers = list(range(1,len(model.cfg.rates)))
+    if any(not 1 <= tier < len(model.cfg.rates) for tier in args.tiers):
+        raise ValueError("codec isolation requires positive tiers present in the checkpoint")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -163,7 +165,7 @@ def add_parser(sub):
     parser.add_argument("--ply", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--tiers", type=int, nargs="+", choices=[1, 2, 3], default=[1, 2, 3])
+    parser.add_argument("--tiers", type=int, nargs="+", help='default: all positive checkpoint tiers')
     parser.add_argument("--snrs", type=float, nargs="+", default=[0, 5, 10, 15, 20])
     parser.add_argument("--channels", nargs="+", choices=["none", "awgn", "rayleigh"],
                         default=["none", "awgn"])

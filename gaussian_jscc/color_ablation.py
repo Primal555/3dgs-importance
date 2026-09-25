@@ -121,6 +121,8 @@ def run(args):
         raise FileExistsError(f'Refusing to overwrite existing diagnostic: {out}')
     device = torch.device(args.device)
     model = load_checkpoint(checkpoint, device)
+    if any(not 1 <= q < len(model.cfg.rates) for q in args.tiers):
+        raise ValueError('requested tier outside checkpoint rate table')
     if model.cfg.position_delivery == 'learned':
         raise ValueError('This diagnostic expects fixed delivered XYZ, not learned positions')
     before = model_id(model)
@@ -165,7 +167,7 @@ def run(args):
     rows = []
     raw_device = raw.to(device)
     for tier in args.tiers:
-        qs = [hard_layout(gi, tier, 0.) for gi in group_ids]
+        qs = [hard_layout(gi, tier, 0.,len(model.cfg.rates)) for gi in group_ids]
         for trial in range(args.trials):
             seed_all(config['seed']+20000+(0 if paired else (tier-1)*1000)+trial)
             received = decode_batches(model, groups, qs, config['snr'], config['channel'], geometry, paired_noise=paired)
@@ -209,7 +211,7 @@ def main():
     parser.add_argument('--ply', help='Override original PLY path after migration')
     parser.add_argument('--source', help='Override scene path after migration')
     parser.add_argument('--out', help='New directory, defaults to training/color_ablation')
-    parser.add_argument('--tiers', type=int, nargs='+', choices=[1, 2, 3], default=[3])
+    parser.add_argument('--tiers', type=int, nargs='+', default=[3])
     parser.add_argument('--trials', type=int, default=2)
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()

@@ -19,6 +19,14 @@ GRID = "#DDE2E6"
 REFERENCE = "#59636E"
 
 
+def tier_styles(count):
+    if count == 4:
+        return TIER_NAMES, TIER_COLORS
+    names = tuple('Drop' if q == 0 else f'q{q}' for q in range(count))
+    colors = tuple('#9AA1A8' if q == 0 else _plt().get_cmap('tab20')((q-1)%20) for q in range(count))
+    return names, colors
+
+
 def _plt():
     import matplotlib
     matplotlib.use("Agg")
@@ -339,7 +347,7 @@ def plot_evaluation(evaluation_dir, output_dir=None):
         tier_arrays = [record.get("tier_counts") for record in group if record.get("tier_counts") is not None]
         if tier_arrays:
             mean_counts = np.asarray(tier_arrays, dtype=float).mean(0)
-            for index, name in enumerate(TIER_NAMES):
+            for index, name in enumerate(tier_styles(len(mean_counts))[0]):
                 row[f"tier_{name.lower()}_count_mean"] = float(mean_counts[index])
                 row[f"tier_{name.lower()}_share"] = float(mean_counts[index] / mean_counts.sum())
         summary.append(row)
@@ -489,7 +497,9 @@ def plot_evaluation(evaluation_dir, output_dir=None):
         axis.legend(ncol=3)
         charts += _finish(fig, out / "channel_uses_vs_snr")
 
-    share_fields = [f"tier_{name.lower()}_share" for name in TIER_NAMES]
+    tier_count = max((len(r.get('tier_counts',[])) for r in data),default=4)
+    tier_names,tier_colors = tier_styles(tier_count or 4)
+    share_fields = [f"tier_{name.lower()}_share" for name in tier_names]
     if all(field in summary[0] for field in share_fields):
         fig, axes = plt.subplots(len(series_names), 1, figsize=(8.5, 4 * len(series_names)),
                                  squeeze=False)
@@ -500,7 +510,7 @@ def plot_evaluation(evaluation_dir, output_dir=None):
             shares = np.asarray([[row[field] for field in share_fields] for row in rows])
             bottom = np.zeros(len(snrs))
             width = .7 * (np.diff(snrs).min() if len(snrs) > 1 else 1.)
-            for index, (name, color) in enumerate(zip(TIER_NAMES, TIER_COLORS)):
+            for index, (name, color) in enumerate(zip(tier_names, tier_colors)):
                 axis.bar(snrs, shares[:, index], bottom=bottom, width=width, label=name,
                          color=color, edgecolor="white", linewidth=.6)
                 bottom += shares[:, index]
@@ -605,16 +615,18 @@ def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 
     out.mkdir(parents=True, exist_ok=True)
     probabilities = np.load(allocation_dir / "probabilities.npy", allow_pickle=False)
     tiers = np.load(allocation_dir / "tiers.npy", allow_pickle=False)
-    if probabilities.ndim != 2 or probabilities.shape[1] != 4 or tiers.shape != (len(probabilities),):
-        raise ValueError("allocation arrays must have shapes [N,4] and [N]")
+    tier_count = len(rates)
+    tier_names,tier_colors = tier_styles(tier_count)
+    if probabilities.ndim != 2 or probabilities.shape[1] != tier_count or tiers.shape != (len(probabilities),):
+        raise ValueError("allocation arrays must have shapes [N,number of tiers] and [N]")
     if not np.isfinite(probabilities).all() or (probabilities < 0).any() or (probabilities > 1).any():
         raise ValueError("allocation probabilities must be finite values in [0,1]")
-    if not np.allclose(probabilities.sum(1), 1., atol=2e-4) or ((tiers < 0) | (tiers > 3)).any():
+    if not np.allclose(probabilities.sum(1), 1., atol=2e-4) or ((tiers < 0) | (tiers >= tier_count)).any():
         raise ValueError("invalid categorical allocation")
     rates = np.asarray(rates, dtype=float)
-    if rates.shape != (4,):
-        raise ValueError("rates must contain four values")
-    counts = np.bincount(tiers.astype(np.int64), minlength=4)
+    if rates.shape != (tier_count,) or tier_count < 2:
+        raise ValueError("rates must contain at least two values")
+    counts = np.bincount(tiers.astype(np.int64), minlength=tier_count)
     shares = counts / len(tiers)
     expected = probabilities @ rates
     existence = 1 - probabilities[:, 0]
@@ -622,7 +634,7 @@ def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 
     plt = _plt()
 
     fig, axis = plt.subplots(figsize=(8, 4.8))
-    bars = axis.bar(TIER_NAMES, shares, color=TIER_COLORS, edgecolor="white", linewidth=.8)
+    bars = axis.bar(tier_names, shares, color=tier_colors, edgecolor="white", linewidth=.8)
     axis.set_ylim(0, max(1., float(shares.max()) * 1.18))
     axis.set_title("Hard tier allocation" + (f" at {snr:g} dB" if snr is not None else ""))
     axis.set_ylabel("Share of source Gaussians")
@@ -647,7 +659,7 @@ def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 
         if xyz.shape != (len(tiers), 3) or not np.isfinite(xyz).all():
             raise ValueError("xyz must be a finite [N,3] array matching the allocation")
         selected = []
-        for tier in range(4):
+        for tier in range(tier_count):
             indices = np.flatnonzero(tiers == tier)
             if len(indices) > 25000:
                 indices = indices[np.linspace(0, len(indices) - 1, 25000).astype(int)]
@@ -656,7 +668,7 @@ def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
         for axis, (a, b, labels) in zip(axes, ((0, 1, ("X", "Y")), (0, 2, ("X", "Z")),
                                                      (1, 2, ("Y", "Z")))):
-            for tier, (name, color) in enumerate(zip(TIER_NAMES, TIER_COLORS)):
+            for tier, (name, color) in enumerate(zip(tier_names, tier_colors)):
                 idx = selected[tiers[selected] == tier]
                 if len(idx):
                     axis.scatter(xyz[idx, a], xyz[idx, b], s=1.2, alpha=.4, color=color,
@@ -670,7 +682,7 @@ def plot_allocation(allocation_dir, output_dir=None, xyz=None, rates=(0, 8, 16, 
 
     summary = [{"tier": name, "symbol_length": float(rates[index]), "count": int(counts[index]),
                 "share": float(shares[index]), "snr_db": snr}
-               for index, name in enumerate(TIER_NAMES)]
+               for index, name in enumerate(tier_names)]
     _write_csv(out / "allocation_chart_data.csv", summary, list(summary[0]))
     return _manifest(out, "allocation", allocation_dir, charts,
                      ["Existence probability is defined as 1 - P(drop).",

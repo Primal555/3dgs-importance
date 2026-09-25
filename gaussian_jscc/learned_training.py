@@ -48,9 +48,9 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
             batches.append((features, q))
             retained.append(ids[q > 0])
         ids = torch.cat(retained)
-        counts = torch.zeros(4,device=device)
+        counts = torch.zeros(len(model.cfg.rates),device=device)
         for (_,q), original_ids in zip(batches,id_batches):
-            counts += torch.bincount(q[original_ids.to(device)>=0],minlength=4)
+            counts += torch.bincount(q[original_ids.to(device)>=0],minlength=len(model.cfg.rates))
         compositions.append(counts)
         log_probs.append(torch.stack(sample_logs).sum())
         expectations.append(torch.stack(rates).sum()/source_count)
@@ -100,9 +100,16 @@ def decode_batches(model, feature_batches, q_batches, snr, kind, geometry, paire
                       for f, q in zip(feature_batches, q_batches)])
 
 
-def hard_layout(ids, uniform=None, drop=.05):
+def layout_schedule(rates):
+    """One update per positive prefix, then one per-point mixed update."""
+    return tuple(range(1, len(rates))) + (None,)
+
+
+def hard_layout(ids, uniform=None, drop=.05, tier_count=4):
+    if tier_count < 2 or (uniform is not None and not 1 <= uniform < tier_count):
+        raise ValueError('uniform tier must be positive and present in the rate table')
     valid = ids >= 0
-    q = torch.full_like(ids, uniform) if uniform is not None else torch.randint(1, 4, ids.shape, device=ids.device)
+    q = torch.full_like(ids, uniform) if uniform is not None else torch.randint(1, tier_count, ids.shape, device=ids.device)
     if uniform is None and drop:
         q[torch.rand(ids.shape, device=ids.device) < drop] = 0
     return torch.where(valid, q, 0)

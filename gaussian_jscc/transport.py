@@ -47,30 +47,44 @@ def load_checkpoint(path, device):
     return model.to(device).eval()
 
 
-def pack_tiers(q):
-    q = np.asarray(q, dtype=np.uint8)
-    out = np.zeros((len(q) + 3) // 4, dtype=np.uint8)
-    for shift in range(4):
-        part = q[shift::4]
-        out[:len(part)] |= part << (2 * shift)
-    return out.tobytes()
+def tier_id_bits(tier_count):
+    if not 2 <= tier_count <= 256:
+        raise ValueError('tier count must be 2..256')
+    return max(1, (tier_count-1).bit_length())
 
 
-def unpack_tiers(data, n):
+def pack_tiers(q, bits=2):
+    q = np.asarray(q)
+    if (not 1 <= bits <= 8 or q.ndim != 1 or (q.size and not np.issubdtype(q.dtype,np.integer))
+            or ((q < 0) | (q >= 2**bits)).any()):
+        raise ValueError('tier IDs do not fit the packed bit width')
+    # LSB-first preserves the exact historical four-2-bit-IDs-per-byte format.
+    unpacked = (q.astype(np.uint8)[:,None] >> np.arange(bits)) & 1
+    return np.packbits(unpacked.reshape(-1),bitorder='little').tobytes()
+
+
+def unpack_tiers(data, n, bits=2):
+    if not 1 <= bits <= 8 or n < 0 or len(data) != (n*bits+7)//8:
+        raise ValueError('invalid packed tier lengths')
     packed = np.frombuffer(data, dtype=np.uint8)
-    q = np.empty(n, dtype=np.int64)
-    for shift in range(4):
-        part = q[shift::4]
-        part[:] = (packed[:len(part)] >> (2 * shift)) & 3
-    return q
+    unpacked = np.unpackbits(packed,bitorder='little')[:n*bits].reshape(n,bits)
+    return (unpacked.astype(np.int64) * (1 << np.arange(bits))).sum(-1)
 
 
 def encode_metadata(header, q):
+    header = dict(header)
+    count = len(header.get('config',{}).get('rates',(0,8,16,32)))
+    bits = tier_id_bits(count)
+    if bits != 2:
+        header['tier_id_bits'] = bits
     text = json.dumps(header, sort_keys=True, separators=(",", ":")).encode()
     body = struct.pack("<I", len(text)) + text
     # Complete q sequence frames the variable-length stream and preserves q=0.
-    # Packing four 2-bit decisions per byte avoids a wasteful uint8 array.
-    body += pack_tiers(q)
+    # Expanded rate tables need wider IDs, not silently truncated 2-bit values.
+    q = np.asarray(q)
+    if ((q < 0) | (q >= count)).any():
+        raise ValueError('tier outside configured rate table')
+    body += pack_tiers(q,bits)
     compressed = zlib.compress(body, level=9)
     return b"GJS2" + struct.pack("<I", zlib.crc32(compressed)) + compressed
 
@@ -84,11 +98,13 @@ def decode_metadata(data):
     size = struct.unpack("<I", body[:4])[0]
     header = json.loads(body[4:4 + size])
     n = header["source_count"]
-    if n < 0 or len(body) != 4 + size + (n + 3) // 4:
+    bits = header.get('tier_id_bits',2)
+    count = len(header.get('config',{}).get('rates',(0,8,16,32)))
+    if bits != tier_id_bits(count) or n < 0 or len(body) != 4 + size + (n*bits+7)//8:
         raise ValueError("invalid metadata lengths")
     offset = 4 + size
-    q = unpack_tiers(body[offset:], n)
-    if int((q > 0).sum()) != header["count"]:
+    q = unpack_tiers(body[offset:], n,bits)
+    if (q >= count).any() or int((q > 0).sum()) != header["count"]:
         raise ValueError("invalid retained tier count")
     return header, torch.from_numpy(q)
 
@@ -105,7 +121,7 @@ def metadata_channel_uses(bits, snr, code_rate=None, modulation_bits=2):
 @torch.no_grad()
 def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_bits=2):
     from .codec import validate_tiers
-    validate_tiers(q, len(raw))
+    validate_tiers(q, len(raw),len(model.cfg.rates))
     if kind not in ("none", "awgn", "rayleigh") or not math.isfinite(float(snr)):
         raise ValueError("invalid channel/SNR")
     # Validate accounting before producing any packet files.
@@ -144,10 +160,11 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
     meta_uses = metadata_channel_uses(bits, snr, code_rate, modulation_bits)
     coordinate_uses = metadata_channel_uses(coordinate_bits, snr, code_rate, modulation_bits)
     stats = {"source_gaussians": len(raw), "retained_gaussians": int((q > 0).sum()),
-             "tier_counts": torch.bincount(q, minlength=4).tolist(),
+             "tier_counts": torch.bincount(q, minlength=len(model.cfg.rates)).tolist(),
              "payload_complex_symbols": len(received), "metadata_bytes": len(metadata),
              "transmitted_mean_complex_energy": transmitted_energy / max(1,len(received)),
-             "tier_map_uncompressed_bytes": (len(q) + 3) // 4,
+             "tier_id_bits": tier_id_bits(len(model.cfg.rates)),
+             "tier_map_uncompressed_bytes": (len(q)*tier_id_bits(len(model.cfg.rates))+7)//8,
              "per_gaussian_coordinates_in_metadata": False,
              "global_geometry_floats": 6,
              "metadata_channel_uses": meta_uses, "total_channel_uses": len(received) + meta_uses + coordinate_uses,
@@ -166,7 +183,9 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
                  position_seed_is_final=True,
                  receiver_context='local received features; no source or predicted XYZ inputs',
                  grouping='fixed source-row intervals; q0 holes retained in syntax',
-                 power_normalization='smooth per-row RMS; mean complex energy <= 1')
+                 power_normalization=('independent incremental-layer RMS; per-layer mean complex energy <= 1'
+                                      if model.cfg.prefix_mode == 'progressive' else
+                                      'smooth per-row RMS; mean complex energy <= 1'))
     stats.update(position_cost(model.cfg, int((q > 0).sum()), coordinate_bits//8),
                  position_channel_uses=coordinate_uses,
                  position_stream_assumption='reliably delivered; no FEC or coordinate packet errors simulated',

@@ -51,14 +51,14 @@ def write_ply(path, raw, degree):
     PlyData([PlyElement.describe(out, "vertex")], text=False).write(str(path))
 
 
-def load_tiers(path, n, uniform=None):
+def load_tiers(path, n, uniform=None, tier_count=4):
     if path:
         a = np.load(path, allow_pickle=False)
-        if a.shape != (n,) or not np.issubdtype(a.dtype, np.integer) or ((a < 0) | (a > 3)).any():
-            raise ValueError("rate map must be an integer .npy array [N], tiers 0..3, in input PLY order")
+        if a.shape != (n,) or not np.issubdtype(a.dtype, np.integer) or ((a < 0) | (a >= tier_count)).any():
+            raise ValueError(f"rate map must be an integer .npy array [N], tiers 0..{tier_count-1}, in input PLY order")
         return torch.from_numpy(a.astype(np.int64))
-    if uniform not in (1, 2, 3):
-        raise ValueError("specify --rate-map or --uniform-tier 1/2/3")
+    if uniform is None or not 1 <= uniform < tier_count:
+        raise ValueError(f"specify --rate-map or --uniform-tier in 1..{tier_count-1}")
     return torch.full((n,), uniform, dtype=torch.long)
 
 

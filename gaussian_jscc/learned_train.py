@@ -8,7 +8,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from .codec import CodecConfig, GaussianCodec
 from .data import read_ply, Geometry, morton_order, to_features
-from .learned_training import discrete_joint_step, hard_layout
+from .learned_training import discrete_joint_step, hard_layout, layout_schedule
 from .optimization import clip_codec_gradients, preserved_rng, update_stats
 from .render_objective import bootstrap_loss, MultiViewRenderTask, split_cameras
 from .render_validation import append_json, validate_render
@@ -54,7 +54,8 @@ def add_parser(sub):
     p.add_argument('--depth', type=int, default=2)
     p.add_argument('--grid-dim', type=int, default=16)
     p.add_argument('--levels', nargs='+', type=int, default=[4,8])
-    p.add_argument('--rates', nargs=4, type=int, default=[0,8,16,32])
+    p.add_argument('--rates', nargs='+', type=int, default=None,
+                   help='0 followed by increasing complex prefix lengths; default 0 8 16 32, or checkpoint rates with --init')
     p.add_argument('--lr', type=float, default=1e-4, help='bootstrap learning rate')
     p.add_argument('--render-lr', type=float, default=1e-5, help='render and joint codec learning rate')
     p.add_argument('--mask-lr', type=float, default=1e-3)
@@ -125,6 +126,8 @@ def train(args):
             raise ValueError('requires matching learned_joint weights; omit --init for old architectures')
         if model.cfg.prefix_mode != args.prefix_mode:
             raise ValueError('initializer prefix_mode must match --prefix-mode; start a new random run to change coding semantics')
+        if args.rates is not None and tuple(args.rates) != model.cfg.rates:
+            raise ValueError('initializer rates must match --rates; changed prefix boundaries require a new random run')
         if (model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits
                 or model.cfg.position_compression != args.position_compression):
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
@@ -133,7 +136,7 @@ def train(args):
     else:
         cfg = CodecConfig(architecture='learned_joint',loss_profile='learned_v1',sh_degree=degree,
                           hidden=args.hidden,grid_dim=args.grid_dim,depth=args.depth,levels=tuple(args.levels),
-                          planes=False,rates=tuple(args.rates),block_size=args.block_size,
+                          planes=False,rates=tuple(args.rates or (0,8,16,32)),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
                           position_delivery=args.position_delivery,position_bits=args.position_bits,
                           position_compression=args.position_compression,prefix_mode=args.prefix_mode)
@@ -149,7 +152,9 @@ def train(args):
         mask = load_mask(args.allocation_init,original,model,device).train()
     else:
         prior = np.load(args.existence_prior,allow_pickle=False) if args.existence_prior else None
-        mask = GaussianTierMask(len(original),existence_prior=prior).to(device) if args.joint_steps else None
+        mask = GaussianTierMask(len(original),existence_prior=prior,tier_count=len(model.cfg.rates)).to(device) if args.joint_steps else None
+    schedule = layout_schedule(model.cfg.rates)
+    tier_count = len(model.cfg.rates)
     geometry = Geometry.fit(original[:,:3],model.cfg.morton_bits)
     order = torch.from_numpy(morton_order(geometry.quantize(original[:,:3]).numpy()).astype(np.int64))
     raw = original[order]
@@ -202,12 +207,16 @@ def train(args):
                   phase_transition='retain codec weights; clear Adam moments; set render_lr; position delivery unchanged',
                   mask_gradient='REINFORCE image MSE; exact expected normalized payload penalty',
                   budget='per-Gaussian payload; optional Lagrange penalty, NOT a hard cap',
-                  metadata='reliable global bbox + per-row tier syntax unchanged; chart payload excludes metadata',
+                  metadata='reliable global bbox + packed per-row tier IDs; training rate excludes metadata',
                   clipping='none by default; any threshold is an explicit empirical hyperparameter')
     record.update(position_delivery=model.cfg.position_delivery,
                   prefix_mode=model.cfg.prefix_mode,
                   incremental_complex_symbols=[b-a for a,b in zip(model.cfg.rates[:-1],model.cfg.rates[1:])],
-                  layout_schedule='repeat q1, q2, q3, per-Gaussian mixed; one render objective per update',
+                  rates=list(model.cfg.rates),
+                  layout_schedule=['mixed' if q is None else str(q) for q in schedule],
+                  layout_schedule_note='one optimizer update per layout; mixed samples all positive tiers uniformly per Gaussian',
+                  updates_per_full_layout_cycle=len(schedule),
+                  tier_id_bits=max(1,(tier_count-1).bit_length()),
                   validation_noise=('paired full-slot noise across layouts' if model.cfg.prefix_mode == 'progressive'
                                     else 'independent fixed noise per layout'),
                   position_protocol=('XYZ learned from JSCC payload; no coordinate side stream'
@@ -220,6 +229,8 @@ def train(args):
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
           f'train/val views={len(cameras or [])}/{len(val_cameras or [])}',flush=True)
     print(f'Prefix mode: {model.cfg.prefix_mode}; incremental symbols={record["incremental_complex_symbols"]}',flush=True)
+    print(f'Layout cycle: {record["layout_schedule"]}; {len(schedule)} optimizer updates per cycle. '
+          'More tiers at the same step count mean fewer uniform updates per tier.',flush=True)
 
     def initialization_loss(pred, target):
         if args.bootstrap_objective == 'local-response':
@@ -235,14 +246,15 @@ def train(args):
             seed_all(args.seed+9000)
             model.eval()
             values = []
-            for tier in (1,2,3,None):
+            for tier in schedule:
                 losses = []
                 for i in validation_indices:
                     f = blocks[i].to(device)
-                    q = hard_layout(ids[i].to(device),tier,0.)
+                    q = hard_layout(ids[i].to(device),tier,0.,tier_count)
                     pred = model(f,f[:,:3],q,args.snr,args.channel)
                     losses.append(float(initialization_loss(pred,f)[0]))
-                entry = {'layout':'mixed' if tier is None else str(tier),'loss':sum(losses)/len(losses)}
+                entry = {'layout':'mixed' if tier is None else str(tier),'loss':sum(losses)/len(losses),
+                         'uniform_complex_symbols':None if tier is None else model.cfg.rates[tier]}
                 if args.bootstrap_objective == 'feature':
                     entry['feature_loss'] = entry['loss']  # Existing consumers.
                 values.append(entry)
@@ -283,6 +295,7 @@ def train(args):
         if phase == 'render' and args.bootstrap_steps:
             optimizer.state.clear()
         best, patience_best, stale = float('inf'),float('inf'),0
+        layout_updates = {label:0 for label in (['learned_mask'] if phase == 'joint' else record['layout_schedule'])}
         if phase != 'bootstrap':
             initial = initial_validation if phase == 'render' and step == 0 else validation(step,phase)
             best = patience_best = initial['score']
@@ -294,16 +307,19 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             if mask_optimizer is not None:
                 mask_optimizer.zero_grad(set_to_none=True)
-            tier = (1,2,3,None)[(local_step-1)%4]
-            stats = {'layout':'mixed' if tier is None else str(tier)}
+            tier = schedule[(local_step-1)%len(schedule)]
+            label = 'learned_mask' if phase == 'joint' else ('mixed' if tier is None else str(tier))
+            layout_updates[label] += 1
+            stats = {'layout':label, 'layout_updates_this_phase':dict(layout_updates),
+                     'uniform_complex_symbols':None if tier is None or phase == 'joint' else model.cfg.rates[tier]}
             if phase == 'bootstrap':
                 selected = [training_indices[i] for i in torch.randint(len(training_indices),(args.blocks_per_batch,)).tolist()]
                 f = pad_sequence([blocks[i] for i in selected],batch_first=True).to(device)
                 gi = pad_sequence([ids[i] for i in selected],batch_first=True,padding_value=-1).to(device)
-                q = hard_layout(gi,tier,args.drop)
+                q = hard_layout(gi,tier,args.drop,tier_count)
                 if not (q>0).any():
                     q[gi>=0] = 1
-                choices = torch.nn.functional.one_hot(q,4).to(f)
+                choices = torch.nn.functional.one_hot(q,tier_count).to(f)
                 pred,_,_ = model.forward_tier_batches(f,f[...,:3],choices,args.snr,args.channel)
                 loss,local_stats = initialization_loss(pred[q>0],f[q>0])
                 stats.update(local_stats,bootstrap_objective=args.bootstrap_objective)
@@ -315,9 +331,9 @@ def train(args):
                 view_ids = torch.randperm(len(cameras))[:args.views_per_step].tolist()
                 task = MultiViewRenderTask([cameras[i] for i in view_ids],reference,degree,args.white_background)
                 if phase == 'render':
-                    qs = [hard_layout(gi,tier,args.drop) for gi in group_ids]
+                    qs = [hard_layout(gi,tier,args.drop,tier_count) for gi in group_ids]
                     if not any((q>0).any() for q in qs):
-                        qs = [hard_layout(gi,1,0.) for gi in group_ids]
+                        qs = [hard_layout(gi,1,0.,tier_count) for gi in group_ids]
                     loss, details = full_scene_step(model,list(zip(groups,qs)),geometry,args.snr,args.channel,
                                                     task,attr_weight=0.,mode=args.render_backward)
                     stats.update(details,**task.stats)
@@ -352,7 +368,8 @@ def train(args):
                    **stats,**gradient_stats}
             append_json(out/'loss.jsonl',row)
             if local_step == 1 or local_step%10 == 0:
-                print(f'{phase} {local_step}/{maximum}: loss={row["loss"]:.6f}, grad={float(norm):.4g}, '
+                print(f'{phase} {local_step}/{maximum}: q={stats["layout"]}, symbols={stats["uniform_complex_symbols"]}, '
+                      f'loss={row["loss"]:.6f}, grad={float(norm):.4g}, '
                       f'update={update_norm:.4g}, sec={row["step_seconds"]:.2f}',flush=True)
             if step%args.save_every == 0:
                 save(f'_{step}',phase,step)
@@ -380,6 +397,10 @@ def train(args):
                     if args.patience and stale >= args.patience:
                         print(f'{phase}: stopping after {stale} validation checks without sufficient MSE improvement.',flush=True)
                         break
+                # Refresh figures at each check, so a running/interrupted job
+                # already has length-quality curves in its own output folder.
+                from .plots import safe_plot
+                safe_plot('training',out)
         save('_end_'+phase,phase,step)
     # Final and best are deliberately different files; do not call the last
     # weights "best", silently restore them, or mismatch a codec/mask pair.
