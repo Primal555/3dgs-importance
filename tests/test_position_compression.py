@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from gaussian_jscc.codec import CodecConfig, GaussianCodec
 from gaussian_jscc.position_delivery import (delivered_positions, encode_positions,
-    decode_positions, position_cost, PositionCostMeter)
+    decode_positions, position_cost, PositionCostMeter, _encode_quantized_integers, training_position_cost)
 from gaussian_jscc.transport import transmit, receive, save_checkpoint, load_checkpoint, model_id
 from gaussian_jscc.data import prepare
 from test_learned_joint import setup
@@ -54,16 +54,52 @@ class CompressionTests(unittest.TestCase):
 
     def test_meter_cache_counts_retention_not_tier(self):
         cfg=self.config();unit=torch.rand(40,3);meter=PositionCostMeter(cfg,unit)
-        with patch('gaussian_jscc.position_delivery.encode_positions',wraps=encode_positions) as spy:
+        with patch('gaussian_jscc.position_delivery._encode_quantized_integers',wraps=_encode_quantized_integers) as spy:
             a=meter.stream_bytes(torch.ones(40,dtype=torch.long))
             b=meter.stream_bytes(torch.full((40,),3,dtype=torch.long))
             self.assertEqual(a,b);self.assertEqual(spy.call_count,1)
             q=torch.ones(40,dtype=torch.long);q[0]=0
             meter.stream_bytes(q);self.assertEqual(spy.call_count,2)
 
+    def test_levels_preserve_xyz_and_meter_matches_export(self):
+        torch.manual_seed(33)
+        unit=torch.rand(300,3)
+        unit[:2]=torch.tensor([[0.,1.,.5],[1.,0.,.5]])
+        for bits in (1,12,16):
+            for level in (1,3,6,9):
+                cfg=self.config(bits);cfg.position_compression_level=level
+                meter=PositionCostMeter(cfg,unit)
+                for q in (torch.arange(len(unit))%4,torch.ones(len(unit),dtype=torch.long),torch.zeros(len(unit),dtype=torch.long)):
+                    encoded=encode_positions(unit,q,cfg)
+                    self.assertEqual(meter.stream_bytes(q),len(encoded))
+                    expected=delivered_positions(unit,q,cfg)
+                    torch.testing.assert_close(decode_positions(encoded,q,cfg),expected,atol=0,rtol=0)
+                    torch.testing.assert_close(decode_positions(encoded,q,self.config(bits)),expected,atol=0,rtol=0)
+
+    def test_level_serialization_legacy_and_validation(self):
+        cfg=self.config()
+        self.assertNotIn('position_compression_level',cfg.to_dict())
+        self.assertEqual(CodecConfig.from_dict(cfg.to_dict()).position_compression_level,9)
+        cfg.position_compression_level=6
+        self.assertEqual(CodecConfig.from_dict(cfg.to_dict()).position_compression_level,6)
+        for value in (0,10,6.5,True):
+            with self.assertRaises(ValueError):
+                CodecConfig(position_compression_level=value)
+
+    def test_render_cost_not_measured_is_not_zero(self):
+        cfg=self.config()
+        result=training_position_cost(cfg,5,10,80,2,allow_unmeasured=True)
+        self.assertEqual(result['position_cost_status'],'not_measured')
+        self.assertEqual(result['position_content_bits'],5*3*16)
+        for key in ('position_stream_bytes','position_stream_bits','position_channel_uses_estimate',
+                    'position_uses_per_source_gaussian','payload_plus_position_uses_per_source_gaussian'):
+            self.assertIsNone(result[key])
+        with self.assertRaises(ValueError):training_position_cost(cfg,5,10,80,2)
+
     def test_packet_only_receiver_accounting_checkpoint_and_attribute_identity(self):
         raw,_,f,base=setup(17)
-        cfg=CodecConfig(**(base.cfg.to_dict()|dict(position_delivery='quantized',position_bits=16,position_compression='delta_zlib')))
+        cfg=CodecConfig(**(base.cfg.to_dict()|dict(position_delivery='quantized',position_bits=16,
+                                                position_compression='delta_zlib',position_compression_level=6)))
         model=GaussianCodec(cfg);model.load_state_dict(base.state_dict())
         plain_cfg=CodecConfig(**(cfg.to_dict()|{'position_compression':'none'}))
         plain=GaussianCodec(plain_cfg);plain.load_state_dict(base.state_dict())
@@ -87,7 +123,7 @@ class CompressionTests(unittest.TestCase):
             self.assertEqual(stats['position_channel_uses'],size*4)
             self.assertEqual(stats['total_channel_uses'],stats['payload_complex_symbols']+stats['metadata_channel_uses']+size*4)
 
-    def test_training_and_validation_use_measured_cached_bytes(self):
+    def test_render_skips_compression_but_validation_measures(self):
         from gaussian_jscc.cli import main
         from gaussian_jscc.data import write_ply
         from test_render_first import synthetic_render, RenderFirstTests
@@ -95,23 +131,28 @@ class CompressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);write_ply(root/'input.ply',raw,0)
             argv=['gaussian_jscc','train-learned','--ply',str(root/'input.ply'),'--out',str(root/'run'),
-                  '--source','mock','--device','cuda','--render-steps','2','--validation-views','1',
-                  '--validation-trials','1','--validate-every','1','--hidden','16','--depth','1',
+                  '--source','mock','--device','cuda','--render-steps','4','--validation-views','1',
+                  '--validation-trials','1','--validate-every','4','--hidden','16','--depth','1',
+                  '--drop','0.5',
                   '--grid-dim','4','--levels','2','--block-size','8','--decoder-window','4',
                   '--position-delivery','quantized','--position-bits','16','--position-compression','delta_zlib']
             with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
                  patch('gaussian_jscc.rendering.load_cameras',return_value=RenderFirstTests().cameras()*2), \
                  patch('gaussian_jscc.rendering.render',side_effect=synthetic_render),patch('gaussian_jscc.plots.safe_plot'), \
-                 patch('gaussian_jscc.position_delivery.encode_positions',wraps=encode_positions) as spy:
+                 patch('gaussian_jscc.position_delivery._encode_quantized_integers',wraps=_encode_quantized_integers) as spy:
                 main()
                 self.assertEqual(spy.call_count,1)
             model=load_checkpoint(root/'run/codec.pt','cpu')
+            self.assertEqual(model.cfg.position_compression_level,6)
             ordered,g,q=prepare(raw,16,torch.ones(16,dtype=torch.long))
             size=len(encode_positions(g.normalize(ordered[:,:3]),q,model.cfg))
             rows=[json.loads(x) for x in (root/'run/loss.jsonl').read_text().splitlines()]
             for row in rows:
-                self.assertEqual(row['position_stream_bytes'],size)
-                self.assertEqual(row['position_channel_uses_estimate'],size*4)
+                self.assertIsNone(row['position_stream_bytes'])
+                self.assertIsNone(row['position_channel_uses_estimate'])
+                self.assertEqual(row['position_cost_status'],'not_measured')
+                self.assertEqual(row['position_compression_seconds'],0.)
+            self.assertEqual(rows[-1]['layout'],'mixed')
             for row in [json.loads(x) for x in (root/'run/validation.jsonl').read_text().splitlines()]:
                 for entry in row['layouts']:
                     self.assertEqual(entry['position_stream_bytes'],size)

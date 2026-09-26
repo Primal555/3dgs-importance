@@ -1,5 +1,6 @@
 """Training utilities for learned_joint, including honest discrete mask actions."""
 from contextlib import contextmanager
+import time
 import torch
 from torch.nn import functional as F
 from .training import full_scene_step, codec_batch
@@ -57,6 +58,7 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
         return codec_batch(model,f,q,snr,kind,geometry,0,return_metrics=True,
                            compute_auxiliary=auxiliary_weight!=0,paired_noise=True)
     log_probs, costs, all_stats, expectations, compositions, side_costs = [], [], [], [], [], []
+    cost_timings, task_timings = [], []
     source_count = sum(int((ids >= 0).sum()) for ids in id_batches)
     for _ in range(samples):
         batches, retained, sample_logs, rates = [], [], [], []
@@ -79,7 +81,12 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
         log_probs.append(torch.stack(sample_logs).sum())
         expectations.append(torch.stack(rates).sum()/source_count)
         flat_q = torch.cat([q[gi.to(q.device)>=0].cpu() for (_,q),gi in zip(batches,id_batches)])
-        side_costs.append(rate_meter.details(flat_q)['allocation_side_uses_per_source_gaussian'] if rate_meter else 0.)
+        cost_started = time.perf_counter()
+        measured = rate_meter.details(flat_q) if rate_meter else {}
+        side_costs.append(measured.get('allocation_side_uses_per_source_gaussian', 0.))
+        cost_timings.append((time.perf_counter()-cost_started, measured.get('position_compression_seconds', 0.),
+                             measured.get('tier_map_compression_seconds', 0.)))
+        task_started = time.perf_counter()
         if len(ids) and not train_codec:
             with noise_context():
                 scene = decode_batches(model, feature_batches, [q for _,q in batches], snr, kind, geometry,paired_noise=paired_noise)
@@ -109,6 +116,7 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
             stats = {'retained_gaussians': 0, 'render_loss': float(cost)/samples}
         costs.append(cost)
         all_stats.append(stats)
+        task_timings.append(time.perf_counter()-task_started)
     normalizer = rate_meter.normalizer if rate_meter else model.cfg.rates[-1]
     rewards = [c + beta*s/normalizer for c,s in zip(costs,side_costs)]
     policy = policy_objective(log_probs, rewards)
@@ -122,6 +130,10 @@ def discrete_joint_step(model, mask, feature_batches, id_batches, geometry, snr,
         'policy_surrogate': float(policy.detach()), 'sample_task_costs': [float(c) for c in costs],
         'expected_symbols_per_gaussian': float(mean_rate.detach()),
         'rate_loss': float(total_rate_loss), 'mask_samples': samples,
+        'rate_accounting_seconds': sum(t[0] for t in cost_timings),
+        'position_compression_seconds': sum(t[1] for t in cost_timings),
+        'tier_map_compression_seconds': sum(t[2] for t in cost_timings),
+        'codec_task_seconds': sum(task_timings),
         'sample_side_uses_per_gaussian': side_costs, 'rate_normalizer': normalizer,
         'sample_policy_costs': [float(r) for r in rewards], 'codec_updated': train_codec,
         'paired_mask_channel_noise': paired_noise,

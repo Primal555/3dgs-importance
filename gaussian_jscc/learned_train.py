@@ -39,6 +39,8 @@ def add_parser(sub):
     p.add_argument('--position-bits', type=int, default=12, help='quantized XYZ bits per axis (1..16)')
     p.add_argument('--position-compression', choices=['none','delta_zlib'], default='none',
                    help='lossless integer delta/byte-plane/zlib side stream; does not change attributes')
+    p.add_argument('--position-compression-level', type=int, choices=range(1,10), default=None,
+                   help='new runs default to 6; --init preserves checkpoint level (historical: 9); used in training, validation and export')
     p.add_argument('--position-net-bits-per-use', type=float, default=2.,
                    help='assumed digital net information bits/complex use for training charts; not a tested FEC')
     p.add_argument('--bootstrap-steps', '--steps', dest='bootstrap_steps', type=int, default=0,
@@ -135,6 +137,8 @@ def train(args):
         if (model.cfg.position_delivery != args.position_delivery or model.cfg.position_bits != args.position_bits
                 or model.cfg.position_compression != args.position_compression):
             raise ValueError('initializer position delivery/bits must match explicit construction flags')
+        if args.position_compression_level is not None and model.cfg.position_compression_level != args.position_compression_level:
+            raise ValueError('--init preserves checkpoint compression level; omit --position-compression-level or use its saved value')
         print('Loaded learned_joint weights/statistics; fresh optimizer. Legacy auxiliary weights are NOT used.',flush=True)
         print('Architecture, rates and feature statistics come from the checkpoint; position-delivery flags must match it.',flush=True)
     else:
@@ -143,7 +147,8 @@ def train(args):
                           planes=False,rates=tuple(args.rates or (0,8,16,32)),block_size=args.block_size,
                           decoder_window=args.decoder_window,attention_heads=args.attention_heads,power_floor=args.power_floor,
                           position_delivery=args.position_delivery,position_bits=args.position_bits,
-                          position_compression=args.position_compression,prefix_mode=args.prefix_mode)
+                          position_compression=args.position_compression,prefix_mode=args.prefix_mode,
+                          position_compression_level=args.position_compression_level if args.position_compression_level is not None else 6)
         model = GaussianCodec(cfg).to(device)
         model.attr_mean.copy_(original[:,3:].mean(0).to(device))
         model.attr_std.copy_(original[:,3:].std(0,unbiased=False).clamp_min(.01).to(device))
@@ -164,6 +169,9 @@ def train(args):
     raw = original[order]
     del original
     position_meter = PositionCostMeter(model.cfg, geometry.normalize(raw[:, :3]))
+    args.position_compression_level = model.cfg.position_compression_level
+    print(f'XYZ compression level: {model.cfg.position_compression_level}; render updates skip compressed-byte measurement; '
+          'validation/export and joint allocation use measured cost.', flush=True)
     allocation_meter = AllocationCostMeter(model.cfg,position_meter,len(raw),args.position_net_bits_per_use) if mask is not None else None
     cache_device = device if args.training_data_device == 'cuda' else torch.device('cpu')
     blocks, ids = [], []
@@ -218,6 +226,8 @@ def train(args):
                   mask_gradient='REINFORCE image MSE + measured XYZ/tier side cost; exact expected payload gradient',
                   budget='payload + XYZ + compressed tier-map proxy; beta is a Lagrange penalty, NOT a hard cap',
                   metadata='reliable bbox/tier syntax; joint charges compressed tier-map proxy but excludes packet JSON/bbox/model-ID framing',
+                  position_accounting='render updates omit compressed-byte measurement (null); validation, joint and export measure actual bytes at the checkpoint compression level',
+                  timing_scope='step_seconds excludes checkpoint/validation/plotting; codec_task_seconds and rate_accounting_seconds are wall-clock subranges, not CUDA kernel profiling',
                   clipping='none by default; any threshold is an explicit empirical hyperparameter')
     record.update(position_delivery=model.cfg.position_delivery,
                   prefix_mode=model.cfg.prefix_mode,
@@ -352,17 +362,21 @@ def train(args):
                 view_ids = torch.randperm(len(cameras))[:args.views_per_step].tolist()
                 task = MultiViewRenderTask([cameras[i] for i in view_ids],reference,degree,args.white_background)
                 if phase == 'render':
+                    task_started = time.perf_counter()
                     qs = [hard_layout(gi,tier,args.drop,tier_count) for gi in group_ids]
                     if not any((q>0).any() for q in qs):
                         qs = [hard_layout(gi,1,0.,tier_count) for gi in group_ids]
                     loss, details = full_scene_step(model,list(zip(groups,qs)),geometry,args.snr,args.channel,
                                                     task,attr_weight=0.,mode=args.render_backward)
                     stats.update(details,**task.stats)
+                    stats['codec_task_seconds'] = time.perf_counter()-task_started
+                    rate_started = time.perf_counter()
                     stats['symbols_per_source_gaussian'] = sum(float(torch.tensor(model.cfg.rates,device=q.device)[q].sum()) for q in qs)/len(raw)
                     stats.update(training_position_cost(model.cfg,details['retained_gaussians'],len(raw),
                                  stats['symbols_per_source_gaussian']*len(raw),args.position_net_bits_per_use,
-                                 position_meter.stream_bytes(torch.cat([
-                                     q[gi.to(q.device)>=0].cpu() for q,gi in zip(qs,group_ids)]))))
+                                 allow_unmeasured=True))
+                    stats.update(rate_accounting_seconds=time.perf_counter()-rate_started,
+                                 position_compression_seconds=0.)
                 else:
                     loss,details = discrete_joint_step(model,mask,groups,group_ids,geometry,args.snr,args.channel,
                                                        task,beta=args.beta,auxiliary_weight=0.,samples=args.mask_samples,
@@ -394,7 +408,8 @@ def train(args):
             if local_step == 1 or local_step%10 == 0:
                 print(f'{phase} {local_step}/{maximum}: q={stats["layout"]}, symbols={stats["uniform_complex_symbols"]}, '
                       f'loss={row["loss"]:.6f}, grad={float(norm):.4g}, '
-                      f'update={update_norm:.4g}, sec={row["step_seconds"]:.2f}',flush=True)
+                      f'update={update_norm:.4g}, sec={row["step_seconds"]:.2f}, '
+                      f'rate_sec={stats.get("rate_accounting_seconds",0.):.3f}',flush=True)
                 if phase == 'joint':
                     print(f'  mask_grad={stats["mask_grad_norm"]:.4g}, codec_updated={stats["codec_updated"]}, '
                           f'image_mse={stats["render_loss"]:.6g}, rate_penalty={stats["rate_loss"]:.6g}, '

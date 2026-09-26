@@ -2,6 +2,13 @@
 
 ## Gaussian JSCC codec extension
 
+### Coordinate-cost speed fix
+
+New `train-learned` runs use zlib level 6 for compressed 16-bit XYZ, consistently
+in joint training, validation and export. Render-only updates no longer compress
+random retention masks just to log bytes; unmeasured compressed costs are `null`.
+See [behavior, compatibility and CPU benchmark](docs/position_cost_speed.md).
+
 ### Two-stage option: cheap attribute response pretraining, then scene rendering
 
 `scripts/train_progressive16_two_stage.sh` restores the September 19 isolated

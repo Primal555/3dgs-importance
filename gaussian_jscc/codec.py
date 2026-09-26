@@ -40,6 +40,9 @@ class CodecConfig:
     position_delivery: str = 'learned'
     position_bits: int = 12
     position_compression: str = 'none'
+    # Legacy checkpoints omitted this field and used level 9. New training
+    # explicitly selects level 6; keep old packet/model identities intact.
+    position_compression_level: int = 9
     # Absent in historical checkpoints: preserve their adaptive code semantics.
     prefix_mode: str = 'adaptive'
 
@@ -48,6 +51,8 @@ class CodecConfig:
             raise ValueError('prefix_mode must be adaptive or progressive')
         if self.position_compression not in ('none', 'delta_zlib'):
             raise ValueError('position_compression must be none or delta_zlib')
+        if type(self.position_compression_level) is not int or not 1 <= self.position_compression_level <= 9:
+            raise ValueError('position_compression_level must be an integer in 1..9')
         if self.position_compression != 'none' and self.position_delivery != 'quantized':
             raise ValueError('coordinate compression requires quantized position delivery')
         if self.position_delivery not in ('learned', 'float32', 'quantized'):
@@ -95,6 +100,8 @@ class CodecConfig:
             result.pop('prefix_mode')  # Preserve historical weights/packet hashes.
         if self.position_compression == 'none':
             result.pop('position_compression')  # Preserve historical model hashes.
+        if self.position_compression == 'none' or self.position_compression_level == 9:
+            result.pop('position_compression_level')
         if self.position_delivery == 'learned' and self.position_bits == 12:
             # Preserve existing v4 shared-model hashes exactly.
             result.pop('position_delivery')

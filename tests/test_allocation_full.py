@@ -156,10 +156,17 @@ class AllocationFullTests(unittest.TestCase):
             loss=[json.loads(line) for line in (run/'loss.jsonl').read_text().splitlines()]
             self.assertEqual([r['phase'] for r in loss],['bootstrap','render','joint','joint'])
             self.assertEqual(loss[-2]['update_norm'],0.)
+            self.assertIsNone(loss[1]['position_stream_bytes'])
+            for r in loss[-2:]:
+                self.assertGreater(r['rate_accounting_seconds'],0)
+                self.assertGreater(r['position_compression_seconds'],0)
+                self.assertGreater(r['tier_map_compression_seconds'],0)
+                self.assertGreater(r['rate_loss'],0)
             self.assertGreater(loss[-1]['update_norm'],0.)
             self.assertEqual(model_id(load_checkpoint(run/'codec_end_render.pt','cpu')),
                              model_id(load_checkpoint(run/'codec_3.pt','cpu')))
             model=load_checkpoint(run/'codec_best_joint.pt','cpu')
+            self.assertEqual(model.cfg.position_compression_level,6)
             source,_=read_ply(root/'source.ply')
             loaded=load_mask(run/'route2_best_joint.pt',source,model,'cpu')
             self.assertEqual(len(loaded.logits),24)

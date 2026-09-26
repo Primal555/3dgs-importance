@@ -6,6 +6,7 @@ module never substitutes opacity for a missing MaskGaussian existence mask.
 import json
 import math
 import zlib
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -55,15 +56,21 @@ class AllocationCostMeter:
         self.normalizer = self.details(torch.full((count,), len(cfg.rates)-1))['allocation_uses_per_source_gaussian']
 
     def details(self, q):
+        started = time.perf_counter()
         q = q.detach().cpu().reshape(-1)
         if len(q) != self.count or q.dtype != torch.long or ((q < 0) | (q >= len(self.cfg.rates))).any():
             raise ValueError('allocation cost needs valid packet-order tiers for every source row')
         payload = int(torch.tensor(self.cfg.rates)[q].sum())
         result = training_position_cost(self.cfg, int((q > 0).sum()), self.count, payload,
                                         self.bits, self.positions.stream_bytes(q))
+        position_seconds = self.positions.last_seconds
+        tier_started = time.perf_counter()
         tier_bytes = len(zlib.compress(pack_tiers(q.numpy(), tier_id_bits(len(self.cfg.rates))), level=9))
+        tier_seconds = time.perf_counter()-tier_started
         side = result['position_channel_uses_estimate'] + math.ceil(tier_bytes*8/self.bits)
         result.update(tier_map_proxy_bytes=tier_bytes, allocation_side_uses_per_source_gaussian=side/self.count,
+                      position_compression_seconds=position_seconds, position_cost_cache_hit=self.positions.last_cache_hit,
+                      tier_map_compression_seconds=tier_seconds, rate_accounting_seconds=time.perf_counter()-started,
                       allocation_uses_per_source_gaussian=(payload+side)/self.count,
                       allocation_rate_scope='payload + framed XYZ + zlib tier-map proxy; excludes packet JSON/header and shared weights')
         return result

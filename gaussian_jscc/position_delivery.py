@@ -10,6 +10,7 @@ not bit-exact original-world-coordinate recovery after normalization.
 import math
 import struct
 import zlib
+import time
 import numpy as np
 import torch
 from collections import OrderedDict
@@ -25,7 +26,7 @@ def delivered_positions(unit, q, cfg):
     return value * (q > 0)[..., None]
 
 
-def position_cost(cfg, retained, stream_bytes=None):
+def position_cost(cfg, retained, stream_bytes=None, *, allow_unmeasured=False):
     bits = 0 if cfg.position_delivery == 'learned' else (32 if cfg.position_delivery == 'float32' else cfg.position_bits)
     content = int(retained) * 3 * bits
     # Header: magic(4), mode(1), precision(1), count(8), CRC(4).
@@ -33,15 +34,41 @@ def position_cost(cfg, retained, stream_bytes=None):
     packed_size = size
     coding = getattr(cfg, 'position_compression', 'none')
     if coding != 'none':
-        if stream_bytes is None:
+        if stream_bytes is None and not allow_unmeasured:
             raise ValueError('compressed coordinate cost requires measured stream_bytes')
-        if not isinstance(stream_bytes, int) or stream_bytes < 18:
+        if stream_bytes is not None and (not isinstance(stream_bytes, int) or stream_bytes < 18):
             raise ValueError('invalid measured coordinate stream length')
         size = stream_bytes
     return {'position_delivery': cfg.position_delivery, 'position_bits_per_axis': bits,
             'position_compression': coding, 'position_packed_stream_bytes': packed_size,
             'position_content_bits': content, 'position_stream_bytes': size,
-            'position_stream_bits': size*8}
+            'position_stream_bits': None if size is None else size*8,
+            'position_compression_level': getattr(cfg, 'position_compression_level', 9) if coding != 'none' else None,
+            'position_cost_status': 'not_measured' if size is None else ('measured' if coding != 'none' else 'exact_packed')}
+
+
+def _frame_positions(mode, bits, count, payload):
+    body = struct.pack('<BBQ', mode, bits, count) + payload
+    return b'GXYZ' + struct.pack('<I', zlib.crc32(body)) + body
+
+
+def _encode_quantized_integers(integers, cfg):
+    """Shared export/meter path. Integer coordinates are exact cached inputs.
+
+    Selection must happen BEFORE differencing: deleting a row changes its
+    successor's delta. Compression level changes bytes, never decoded XYZ.
+    """
+    bits = cfg.position_bits
+    if getattr(cfg, 'position_compression', 'none') == 'delta_zlib':
+        mode = 3
+        delta = np.diff(integers, axis=0, prepend=np.zeros((1, 3), np.int32)).astype('<i4')
+        planes = delta.T.copy().view(np.uint8).reshape(3, len(integers), 4).transpose(0, 2, 1)
+        payload = zlib.compress(planes.tobytes(), level=getattr(cfg, 'position_compression_level', 9))
+    else:
+        mode = 2
+        binary = ((integers.reshape(-1, 1).astype(np.uint32) >> np.arange(bits, dtype=np.uint32)) & 1).astype(np.uint8)
+        payload = np.packbits(binary.reshape(-1), bitorder='little').tobytes()
+    return _frame_positions(mode, bits, len(integers), payload)
 
 
 def encode_positions(unit, q, cfg):
@@ -54,19 +81,10 @@ def encode_positions(unit, q, cfg):
         mode, bits = 1, 32
         payload = xyz.astype('<f4').tobytes()
     else:
-        mode, bits = 2, cfg.position_bits
+        bits = cfg.position_bits
         integers = np.rint(xyz * (2**bits-1)).astype(np.int32)
-        if getattr(cfg, 'position_compression', 'none') == 'delta_zlib':
-            mode = 3
-            # First row is relative to zero. Preserve order and duplicates.
-            delta = np.diff(integers, axis=0, prepend=np.zeros((1, 3), np.int32)).astype('<i4')
-            planes = delta.T.copy().view(np.uint8).reshape(3, len(xyz), 4).transpose(0, 2, 1)
-            payload = zlib.compress(planes.tobytes(), level=9)
-        else:
-            binary = ((integers.reshape(-1, 1).astype(np.uint32) >> np.arange(bits, dtype=np.uint32)) & 1).astype(np.uint8)
-            payload = np.packbits(binary.reshape(-1), bitorder='little').tobytes()
-    body = struct.pack('<BBQ', mode, bits, len(xyz)) + payload
-    return b'GXYZ' + struct.pack('<I', zlib.crc32(body)) + body
+        return _encode_quantized_integers(integers, cfg)
+    return _frame_positions(mode, bits, len(xyz), payload)
 
 
 def decode_positions(data, q, cfg):
@@ -113,15 +131,15 @@ def decode_positions(data, q, cfg):
     return result
 
 
-def training_position_cost(cfg, retained, source_count, payload, bits_per_use, stream_bytes=None):
+def training_position_cost(cfg, retained, source_count, payload, bits_per_use, stream_bytes=None, *, allow_unmeasured=False):
     if not math.isfinite(bits_per_use) or bits_per_use <= 0:
         raise ValueError('position net bits/use must be positive and finite')
-    result = position_cost(cfg, retained, stream_bytes)
-    uses = math.ceil(result['position_stream_bits']/bits_per_use)
+    result = position_cost(cfg, retained, stream_bytes, allow_unmeasured=allow_unmeasured)
+    uses = None if result['position_stream_bits'] is None else math.ceil(result['position_stream_bits']/bits_per_use)
     result.update(position_assumed_net_bits_per_use=bits_per_use,
                   position_channel_uses_estimate=uses,
-                  position_uses_per_source_gaussian=uses/max(1, source_count),
-                  payload_plus_position_uses_per_source_gaussian=(payload+uses)/max(1, source_count),
+                  position_uses_per_source_gaussian=None if uses is None else uses/max(1, source_count),
+                  payload_plus_position_uses_per_source_gaussian=None if uses is None else (payload+uses)/max(1, source_count),
                   position_reliability='assumed reliable; no FEC/packet errors simulated',
                   rate_scope='payload + XYZ framing; excludes existing bbox/tier/model metadata')
     return result
@@ -135,19 +153,32 @@ class PositionCostMeter:
     """
     def __init__(self, cfg, unit):
         self.cfg = cfg
-        self.unit = unit.detach().cpu()
+        self.unit = unit.detach().cpu().clone()
+        self.integers = None
+        if getattr(cfg, 'position_compression', 'none') == 'delta_zlib':
+            if not torch.isfinite(self.unit).all():
+                raise ValueError('side XYZ must be finite normalized coordinates')
+            self.integers = (self.unit.float().clamp(0, 1) * (2**cfg.position_bits-1)).round().numpy().astype(np.int32)
         self.cache = OrderedDict()
+        self.last_seconds = 0.
+        self.last_cache_hit = False
 
     def stream_bytes(self, q):
+        started = time.perf_counter()
         q = q.detach().cpu().reshape(-1)
         if len(q) != len(self.unit):
             raise ValueError('coordinate mask/source length mismatch')
         if getattr(self.cfg, 'position_compression', 'none') == 'none':
+            self.last_seconds = time.perf_counter()-started
+            self.last_cache_hit = False
             return None
-        key = np.packbits((q > 0).numpy(), bitorder='little').tobytes()
+        keep = (q > 0).numpy()
+        key = (getattr(self.cfg, 'position_compression_level', 9), np.packbits(keep, bitorder='little').tobytes())
+        self.last_cache_hit = key in self.cache
         if key not in self.cache:
-            self.cache[key] = len(encode_positions(self.unit, q, self.cfg))
+            self.cache[key] = len(_encode_quantized_integers(self.integers[keep], self.cfg))
             if len(self.cache) > 8:
                 self.cache.popitem(last=False)
         self.cache.move_to_end(key)
+        self.last_seconds = time.perf_counter()-started
         return self.cache[key]
