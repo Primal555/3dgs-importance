@@ -1,49 +1,49 @@
-# 四档 mask 与 codec 联合训练
+# Four-tier per-Gaussian allocation: local image feedback
 
-固定16 bit坐标＋三档渐进属性＋不传档的完整新实验见
-[progressive_mask_full.md](progressive_mask_full.md)。入口为
-`scripts/train_progressive16_mask_full.sh`，保留逐点概率表，不新增档位预测网络。
+The current training entry point is `train-learned --joint-steps N` with a
+**progressive** codec and a matching trained codec checkpoint. The historical
+scene-level REINFORCE allocator is no longer called by this entry point.
+`scripts/test_local_mask_feedback.sh` starts one controlled run from a fixed
+codec: first mask-only updates, then optional joint codec/mask updates. It
+writes parity diagnostics, validation images, allocation snapshots and measured
+rates into the same output directory.
 
-联合训练已统一到 `train-learned --joint-steps N`。`train-route2` 及旧的 Gumbel-ST 训练循环已移除。
+## Forward semantics
 
-## 当前含义
+Each original PLY row has four logits. Hard sampled tiers select q0 (drop) or
+one of the 8/16/32-complex-symbol progressive prefixes. Only q>0 rows receive
+16-bit compressed XYZ. Deployment uses `argmax` tiers, real packing and the
+ordinary Gaussian rasterizer. There is no q0 payload, coordinate or splat.
 
-- q0：不发送、不渲染；不构造假位置参与反向传播。
-- q1/q2/q3：每个 Gaussian 独立的不同复符号预算；不代表缩小透明度。
-- 同一局部块可以混合多个档位；局部块不是档位分配单位。
-- mask 仍是按原始 PLY 行索引的四类可学习 logits，不是 Transformer 注意力权重。
+During **training only**, up to `--mask-shadow-per-block` sampled q0 rows per
+source block are decoded hypothetically as q1 and added to the MaskGaussian
+renderer with an exactly zero existence mask. This cap limits counterfactual
+context changes and makes q0 feedback sparse when many rows are dropped.
+This does not change the rendered forward image; the custom rasterizer supplies
+an image derivative with respect to that row's mask. Positive-tier choices use
+hard-forward/soft-backward cumulative prefix gates and a differentiable tier
+embedding. The common codeword, quantized XYZ and full-slot paired noise match
+the hard progressive path. This is a *biased local gradient surrogate*, not an
+exact derivative through an actual discrete transmission.
 
-可通过 `--existence-prior prior.npy` 初始化存在概率。文件必须与原始 PLY 行顺序一致。
+The visual objective remains multiview RGB MSE against the source PLY render.
+No position, parameter or projection auxiliary is added in joint allocation.
+Payload has an exact differentiable expected rate. The compressed XYZ stream
+has a detached measured per-retained-row proxy; the compressed tier-map byte
+count is measured but does not provide a gradient. Actual compressed bytes and
+hard deployment q0/q1/q2/q3 counts are logged at validation and export; the
+proxy objective must not be presented as an exact total-rate gradient.
 
-## 梯度与目标
+## Checks before interpreting a run
 
-codec 对实际采样档位的多视角图像 MSE 正常反向传播，不再加入参数重建或逐点投影辅助损失。
-mask 使用硬采样的 REINFORCE 梯度、独立样本的 leave-one-out 基线，以及期望 payload 码率的解析梯度。
-mask 的任务奖励同样来自完整原场景渲染的图像误差；删点不能通过移除某一行的参数误差获得虚假收益。
+`mask_renderer_check.json` compares an ordinary hard scene render to the
+masked renderer with zero-gated candidate rows. Training aborts if this
+forward discrepancy exceeds the configured tolerance. CPU tests check that
+the straight-through codec's hard forward matches the existing paired-noise
+codec and that q0 plus positive tiers receive gradients. Those checks do not
+establish real-scene visual quality or validate the *direction* of the biased
+gradient. The latter requires held-out quality and measured-rate improvement,
+and ideally spot-checking sampled one-point tier flips on CUDA.
 
-`--mask-samples` 默认 2；样本数增加会增加全场景开销。场景级策略梯度的方差仍需观察，不能仅凭梯度非零认定重要性学习有效。
-`--beta` 是通信成本的拉格朗日权重，不是严格的总符号数上限。
-当前训练还计入实际压缩的坐标流及压缩档位表代理成本，后两项通过策略梯度优化；
-完整包头成本在最终传输评估中统计。`--existence-prior auto` 可直接读取同一PLY中的
-MaskGaussian logits；不存在时会明确报告，不会拿opacity冒充历史存在概率。
-
-完整连续训练：
-
-```bash
-JOINT_STEPS=1000 CUDA_VISIBLE_DEVICES=0 bash scripts/train_codec_learned.sh
-```
-
-仅从已训练的新 codec 开始联合优化：
-
-```bash
-python -m gaussian_jscc train-learned \
-  --ply /path/to/point_cloud.ply --source /path/to/scene \
-  --init /path/to/learned_codec.pt --out /path/to/new_joint_output \
-  --steps 0 --render-steps 0 --joint-steps 1000 --device cuda
-```
-
-上面使用的只能是 learned_joint 检查点。`--allocation-init` 可恢复与初始化 codec 匹配的 `route2.pt`；优化器和步数计划重新开始，不是精确断点续训。
-
-结果包含配对的 `codec.pt` / `route2.pt`，以及配对的最佳联合检查点。不得跨次保存混用。
-
-架构、验证图及预算假设见 [主说明](learned_joint_jscc.md)。
+Use the matched `codec_best_joint.pt` and `route2_best_joint.pt` together.
+`--init` starts fresh optimizer state; it is not an exact resume.

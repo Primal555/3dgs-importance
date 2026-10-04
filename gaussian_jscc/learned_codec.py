@@ -111,11 +111,17 @@ class LearnedCore(nn.Module):
         # bounds normalization gain; no padding waveform to force equality.
         return z / (energy + self.cfg.power_floor).sqrt()
 
-    def decode(self, received, q, snr):
+    def decode(self, received, q, snr, choices=None, receive_mask=None):
         active = q > 0
-        mask = prefix_mask(q.flatten(), self.cfg.rates).reshape_as(received)
+        mask = (prefix_mask(q.flatten(), self.cfg.rates).reshape_as(received).to(received)
+                if receive_mask is None else receive_mask)
         h = self.dec_in(torch.cat((received * mask, mask.to(received)), -1))
-        h = h + self.condition(q, snr, received.dtype)
+        if choices is None:
+            condition = self.condition(q, snr, received.dtype)
+        else:
+            snr_col = received.new_full((*q.shape, 1), float(snr)/20)
+            condition = choices @ self.tier.weight + self.snr(snr_col)
+        h = h + condition
         # Deterministic offsets restart at every fixed source block. They do not
         # identify a point globally and contain no spatial coordinates.
         pos = torch.arange(q.shape[1], device=q.device, dtype=received.dtype)[:, None]

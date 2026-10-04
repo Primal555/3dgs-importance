@@ -74,6 +74,17 @@ class MultiViewRenderTask:
         return scene.new_tensor(sum(values)/len(values))
 
 
+class MaskedMultiViewRenderTask(MultiViewRenderTask):
+    """Same image MSE, with a differentiable per-Gaussian existence column."""
+
+    def _terms(self, scene):
+        from .rendering import render
+        raw, existence = scene[:, :-1], scene[:, -1]
+        for camera in self.cameras:
+            image = render(raw, camera, self.degree, self.white_background, existence)
+            yield image_distortion(image, self.reference.get(camera, scene.device))
+
+
 def spaced_indices(size, count):
     if size < 1 or count < 1:
         raise ValueError('size/count must be positive')

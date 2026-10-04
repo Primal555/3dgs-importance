@@ -32,7 +32,7 @@ printf 'GPU: %s\nOutput: %s\n' "$CUDA_VISIBLE_DEVICES" "$OUT"
   --position-net-bits-per-use 2 --rates 0 8 16 32 \
   --bootstrap-steps "${BOOTSTRAP_STEPS:-5000}" --bootstrap-objective local-response --local-response-views 4 \
   --render-steps "${RENDER_STEPS:-5000}" --joint-steps "${JOINT_STEPS:-3000}" \
-  --mask-only-steps "${MASK_ONLY_STEPS:-500}" --mask-samples "${MASK_SAMPLES:-2}" \
+  --mask-only-steps "${MASK_ONLY_STEPS:-500}" \
   --existence-prior "${EXISTENCE_PRIOR:-auto}" --mask-lr "${MASK_LR:-0.001}" --beta "${BETA:-0.01}" \
   --lr "${LR:-0.0001}" --render-lr "${RENDER_LR:-0.0001}" --drop 0.05 --clip-mode none \
   --block-size 256 --decoder-window 32 --blocks-per-batch "${BLOCKS_PER_BATCH:-64}" \

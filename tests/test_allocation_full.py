@@ -11,15 +11,13 @@ from gaussian_jscc.allocation import GaussianTierMask
 from gaussian_jscc.allocation_diagnostics import (load_existence_prior, AllocationCostMeter,
                                                 prior_ranked_tiers, record_allocation)
 from gaussian_jscc.position_delivery import PositionCostMeter, encode_positions
-from gaussian_jscc.learned_training import discrete_joint_step
 from gaussian_jscc.render_validation import validate_render
 from gaussian_jscc.render_plots import plot_render_training
-from gaussian_jscc.render_objective import MultiViewRenderTask
 from gaussian_jscc.data import write_ply, read_ply
 from gaussian_jscc.transport import load_checkpoint, model_id
 from gaussian_jscc.route2 import load_mask
 from test_dense_prefix import dense
-from test_render_first import synthetic_render, Reference
+from test_render_first import synthetic_render
 import test_render_first as rf
 import test_training_launcher as launcher
 
@@ -77,61 +75,6 @@ class AllocationFullTests(unittest.TestCase):
             self.assertEqual(info['changed_since_previous'],0)
             self.assertEqual(sum(map(sum,info['existence_decile_tier_counts'])),5)
 
-    def test_mask_only_and_joint_have_separate_gradients(self):
-        raw,g,f,model=dense(8)
-        mask=GaussianTierMask(8,tier_count=9)
-        meter=AllocationCostMeter(model.cfg,PositionCostMeter(model.cfg,g.normalize(raw[:,:3])),8,2.)
-        task=MultiViewRenderTask(rf.RenderFirstTests().cameras(),Reference(),0)
-        with patch('gaussian_jscc.rendering.render',side_effect=synthetic_render):
-            for train_codec in (False,True):
-                model.zero_grad(set_to_none=True)
-                mask.zero_grad(set_to_none=True)
-                torch.manual_seed(29)
-                before=model_id(model)
-                loss,stats=discrete_joint_step(model,mask,[f[None]],[torch.arange(8)[None]],g,10,'awgn',task,
-                                               beta=.01,rate_meter=meter,train_codec=train_codec,paired_noise=True)
-                self.assertEqual(before,model_id(model))
-                self.assertTrue(torch.isfinite(loss))
-                self.assertGreater(float(mask.logits.grad.norm()),0)
-                self.assertEqual(any(p.grad is not None for p in model.parameters()),train_codec)
-                self.assertEqual(stats['codec_updated'],train_codec)
-                self.assertTrue(stats['paired_mask_channel_noise'])
-                self.assertTrue(all(v>0 for v in stats['sample_side_uses_per_gaussian']))
-
-    def test_cost_only_training_reduces_expected_payload(self):
-        raw,g,f,model=dense(8)
-        mask=GaussianTierMask(8,tier_count=9)
-        optimizer=torch.optim.Adam(mask.parameters(),lr=.1)
-        rates=torch.tensor(model.cfg.rates)
-        def expected():
-            return float((mask.logits.softmax(-1)*rates).sum(-1).mean().detach())
-        initial=expected()
-        meter=AllocationCostMeter(model.cfg,PositionCostMeter(model.cfg,g.normalize(raw[:,:3])),8,2.)
-        for step in range(30):
-            torch.manual_seed(step)
-            optimizer.zero_grad(set_to_none=True)
-            discrete_joint_step(model,mask,[f[None]],[torch.arange(8)[None]],g,10,'none',
-                                lambda scene,ids:scene.new_tensor(.1),beta=1.,rate_meter=meter,train_codec=False)
-            optimizer.step()
-        self.assertLess(expected(),initial*.7)
-
-    def test_discrete_side_cost_changes_policy_gradient(self):
-        _,g,f,model=dense(8)
-        mask=GaussianTierMask(8,existence_prior=torch.full((8,),.5),tier_count=9)
-        class Meter:
-            normalizer=32.
-            def details(self,q):
-                return {'allocation_side_uses_per_source_gaussian':float((q>0).sum())**2}
-        gradients=[]
-        for meter in (None,Meter()):
-            mask.zero_grad(set_to_none=True)
-            torch.manual_seed(37)
-            discrete_joint_step(model,mask,[f[None]],[torch.arange(8)[None]],g,10,'none',
-                                lambda scene,ids:scene.new_tensor(.1),beta=1.,rate_meter=meter,
-                                train_codec=False,samples=4)
-            gradients.append(mask.logits.grad.clone())
-        self.assertGreater(float((gradients[1]-gradients[0]).norm()),1e-5)
-
     def test_full_three_stage_fixed_coordinates(self):
         from gaussian_jscc.cli import main
         raw,_,_,_=dense(24)
@@ -150,6 +93,7 @@ class AllocationFullTests(unittest.TestCase):
                   '--hidden','16','--depth','1','--grid-dim','4','--levels','2','--patience','0']
             with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
                  patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
+                 patch('gaussian_jscc.mask_checks.check_masked_renderer',return_value={'cpu_test_stub':True}), \
                  patch('gaussian_jscc.rendering.load_cameras',return_value=rf.RenderFirstTests().cameras()*2), \
                  patch('gaussian_jscc.plots.safe_plot'):
                 main()
@@ -162,6 +106,8 @@ class AllocationFullTests(unittest.TestCase):
                 self.assertGreater(r['position_compression_seconds'],0)
                 self.assertGreater(r['tier_map_compression_seconds'],0)
                 self.assertGreater(r['rate_loss'],0)
+                self.assertIn('local masked-render gradient',r['mask_estimator'])
+                self.assertIn('mask_image_grad_norm',r)
             self.assertGreater(loss[-1]['update_norm'],0.)
             self.assertEqual(model_id(load_checkpoint(run/'codec_end_render.pt','cpu')),
                              model_id(load_checkpoint(run/'codec_3.pt','cpu')))

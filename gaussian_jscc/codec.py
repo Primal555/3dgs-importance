@@ -331,7 +331,7 @@ class GaussianCodec(nn.Module):
         if choices.shape != (*features.shape[:2], len(self.cfg.rates)) or features.ndim != 3:
             raise ValueError("batched choices must have shape [B,N, number of tiers]")
         if choices.requires_grad or not torch.equal(choices, F.one_hot(choices.argmax(-1), len(self.cfg.rates)).to(choices)):
-            raise ValueError('Use hard actions and score-function mask gradients, not ST choices')
+            raise ValueError('This API accepts hard actions only; use forward_st_prefix_batches for local allocation gradients')
         q = choices.argmax(-1)
         latent = self.learned.encode(features, xyz, q, snr)
         mask = prefix_mask(q.flatten(), self.cfg.rates).reshape_as(latent)
@@ -347,3 +347,26 @@ class GaussianCodec(nn.Module):
         from .position_delivery import delivered_positions
         result = self.apply_position_delivery(result, q, delivered_positions(features[..., :3], q, self.cfg))
         return result, result[..., :3], (q > 0).to(features)
+
+    def forward_st_prefix_batches(self, features, xyz, q, probabilities, snr, kind="awgn"):
+        """Hard progressive transmission, local straight-through prefix gradient.
+
+        Only the backward pass sees soft tier probabilities. The forward values,
+        channel noise slots and delivered XYZ are identical to paired hard q.
+        q0 existence feedback is supplied separately by the masked renderer.
+        """
+        if self.cfg.prefix_mode != 'progressive':
+            raise ValueError('per-point prefix gradients require progressive coding')
+        if q.shape != features.shape[:2] or probabilities.shape != (*q.shape, len(self.cfg.rates)):
+            raise ValueError('invalid tier/probability shape')
+        hard = F.one_hot(q, len(self.cfg.rates)).to(features)
+        choices = hard + probabilities - probabilities.detach()
+        boundaries = torch.as_tensor(self.cfg.rates, device=q.device)
+        templates = (torch.arange(2*self.cfg.rates[-1], device=q.device)[None, :]
+                     < 2*boundaries[:, None]).to(features)
+        mask = choices @ templates
+        latent = self.learned.encode_full(features, xyz, q > 0, snr)
+        received = channel(latent.reshape(-1, 2), snr, kind).reshape_as(latent) * mask
+        result = self.learned.decode(received, q, snr, choices=choices, receive_mask=mask)
+        from .position_delivery import delivered_positions
+        return self.apply_position_delivery(result, q, delivered_positions(features[..., :3], q, self.cfg))

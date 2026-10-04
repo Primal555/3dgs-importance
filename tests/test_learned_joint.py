@@ -1,6 +1,5 @@
 import copy
 import hashlib
-import itertools
 import json
 from pathlib import Path
 import tempfile
@@ -14,11 +13,9 @@ from gaussian_jscc.codec import CodecConfig, GaussianCodec
 from gaussian_jscc.data import prepare, to_features, to_raw, write_ply
 from gaussian_jscc.transport import save_checkpoint, load_checkpoint, transmit, receive, model_id
 from gaussian_jscc.training import full_scene_step
-from gaussian_jscc.learned_training import policy_objective, discrete_joint_step
 from gaussian_jscc.learned_objective import projection_loss
 from gaussian_jscc.losses import reconstruction_loss
 from gaussian_jscc.optimization import clip_codec_gradients
-from gaussian_jscc.allocation import GaussianTierMask
 
 
 def setup(n=17):
@@ -66,7 +63,7 @@ class LearnedTests(unittest.TestCase):
     def test_reject_fake_st_gradients(self):
         _,_,f,m = setup(8)
         choices = F.one_hot(torch.ones(1,8,dtype=torch.long),4).float().requires_grad_()
-        with self.assertRaisesRegex(ValueError,'score-function'):
+        with self.assertRaisesRegex(ValueError,'hard actions only'):
             m.forward_tier_batches(f[None],f[None,:,:3],choices,10)
 
     def test_power_budget_empty_windows_and_singletons(self):
@@ -175,33 +172,6 @@ class LearnedTests(unittest.TestCase):
             if a is not None:
                 torch.testing.assert_close(a,b,rtol=2e-3,atol=2e-4)
 
-    def test_score_function_expectation_matches_exact_gradient(self):
-        logits = torch.tensor([.1,.2,-.3,.4],requires_grad=True)
-        costs = torch.tensor([3.,1.,.7,.5])
-        p = logits.softmax(-1)
-        exact = torch.autograd.grad((p*costs).sum(),logits,retain_graph=True)[0]
-        expected = torch.zeros_like(logits)
-        for a,b in itertools.product(range(4),repeat=2):
-            loss = policy_objective([logits.log_softmax(-1)[a],logits.log_softmax(-1)[b]],[costs[a],costs[b]])
-            grad = torch.autograd.grad(loss,logits,retain_graph=True)[0]
-            expected += (p[a]*p[b]).detach()*grad
-        torch.testing.assert_close(exact,expected)
-
-    def test_discrete_joint_omits_zero_rows_and_backpropagates(self):
-        _,g,f,m = setup(8)
-        mask = GaussianTierMask(8,existence_prior=torch.full((8,),.6))
-        visited = []
-        def task(raw,ids):
-            visited.append((len(raw),len(ids)))
-            # CPU differentiable task stub, explicitly penalizes omission.
-            return raw[:,:3].square().sum()/8 + (8-len(raw))*.5
-        loss,stats = discrete_joint_step(m,mask,[f[None]],[torch.arange(8)[None]],g,10,'none',task)
-        self.assertTrue(torch.isfinite(loss))
-        self.assertTrue(all(a==b for a,b in visited))
-        self.assertGreater(float(mask.logits.grad.norm()),0)
-        self.assertTrue(torch.isfinite(mask.logits.grad).all())
-        self.assertEqual(stats['mask_samples'],2)
-
     def test_no_clipping_means_no_gradient_change(self):
         _,_,f,m = setup(8)
         m(f,f[:,:3],torch.ones(8,dtype=torch.long),10,'none').sum().backward()
@@ -247,7 +217,7 @@ class LearnedTests(unittest.TestCase):
                     main()
 
     def test_complete_stage_control_flow_with_mock_renderer(self):
-        # Real codec/replay/policy gradients; ONLY camera/rasterizer boundary is
+        # Real codec/replay/local-mask gradients; ONLY camera/rasterizer boundary is
         # mocked to run on CPU. This is not a CUDA rasterizer quality test.
         from gaussian_jscc.cli import main
         raw,_,_,_ = setup(24)
@@ -256,18 +226,22 @@ class LearnedTests(unittest.TestCase):
         def renderer(scene,*args):
             if not len(scene):
                 return torch.zeros(3,8,8)
-            return (scene[:,:3].sum(0)/24).sigmoid()[:,None,None].expand(3,8,8)
+            existence = args[3] if len(args) == 4 else scene.new_ones(len(scene))
+            return ((scene[:,:3] * existence[:,None]).sum(0)/24).sigmoid()[:,None,None].expand(3,8,8)
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
             write_ply(root/'input.ply',raw,0)
             argv=['gaussian_jscc','train-learned','--ply',str(root/'input.ply'),'--out',str(root/'run'),
-                  '--device','cuda','--source','mock','--steps','1','--render-steps','2','--joint-steps','2',
+                  '--device','cuda','--source','mock','--prefix-mode','progressive',
+                  '--steps','1','--render-steps','2','--joint-steps','2',
                   '--views-per-step','1','--validation-trials','1','--block-size','8','--hidden','16','--decoder-window','4',
                   '--depth','1','--grid-dim','4','--levels','2','--blocks-per-batch','2',
                   '--validation-blocks','1','--validation-views','1','--validate-every','1','--save-every','1']
             with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
                  patch('gaussian_jscc.rendering.load_cameras',return_value=[camera,camera]), \
-                 patch('gaussian_jscc.rendering.render',side_effect=renderer),patch('gaussian_jscc.plots.safe_plot'):
+                 patch('gaussian_jscc.rendering.render',side_effect=renderer), \
+                 patch('gaussian_jscc.mask_checks.check_masked_renderer',return_value={'cpu_test_stub':True}), \
+                 patch('gaussian_jscc.plots.safe_plot'):
                 main()
             rows=[json.loads(x) for x in (root/'run'/'loss.jsonl').read_text().splitlines()]
             self.assertEqual([r['phase'] for r in rows],['bootstrap','render','render','joint','joint'])

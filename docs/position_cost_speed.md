@@ -14,7 +14,9 @@ each mixed update, defeating the whole-mask coordinate cost cache.
    estimates or stale measurements are substituted. Validation still measures
    actual compressed costs at the normal validation interval.
 2. **Joint allocation:** continue measuring each sampled mask's actual XYZ and
-   tier-map bytes, including their contribution to REINFORCE. New training uses
+   tier-map bytes. The historical REINFORCE path put them in a score-function
+   reward; the current local-gradient path uses a measured per-retained-row XYZ
+   proxy and reports the actual compressed rate separately. New training uses
    zlib level **6** for XYZ. Validation, normalizer and export use the same saved
    setting. The tier-map compressor remains at level 9: it was not the bottleneck.
 3. **Fixed preprocessing:** cache the quantized integer XYZ once per cost meter.

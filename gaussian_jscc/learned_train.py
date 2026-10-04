@@ -8,7 +8,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from .codec import CodecConfig, GaussianCodec
 from .data import read_ply, Geometry, morton_order, to_features
-from .learned_training import discrete_joint_step, hard_layout, layout_schedule
+from .learned_training import hard_layout, layout_schedule
+from .mask_gradient import local_mask_step
 from .optimization import clip_codec_gradients, preserved_rng, update_stats
 from .render_objective import bootstrap_loss, MultiViewRenderTask, split_cameras
 from .render_validation import append_json, validate_render
@@ -63,7 +64,8 @@ def add_parser(sub):
     p.add_argument('--lr', type=float, default=1e-4, help='bootstrap learning rate')
     p.add_argument('--render-lr', type=float, default=1e-5, help='render and joint codec learning rate')
     p.add_argument('--mask-lr', type=float, default=1e-3)
-    p.add_argument('--mask-samples', type=int, default=2)
+    p.add_argument('--mask-shadow-per-block', type=int, default=4,
+                   help='maximum q0->q1 zero-gated candidates per source block in local-gradient training')
     p.add_argument('--beta', type=float, default=.001, help='joint-only normalized payload+XYZ+tier-map proxy penalty; not a hard cap')
     p.add_argument('--drop', type=float, default=0., help='optional random q0 in mixed codec layouts')
     p.add_argument('--power-floor', type=float, default=.01)
@@ -97,10 +99,11 @@ def train(args):
     if min(args.bootstrap_steps,args.render_steps,args.joint_steps,args.patience,args.train_views) < 0 or args.bootstrap_steps+args.render_steps+args.joint_steps < 1:
         raise ValueError('invalid stage lengths/view count')
     if min(args.validate_every,args.validation_blocks,args.validation_views,args.validation_trials,
-           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views) < 1:
+           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views,
+           args.mask_shadow_per_block) < 1:
         raise ValueError('counts must be positive')
-    if not 0 <= args.drop < 1 or args.mask_samples < 2:
-        raise ValueError('invalid drop probability or mask-samples')
+    if not 0 <= args.drop < 1:
+        raise ValueError('invalid drop probability')
     for key in ('lr','render_lr','mask_lr','clip_norm','power_floor','position_net_bits_per_use'):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             raise ValueError(f'{key} must be positive and finite')
@@ -120,6 +123,8 @@ def train(args):
         raise ValueError('existence-prior requires joint-steps and no allocation-init')
     if not 0 <= args.mask_only_steps <= args.joint_steps:
         raise ValueError('mask-only-steps must lie in 0..joint-steps')
+    if args.joint_steps and args.prefix_mode != 'progressive':
+        raise ValueError('joint allocation requires progressive prefixes for local tier gradients')
     out = Path(args.out)
     if out.exists():
         raise FileExistsError(f'Use a new output directory: {out}')
@@ -198,6 +203,11 @@ def train(args):
     mask_optimizer = torch.optim.Adam(mask.parameters(),lr=args.mask_lr) if mask is not None else None
     out.mkdir(parents=True,exist_ok=False)
     if mask is not None:
+        from .mask_checks import check_masked_renderer
+        parity = check_masked_renderer(raw.to(device), cameras[0], degree, args.white_background)
+        (out/'mask_renderer_check.json').write_text(json.dumps(parity,indent=2),encoding='utf-8')
+        print(f'Masked renderer hard-forward check: {parity}', flush=True)
+    if mask is not None:
         (out/'existence_prior.json').write_text(json.dumps(prior_info,indent=2),encoding='utf-8')
         if prior is not None:
             np.save(out/'existence_prior.npy',prior.numpy(),allow_pickle=False)
@@ -223,7 +233,7 @@ def train(args):
                   bootstrap_objective_origin=('d74bf75 / 37e4d35 historical local-response implementation'
                                               if args.bootstrap_objective=='local-response' else 'normalized-feature SmoothL1'),
                   phase_transition='retain codec weights; clear Adam moments; set render_lr; position delivery unchanged',
-                  mask_gradient='REINFORCE image MSE + measured XYZ/tier side cost; exact expected payload gradient',
+                  mask_gradient='MaskGaussian zero-gate image gradient for q0; straight-through nested progressive prefixes for q1+; exact expected payload gradient',
                   budget='payload + XYZ + compressed tier-map proxy; beta is a Lagrange penalty, NOT a hard cap',
                   metadata='reliable bbox/tier syntax; joint charges compressed tier-map proxy but excludes packet JSON/bbox/model-ID framing',
                   position_accounting='render updates omit compressed-byte measurement (null); validation, joint and export measure actual bytes at the checkpoint compression level',
@@ -246,7 +256,7 @@ def train(args):
                   position_net_bits_per_use=args.position_net_bits_per_use)
     if allocation_meter is not None:
         record.update(allocation_rate_normalizer=allocation_meter.normalizer,existence_prior_info=prior_info,
-                      allocation_estimator_caveat='scene-level REINFORCE can have high variance for very many points; not per-point oracle gains',
+                      allocation_estimator_caveat='local straight-through gradients are biased; compressed XYZ/tier map has a measured but non-differentiable training proxy',
                       mask_only_steps=args.mask_only_steps)
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
@@ -360,8 +370,8 @@ def train(args):
                 stats['bootstrap_loss'] = float(loss.detach())
             else:
                 view_ids = torch.randperm(len(cameras))[:args.views_per_step].tolist()
-                task = MultiViewRenderTask([cameras[i] for i in view_ids],reference,degree,args.white_background)
                 if phase == 'render':
+                    task = MultiViewRenderTask([cameras[i] for i in view_ids],reference,degree,args.white_background)
                     task_started = time.perf_counter()
                     qs = [hard_layout(gi,tier,args.drop,tier_count) for gi in group_ids]
                     if not any((q>0).any() for q in qs):
@@ -378,11 +388,14 @@ def train(args):
                     stats.update(rate_accounting_seconds=time.perf_counter()-rate_started,
                                  position_compression_seconds=0.)
                 else:
-                    loss,details = discrete_joint_step(model,mask,groups,group_ids,geometry,args.snr,args.channel,
-                                                       task,beta=args.beta,auxiliary_weight=0.,samples=args.mask_samples,
-                                                       mode=args.render_backward,rate_meter=allocation_meter,
-                                                       train_codec=local_step>args.mask_only_steps,
-                                                       paired_noise=model.cfg.prefix_mode=='progressive')
+                    from .render_objective import MaskedMultiViewRenderTask
+                    task = MaskedMultiViewRenderTask([cameras[i] for i in view_ids],reference,degree,
+                                                     args.white_background)
+                    loss,details = local_mask_step(model,mask,groups,group_ids,geometry,args.snr,args.channel,
+                                                   task,beta=args.beta,rate_meter=allocation_meter,
+                                                   mode=args.render_backward,
+                                                   train_codec=local_step>args.mask_only_steps,
+                                                   shadow_per_block=args.mask_shadow_per_block)
                     stats.update(details)
                     stats['layout'] = 'learned_mask'
                 stats.update(image_mse=stats['render_loss'],training_view_indices=view_ids,
@@ -413,7 +426,11 @@ def train(args):
                 if phase == 'joint':
                     print(f'  mask_grad={stats["mask_grad_norm"]:.4g}, codec_updated={stats["codec_updated"]}, '
                           f'image_mse={stats["render_loss"]:.6g}, rate_penalty={stats["rate_loss"]:.6g}, '
-                          f'sampled_counts={stats["sampled_tier_counts"]}',flush=True)
+                          f'sampled_counts={stats["sampled_tier_counts"]}, '
+                          f'shadow_q0={stats["sampled_q0_shadow_candidates"]}, '
+                          f'image_grad_q0={stats["mask_image_grad_q0_norm"]:.4g}, '
+                          f'image_grad_positive={stats["mask_image_grad_positive_norm"]:.4g}, '
+                          f'measured_uses/G={stats["measured_allocation_uses_per_gaussian"]:.4g}',flush=True)
             if step%args.save_every == 0:
                 save(f'_{step}',phase,step)
             if local_step%args.validate_every == 0 or local_step == maximum:

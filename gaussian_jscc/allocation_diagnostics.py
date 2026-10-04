@@ -53,7 +53,9 @@ class AllocationCostMeter:
         if count < 1 or not math.isfinite(bits_per_use) or bits_per_use <= 0:
             raise ValueError('invalid allocation rate dimensions')
         self.cfg, self.positions, self.count, self.bits = cfg, position_meter, count, bits_per_use
-        self.normalizer = self.details(torch.full((count,), len(cfg.rates)-1))['allocation_uses_per_source_gaussian']
+        full = self.details(torch.full((count,), len(cfg.rates)-1))
+        self.normalizer = full['allocation_uses_per_source_gaussian']
+        self.position_unit = full['position_channel_uses_estimate'] / count
 
     def details(self, q):
         started = time.perf_counter()

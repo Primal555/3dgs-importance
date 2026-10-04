@@ -105,7 +105,7 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
         model.train(was_training)
     codec_score = sum(e['source_mse'] for e in entries[:len(codec_layouts)])/len(codec_layouts)
     # Joint checkpoint selection evaluates ACTUAL hard deployment, not the
-    # expected soft allocation rate used in score-function training.
+    # differentiable training-rate proxy; checkpoint selection uses measured hard rate.
     selected = next((e for e in entries if e['layout']=='mask'),None)
     if selected:
         rate = selected['allocation_uses_per_source_gaussian'] if allocation_meter else selected['symbols_per_source_gaussian']

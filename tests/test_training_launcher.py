@@ -127,6 +127,30 @@ class LauncherTests(unittest.TestCase):
         for argument in ('--bootstrap-steps 3000','--render-steps 2000','--lr 0.0002','--render-lr 0.0001'):
             self.assertIn(argument,result.stdout)
 
+    def test_local_mask_feedback_launcher_uses_one_checkpoint_and_output(self):
+        bash = 'C:/softwares/Git/bin/bash.exe' if os.name=='nt' else shutil.which('bash')
+        if not bash or not Path(bash).exists():
+            self.skipTest('Bash unavailable')
+        root=Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            folder=Path(temp)
+            (folder/'input.ply').touch()
+            (folder/'codec.pt').touch()
+            (folder/'sparse').mkdir()
+            env=os.environ.copy()
+            env.update(CUDA_VISIBLE_DEVICES='2',PYTHON_BIN='/bin/echo',
+                       PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
+            result=subprocess.run([bash,'scripts/test_local_mask_feedback.sh',
+                                   (folder/'codec.pt').as_posix(),(folder/'run').as_posix()],
+                                  cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',timeout=15)
+            self.assertEqual(result.returncode,0,result.stderr)
+            for argument in ('--init ', '--joint-steps 1000', '--mask-only-steps 500',
+                             '--mask-shadow-per-block 4', '--prefix-mode progressive',
+                             '--position-bits 16','--render-steps 0',
+                             'codec_best_joint.pt','route2_best_joint.pt'):
+                self.assertIn(argument,result.stdout)
+            self.assertNotIn('--mask-samples',result.stdout)
+
 
 if __name__=='__main__':
     unittest.main()
