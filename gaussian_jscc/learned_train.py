@@ -64,8 +64,6 @@ def add_parser(sub):
     p.add_argument('--lr', type=float, default=1e-4, help='bootstrap learning rate')
     p.add_argument('--render-lr', type=float, default=1e-5, help='render and joint codec learning rate')
     p.add_argument('--mask-lr', type=float, default=1e-3)
-    p.add_argument('--mask-shadow-per-block', type=int, default=4,
-                   help='maximum q0->q1 zero-gated candidates per source block in local-gradient training')
     p.add_argument('--beta', type=float, default=.001, help='joint-only normalized payload+XYZ+tier-map proxy penalty; not a hard cap')
     p.add_argument('--drop', type=float, default=0., help='optional random q0 in mixed codec layouts')
     p.add_argument('--power-floor', type=float, default=.01)
@@ -99,8 +97,7 @@ def train(args):
     if min(args.bootstrap_steps,args.render_steps,args.joint_steps,args.patience,args.train_views) < 0 or args.bootstrap_steps+args.render_steps+args.joint_steps < 1:
         raise ValueError('invalid stage lengths/view count')
     if min(args.validate_every,args.validation_blocks,args.validation_views,args.validation_trials,
-           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views,
-           args.mask_shadow_per_block) < 1:
+           args.save_every,args.blocks_per_batch,args.views_per_step,args.cpu_threads,args.local_response_views) < 1:
         raise ValueError('counts must be positive')
     if not 0 <= args.drop < 1:
         raise ValueError('invalid drop probability')
@@ -234,6 +231,8 @@ def train(args):
                                               if args.bootstrap_objective=='local-response' else 'normalized-feature SmoothL1'),
                   phase_transition='retain codec weights; clear Adam moments; set render_lr; position delivery unchanged',
                   mask_gradient='MaskGaussian zero-gate image gradient for q0; straight-through nested progressive prefixes for q1+; exact expected payload gradient',
+                  allocation_deployment='fixed-seed ten categorical draws per source Gaussian; all q0 -> drop; otherwise positive mode, tied by probability then seeded random',
+                  q0_shadow='all sampled q0 rows receive a hypothetical q1 zero-gated splat during training',
                   budget='payload + XYZ + compressed tier-map proxy; beta is a Lagrange penalty, NOT a hard cap',
                   metadata='reliable bbox/tier syntax; joint charges compressed tier-map proxy but excludes packet JSON/bbox/model-ID framing',
                   position_accounting='render updates omit compressed-byte measurement (null); validation, joint and export measure actual bytes at the checkpoint compression level',
@@ -298,8 +297,10 @@ def train(args):
 
     def validation(step,phase):
         extra = None
+        deployment_q = None
         if phase == 'joint':
-            q,_ = record_allocation(out,step,mask,args.snr,model.cfg.rates,prior)
+            q,_ = record_allocation(out,step,mask,args.snr,model.cfg.rates,prior,seed=args.seed)
+            deployment_q = q
             if prior is not None:
                 ranked = prior_ranked_tiers(prior,q)
                 extra = {'prior_ranked':[torch.where(gi>=0,ranked[gi.cpu().clamp_min(0)].to(gi.device),0) for gi in group_ids]}
@@ -308,7 +309,7 @@ def train(args):
                                mask=mask if phase == 'joint' else None,white_background=args.white_background,beta=args.beta,
                                position_net_bits_per_use=args.position_net_bits_per_use,
                                position_meter=position_meter,allocation_meter=allocation_meter if phase == 'joint' else None,
-                               extra_layouts=extra)
+                               extra_layouts=extra,mask_tiers=deployment_q)
 
     def save(suffix,phase,step):
         if phase == 'joint':
@@ -394,8 +395,7 @@ def train(args):
                     loss,details = local_mask_step(model,mask,groups,group_ids,geometry,args.snr,args.channel,
                                                    task,beta=args.beta,rate_meter=allocation_meter,
                                                    mode=args.render_backward,
-                                                   train_codec=local_step>args.mask_only_steps,
-                                                   shadow_per_block=args.mask_shadow_per_block)
+                                                   train_codec=local_step>args.mask_only_steps)
                     stats.update(details)
                     stats['layout'] = 'learned_mask'
                 stats.update(image_mse=stats['render_loss'],training_view_indices=view_ids,

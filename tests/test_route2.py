@@ -13,9 +13,11 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from gaussian_jscc.allocation import GaussianTierMask, expected_rate, scene_fingerprint
+from gaussian_jscc.allocation import (GaussianTierMask, _tiers_from_draws,
+                                      deployment_tiers, expected_rate, scene_fingerprint)
 from gaussian_jscc.codec import GaussianCodec
 from gaussian_jscc.data import prepare, to_features, to_raw, write_ply
+from gaussian_jscc.transport import decode_metadata
 from gaussian_jscc.route2 import load_mask, save_joint, hard_tiers
 from test_gaussian_jscc import fixture
 
@@ -39,6 +41,28 @@ class Route2Tests(unittest.TestCase):
         with torch.no_grad():
             mask.snr_slopes[:, 1] = 3.
         self.assertFalse(torch.allclose(mask.probabilities(ids, 0.), mask.probabilities(ids, 20.)))
+
+    def test_balanced_positive_initialization_and_conservative_q0(self):
+        mask = GaussianTierMask(3)
+        expected = torch.tensor([[.01, .33, .33, .33]]).expand(3, -1)
+        torch.testing.assert_close(mask.probabilities(torch.arange(3), 10.), expected)
+
+    def test_ten_draw_drop_mode_and_positive_tie_break(self):
+        draws = torch.tensor([[0]*10, [0]*9+[2], [1]*4+[2]*4+[0]*2,
+                              [1]*5+[3]*5])
+        probabilities = torch.tensor([[.99, .003, .004, .003],
+                                      [.9, .01, .08, .01],
+                                      [.2, .3, .4, .1],
+                                      [.1, .4, .1, .4]])
+        tie_random = torch.tensor([[.1, .2, .3], [.1, .2, .3],
+                                   [.1, .2, .3], [.9, .1, .1]])
+        torch.testing.assert_close(_tiers_from_draws(draws, probabilities, tie_random),
+                                   torch.tensor([0, 2, 2, 1]))
+        soft = torch.tensor([[.01, .33, .33, .33]]).expand(1000, -1)
+        torch.testing.assert_close(deployment_tiers(soft, 19), deployment_tiers(soft, 19))
+        self.assertGreater(len(torch.unique(deployment_tiers(soft, 19))), 1)
+        counts = torch.bincount(deployment_tiers(soft, 19), minlength=4)
+        self.assertLess(int(counts[1:].max() - counts[1:].min()), 100)
 
     def test_saved_masks_keep_original_ply_order_and_check_identity(self):
         raw, model = fixture(n=17)
@@ -74,11 +98,16 @@ class Route2Tests(unittest.TestCase):
             run("export-route2", "--ply", ply, "--checkpoint", codec, "--allocation", allocation,
                 "--out", root / "map", "--device", "cpu")
             self.assertEqual(np.load(root / "map" / "probabilities.npy").shape, (12, 4))
+            exported = torch.from_numpy(np.load(root / "map" / "tiers.npy").astype(np.int64))
+            torch.testing.assert_close(exported, hard_tiers(mask, 10.))
             run("evaluate", "--ply", ply, "--checkpoint", codec, "--allocation", allocation,
                 "--snrs", 0, 10, "--out", root / "eval", "--device", "cpu")
             self.assertEqual(len(json.loads((root / "eval" / "results.json").read_text())), 2)
             run("transmit", "--ply", ply, "--checkpoint", codec, "--allocation", allocation,
                 "--out", root / "packet", "--device", "cpu")
+            _, packet_tiers = decode_metadata((root / "packet" / "metadata.bin").read_bytes())
+            _, _, ordered_tiers = prepare(raw, model.cfg.morton_bits, exported)
+            torch.testing.assert_close(packet_tiers, ordered_tiers)
             ply.unlink()
             allocation.unlink()
             run("decode", "--checkpoint", codec, "--packet", root / "packet",

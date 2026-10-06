@@ -32,7 +32,7 @@ def save_panel(path, photo, reference, decoded):
 def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                     snr, channel, trials, seed, out, step, phase, mask=None,
                     white_background=False, beta=0., position_net_bits_per_use=2., position_meter=None,
-                    allocation_meter=None, extra_layouts=None):
+                    allocation_meter=None, extra_layouts=None, mask_tiers=None):
     from .cli import seed_all
     from .rendering import render
     device = next(model.parameters()).device
@@ -49,15 +49,20 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
         raise ValueError('extra layout names must be safe distinct diagnostic labels')
     layouts = codec_layouts + (('mask',) if mask is not None else ()) + tuple(extra_layouts)
     tier_count = len(model.cfg.rates)
+    if mask is not None:
+        from .route2 import hard_tiers
+        mask_tiers = hard_tiers(mask, snr, seed) if mask_tiers is None else torch.as_tensor(mask_tiers).cpu()
+        if mask_tiers.shape != (len(raw),):
+            raise ValueError('deployment tier map must match original PLY rows')
     try:
         with preserved_rng(device):
             model.eval()
             for index, tier in enumerate(layouts):
                 label = 'mixed' if tier is None else str(tier)
                 seed_all(seed+10000+index*1000)
-                qs = extra_layouts[tier] if tier in extra_layouts else [torch.where(ids.to(device)>=0,
-                                  mask.scores(ids.clamp_min(0).to(device),snr).argmax(-1),0)
-                      if tier == 'mask' else hard_layout(ids,tier,0.,tier_count) for ids in group_ids]
+                qs = extra_layouts[tier] if tier in extra_layouts else [
+                    torch.where(ids.cpu() >= 0, mask_tiers[ids.cpu().clamp_min(0)], 0).to(device)
+                    if tier == 'mask' else hard_layout(ids,tier,0.,tier_count) for ids in group_ids]
                 # Layout is fixed across trials. Padding is never a source row.
                 flat_q = torch.cat([q[ids.to(q.device)>=0].cpu() for q,ids in zip(qs,group_ids)])
                 lengths = torch.tensor(model.cfg.rates)[flat_q]
@@ -116,8 +121,9 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
               'rates':list(model.cfg.rates),
               'tier_id_bits':max(1,(tier_count-1).bit_length()),
               'prefix_mode':model.cfg.prefix_mode,'paired_prefix_noise':paired_noise,
-              'score_definition':('hard_mask_source_mse_plus_normalized_payload_and_side_proxy' if allocation_meter
-                                  else 'hard_mask_source_mse_plus_normalized_payload') if selected else 'mean_layout_source_mse',
+              'score_definition':('ten_draw_mask_source_mse_plus_normalized_payload_and_side_proxy' if allocation_meter
+                                  else 'ten_draw_mask_source_mse_plus_normalized_payload') if selected else 'mean_layout_source_mse',
+              'deployment_decision':('fixed-seed ten-draw tier map' if selected else None),
               'codec_score':codec_score,'snr':snr,'channel':channel,'trials':trials,
               'validation_views':len(cameras),'layouts':entries,
               'metrics_note':'unclipped MSE/PSNR; displayed-RGB SSIM; no projection/parameter loss; payload excludes metadata'}

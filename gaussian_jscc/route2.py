@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 import numpy as np
 import torch
-from .allocation import GaussianTierMask, scene_fingerprint, expected_rate
+from .allocation import (DEPLOYMENT_DRAWS, GaussianTierMask, deployment_tiers,
+                         scene_fingerprint, expected_rate)
 from .data import read_ply
 from .transport import model_id, save_checkpoint, load_checkpoint
 
@@ -29,10 +30,13 @@ def load_mask(path, raw, model, device):
 
 
 @torch.no_grad()
-def hard_tiers(mask, snr):
+def hard_tiers(mask, snr, seed=42):
+    """One fixed ten-draw hard map, in original PLY row order."""
     device = mask.logits.device
-    return torch.cat([mask.scores(torch.arange(start, min(start + 65536, len(mask.logits)), device=device), snr)
-                     .argmax(-1).cpu() for start in range(0, len(mask.logits), 65536)])
+    probabilities = torch.cat([mask.probabilities(
+        torch.arange(start, min(start + 65536, len(mask.logits)), device=device), snr).cpu()
+        for start in range(0, len(mask.logits), 65536)])
+    return deployment_tiers(probabilities, seed)
 
 
 def export_mask(args):
@@ -49,11 +53,14 @@ def export_mask(args):
             ids = torch.arange(start, min(start + 65536, len(raw)), device=device)
             probabilities.append(mask.probabilities(ids, args.snr).cpu())
     probabilities = torch.cat(probabilities)
-    tiers = probabilities.argmax(-1).numpy().astype(np.uint8)
+    tiers = deployment_tiers(probabilities, args.allocation_seed).numpy().astype(np.uint8)
     np.save(out / "tiers.npy", tiers)
     np.save(out / "probabilities.npy", probabilities.numpy())
     info = {"snr_db": args.snr, "original_ply_row_order": True,
-            "decision": "argmax; no hard total-budget guarantee",
+            "decision": "10 categorical draws; q0 only if all 10 are q0; otherwise positive mode",
+            "allocation_seed": args.allocation_seed, "allocation_draws": DEPLOYMENT_DRAWS,
+            "positive_tie_break": "highest learned probability, then seeded random",
+            "expected_q0_after_ten_draws": float(probabilities[:, 0].double().pow(DEPLOYMENT_DRAWS).sum()),
             "scene_fingerprint": scene_fingerprint(raw), "codec_id": model_id(model),
             "rates": list(model.cfg.rates),
             "tier_counts": np.bincount(tiers, minlength=len(model.cfg.rates)).tolist(),
@@ -66,11 +73,12 @@ def export_mask(args):
 
 
 def add_parsers(sub):
-    p = sub.add_parser("export-route2", help="export learned probabilities and hard q in original PLY order")
+    p = sub.add_parser("export-route2", help="export learned probabilities and fixed ten-draw q in original PLY order")
     p.set_defaults(func=export_mask)
     p.add_argument("--ply", required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--allocation", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--snr", type=float, default=10.)
+    p.add_argument("--allocation-seed", type=int, default=42)
     p.add_argument("--device", default="cuda")

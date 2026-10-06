@@ -288,7 +288,7 @@ def plot_training(training_dir, output_dir=None):
                      ["Smoothing is per contiguous phase/profile, window=min(101, max(1, phase_rows//40)).",
                       "Objective panels have independent axes; losses are not comparable across changed objectives.",
                       "Missing historical weighted contributions are not inferred; raw terms use different units.",
-                      "Tier composition records sampled hard actions (possibly sample averages), not deployment argmax counts."])
+                      "Training tier composition records per-step sampled actions, not the fixed ten-draw deployment map."])
 
 
 def _evaluation_series(row):

@@ -70,6 +70,9 @@ class AllocationFullTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             q,info=record_allocation(temp,0,mask,10,(0,8,16,32),prior)
             torch.testing.assert_close(q,wanted)
+            self.assertEqual(info['allocation_draws'],10)
+            self.assertEqual(info['allocation_seed'],42)
+            self.assertEqual(info['hard_tier_counts'],torch.bincount(wanted,minlength=4).tolist())
             np.testing.assert_array_equal(np.load(Path(temp)/'allocation_latest'/'tiers.npy'),wanted.numpy())
             _,info=record_allocation(temp,1,mask,10,(0,8,16,32),prior)
             self.assertEqual(info['changed_since_previous'],0)

@@ -10,15 +10,17 @@ rates into the same output directory.
 
 ## Forward semantics
 
-Each original PLY row has four logits. Hard sampled tiers select q0 (drop) or
-one of the 8/16/32-complex-symbol progressive prefixes. Only q>0 rows receive
-16-bit compressed XYZ. Deployment uses `argmax` tiers, real packing and the
-ordinary Gaussian rasterizer. There is no q0 payload, coordinate or splat.
+Each original PLY row has four logits. New masks initialize q0 at 1% and split
+the remaining probability equally across positive tiers. Hard sampled tiers
+select q0 (drop) or one of the 8/16/32-complex-symbol progressive prefixes.
+Only q>0 rows receive 16-bit compressed XYZ. Deployment uses a fixed seed and
+ten independent categorical draws per row: q0 only if all draws are q0;
+otherwise the modal positive tier (ties use higher learned probability, then
+seeded random choice). The resulting hard map is packed and sent. There is no q0 payload,
+coordinate or splat. At initial q0 probability 1%, ten-draw q0 is negligible.
 
-During **training only**, up to `--mask-shadow-per-block` sampled q0 rows per
-source block are decoded hypothetically as q1 and added to the MaskGaussian
-renderer with an exactly zero existence mask. This cap limits counterfactual
-context changes and makes q0 feedback sparse when many rows are dropped.
+During **training only**, every sampled q0 row is decoded hypothetically as q1
+and added to the MaskGaussian renderer with an exactly zero existence mask.
 This does not change the rendered forward image; the custom rasterizer supplies
 an image derivative with respect to that row's mask. Positive-tier choices use
 hard-forward/soft-backward cumulative prefix gates and a differentiable tier

@@ -41,11 +41,14 @@ def send(args):
     if args.allocation:
         from .route2 import load_mask, hard_tiers
         mask = load_mask(args.allocation, raw, model, device_for(args.device))
-        q = hard_tiers(mask, args.snr)
+        q = hard_tiers(mask, args.snr, args.allocation_seed)
     else:
         q = load_tiers(args.rate_map, len(raw), args.uniform_tier,len(model.cfg.rates))
     stats = transmit(model, raw, q, args.snr, args.channel, args.seed, args.out,
                      args.metadata_code_rate, args.metadata_modulation_bits)
+    if args.allocation:
+        stats.update(allocation_seed=args.allocation_seed,
+                     allocation_decision='fixed ten-draw tier map; q0 iff all draws are q0')
     print(json.dumps(stats, indent=2))
 
 
@@ -86,7 +89,7 @@ def evaluate(args):
     options = [None] if args.rate_map or learned is not None else tiers
     for tier in options:
         for snr in args.snrs:
-            q = hard_tiers(learned, snr) if learned is not None else load_tiers(args.rate_map, len(raw), tier,len(model.cfg.rates))
+            q = hard_tiers(learned, snr, args.allocation_seed) if learned is not None else load_tiers(args.rate_map, len(raw), tier,len(model.cfg.rates))
             ordered, _, oq = prepare(raw, model.cfg.morton_bits, q)
             target = ordered[oq > 0]
             for trial in range(args.trials):
@@ -94,6 +97,9 @@ def evaluate(args):
                 run = out / label
                 stats = transmit(model, raw, q, snr, args.channel, args.seed + trial, run,
                                  args.metadata_code_rate, args.metadata_modulation_bits)
+                if learned is not None:
+                    stats.update(allocation_seed=args.allocation_seed,
+                                 allocation_decision='fixed ten-draw tier map; q0 iff all draws are q0')
                 recovered = receive(model, run)
                 stats["label"] = label
                 stats["position_rmse"] = (float((recovered[:, :3] - target[:, :3]).square().mean().sqrt())
@@ -134,7 +140,7 @@ def main():
     p.add_argument("--out", required=True, help="new receiver packet directory")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--rate-map")
-    group.add_argument("--allocation", help="matching route2.pt; choose hard q at this SNR")
+    group.add_argument("--allocation", help="matching route2.pt; fixed ten-draw q at this SNR")
     group.add_argument("--uniform-tier", type=int, help='positive tier index in the checkpoint rate table')
     p.add_argument("--snr", type=float, default=10)
     send_parser = p
@@ -151,7 +157,7 @@ def main():
     p.add_argument("--out", required=True)
     group = p.add_mutually_exclusive_group()
     group.add_argument("--rate-map")
-    group.add_argument("--allocation", help="matching route2.pt; recompute hard q for every SNR")
+    group.add_argument("--allocation", help="matching route2.pt; recompute fixed ten-draw q for every SNR")
     p.add_argument("--tiers", type=int, nargs="+", help='default: all positive checkpoint tiers')
     p.add_argument("--snrs", type=float, nargs="+", default=[0, 5, 10, 15, 20])
     p.add_argument("--trials", type=int, default=1)
@@ -163,6 +169,8 @@ def main():
         p.add_argument("--device", default="cuda")
         p.add_argument("--channel", choices=["none", "awgn", "rayleigh"], default="awgn")
         p.add_argument("--seed", type=int, default=42)
+        p.add_argument("--allocation-seed", type=int, default=42,
+                       help="fixed ten-draw tier-map seed; independent of channel noise seed")
     for p in (eval_parser,):
         p.add_argument("--source", help="COLMAP/Blender source images and cameras")
         p.add_argument("--resolution", type=int, default=2)

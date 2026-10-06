@@ -68,6 +68,7 @@ class LocalMaskTests(unittest.TestCase):
         self.assertGreater(float(mask.logits.grad.norm()), 0.)
         self.assertFalse(any(p.grad is not None for p in model.parameters()))
         self.assertEqual(stats['sampled_retained_gaussians'], 12 - stats['sampled_tier_counts'][0])
+        self.assertEqual(stats['sampled_q0_shadow_candidates'], stats['sampled_tier_counts'][0])
         self.assertGreater(stats['mask_image_grad_q0_norm'], 0.)
         self.assertGreater(stats['mask_image_grad_positive_norm'], 0.)
         self.assertIn('measured_allocation_uses_per_gaussian', stats)
@@ -113,6 +114,21 @@ class LocalMaskTests(unittest.TestCase):
                                        train_codec=False)
         self.assertAlmostEqual(stats['render_loss'], exact, places=6)
         self.assertEqual(stats['sampled_tier_counts'], [2, 2, 2, 2])
+
+    def test_every_q0_gets_shadow_even_when_more_than_four_per_block(self):
+        raw, geometry, features, model = progressive(12)
+        mask = GaussianTierMask(12, existence_prior=torch.full((12,), .5))
+        meter = AllocationCostMeter(model.cfg, PositionCostMeter(model.cfg,
+                                                               geometry.normalize(raw[:, :3])), 12, 2.)
+        task = MaskedMultiViewRenderTask([SimpleNamespace(factor=1.)], Reference(), 0)
+        tiers = torch.tensor([[0]*7 + [1]*5])
+        with patch('torch.distributions.Categorical.sample', return_value=tiers), \
+             patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
+            _, stats = local_mask_step(model, mask, [features[None]],
+                                       [torch.arange(12)[None]], geometry, 10, 'none',
+                                       task, beta=0., rate_meter=meter, train_codec=False)
+        self.assertEqual(stats['sampled_q0_shadow_candidates'], 7)
+        self.assertEqual(stats['sampled_q0_shadow_candidates'], stats['sampled_tier_counts'][0])
 
 
 if __name__ == '__main__':

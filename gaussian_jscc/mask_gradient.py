@@ -16,14 +16,11 @@ from .training import full_scene_step
 
 
 def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kind,
-                    distortion_fn, beta, rate_meter, train_codec=True, mode='replay',
-                    shadow_per_block=4):
+                    distortion_fn, beta, rate_meter, train_codec=True, mode='replay'):
     if model.cfg.prefix_mode != 'progressive':
         raise ValueError('local mask gradient requires progressive prefixes')
     if rate_meter is None:
         raise ValueError('local mask gradient requires measured side-rate accounting')
-    if shadow_per_block < 1:
-        raise ValueError('shadow_per_block must be positive')
     device = next(model.parameters()).device
     started = time.perf_counter()
     batches, flat_tiers = [], []
@@ -37,9 +34,7 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
             q = torch.distributions.Categorical(logits=logits).sample()
             q = torch.where(valid, q, 0)
             absent = valid & (q == 0)
-            scores = torch.rand(q.shape, device=device).masked_fill(~absent, -1.)
-            chosen = scores.topk(min(shadow_per_block, q.shape[1]), dim=-1).indices
-            shadow_selected = torch.zeros_like(absent).scatter_(1, chosen, True) & absent
+            shadow_selected = absent
             shadow_count += int(shadow_selected.sum())
             batches.append(torch.stack((q, ids, shadow_selected.long()), -1))
             flat_tiers.append(q[valid].cpu())
@@ -78,8 +73,7 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
     if not train_codec:
         model.requires_grad_(False)
     try:
-        # Every active row is present. A bounded sample of q0 rows has hard-zero
-        # shadow splats; the rest are absent exactly as in deployment.
+        # Every sampled q0 source row has a hard-zero counterfactual splat.
         scene_loss, stats = full_scene_step(
             model, list(zip(feature_batches, batches)), geometry, snr, kind,
             distortion_fn, attr_weight=0., mode=mode, batch_forward=forward)

@@ -23,7 +23,6 @@ echo 'One local-feedback allocation run. Frozen codec first, then optional joint
   --rates 0 8 16 32 --position-net-bits-per-use 2 \
   --bootstrap-steps 0 --render-steps 0 --joint-steps "${JOINT_STEPS:-1000}" \
   --mask-only-steps "${MASK_ONLY_STEPS:-500}" --mask-lr "${MASK_LR:-0.001}" \
-  --mask-shadow-per-block "${MASK_SHADOW_PER_BLOCK:-4}" \
   --existence-prior "${EXISTENCE_PRIOR:-auto}" --beta "${BETA:-0.01}" \
   --render-lr "${RENDER_LR:-0.0001}" --clip-mode none \
   --blocks-per-batch "${BLOCKS_PER_BATCH:-64}" --render-backward replay \

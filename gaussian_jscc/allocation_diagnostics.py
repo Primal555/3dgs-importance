@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from plyfile import PlyData
+from .allocation import DEPLOYMENT_DRAWS, deployment_tiers
 from .position_delivery import training_position_cost
 from .transport import pack_tiers, tier_id_bits
 
@@ -91,12 +92,12 @@ def prior_ranked_tiers(prior, learned_tiers):
 
 
 @torch.no_grad()
-def record_allocation(out, step, mask, snr, rates, prior=None):
+def record_allocation(out, step, mask, snr, rates, prior=None, seed=42):
     """Snapshot and append deployment counts; arrays always ORIGINAL PLY order."""
     from .render_validation import append_json
     probs = torch.cat([mask.probabilities(torch.arange(i, min(i+65536, len(mask.logits)),
                          device=mask.logits.device), snr).cpu() for i in range(0,len(mask.logits),65536)])
-    q = probs.argmax(-1)
+    q = deployment_tiers(probs, seed)
     count = len(q)
     counts = torch.bincount(q, minlength=len(rates))
     previous_path = Path(out)/'allocation_latest'/'tiers.npy'
@@ -107,8 +108,11 @@ def record_allocation(out, step, mask, snr, rates, prior=None):
             'hard_payload_symbols': int(torch.tensor(rates)[q].sum()),
             'mean_entropy_nats': float(-(probs*probs.clamp_min(1e-30).log()).sum(-1).mean()),
             'mean_max_probability': float(probs.max(-1).values.mean()),
+            'mean_q0_probability': float(probs[:, 0].mean()),
+            'expected_q0_after_ten_draws': float(probs[:, 0].double().pow(DEPLOYMENT_DRAWS).sum()),
+            'allocation_seed': seed, 'allocation_draws': DEPLOYMENT_DRAWS,
             'changed_since_previous': int((q != previous).sum()) if previous is not None else None,
-            'decision': 'argmax; source-specific learned logits; no hard budget guarantee'}
+            'decision': '10 draws; q0 iff all q0; otherwise positive mode; ties use learned probability then seeded random'}
     if prior is not None:
         bins = (prior.cpu()*10).long().clamp(0,9)
         table = torch.bincount(bins*len(rates)+q, minlength=10*len(rates)).reshape(10,len(rates))

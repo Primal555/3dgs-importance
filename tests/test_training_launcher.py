@@ -145,11 +145,12 @@ class LauncherTests(unittest.TestCase):
                                   cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',timeout=15)
             self.assertEqual(result.returncode,0,result.stderr)
             for argument in ('--init ', '--joint-steps 1000', '--mask-only-steps 500',
-                             '--mask-shadow-per-block 4', '--prefix-mode progressive',
+                             '--prefix-mode progressive',
                              '--position-bits 16','--render-steps 0',
                              'codec_best_joint.pt','route2_best_joint.pt'):
                 self.assertIn(argument,result.stdout)
             self.assertNotIn('--mask-samples',result.stdout)
+            self.assertNotIn('--mask-shadow-per-block',result.stdout)
 
 
 if __name__=='__main__':
