@@ -64,6 +64,8 @@ def add_parser(sub):
     p.add_argument('--lr', type=float, default=1e-4, help='bootstrap learning rate')
     p.add_argument('--render-lr', type=float, default=1e-5, help='render and joint codec learning rate')
     p.add_argument('--mask-lr', type=float, default=1e-3)
+    p.add_argument('--keep-lr', type=float, default=1e-2)
+    p.add_argument('--mask-adam-eps', type=float, default=1e-15)
     p.add_argument('--beta', type=float, default=.001, help='joint-only normalized payload+XYZ+tier-map proxy penalty; not a hard cap')
     p.add_argument('--drop', type=float, default=0., help='optional random q0 in mixed codec layouts')
     p.add_argument('--power-floor', type=float, default=.01)
@@ -101,7 +103,7 @@ def train(args):
         raise ValueError('counts must be positive')
     if not 0 <= args.drop < 1:
         raise ValueError('invalid drop probability')
-    for key in ('lr','render_lr','mask_lr','clip_norm','power_floor','position_net_bits_per_use'):
+    for key in ('lr','render_lr','mask_lr','keep_lr','mask_adam_eps','clip_norm','power_floor','position_net_bits_per_use'):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             raise ValueError(f'{key} must be positive and finite')
     for key in ('beta','min_delta'):
@@ -197,7 +199,10 @@ def train(args):
         reference = RenderReference(raw,degree,args.white_background,'source')
         del all_cameras
     optimizer = torch.optim.Adam(model.parameters(),lr=args.lr)
-    mask_optimizer = torch.optim.Adam(mask.parameters(),lr=args.mask_lr) if mask is not None else None
+    mask_optimizer = torch.optim.Adam([
+        {'params': [mask.keep_logits] + ([mask.keep_snr_slopes] if mask.keep_snr_slopes is not None else []), 'lr': args.keep_lr},
+        {'params': [mask.logits] + ([mask.snr_slopes] if mask.snr_slopes is not None else []), 'lr': args.mask_lr},
+    ], eps=args.mask_adam_eps) if mask is not None else None
     out.mkdir(parents=True,exist_ok=False)
     if mask is not None:
         from .mask_checks import check_masked_renderer
@@ -230,9 +235,9 @@ def train(args):
                   bootstrap_objective_origin=('d74bf75 / 37e4d35 historical local-response implementation'
                                               if args.bootstrap_objective=='local-response' else 'normalized-feature SmoothL1'),
                   phase_transition='retain codec weights; clear Adam moments; set render_lr; position delivery unchanged',
-                  mask_gradient='MaskGaussian zero-gate image gradient for q0; straight-through nested progressive prefixes for q1+; exact expected payload gradient',
+                  mask_gradient='independent hard Gumbel keep/tier branches; zero-gate image gradient for q0; nested progressive prefixes for q1+; exact expected payload gradient',
                   allocation_deployment='fixed-seed ten categorical draws per source Gaussian; all q0 -> drop; otherwise positive mode, tied by probability then seeded random',
-                  q0_shadow='all sampled q0 rows receive a hypothetical q1 zero-gated splat during training',
+                  q0_shadow='all sampled q0 rows receive a conditional-positive-tier zero-gated splat; live codec context uses actual hard map',
                   budget='payload + XYZ + compressed tier-map proxy; beta is a Lagrange penalty, NOT a hard cap',
                   metadata='reliable bbox/tier syntax; joint charges compressed tier-map proxy but excludes packet JSON/bbox/model-ID framing',
                   position_accounting='render updates omit compressed-byte measurement (null); validation, joint and export measure actual bytes at the checkpoint compression level',
@@ -407,7 +412,11 @@ def train(args):
                 if not torch.isfinite(mask_norm):
                     raise RuntimeError('nonfinite mask gradient; no optimizer steps performed')
                 stats['mask_grad_norm'] = float(mask_norm)
+                mask_before = [p.detach().clone() for p in (mask.keep_logits, mask.logits)]
+                stats.update(keep_lr=args.keep_lr, tier_lr=args.mask_lr, mask_adam_eps=args.mask_adam_eps)
                 mask_optimizer.step()
+                stats['mask_keep_update_norm'] = float((mask.keep_logits-mask_before[0]).detach().norm())
+                stats['mask_tier_update_norm'] = float((mask.logits-mask_before[1]).detach().norm())
             if phase != 'joint' or local_step > args.mask_only_steps:
                 optimizer.step()
             updates = update_stats(model,before)

@@ -1,7 +1,7 @@
 """Per-Gaussian image feedback for progressive four-tier allocation.
 
 The deployed forward is hard: q0 contributes no splat/payload/XYZ. During
-training, a q1 *counterfactual* is rendered behind a zero MaskGaussian gate
+training, a conditional positive-tier *counterfactual* is rendered behind a zero MaskGaussian gate
 for q0 rows, so those rows can receive an image derivative. Positive-tier
 gradients use straight-through nested prefix gates. These are biased local
 surrogates, not derivatives of zlib bytes or exact finite differences.
@@ -9,7 +9,6 @@ surrogates, not derivatives of zlib bytes or exact finite differences.
 import time
 
 import torch
-from torch.nn import functional as F
 
 from .data import to_raw
 from .training import full_scene_step
@@ -30,13 +29,13 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         for ids in id_batches:
             ids = ids.to(device)
             valid = ids >= 0
-            logits = mask.scores(ids.clamp_min(0), snr)
-            q = torch.distributions.Categorical(logits=logits).sample()
+            noise = -torch.empty((*ids.shape, len(model.cfg.rates)+1), device=device).exponential_().log()
+            q, _, _, _ = mask.sample(ids.clamp_min(0), snr, noise=noise)
             q = torch.where(valid, q, 0)
             absent = valid & (q == 0)
             shadow_selected = absent
             shadow_count += int(shadow_selected.sum())
-            batches.append(torch.stack((q, ids, shadow_selected.long()), -1))
+            batches.append(torch.cat((torch.stack((q, ids), -1).double(), noise.double()), -1))
             flat_tiers.append(q[valid].cpu())
             q_by_source[ids[valid]] = q[valid]
     measured = rate_meter.details(torch.cat(flat_tiers))
@@ -44,28 +43,29 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
     counts = torch.bincount(torch.cat(flat_tiers), minlength=len(model.cfg.rates))
 
     def forward(features, packed):
-        q, ids, shadow_selected = packed.unbind(-1)
+        q, ids = packed[..., 0].long(), packed[..., 1].long()
         valid = ids >= 0
-        probabilities = mask.scores(ids.clamp_min(0), snr).softmax(-1)
+        _, presence, conditional, positive = mask.sample(ids.clamp_min(0), snr,
+                                                         noise=packed[..., 2:].to(features))
+        keep = valid & (q > 0)
+        absent = valid & (q == 0)
+        # Do not let hypothetical q0 points alter the live codec's attention
+        # context. Its forward must see the actual delivered map.
+        probabilities = torch.cat(((q == 0).to(conditional)[..., None],
+                                   conditional * (q > 0)[..., None]), -1)
         pred = model.forward_st_prefix_batches(features, features[..., :3], q,
                                                probabilities, snr, kind)
-        keep = valid & (q > 0)
-        absent = shadow_selected.bool()
-        rows = [to_raw(pred[keep], geometry, model)]
-        if absent.any():
-            # This prediction is hypothetical only. No q0 payload/XYZ is sent.
-            # Its only derivative comes from the zero-valued existence gate.
-            shadow_q = torch.where(absent, 1, q)
-            with torch.no_grad():
-                shadow_choices = F.one_hot(shadow_q, len(model.cfg.rates)).to(features)
-                shadow, _, _ = model.forward_tier_batches(
-                    features, features[..., :3], shadow_choices, snr, kind,
-                    paired_noise=True)
-                rows.append(to_raw(shadow[absent], geometry, model))
-        presence = 1 - probabilities[..., 0]
         hard_presence = (q > 0).to(presence)
-        st_presence = hard_presence + presence - presence.detach()
-        gates = [st_presence[keep], st_presence[absent]] if absent.any() else [st_presence[keep]]
+        st_presence = hard_presence + (presence - presence.detach())
+        rows, gates = [to_raw(pred[keep], geometry, model)], [st_presence[keep]]
+        if absent.any():
+            shadow_q = torch.where(absent, positive, q)
+            with torch.no_grad():
+                choices = torch.nn.functional.one_hot(shadow_q, len(model.cfg.rates)).to(features)
+                shadow, _, _ = model.forward_tier_batches(features, features[..., :3], choices,
+                                                          snr, kind, paired_noise=True)
+            rows.append(to_raw(shadow[absent], geometry, model))
+            gates.append(st_presence[absent])
         scene = torch.cat((torch.cat(rows), torch.cat(gates)[:, None]), -1)
         return scene, scene.sum() * 0, {}
 
@@ -83,7 +83,7 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
                 parameter.requires_grad_(flag)
     if mask.logits.grad is None:
         raise RuntimeError('masked render did not supply gradients to allocation logits')
-    image_gradient = mask.logits.grad.detach().clone()
+    image_gradient = torch.cat((mask.keep_logits.grad.detach(), mask.logits.grad.detach()), -1).clone()
     image_grad_q0 = image_gradient[q_by_source == 0]
     image_grad_positive = image_gradient[q_by_source > 0]
 
@@ -102,8 +102,8 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
     proxy_total = expected_payload + expected_xyz + tier_uses
     rate_loss = beta * proxy_total / rate_meter.normalizer
     rate_loss.backward()
-    rate_gradient = mask.logits.grad.detach() - image_gradient
-    stats.update(mask_estimator='local masked-render gradient + straight-through progressive prefixes',
+    rate_gradient = torch.cat((mask.keep_logits.grad.detach(), mask.logits.grad.detach()), -1) - image_gradient
+    stats.update(mask_estimator='hierarchical hard Gumbel keep/tier + local masked-render gradient + progressive prefixes',
                  mask_gradient_caveat='biased local surrogate; compressed XYZ/tier costs measured but not differentiated exactly',
                  sampled_tier_counts=counts.tolist(),
                  expected_symbols_per_gaussian=float(expected_payload.detach()),
@@ -117,6 +117,12 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
                  mask_image_grad_positive_norm=float(image_grad_positive.norm()),
                  mask_image_grad_nonzero_rows=int((image_gradient.norm(dim=-1) > 0).sum()),
                  mask_rate_grad_norm=float(rate_gradient.norm()),
+                 mask_keep_image_grad_norm=float(image_gradient[:, :2].norm()),
+                 mask_tier_image_grad_norm=float(image_gradient[:, 2:].norm()),
+                 mask_keep_rate_grad_norm=float(rate_gradient[:, :2].norm()),
+                 mask_tier_rate_grad_norm=float(rate_gradient[:, 2:].norm()),
+                 mean_keep_probability=float((1-probabilities[:, 0]).mean().detach()),
+                 conditional_tier_probabilities_mean=(probabilities[:, 1:] / (1-probabilities[:, :1]).clamp_min(1e-12)).mean(0).detach().tolist(),
                  position_compression_seconds=measured.get('position_compression_seconds', 0.),
                  tier_map_compression_seconds=measured.get('tier_map_compression_seconds', 0.),
                  sampled_retained_gaussians=retained, codec_updated=train_codec)

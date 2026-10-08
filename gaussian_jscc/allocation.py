@@ -31,15 +31,38 @@ class GaussianTierMask(nn.Module):
         # Keep the conservative q0 prior, but do not privilege the largest
         # positive prefix before any per-Gaussian evidence has been learned.
         positive = torch.full((tier_count-1,), 1/(tier_count-1))
-        probabilities = torch.cat(((1 - p)[:, None], p[:, None] * positive), -1)
-        self.logits = nn.Parameter(probabilities.log())
+        self.keep_logits = nn.Parameter(torch.stack((1-p, p), -1).log())
+        self.logits = nn.Parameter(positive.log().expand(count, -1).clone())
         self.snr_slopes = nn.Parameter(torch.zeros_like(self.logits)) if snr_conditioned else None
+        self.keep_snr_slopes = nn.Parameter(torch.zeros_like(self.keep_logits)) if snr_conditioned else None
 
     def scores(self, indices, snr):
+        keep, tier = self.branch_scores(indices, snr)
+        keep = keep.log_softmax(-1)
+        return torch.cat((keep[..., :1], keep[..., 1:] + tier.log_softmax(-1)), -1)
+
+    def branch_scores(self, indices, snr):
         values = self.logits[indices]
+        keep = self.keep_logits[indices]
         if self.snr_slopes is not None:
             values = values + self.snr_slopes[indices] * ((float(snr) - 10.) / 10.)
-        return values
+            keep = keep + self.keep_snr_slopes[indices] * ((float(snr) - 10.) / 10.)
+        return keep, values
+
+    def sample(self, indices, snr, temperature=1., noise=None):
+        """Hard forward, stochastic relaxed backward; replay preserves RNG."""
+        keep, tier = self.branch_scores(indices, snr)
+        def draw(scores, perturbation):
+            if perturbation is None:
+                return torch.nn.functional.gumbel_softmax(scores, tau=temperature, hard=True)
+            soft = ((scores + perturbation) / temperature).softmax(-1)
+            hard = torch.nn.functional.one_hot(soft.argmax(-1), scores.shape[-1]).to(soft)
+            return hard + (soft - soft.detach())
+        presence = draw(keep, None if noise is None else noise[..., :2])[..., 1]
+        choices = draw(tier, None if noise is None else noise[..., 2:])
+        positive = choices.detach().argmax(-1) + 1
+        q = torch.where(presence.detach().bool(), positive, 0)
+        return q, presence, choices, positive
 
     def probabilities(self, indices, snr):
         return self.scores(indices, snr).softmax(-1)

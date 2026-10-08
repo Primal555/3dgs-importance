@@ -11,7 +11,7 @@ from .transport import model_id, save_checkpoint, load_checkpoint
 
 def save_joint(out, suffix, model, mask, fingerprint, step, record):
     save_checkpoint(out / f"codec{suffix}.pt", model, step, record)
-    torch.save({"version": 1, "count": len(mask.logits), "scene_fingerprint": fingerprint,
+    torch.save({"version": 2, "count": len(mask.logits), "scene_fingerprint": fingerprint,
                 "snr_conditioned": mask.snr_slopes is not None,
                 "state_dict": mask.state_dict(), "codec_id": model_id(model),
                 "rates": list(model.cfg.rates), "step": step, "training": record},
@@ -20,11 +20,13 @@ def save_joint(out, suffix, model, mask, fingerprint, step, record):
 
 def load_mask(path, raw, model, device):
     saved = torch.load(path, map_location="cpu", weights_only=True)
-    if saved.get("version") != 1 or saved["scene_fingerprint"] != scene_fingerprint(raw):
+    if saved.get("version") not in (1, 2) or saved["scene_fingerprint"] != scene_fingerprint(raw):
         raise ValueError("route2 checkpoint does not match this PLY and row order")
     if saved["codec_id"] != model_id(model) or tuple(saved["rates"]) != model.cfg.rates:
         raise ValueError("route2 checkpoint requires its matching codec checkpoint")
     mask = GaussianTierMask(saved["count"], snr_conditioned=saved["snr_conditioned"], tier_count=len(model.cfg.rates))
+    if saved['version'] == 1:
+        raise ValueError('flat allocation checkpoint predates hierarchical keep/tier learning; initialize a new allocator with the matching codec')
     mask.load_state_dict(saved["state_dict"])
     return mask.to(device).eval()
 

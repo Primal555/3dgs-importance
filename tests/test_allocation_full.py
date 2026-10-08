@@ -61,7 +61,8 @@ class AllocationFullTests(unittest.TestCase):
         mask=GaussianTierMask(5)
         wanted=torch.tensor([3,0,2,1,3])
         with torch.no_grad():
-            mask.logits.copy_(torch.nn.functional.one_hot(wanted,4)*20.)
+            mask.keep_logits.copy_(torch.nn.functional.one_hot((wanted>0).long(),2)*20.)
+            mask.logits.copy_(torch.nn.functional.one_hot((wanted-1).clamp_min(0),3)*20.)
         prior=torch.tensor([.1,.9,.5,.2,.6])
         ranked=prior_ranked_tiers(prior,wanted)
         torch.testing.assert_close(torch.bincount(wanted),torch.bincount(ranked))

@@ -69,7 +69,8 @@ class Route2Tests(unittest.TestCase):
         mask = GaussianTierMask(len(raw))
         wanted = torch.arange(len(raw)) % 4
         with torch.no_grad():
-            mask.logits.copy_(F.one_hot(wanted, 4) * 20.)
+            mask.keep_logits.copy_(F.one_hot((wanted > 0).long(), 2) * 20.)
+            mask.logits.copy_(F.one_hot((wanted-1).clamp_min(0), 3) * 20.)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             save_joint(root, "", model, mask, scene_fingerprint(raw), 0, {})

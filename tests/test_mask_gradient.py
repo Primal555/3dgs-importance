@@ -70,8 +70,27 @@ class LocalMaskTests(unittest.TestCase):
         self.assertEqual(stats['sampled_retained_gaussians'], 12 - stats['sampled_tier_counts'][0])
         self.assertEqual(stats['sampled_q0_shadow_candidates'], stats['sampled_tier_counts'][0])
         self.assertGreater(stats['mask_image_grad_q0_norm'], 0.)
+        self.assertGreater(stats['mask_keep_image_grad_norm'], 0.)
+        self.assertGreater(stats['mask_tier_image_grad_norm'], 0.)
         self.assertGreater(stats['mask_image_grad_positive_norm'], 0.)
         self.assertIn('measured_allocation_uses_per_gaussian', stats)
+
+    def test_replay_and_checkpoint_agree_on_hierarchical_gradients(self):
+        raw, geometry, features, model = progressive(12)
+        results = []
+        for mode in ('replay', 'checkpoint'):
+            mask = GaussianTierMask(12, existence_prior=torch.full((12,), .5))
+            meter = AllocationCostMeter(model.cfg, PositionCostMeter(model.cfg,
+                                        geometry.normalize(raw[:, :3])), 12, 2.)
+            task = MaskedMultiViewRenderTask([SimpleNamespace(factor=1.)], Reference(), 0)
+            with patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
+                torch.manual_seed(7)
+                loss, stats = local_mask_step(model, mask, [features[None]],
+                    [torch.arange(12)[None]], geometry, 10, 'awgn', task,
+                    beta=.01, rate_meter=meter, train_codec=False, mode=mode)
+            results.append((loss, mask.keep_logits.grad, mask.logits.grad))
+        for first, second in zip(*results):
+            torch.testing.assert_close(first, second)
 
     def test_joint_mode_updates_codec_and_rate_proxy_favors_lower_budget(self):
         raw, geometry, features, model = progressive(8)
@@ -81,7 +100,7 @@ class LocalMaskTests(unittest.TestCase):
         camera = SimpleNamespace(factor=1.)
         task = MaskedMultiViewRenderTask([camera], Reference(), 0)
         rates = torch.tensor(model.cfg.rates)
-        before = float((mask.logits.softmax(-1) * rates).sum(-1).mean().detach())
+        before = float((mask.probabilities(torch.arange(8),10) * rates).sum(-1).mean().detach())
         optimizer = torch.optim.SGD(mask.parameters(), lr=.1)
         with patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
             torch.manual_seed(11)
@@ -91,7 +110,7 @@ class LocalMaskTests(unittest.TestCase):
         self.assertTrue(stats['codec_updated'])
         self.assertTrue(any(p.grad is not None and p.grad.norm() > 0 for p in model.parameters()))
         optimizer.step()
-        after = float((mask.logits.softmax(-1) * rates).sum(-1).mean().detach())
+        after = float((mask.probabilities(torch.arange(8),10) * rates).sum(-1).mean().detach())
         self.assertLess(after, before)
 
     def test_zero_mask_shadow_does_not_change_hard_deployment_image(self):
@@ -107,7 +126,12 @@ class LocalMaskTests(unittest.TestCase):
                                compute_auxiliary=False, paired_noise=True)[0]
         target = Reference().get(camera, torch.device('cpu'))
         exact = float((toy_mask_render(deployed, camera, 0) - target).square().mean().detach())
-        with patch('torch.distributions.Categorical.sample', return_value=tiers), \
+        original_sample = mask.sample
+        def fixed(indices, snr, **kwargs):
+            _, presence, choices, positive = original_sample(indices, snr, **kwargs)
+            positive = torch.where(tiers > 0, tiers, positive)
+            return tiers, presence, choices, positive
+        with patch.object(mask, 'sample', side_effect=fixed), \
              patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
             _, stats = local_mask_step(model, mask, [features[None]], [torch.arange(8)[None]],
                                        geometry, 10, 'none', task, beta=0., rate_meter=meter,
@@ -122,7 +146,11 @@ class LocalMaskTests(unittest.TestCase):
                                                                geometry.normalize(raw[:, :3])), 12, 2.)
         task = MaskedMultiViewRenderTask([SimpleNamespace(factor=1.)], Reference(), 0)
         tiers = torch.tensor([[0]*7 + [1]*5])
-        with patch('torch.distributions.Categorical.sample', return_value=tiers), \
+        original_sample = mask.sample
+        def fixed(indices, snr, **kwargs):
+            _, presence, choices, positive = original_sample(indices, snr, **kwargs)
+            return tiers, presence, choices, torch.where(tiers > 0, tiers, positive)
+        with patch.object(mask, 'sample', side_effect=fixed), \
              patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
             _, stats = local_mask_step(model, mask, [features[None]],
                                        [torch.arange(12)[None]], geometry, 10, 'none',
