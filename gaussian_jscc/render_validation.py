@@ -127,6 +127,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
               'codec_score':codec_score,'snr':snr,'channel':channel,'trials':trials,
               'validation_views':len(cameras),'layouts':entries,
               'metrics_note':'unclipped MSE/PSNR; displayed-RGB SSIM; no projection/parameter loss; payload excludes metadata'}
+    if allocation_meter is not None:
+        result.update(beta=beta, allocation_rate_normalizer=allocation_meter.normalizer)
     if paired_noise:
         # Empirical improvements, not a monotonicity constraint or a loss term.
         result['prefix_gains'] = []

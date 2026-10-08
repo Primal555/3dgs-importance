@@ -19,7 +19,8 @@ class LauncherTests(unittest.TestCase):
             (folder/'sparse').mkdir()
             (folder/'codec.pt').touch()
             env=os.environ.copy()
-            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES','PREFIX_MODE'):
+            for key in ('INITIALIZATION','INIT','STEPS','BOOTSTRAP_STEPS','CUDA_VISIBLE_DEVICES','PREFIX_MODE',
+                        'ALLOCATION_INIT','ALLOCATION_STEPS','JOINT_FINETUNE_STEPS'):
                 env.pop(key,None)
             env.update(PYTHON_BIN='/bin/echo',PLY=(folder/'input.ply').as_posix(),SCENE=folder.as_posix())
             env.update(overrides or {})
@@ -144,7 +145,7 @@ class LauncherTests(unittest.TestCase):
                                    (folder/'codec.pt').as_posix(),(folder/'run').as_posix()],
                                   cwd=root,env=env,capture_output=True,text=True,encoding='utf-8',timeout=15)
             self.assertEqual(result.returncode,0,result.stderr)
-            for argument in ('--init ', '--joint-steps 1000', '--mask-only-steps 500',
+            for argument in ('--init ', '--joint-steps 1000', '--mask-only-steps 1000',
                              '--prefix-mode progressive',
                              '--position-bits 16','--render-steps 0',
                              'codec_best_joint.pt','route2_best_joint.pt'):

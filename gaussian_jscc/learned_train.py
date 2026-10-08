@@ -79,6 +79,8 @@ def add_parser(sub):
     p.add_argument('--train-views', type=int, default=0, help='spaced training view subset; 0 uses all non-validation views')
     p.add_argument('--views-per-step', type=int, default=2)
     p.add_argument('--validate-every', type=int, default=100)
+    p.add_argument('--joint-validate-every', type=int, default=None,
+                   help='validation interval for allocation-only and joint updates; omitted uses validate-every')
     p.add_argument('--validation-blocks', type=int, default=8, help='bootstrap diagnostic only')
     p.add_argument('--validation-views', type=int, default=4)
     p.add_argument('--validation-trials', type=int, default=2)
@@ -111,6 +113,8 @@ def train(args):
             raise ValueError(f'{key} must be nonnegative and finite')
     if not math.isfinite(args.snr):
         raise ValueError('SNR must be finite')
+    if args.joint_validate_every is not None and args.joint_validate_every < 1:
+        raise ValueError('joint-validate-every must be positive')
     if args.bootstrap_steps and args.bootstrap_objective == 'local-response' and args.position_delivery == 'learned':
         raise ValueError('local-response requires reliable XYZ; it does not supervise position')
     needs_render = bool(args.render_steps or args.joint_steps)
@@ -260,8 +264,14 @@ def train(args):
                   position_net_bits_per_use=args.position_net_bits_per_use)
     if allocation_meter is not None:
         record.update(allocation_rate_normalizer=allocation_meter.normalizer,existence_prior_info=prior_info,
+                      allocation_full_payload_symbols=model.cfg.rates[-1],
+                      allocation_penalty_per_use=args.beta/allocation_meter.normalizer,
                       allocation_estimator_caveat='local straight-through gradients are biased; compressed XYZ/tier map has a measured but non-differentiable training proxy',
-                      mask_only_steps=args.mask_only_steps)
+                      mask_only_steps=args.mask_only_steps,
+                      joint_finetune_steps=args.joint_steps-args.mask_only_steps)
+        print(f'Allocation penalty: beta={args.beta:g}; actual full-tier payload={model.cfg.rates[-1]}; '
+              f'full-retention total uses/point (penalty denominator)={allocation_meter.normalizer:.6g}; '
+              f'penalty per use/point={args.beta/allocation_meter.normalizer:.6g}.',flush=True)
     (out/'training.json').write_text(json.dumps(record,indent=2),encoding='utf-8')
     print(f'render_mse_v1: {args.channel} {args.snr:g} dB; rates={model.cfg.rates}; full scene={len(raw)}; '
           f'clip={args.clip_mode}; position={model.cfg.position_delivery}; '
@@ -335,6 +345,7 @@ def train(args):
         if not maximum:
             continue
         last_phase = phase
+        validate_every = (args.joint_validate_every or args.validate_every) if phase == 'joint' else args.validate_every
         for group in optimizer.param_groups:
             group['lr'] = args.lr if phase == 'bootstrap' else args.render_lr
         # Reset Adam moments across genuinely different objectives; preserve
@@ -359,6 +370,12 @@ def train(args):
             layout_updates[label] += 1
             stats = {'layout':label, 'layout_updates_this_phase':dict(layout_updates),
                      'uniform_complex_symbols':None if tier is None or phase == 'joint' else model.cfg.rates[tier]}
+            if phase == 'joint':
+                stats.update(allocation_stage='allocation_only' if local_step <= args.mask_only_steps else 'joint_finetune',
+                             allocation_rate_normalizer=allocation_meter.normalizer,
+                             allocation_penalty_per_use=args.beta/allocation_meter.normalizer)
+                if local_step == args.mask_only_steps+1:
+                    print('Starting joint fine-tuning: codec and allocation now both update.',flush=True)
             if phase == 'bootstrap':
                 selected = [training_indices[i] for i in torch.randint(len(training_indices),(args.blocks_per_batch,)).tolist()]
                 f = pad_sequence([blocks[i] for i in selected],batch_first=True).to(device)
@@ -442,7 +459,11 @@ def train(args):
                           f'measured_uses/G={stats["measured_allocation_uses_per_gaussian"]:.4g}',flush=True)
             if step%args.save_every == 0:
                 save(f'_{step}',phase,step)
-            if local_step%args.validate_every == 0 or local_step == maximum:
+            allocation_boundary = phase == 'joint' and local_step == args.mask_only_steps
+            if allocation_boundary:
+                save('_end_allocation',phase,step)
+                print('Saved matched codec_end_allocation.pt / route2_end_allocation.pt before joint fine-tuning.',flush=True)
+            if local_step%validate_every == 0 or local_step == maximum or allocation_boundary:
                 if phase == 'bootstrap':
                     validate_bootstrap(step)
                     if needs_render:

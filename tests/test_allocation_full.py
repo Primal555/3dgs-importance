@@ -80,6 +80,12 @@ class AllocationFullTests(unittest.TestCase):
             self.assertEqual(sum(map(sum,info['existence_decile_tier_counts'])),5)
 
     def test_full_three_stage_fixed_coordinates(self):
+        self._run_full_three_stage((0,8,16,32))
+
+    def test_full_41224_pipeline_with_actual_full_tier_penalty(self):
+        self._run_full_three_stage((0,4,12,24))
+
+    def _run_full_three_stage(self, rates):
         from gaussian_jscc.cli import main
         raw,_,_,_=dense(24)
         with tempfile.TemporaryDirectory() as temp:
@@ -88,11 +94,11 @@ class AllocationFullTests(unittest.TestCase):
             np.save(root/'prior.npy',np.linspace(.2,.9,24,dtype=np.float32))
             run=root/'run'
             argv=['jscc','train-learned','--ply',str(root/'source.ply'),'--out',str(run),'--source','mock',
-                  '--device','cuda','--rates','0','8','16','32','--prefix-mode','progressive',
+                  '--device','cuda','--rates',*[str(r) for r in rates],'--prefix-mode','progressive',
                   '--position-delivery','quantized','--position-bits','16','--position-compression','delta_zlib',
                   '--bootstrap-steps','1','--bootstrap-objective','local-response','--render-steps','1',
                   '--joint-steps','2','--mask-only-steps','1','--existence-prior',str(root/'prior.npy'),
-                  '--validate-every','1','--validation-views','1','--validation-trials','1','--save-every','1',
+                  '--validate-every','1','--joint-validate-every','2','--validation-views','1','--validation-trials','1','--save-every','1',
                   '--views-per-step','1','--blocks-per-batch','2','--block-size','8','--decoder-window','4',
                   '--hidden','16','--depth','1','--grid-dim','4','--levels','2','--patience','0']
             with patch('sys.argv',argv),patch('gaussian_jscc.cli.device_for',return_value=torch.device('cpu')), \
@@ -104,6 +110,8 @@ class AllocationFullTests(unittest.TestCase):
             loss=[json.loads(line) for line in (run/'loss.jsonl').read_text().splitlines()]
             self.assertEqual([r['phase'] for r in loss],['bootstrap','render','joint','joint'])
             self.assertEqual(loss[-2]['update_norm'],0.)
+            self.assertEqual(loss[-2]['allocation_stage'],'allocation_only')
+            self.assertEqual(loss[-1]['allocation_stage'],'joint_finetune')
             self.assertIsNone(loss[1]['position_stream_bytes'])
             for r in loss[-2:]:
                 self.assertGreater(r['rate_accounting_seconds'],0)
@@ -115,7 +123,13 @@ class AllocationFullTests(unittest.TestCase):
             self.assertGreater(loss[-1]['update_norm'],0.)
             self.assertEqual(model_id(load_checkpoint(run/'codec_end_render.pt','cpu')),
                              model_id(load_checkpoint(run/'codec_3.pt','cpu')))
+            self.assertEqual(model_id(load_checkpoint(run/'codec_end_render.pt','cpu')),
+                             model_id(load_checkpoint(run/'codec_end_allocation.pt','cpu')))
+            allocation_codec=load_checkpoint(run/'codec_end_allocation.pt','cpu')
+            source,_=read_ply(root/'source.ply')
+            load_mask(run/'route2_end_allocation.pt',source,allocation_codec,'cpu')
             model=load_checkpoint(run/'codec_best_joint.pt','cpu')
+            self.assertEqual(model.cfg.rates,rates)
             self.assertEqual(model.cfg.position_compression_level,6)
             source,_=read_ply(root/'source.ply')
             loaded=load_mask(run/'route2_best_joint.pt',source,model,'cpu')
@@ -126,6 +140,12 @@ class AllocationFullTests(unittest.TestCase):
             ranked=next(e for e in last['layouts'] if e['layout']=='prior_ranked')
             self.assertEqual(mask['tier_counts'],ranked['tier_counts'])
             record=json.loads((run/'training.json').read_text())
+            self.assertEqual(record['allocation_full_payload_symbols'],rates[-1])
+            full_tier=next(e for e in last['layouts'] if e['uniform_complex_symbols']==rates[-1])
+            self.assertAlmostEqual(record['allocation_rate_normalizer'],full_tier['allocation_uses_per_source_gaussian'])
+            self.assertAlmostEqual(record['allocation_penalty_per_use'],record['beta']/record['allocation_rate_normalizer'])
+            # Boundary must validate even though joint interval=2 and local step=1.
+            self.assertTrue(any(r['step']==3 and r['phase']=='joint' for r in checks))
             self.assertAlmostEqual(last['score'],mask['source_mse']+record['beta']*mask['allocation_uses_per_source_gaussian']/record['allocation_rate_normalizer'])
             plot_render_training(run)
             for name in ('allocation_history.png','allocation_history.csv','existence_vs_allocation.png'):
