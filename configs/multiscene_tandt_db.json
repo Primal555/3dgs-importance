@@ -1,0 +1,9 @@
+{
+  "root": "..",
+  "scenes": [
+    {"name": "truck", "role": "train", "ply": "data/pretrained_3dgs/truck/point_cloud/iteration_30000/point_cloud.ply", "source": "data/tandt_db/tandt/truck"},
+    {"name": "train", "role": "train", "ply": "data/pretrained_3dgs/train/point_cloud/iteration_30000/point_cloud.ply", "source": "data/tandt_db/tandt/train"},
+    {"name": "playroom", "role": "train", "ply": "data/pretrained_3dgs/playroom/point_cloud/iteration_30000/point_cloud.ply", "source": "data/tandt_db/db/playroom"},
+    {"name": "drjohnson", "role": "heldout", "ply": "data/pretrained_3dgs/drjohnson/point_cloud/iteration_30000/point_cloud.ply", "source": "data/tandt_db/db/drjohnson"}
+  ]
+}
