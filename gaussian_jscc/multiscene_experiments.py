@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import math
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -80,7 +81,7 @@ def evaluate(args):
         opts.resolution = args.resolution
     opts.net_bits_per_use = args.net_bits_per_use
     selected = [s for s in manifest(args.manifest) if args.role=='all' or s['role']==args.role]
-    if not selected or args.trials<1 or args.test_views<0 or not args.snrs or not all(math.isfinite(s) for s in args.snrs):
+    if not selected or args.trials<1 or args.test_views<0 or args.image_views<1 or not args.snrs or not all(math.isfinite(s) for s in args.snrs):
         raise ValueError('invalid scene/trial/view/SNR selection')
     trained_names = {s['name'] for s in training.get('codec_training_scenes',training.get('selected_scenes',[])) if s['role']=='train'}
     if any(s['role']=='heldout' and s['name'] in trained_names for s in selected):
@@ -88,8 +89,11 @@ def evaluate(args):
     out.mkdir(parents=True)
     # This compact checkpoint is what would need distributing once, not optimizer state.
     from .transport import save_checkpoint
-    save_checkpoint(out/'shared_codec.pt',model,0,{'purpose':'evaluation deployment weights'})
-    model_bytes = (out/'shared_codec.pt').stat().st_size
+    with BytesIO() as buffer:
+        save_checkpoint(buffer,model,0,{'purpose':'evaluation deployment weights'})
+        model_bytes = buffer.getbuffer().nbytes
+        if args.output_profile == 'full':
+            (out/'shared_codec.pt').write_bytes(buffer.getvalue())
     rows, view_rows = [], []
     for spec in selected:
         raw,degree = read_ply(spec['ply'])
@@ -127,7 +131,9 @@ def evaluate(args):
             result = validate_render(model,s.groups,s.group_ids,s.raw,s.geometry,cameras,reference,
                 snr,args.channel,args.trials,args.seed,dest,0,'test',mask=mask,
                 mask_tiers=q,extra_layouts=extras,white_background=opts.white_background,
-                position_net_bits_per_use=args.net_bits_per_use,position_meter=s.position_meter)
+                position_net_bits_per_use=args.net_bits_per_use,position_meter=s.position_meter,
+                image_views=args.image_views if args.output_profile=='compact' else None,
+                image_layouts=('mask','1',str(len(model.cfg.rates)-1),'mixed') if args.output_profile=='compact' else None)
             full_cost = packet_cost(model,s.geometry,s.raw,torch.full((len(s.raw),),len(model.cfg.rates)-1),
                                     snr,args.channel,args.net_bits_per_use)
             for entry in result['layouts']:
@@ -178,13 +184,13 @@ def evaluate(args):
             writer=csv.DictWriter(handle,fieldnames=list(table[0]))
             writer.writeheader()
             writer.writerows(table)
+    from .multiscene_plots import plot_experiments
+    plot_experiments(out, formats=('png',) if args.output_profile=='compact' else ('png','pdf'))
     (out/'evaluation.json').write_text(json.dumps({**vars(args),'codec_id':identity,
         'selection':'test cameras never used for optimizer/model selection',
         'paired_noise':'identical full point/slot AWGN per trial across layouts',
         'shuffle_scope':'exact same tier histogram/payload; compressed side-stream cost can change',
         'uncertainty':'trials/permutations are repeated measurements, not independent scenes'},indent=2),encoding='utf-8')
-    from .multiscene_plots import plot_experiments
-    plot_experiments(out)
 
 
 def parser():
@@ -204,6 +210,8 @@ def parser():
     p.add_argument('--test-views',type=int,default=0,help='0: ALL test views; positive: explicitly labelled quick subset')
     p.add_argument('--resolution',type=int)
     p.add_argument('--net-bits-per-use',type=float,default=2.)
+    p.add_argument('--output-profile',choices=['compact','full'],default='full')
+    p.add_argument('--image-views',type=int,default=4,help='saved panels only; does not restrict metric views')
     return p
 
 

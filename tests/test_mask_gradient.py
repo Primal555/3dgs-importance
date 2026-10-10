@@ -158,6 +158,62 @@ class LocalMaskTests(unittest.TestCase):
         self.assertEqual(stats['sampled_q0_shadow_candidates'], 7)
         self.assertEqual(stats['sampled_q0_shadow_candidates'], stats['sampled_tier_counts'][0])
 
+    def test_deployment_replay_matches_checkpoint_and_rate_uses_ten_draws(self):
+        raw, geometry, features, model = progressive(12)
+        results = []
+        for mode in ('replay', 'checkpoint'):
+            model.zero_grad(set_to_none=True)
+            mask = GaussianTierMask(12, existence_prior=torch.full((12,), .1))
+            meter = AllocationCostMeter(model.cfg, PositionCostMeter(model.cfg,
+                                        geometry.normalize(raw[:, :3])), 12, 2.)
+            task = MaskedMultiViewRenderTask([SimpleNamespace(factor=1.)], Reference(), 0)
+            with patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
+                torch.manual_seed(7)
+                loss, stats = local_mask_step(model, mask, [features[None]],
+                    [torch.arange(12)[None]], geometry, 10, 'awgn', task, beta=.01,
+                    rate_meter=meter, train_codec=True, mode=mode, sampling='deployment', rate_chunk_size=5)
+            self.assertAlmostEqual(stats['mean_deployment_keep_probability'], 1-.9**10, places=5)
+            self.assertEqual(stats['sampled_q0_shadow_candidates'], stats['sampled_tier_counts'][0])
+            self.assertGreater(stats['mask_keep_image_grad_norm'], 0.)
+            results.append((loss, mask.keep_logits.grad, mask.logits.grad,
+                            torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])))
+        for first, second in zip(*results):
+            torch.testing.assert_close(first, second)
+
+    def test_rate_chunks_do_not_backpropagate_full_scene_parameter_per_chunk(self):
+        raw, geometry, features, model = progressive(12)
+        mask = GaussianTierMask(12, existence_prior=torch.full((12,), .1))
+        meter = AllocationCostMeter(model.cfg, PositionCostMeter(model.cfg,
+                                    geometry.normalize(raw[:, :3])), 12, 2.)
+        task = MaskedMultiViewRenderTask([SimpleNamespace(factor=1.)], Reference(), 0)
+        hook_calls = []
+        hook = mask.keep_logits.register_hook(lambda gradient: hook_calls.append(gradient.shape))
+        with patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
+            torch.manual_seed(7)
+            local_mask_step(model, mask, [features[None]], [torch.arange(12)[None]], geometry,
+                10, 'none', task, beta=.01, rate_meter=meter, train_codec=False,
+                sampling='deployment', rate_chunk_size=2)
+        hook.remove()
+        # One full-scene image backward; rate chunks must use local leaf gradients.
+        self.assertEqual(len(hook_calls), 1)
+
+    def test_chunk_size_does_not_change_deployment_rate_gradients(self):
+        raw, geometry, features, model = progressive(12)
+        gradients = []
+        for chunk_size in (2, 12):
+            mask = GaussianTierMask(12, existence_prior=torch.full((12,), .1), snr_conditioned=True)
+            meter = AllocationCostMeter(model.cfg, PositionCostMeter(model.cfg,
+                                        geometry.normalize(raw[:, :3])), 12, 2.)
+            task = MaskedMultiViewRenderTask([SimpleNamespace(factor=1.)], Reference(), 0)
+            with patch('gaussian_jscc.rendering.render', side_effect=toy_mask_render):
+                torch.manual_seed(7)
+                local_mask_step(model, mask, [features[None]], [torch.arange(12)[None]], geometry,
+                    7, 'none', task, beta=.01, rate_meter=meter, train_codec=False,
+                    sampling='deployment', rate_chunk_size=chunk_size)
+            gradients.append([p.grad.clone() for p in mask.parameters()])
+        for small, whole in zip(*gradients):
+            torch.testing.assert_close(small, whole, atol=1e-8, rtol=1e-5)
+
 
 if __name__ == '__main__':
     unittest.main()

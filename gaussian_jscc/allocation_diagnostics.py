@@ -92,7 +92,8 @@ def prior_ranked_tiers(prior, learned_tiers):
 
 
 @torch.no_grad()
-def record_allocation(out, step, mask, snr, rates, prior=None, seed=42):
+def record_allocation(out, step, mask, snr, rates, prior=None, seed=42, save_probabilities=True,
+                      deployment_expectation=False):
     """Snapshot and append deployment counts; arrays always ORIGINAL PLY order."""
     from .render_validation import append_json
     probs = torch.cat([mask.probabilities(torch.arange(i, min(i+65536, len(mask.logits)),
@@ -113,6 +114,15 @@ def record_allocation(out, step, mask, snr, rates, prior=None, seed=42):
             'allocation_seed': seed, 'allocation_draws': DEPLOYMENT_DRAWS,
             'changed_since_previous': int((q != previous).sum()) if previous is not None else None,
             'decision': '10 draws; q0 iff all q0; otherwise positive mode; ties use learned probability then seeded random'}
+    info['expected_tier_counts_definition'] = 'single-draw categorical probabilities, NOT ten-draw deployment'
+    info['single_draw_expected_tier_counts'] = info['expected_tier_counts']
+    if deployment_expectation:
+        from .allocation import deployment_probabilities
+        expected = torch.zeros(len(rates), device=mask.logits.device, dtype=torch.float64)
+        for part in probs.split(1024):
+            expected += deployment_probabilities(part.to(mask.logits.device)).double().sum(0)
+        info['deployment_expected_tier_counts'] = expected.cpu().tolist()
+        info['deployment_expected_payload_symbols'] = float((expected*expected.new_tensor(rates)).sum())
     if prior is not None:
         bins = (prior.cpu()*10).long().clamp(0,9)
         table = torch.bincount(bins*len(rates)+q, minlength=10*len(rates)).reshape(10,len(rates))
@@ -122,8 +132,9 @@ def record_allocation(out, step, mask, snr, rates, prior=None, seed=42):
     folder = Path(out)/'allocation_latest'
     folder.mkdir(exist_ok=True)
     np.save(folder/'tiers.npy', q.numpy().astype(np.uint8), allow_pickle=False)
-    np.save(folder/'probabilities.npy', probs.numpy(), allow_pickle=False)
-    if prior is not None:
+    if save_probabilities:
+        np.save(folder/'probabilities.npy', probs.numpy(), allow_pickle=False)
+    if prior is not None and save_probabilities:
         np.save(folder/'prior_ranked_tiers.npy', prior_ranked_tiers(prior,q).numpy().astype(np.uint8))
     (folder/'allocation.json').write_text(json.dumps(info, indent=2), encoding='utf-8')
     append_json(Path(out)/'allocation_history.jsonl', info)

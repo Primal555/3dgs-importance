@@ -14,7 +14,7 @@ def append_json(path, row):
         handle.write(json.dumps(row, allow_nan=False)+'\n')
 
 
-def save_panel(path, photo, reference, decoded):
+def save_panel(path, photo, reference, decoded, received_label='Received'):
     from PIL import Image, ImageDraw
     images = [photo, reference, decoded, (decoded-reference).abs().mean(0, keepdim=True).expand(3,-1,-1)*4]
     pixels = (torch.cat(images, 2).detach().clamp(0,1).permute(1,2,0).cpu().numpy()*255).round().astype('uint8')
@@ -22,7 +22,7 @@ def save_panel(path, photo, reference, decoded):
     canvas = Image.new('RGB', (panel.width, panel.height+24), 'white')
     canvas.paste(panel, (0,24))
     draw = ImageDraw.Draw(canvas)
-    for i,label in enumerate(('Photo', 'Source PLY', 'Received', 'Abs error x4')):
+    for i,label in enumerate(('Photo', 'Source PLY', received_label, 'Abs error x4')):
         draw.text((i*panel.width//4+4,5), label, fill='black')
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
@@ -32,7 +32,8 @@ def save_panel(path, photo, reference, decoded):
 def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                     snr, channel, trials, seed, out, step, phase, mask=None,
                     white_background=False, beta=0., position_net_bits_per_use=2., position_meter=None,
-                    allocation_meter=None, extra_layouts=None, mask_tiers=None):
+                    allocation_meter=None, extra_layouts=None, mask_tiers=None,
+                    save_images=True, image_views=None, image_layouts=None):
     from .cli import seed_all
     from .rendering import render
     device = next(model.parameters()).device
@@ -49,6 +50,9 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
         raise ValueError('extra layout names must be safe distinct diagnostic labels')
     layouts = codec_layouts + (('mask',) if mask is not None else ()) + tuple(extra_layouts)
     tier_count = len(model.cfg.rates)
+    from .compact_output import representative_views
+    selected_image_views = representative_views(len(cameras), image_views)
+    saved_images = []
     if mask is not None:
         from .route2 import hard_tiers
         mask_tiers = hard_tiers(mask, snr, seed) if mask_tiers is None else torch.as_tensor(mask_tiers).cpu()
@@ -87,9 +91,14 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                                **{'reference_photo_'+k:v for k,v in baseline_metrics.items()}}
                         observations.append(row)
                         view_scores.append(source_metrics['mse'])
-                        if trial == 0:
-                            save_panel(Path(out)/'validation_images'/f'{step:06d}'/f'{label}_view{view:02d}.png',
-                                       photo,target,decoded)
+                        if (save_images and trial == 0 and view in selected_image_views and
+                                (image_layouts is None or label in image_layouts)):
+                            panel_path = Path(out)/'validation_images'/f'{step:06d}'/f'{label}_view{view:02d}.png'
+                            title = ('Received: learned deployment' if label == 'mask' else
+                                     'Received: random mixed' if label == 'mixed' else 'Received: q'+label)
+                            save_panel(panel_path,photo,target,decoded,received_label=title)
+                            saved_images.append({'file': str(panel_path.relative_to(out)), 'layout': label,
+                                                 'view_index': view, 'view': row['view']})
                     trial_scores.append(sum(view_scores)/len(view_scores))
                     del scene
                 keys = [k for k in observations[0] if k not in ('trial','view_index','view')]
@@ -127,6 +136,7 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
               'codec_score':codec_score,'snr':snr,'channel':channel,'trials':trials,
               'validation_views':len(cameras),'layouts':entries,
               'metrics_note':'unclipped MSE/PSNR; displayed-RGB SSIM; no projection/parameter loss; payload excludes metadata'}
+    result['saved_images'] = saved_images
     if allocation_meter is not None:
         result.update(beta=beta, allocation_rate_normalizer=allocation_meter.normalizer)
     if paired_noise:

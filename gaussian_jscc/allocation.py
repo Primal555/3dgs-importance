@@ -5,6 +5,8 @@ per-row SNR slopes let deployment decisions depend on the operating SNR.
 """
 
 import hashlib
+import math
+from functools import lru_cache
 
 import torch
 from torch import nn
@@ -67,12 +69,77 @@ class GaussianTierMask(nn.Module):
     def probabilities(self, indices, snr):
         return self.scores(indices, snr).softmax(-1)
 
+    def sample_deployment(self, indices, snr, seed, temperature=1.):
+        """Ten independent draws; hard deployment rule, relaxed local backward.
+
+        Only the seed is cached by replay. Multiplying HARD-ST drop gates would
+        incorrectly zero existence gradients whenever several draws retain a
+        point, so the complement product uses the genuinely soft gates instead.
+        """
+        if temperature <= 0:
+            raise ValueError('temperature must be positive')
+        keep, tier = self.branch_scores(indices, snr)
+        generator = torch.Generator(device=keep.device).manual_seed(int(seed))
+        noise = -torch.empty((*indices.shape, DEPLOYMENT_DRAWS, tier.shape[-1]+2),
+                             device=keep.device, dtype=keep.dtype).exponential_(generator=generator).log()
+        soft_keep = ((keep[..., None, :] + noise[..., :2])/temperature).softmax(-1)
+        soft_tier = ((tier[..., None, :] + noise[..., 2:])/temperature).softmax(-1)
+        draw_q = torch.where(soft_keep.detach().argmax(-1).bool(),
+                             soft_tier.detach().argmax(-1)+1, 0)
+        p = self.probabilities(indices, snr)
+        tie_random = torch.rand(tier.shape, device=tier.device, dtype=tier.dtype, generator=generator)
+        shape = indices.shape
+        flat_draws, flat_p = draw_q.reshape(-1, DEPLOYMENT_DRAWS), p.reshape(-1, p.shape[-1])
+        q = _tiers_from_draws(flat_draws, flat_p.detach(), tie_random.reshape(-1, tier.shape[-1])).reshape(shape)
+        # All-q0 rows still need a positive counterfactual attribute prediction.
+        tied = p[..., 1:] == p[..., 1:].max(-1, keepdim=True).values
+        fallback = tie_random.masked_fill(~tied, -1).argmax(-1)+1
+        positive = torch.where(q > 0, q, fallback)
+        soft_presence = 1-soft_keep[..., 0].prod(-1)
+        presence = (q > 0).to(soft_presence) + (soft_presence-soft_presence.detach())
+        votes = (soft_keep[..., 1, None]*soft_tier).sum(-2)
+        choices_soft = votes/votes.sum(-1, keepdim=True).clamp_min(torch.finfo(votes.dtype).tiny)
+        choices_hard = torch.nn.functional.one_hot(positive-1, tier.shape[-1]).to(votes)
+        choices = choices_hard + (choices_soft-choices_soft.detach())
+        return q, presence, choices, positive
+
 def expected_rate(probabilities, rates):
     """Expected payload COMPLEX symbols; differentiable in probabilities."""
     return (probabilities * probabilities.new_tensor(rates)).sum(-1)
 
 
 DEPLOYMENT_DRAWS = 10
+
+
+@lru_cache(maxsize=8)
+def _count_patterns(draws):
+    patterns = [(a, b, c, draws-a-b-c) for a in range(draws+1)
+                for b in range(draws-a+1) for c in range(draws-a-b+1)]
+    factors = [math.factorial(draws)/math.prod(math.factorial(n) for n in row) for row in patterns]
+    return torch.tensor(patterns), torch.tensor(factors, dtype=torch.float64)
+
+
+def deployment_probabilities(probabilities, draws=DEPLOYMENT_DRAWS):
+    """Exact four-tier positive-mode distribution (286 count patterns at ten).
+
+    Caller chunks rows and backpropagates each chunk immediately. Tie priority
+    is piecewise constant in learned probabilities; an exact remaining tie is
+    shared uniformly, matching seeded random tie breaking in expectation.
+    Integer powers keep boundary derivatives finite without log(0) tricks.
+    """
+    if probabilities.ndim != 2 or probabilities.shape[-1] != 4 or not 1 <= draws <= 10:
+        raise ValueError('expected [N,4] probabilities and 1..10 draws')
+    counts, coefficients = _count_patterns(draws)
+    counts = counts.to(probabilities.device)
+    coefficients = coefficients.to(probabilities)
+    mass = probabilities[:, None, :].pow(counts[None]).prod(-1)*coefficients
+    tied = counts[:, 1:] == counts[:, 1:].max(-1, keepdim=True).values
+    priority = probabilities.detach()[:, None, 1:].expand(-1, len(counts), -1).masked_fill(~tied, -1)
+    winners = tied & (priority == priority.max(-1, keepdim=True).values)
+    weights = winners.to(probabilities)/winners.sum(-1, keepdim=True)
+    weights = weights * (counts[:, 0] != draws)[None, :, None]
+    positive = (mass[..., None]*weights).sum(1)
+    return torch.cat((probabilities[:, :1].pow(draws), positive), -1)
 
 
 def _tiers_from_draws(draws, probabilities, tie_random):

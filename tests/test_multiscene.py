@@ -136,6 +136,43 @@ class MultiSceneTests(unittest.TestCase):
                 self.assertTrue((root/'evaluation/charts/fixture_holdout_snr_sweep.png').exists())
                 self.assertTrue(any(r['digital_efficiency_exceeds_same_snr_capacity'] for r in results))
                 self.assertTrue(list((run/'charts').glob('*.pdf')))
+                aligned = root/'aligned'
+                aligned_args = parser().parse_args(['--manifest',str(path),'--out',str(aligned),
+                    '--device','cpu','--joint-only','--checkpoint',str(run/'checkpoints/end_allocation/codec.pt'),
+                    '--train-scenes','fixture_a','--bootstrap-steps','0','--render-steps','0','--allocation-steps','0',
+                    '--joint-steps','12','--allocation-sampling','deployment','--prefix-anchor-every','4',
+                    '--output-profile','compact','--validation-views','1','--views-per-step','1',
+                    '--validation-trials','1','--blocks-per-batch','2','--validate-every','4','--save-every','4'])
+                train(aligned_args)
+                aligned_rows=[json.loads(line) for line in (aligned/'loss.jsonl').read_text().splitlines()]
+                self.assertEqual(len(aligned_rows),12)
+                self.assertEqual([r['prefix_anchor_tier'] for r in aligned_rows if r['prefix_anchor_applied']], [1,2,3])
+                self.assertTrue(all(r['allocation_draws']==10 for r in aligned_rows))
+                self.assertEqual({p.name for p in (aligned/'scenes/fixture_a/validation_images').iterdir()}, {'000000','000012'})
+                self.assertFalse((aligned/'checkpoints/initial').exists())
+                self.assertFalse((aligned/'checkpoints/end_joint').exists())
+                self.assertFalse((aligned/'scenes/fixture_a/allocation_latest/probabilities.npy').exists())
+                self.assertFalse(list((aligned/'charts').glob('*.pdf')))
+                initialized=json.loads((aligned/'training.json').read_text())
+                self.assertEqual(initialized['initializer_codec_id'], model_id(b))
+                allocation_rows=[json.loads(line) for line in (aligned/'scenes/fixture_a/allocation_history.jsonl').read_text().splitlines()]
+                self.assertIn('deployment_expected_tier_counts', allocation_rows[0])
+                self.assertIn('NOT ten-draw', allocation_rows[0]['expected_tier_counts_definition'])
+                small_manifest=root/'small_manifest.json'
+                small_manifest.write_text(json.dumps({'scenes': [specifications[0]]}))
+                for stage, checkpoint in [('initial', run/'checkpoints/end_allocation/codec.pt'),
+                                          ('final', aligned/'checkpoints/final/codec.pt')]:
+                    small_eval=eval_parser().parse_args(['--manifest',str(small_manifest),'--checkpoint',str(checkpoint),
+                        '--device','cpu','--out',str(aligned/'evaluation'/stage),'--trials','1',
+                        '--shuffle-seeds','101','--snrs','10','--output-profile','compact'])
+                    evaluate(small_eval)
+                    self.assertFalse((aligned/'evaluation'/stage/'shared_codec.pt').exists())
+                    self.assertFalse(list((aligned/'evaluation'/stage/'charts').glob('*.pdf')))
+                    saved_panels=list((aligned/'evaluation'/stage/'scenes/fixture_a/snr_10/validation_images/000000').glob('*.png'))
+                    self.assertEqual(len(saved_panels), 4*len(cameras))
+                    self.assertEqual({p.name.split('_view')[0] for p in saved_panels}, {'mask','1','3','mixed'})
+                from gaussian_jscc.compact_output import build_review
+                self.assertTrue(build_review(aligned).exists())
                 artifact=os.environ.get('MULTISCENE_TEST_ARTIFACTS')
                 if artifact:
                     shutil.copytree(root,artifact,dirs_exist_ok=False)
