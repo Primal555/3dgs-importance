@@ -88,6 +88,10 @@ def evaluate(args):
     identity = model_id(model)
     saved = torch.load(checkpoint,map_location='cpu',weights_only=True)
     training = saved.get('training',{})
+    from .appearance_metrics import load_regions
+    color_regions = load_regions(args.color_rois) if args.color_rois else training.get('color_regions', {})
+    if args.uniform_only and (args.require_allocations or args.draw_counts):
+        raise ValueError('uniform-only cannot require deployment allocation tables')
     # Use original resolution/layout unless explicitly overridden.
     opts = training_parser().parse_args(['--out',str(out)])
     for key in ('resolution','white_background','images','blocks_per_batch','snr','net_bits_per_use'):
@@ -133,7 +137,7 @@ def evaluate(args):
         allocation_path = folder/f'{s.name}.pt'
         if (args.require_allocations or args.draw_counts) and not allocation_path.is_file():
             raise FileNotFoundError(f'required allocation table missing: {allocation_path}')
-        mask = load_mask(allocation_path,raw,model,device) if allocation_path.exists() else None
+        mask = load_mask(allocation_path,raw,model,device) if allocation_path.exists() and not args.uniform_only else None
         del raw
         # Map sampled ONCE at trained SNR; do not silently reallocate for SNR sweep.
         q = hard_tiers(mask,opts.snr,args.deployment_seed) if mask is not None else None
@@ -175,7 +179,8 @@ def evaluate(args):
                 image_layouts=tuple(args.image_layouts) if args.image_layouts else
                     tuple(diagnostics) if diagnostics and args.output_profile=='compact' else
                     ('mask','1',str(len(model.cfg.rates)-1),'mixed') if args.output_profile=='compact' else None,
-                save_images=not args.no_images)
+                save_images=not args.no_images, color_metrics=args.color_metrics,
+                color_regions=color_regions.get(s.name, {}))
             full_cost = packet_cost(model,s.geometry,s.raw,torch.full((len(s.raw),),len(model.cfg.rates)-1),
                                     snr,args.channel,args.net_bits_per_use)
             for entry in result['layouts']:
@@ -252,6 +257,9 @@ def parser():
     p.add_argument('--draw-counts',nargs='+',type=int,help='diagnostic deployment rules, e.g. 10 5 3; does not retrain tables')
     p.add_argument('--require-allocations',action='store_true',help='fail if a paired scene allocation table is missing')
     p.add_argument('--no-images',action='store_true',help='metrics only; do not save render panels')
+    p.add_argument('--color-metrics',action='store_true',help='also measure RGB bias and channel-difference errors')
+    p.add_argument('--color-rois',help='optional predeclared scene/view/region boxes JSON')
+    p.add_argument('--uniform-only',action='store_true',help='ignore allocation tables; evaluate codec prefixes only')
     p.add_argument('--image-layouts',nargs='+',help='optional panel labels only; does NOT restrict metric layouts')
     p.add_argument('--device',default='cuda')
     p.add_argument('--channel',choices=['awgn','none'],default='awgn')

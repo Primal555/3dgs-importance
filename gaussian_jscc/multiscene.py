@@ -19,7 +19,7 @@ from .allocation_diagnostics import AllocationCostMeter, load_existence_prior, r
 from .codec import CodecConfig, GaussianCodec
 from .data import Geometry, morton_order, read_ply, to_features
 from .learned_training import hard_layout, layout_schedule
-from .local_response import local_response_loss
+from .local_response import local_response_loss, camera_directions
 from .mask_gradient import local_mask_step
 from .optimization import clip_codec_gradients, preserved_rng
 from .position_delivery import PositionCostMeter
@@ -69,6 +69,20 @@ def shared_statistics(raw_scenes):
     mean = torch.stack(means).mean(0)
     std = (torch.stack(seconds).mean(0)-mean.square()).clamp_min(0).sqrt().clamp_min(.01)
     return mean.float(), std.float()
+
+
+def configure_codec_training(model, scope):
+    """Choose actual optimizer parameters; explicit XYZ never becomes trainable."""
+    if scope not in ('all', 'color_heads'):
+        raise ValueError('unknown codec training scope')
+    model.requires_grad_(scope == 'all')
+    if scope == 'color_heads':
+        for name in ('dc', 'sh'):
+            if name in model.learned.heads:
+                model.learned.heads[name].requires_grad_(True)
+    if model.cfg.position_delivery != 'learned':
+        model.learned.heads['xyz'].requires_grad_(False)
+    return [name for name, p in model.named_parameters() if p.requires_grad]
 
 
 class Scene:
@@ -197,8 +211,11 @@ def validate(model, scenes, args, step, phase):
                 allocation_meter=s.rate_meter if use_mask is not None else None,
                 save_images=(args.image_policy=='all' or (args.image_policy=='endpoints' and
                              step in (0, args.total_updates))),
-                image_views=4 if args.output_profile=='compact' else None,
-                image_layouts=('mask','1','3','mixed') if args.output_profile=='compact' else None)
+                image_views=args.image_views if args.output_profile=='compact' else None,
+                image_layouts=(('1','2','3','mixed') if args.color_metrics else
+                               ('mask','1','3','mixed')) if args.output_profile=='compact' else None,
+                color_metrics=args.color_metrics,
+                color_regions=args.color_regions.get(s.name, {}))
         results.append({'scene': s.name, 'score': r['score']})
         s.move_mask('cpu')
     # Each scene contributes exactly once, independent of point/view counts.
@@ -209,6 +226,15 @@ def validate(model, scenes, args, step, phase):
 
 def train(args):
     from .cli import device_for, seed_all
+    if args.render_only and (not args.checkpoint or args.bootstrap_steps or args.allocation_steps or
+                             args.joint_steps or args.render_steps < 1):
+        raise ValueError('render-only requires checkpoint, render steps and zero other phase budgets')
+    if args.trainable == 'color_heads' and not args.render_only:
+        raise ValueError('color_heads requires render-only; no random frozen backbone')
+    if args.uniform_tier is not None and (args.uniform_tier < 1 or args.allocation_steps or args.joint_steps):
+        raise ValueError('uniform-tier must be positive and cannot accompany allocator training')
+    from .appearance_metrics import load_regions
+    args.color_regions = load_regions(args.color_rois)
     selected = [s for s in manifest(args.manifest) if s['role'] == ('heldout' if args.adapt else 'train')]
     if args.train_scenes:
         if args.adapt or not set(args.train_scenes).issubset({s['name'] for s in selected}):
@@ -216,15 +242,15 @@ def train(args):
         selected = [s for s in selected if s['name'] in args.train_scenes]
     if not selected:
         raise ValueError('no scenes selected')
-    if sum((args.adapt, args.allocation_only, args.joint_only)) > 1:
-        raise ValueError('choose only one of adaptation, allocation-only or joint-only')
+    if sum((args.adapt, args.allocation_only, args.joint_only, args.render_only)) > 1:
+        raise ValueError('choose only one specialized training mode')
     if args.adapt and (not args.checkpoint or args.bootstrap_steps or args.render_steps or args.joint_steps):
         raise ValueError('adapt requires --checkpoint and zero bootstrap/render/joint steps; only allocation is fitted')
     if args.allocation_only and (not args.checkpoint or args.bootstrap_steps or args.render_steps or args.joint_steps):
         raise ValueError('allocation-only requires checkpoint and zero bootstrap/render/joint steps')
     if args.joint_only and (not args.checkpoint or args.bootstrap_steps or args.render_steps or args.allocation_steps or args.joint_steps < 1):
         raise ValueError('joint-only requires a paired checkpoint and zero bootstrap/render/allocation budgets')
-    if args.checkpoint and not (args.adapt or args.allocation_only or args.joint_only):
+    if args.checkpoint and not (args.adapt or args.allocation_only or args.joint_only or args.render_only):
         raise ValueError('shared training starts randomly; checkpoint is for frozen allocation fitting')
     counts = [args.bootstrap_steps, args.render_steps, args.allocation_steps, args.joint_steps]
     if args.prefix_anchor_every < 0 or args.rate_chunk_size < 1:
@@ -232,7 +258,7 @@ def train(args):
     if min(counts) < 0 or sum(counts) < 1:
         raise ValueError('invalid per-scene phase budgets')
     if min(args.validate_every, args.save_every, args.blocks_per_batch, args.views_per_step,
-           args.validation_views, args.validation_trials, args.local_response_views) < 1:
+           args.validation_views, args.validation_trials, args.local_response_views, args.image_views) < 1:
         raise ValueError('counts must be positive')
     if not 0 <= args.drop < 1 or not math.isfinite(args.beta) or args.beta < 0:
         raise ValueError('invalid drop or beta')
@@ -275,9 +301,17 @@ def train(args):
         mean, std = shared_statistics([raw for raw,_ in loaded])
         model.attr_mean.copy_(mean.to(device))
         model.attr_std.copy_(std.to(device))
+    if args.uniform_tier is not None and args.uniform_tier >= len(model.cfg.rates):
+        raise ValueError('uniform-tier outside codec rate table')
+    configure_codec_training(model, args.trainable)
     frozen_identity = model_id(model) if args.adapt or args.allocation_only else None
     if frozen_identity is not None:
         model.requires_grad_(False)
+    trainable_names = [n for n,p in model.named_parameters() if p.requires_grad]
+    # Audit every frozen parameter AND all normalization buffers, not only XYZ.
+    frozen_names = {n for n,p in model.named_parameters() if not p.requires_grad}
+    frozen_names.update(n for n,_ in model.named_buffers())
+    frozen_snapshot = {n:t.detach().cpu().clone() for n,t in model.state_dict().items() if n in frozen_names}
     out.mkdir(parents=True)
     args.total_updates = len(selected)*sum(counts)
     record = {k:v for k,v in vars(args).items()}
@@ -290,11 +324,33 @@ def train(args):
         source_target='original PLY rendering; photos are separate evaluation references',
         checkpoint_semantics='weights/tables, not exact optimizer resume',
         total_updates=len(selected)*sum(counts))
+    record.update(trainable_parameters=trainable_names,
+                  frozen_state_keys=sorted(frozen_snapshot),
+                  paired_streams='per-update deterministic seed; camera sampler has independent generator'
+                    if args.paired_training_rng else 'legacy global RNG stream')
+    if not args.checkpoint:
+        record['random_initializer_codec_id'] = model_id(model)
+    if args.render_only:
+        record.update(initializer_codec_id=model_id(model),
+                      initializer_checkpoint=str(Path(args.checkpoint).resolve()),
+                      initialization='same render checkpoint; fresh Adam; fixed layout, NOT exact resume')
     if frozen_identity is not None:
         record.update(initializer_codec_id=frozen_identity, codec_frozen=True,
                       initialization='same checkpoint; fresh allocator and fresh Adam, NOT continuation')
     scenes = [Scene(spec, raw, d, model, args, out, with_mask=bool(args.allocation_steps or args.joint_steps))
               for spec,(raw,d) in zip(selected,loaded)]
+    if args.scene_reference_run:
+        for s in scenes:
+            old = json.loads((Path(args.scene_reference_run)/'scenes'/s.name/'scene.json').read_text(encoding='utf-8'))
+            current = json.loads((s.out/'scene.json').read_text(encoding='utf-8'))
+            for key in ('fingerprint','source_gaussians','train_view_names','validation_view_names'):
+                if key not in old or current[key] != old[key]:
+                    raise ValueError(f'{s.name}: reference scene mismatch: {key}')
+        record['reference_scene_identity_and_splits_verified'] = True
+    if args.bootstrap_steps and args.bootstrap_directions == 'camera':
+        for s in scenes:
+            # Scene.cameras already excludes validation cameras; never load test cameras here.
+            s.bootstrap_centers = torch.stack([c.camera_center.detach().cpu() for c in s.cameras])
     # A separate view RNG makes frozen single/deployment/beta controls see the
     # same cameras even though their mask samplers consume different RNG draws.
     allocation_view_rng = {s.name:torch.Generator().manual_seed(args.seed+1009*i)
@@ -320,7 +376,7 @@ def train(args):
         from .mask_checks import check_masked_renderer
         parity = check_masked_renderer(scenes[0].raw.to(device), scenes[0].cameras[0], degree, args.white_background)
         (out/'mask_renderer_check.json').write_text(json.dumps(parity, indent=2), encoding='utf-8')
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad] or list(model.parameters()), lr=args.lr)
     schedule, step = layout_schedule(model.cfg.rates), 0
     print(f'Scenes: {[s.name for s in scenes]}; per-scene budgets {counts}; total actual updates {record["total_updates"]}', flush=True)
     if not (args.checkpoint and args.output_profile=='compact'):
@@ -338,10 +394,13 @@ def train(args):
             for s in scenes:
                 start = time.perf_counter()
                 step += 1
+                if args.paired_training_rng:
+                    # Different local-direction samplers must not shift later noise/batches/views.
+                    seed_all((args.seed + step*104729) % (2**32))
                 s.visits[phase] = visit
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
-                tier = schedule[(visit-1)%len(schedule)]
+                tier = args.uniform_tier if args.uniform_tier is not None else schedule[(visit-1)%len(schedule)]
                 stats = {'layout': 'mixed' if tier is None else str(tier)}
                 if phase == 'bootstrap':
                     indices = torch.randint(len(s.blocks), (args.blocks_per_batch,)).tolist()
@@ -352,7 +411,18 @@ def train(args):
                         q[ids>=0] = 1
                     choices = torch.nn.functional.one_hot(q, len(model.cfg.rates)).to(f)
                     pred,_,_ = model.forward_tier_batches(f, f[...,:3], choices, args.snr, args.channel)
-                    loss, details = local_response_loss(pred[q>0], f[q>0], s.geometry, model, args.local_response_views)
+                    directions, direction_indices = None, None
+                    if args.bootstrap_directions == 'camera':
+                        generator = torch.Generator().manual_seed(args.seed + step*7919)
+                        direction_indices = torch.randint(len(s.bootstrap_centers),
+                            (args.local_response_views,), generator=generator)
+                        points = s.geometry.denormalize(f[q>0][:, :3])
+                        directions = camera_directions(points, s.bootstrap_centers[direction_indices])
+                    loss, details = local_response_loss(pred[q>0], f[q>0], s.geometry, model,
+                                                       args.local_response_views, directions=directions)
+                    details['bootstrap_directions'] = args.bootstrap_directions
+                    if direction_indices is not None:
+                        details['bootstrap_camera_names'] = [str(s.cameras[i].image_name) for i in direction_indices.tolist()]
                     loss.backward()
                 else:
                     view_generator = allocation_view_rng.get(s.name)
@@ -414,6 +484,8 @@ def train(args):
         if not (args.joint_only and args.output_profile=='compact'):
             save_bundle(out, 'end_'+phase, model, scenes, step, record)
     final_identity = model_id(model)
+    if any(not torch.equal(model.state_dict()[n].detach().cpu(), value) for n,value in frozen_snapshot.items()):
+        raise RuntimeError('frozen codec parameters/statistics changed; no completion marker saved')
     if frozen_identity is not None and final_identity != frozen_identity:
         raise RuntimeError('frozen allocation fitting changed codec weights or statistics; no completion marker saved')
     if frozen_identity is not None:
@@ -421,7 +493,8 @@ def train(args):
     save_bundle(out, 'final', model, scenes, step, record)
     (out/'complete.json').write_text(json.dumps({'updates':step,'scene_visits':{s.name:s.visits for s in scenes},
         'codec_id':final_identity, 'initializer_codec_id':frozen_identity,
-        'frozen_codec_verified': final_identity == frozen_identity if frozen_identity is not None else None},indent=2),encoding='utf-8')
+        'frozen_codec_verified': final_identity == frozen_identity if frozen_identity is not None else None,
+        'frozen_parameters_verified': True, 'trainable_parameters': trainable_names},indent=2),encoding='utf-8')
 
 
 def parser():
@@ -432,6 +505,15 @@ def parser():
     p.add_argument('--adapt', action='store_true', help='fit heldout scene tables only; never update shared codec/statistics')
     p.add_argument('--allocation-only', action='store_true', help='fit fresh training-scene tables on a frozen checkpoint; beta controls')
     p.add_argument('--joint-only', action='store_true', help='initialize joint training from matched codec and scene tables; fresh optimizers')
+    p.add_argument('--render-only', action='store_true', help='fixed-layout codec finetune from checkpoint, without allocator')
+    p.add_argument('--trainable', choices=['all','color_heads'], default='all')
+    p.add_argument('--uniform-tier', type=int, help='fixed positive tier for bootstrap/render controls')
+    p.add_argument('--bootstrap-directions', choices=['random','camera'], default='random')
+    p.add_argument('--paired-training-rng', action='store_true')
+    p.add_argument('--scene-reference-run', help='optional source run: verify exact PLY and training/validation camera split before updates')
+    p.add_argument('--color-metrics', action='store_true', help='RGB bias/MAE and channel-difference errors, not a loss')
+    p.add_argument('--color-rois', help='optional predeclared scene/view/region normalized boxes JSON')
+    p.add_argument('--image-views', type=int, default=4)
     p.add_argument('--checkpoint')
     p.add_argument('--allocations-dir', help='matched scene tables; defaults to checkpoint directory')
     p.add_argument('--allocation-sampling', choices=['single','deployment'], default='single')

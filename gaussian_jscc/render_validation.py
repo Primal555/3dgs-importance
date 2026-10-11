@@ -33,7 +33,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                     snr, channel, trials, seed, out, step, phase, mask=None,
                     white_background=False, beta=0., position_net_bits_per_use=2., position_meter=None,
                     allocation_meter=None, extra_layouts=None, mask_tiers=None,
-                    save_images=True, image_views=None, image_layouts=None):
+                    save_images=True, image_views=None, image_layouts=None,
+                    color_metrics=False, color_regions=None):
     from .cli import seed_all
     from .rendering import render
     device = next(model.parameters()).device
@@ -89,6 +90,14 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                                **{'source_'+k:v for k,v in source_metrics.items()},
                                **{'photo_'+k:v for k,v in photo_metrics.items()},
                                **{'reference_photo_'+k:v for k,v in baseline_metrics.items()}}
+                        if color_metrics:
+                            from .appearance_metrics import appearance_metrics
+                            regions = (color_regions or {}).get(row['view'], {})
+                            for prefix, comparison in (('source', target), ('photo', photo)):
+                                measured = appearance_metrics(decoded, comparison, regions)
+                                row.update({prefix+'_color_'+k:v for k,v in measured.items() if k != 'regions'})
+                                if regions:
+                                    row[prefix+'_regions'] = measured['regions']
                         observations.append(row)
                         view_scores.append(source_metrics['mse'])
                         if (save_images and trial == 0 and view in selected_image_views and
@@ -101,7 +110,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                                                  'view_index': view, 'view': row['view']})
                     trial_scores.append(sum(view_scores)/len(view_scores))
                     del scene
-                keys = [k for k in observations[0] if k not in ('trial','view_index','view')]
+                keys = [k for k in observations[0] if k not in
+                        ('trial','view_index','view','source_regions','photo_regions')]
                 entry = {'layout':label, **{k:sum(r[k] for r in observations)/len(observations) for k in keys},
                          'noise_trial_mse_std':float(torch.tensor(trial_scores).std(unbiased=False)),
                          'xyz_rmse_retained':sum(xyz_errors)/len(xyz_errors) if xyz_errors else None,
@@ -109,6 +119,8 @@ def validate_render(model, groups, group_ids, raw, geometry, cameras, reference,
                          'uniform_complex_symbols':model.cfg.rates[tier] if isinstance(tier,int) else None,
                          'tier_counts':torch.bincount(flat_q,minlength=tier_count).tolist(),
                          'views':observations}
+                if color_metrics:
+                    entry['color_metrics_note'] = 'Uncorrected unclipped RGB; bias can cancel; channel-difference RMSE is not Delta-E'
                 entry.update(training_position_cost(model.cfg,int((flat_q>0).sum()),len(raw),
                                                     int(lengths.sum()),position_net_bits_per_use,
                                                     position_meter.stream_bytes(flat_q)))

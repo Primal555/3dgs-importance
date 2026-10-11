@@ -1,6 +1,6 @@
 """Training-only isolated Gaussian response, not a receiver or full renderer.
 
-Orthographic footprints, shared centers, uniformly sampled viewing directions,
+Orthographic footprints, shared centers, random or supplied viewing directions,
 and equally weighted black/white backgrounds. Source and detached prediction
 footprint probes prevent broad predictions from escaping the sampled domain.
 No occlusion, perspective, or pixel low-pass filter: scene rendering remains
@@ -33,7 +33,8 @@ def footprint(raw, frames):
     # solves then operate on bounded 2x2 matrices, not scene-sized coordinates.
     log_radius = raw[:,4:7].amax(-1)
     factor = rotation_matrix(raw[:,7:11]) * (raw[:,4:7]-log_radius[:,None]).exp()[:,None,:]
-    projected = torch.einsum('vij,njk->nvik', frames, factor)
+    projected = (torch.einsum('vij,njk->nvik', frames, factor) if frames.ndim == 3 else
+                 torch.einsum('nvij,njk->nvik', frames, factor))
     covariance = projected @ projected.transpose(-1,-2)
     # Finite footprint floor relative to the largest 3D axis (not loss weight).
     covariance = covariance + 1e-5*torch.eye(2,device=raw.device,dtype=raw.dtype)
@@ -54,10 +55,29 @@ def response_terms(raw, directions, cholesky, log_radius, reference_radius, prob
     # PLY SH is channel-major; DC is stored separately from higher orders.
     rest = raw[:,14:].reshape(len(raw),3,(degree+1)**2-1)
     sh = torch.cat((raw[:,11:14,None],rest),-1)
-    color = (eval_sh(degree,sh[:,None],directions[None])+.5).clamp_min(0)
+    dirs = directions[None] if directions.ndim == 2 else directions
+    color = (eval_sh(degree,sh[:,None],dirs)+.5).clamp_min(0)
     black = alpha[...,None]*color[:,:,None,:]
     white = black + 1-alpha[...,None]
     return black, white
+
+
+@torch.no_grad()
+def camera_directions(points, camera_centers):
+    """World-space camera -> point directions, matching the rasterizer SH sign.
+
+    Training teacher inputs only, never passed to the receiver. The sampled
+    centers must come from training cameras, not validation/test cameras.
+    """
+    centers = torch.as_tensor(camera_centers, device=points.device, dtype=points.dtype)
+    if (points.ndim != 2 or points.shape[-1] != 3 or centers.ndim != 2 or
+            centers.shape[-1] != 3 or not len(points) or not len(centers) or
+            not torch.isfinite(points).all() or not torch.isfinite(centers).all()):
+        raise ValueError('finite nonempty [points,3] and [cameras,3] required')
+    delta = points.detach()[:, None] - centers.detach()[None]
+    if (delta.norm(dim=-1) < 1e-8).any():
+        raise ValueError('camera center coincides with a Gaussian center')
+    return F.normalize(delta, dim=-1)
 
 
 def local_response_loss(pred, target, geometry, model, views=4, directions=None):
@@ -78,8 +98,10 @@ def local_response_loss(pred, target, geometry, model, views=4, directions=None)
         source = to_raw(target,geometry,model)
         if directions is None:
             directions = torch.randn(views,3,device=pred.device,dtype=pred.dtype)
-        if directions.ndim != 2 or directions.shape[-1] != 3 or not torch.isfinite(directions).all() or (directions.norm(dim=-1)<1e-8).any():
-            raise ValueError('directions must be finite nonzero [views,3]')
+        if (directions.ndim not in (2, 3) or directions.shape[-1] != 3 or
+                directions.shape[-2] < 1 or (directions.ndim == 3 and directions.shape[0] != len(pred)) or
+                not torch.isfinite(directions).all() or (directions.norm(dim=-1)<1e-8).any()):
+            raise ValueError('directions must be finite nonzero [views,3] or [points,views,3]')
         directions, frames = view_frames(directions.to(pred))
         source_chol, source_radius = footprint(source,frames)
     decoded_chol, decoded_radius = footprint(decoded,frames)

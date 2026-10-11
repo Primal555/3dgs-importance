@@ -80,11 +80,13 @@ def save_grid(path, images):
 
 
 @torch.no_grad()
-def evaluate_decoded(received, source, cameras, degree, white_background, out, tier, trial):
+def evaluate_decoded(received, source, cameras, degree, white_background, out, tier, trial, image_views=None):
     from .rendering import render
     device = received.device
     targets = [render(source, c, degree, white_background) for c in cameras]
     sheets = [[('Source PLY (original XYZ)', t.cpu())] for t in targets] if trial == 0 else None
+    from .compact_output import representative_views
+    selected_images = representative_views(len(cameras), image_views)
     observations = []
     for variant in SWAPS:
         scene = swap_attributes(received, source, variant)
@@ -97,14 +99,15 @@ def evaluate_decoded(received, source, cameras, degree, white_background, out, t
                 **{'source_'+k: v for k, v in metrics.items()},
                 **color_metrics(image, target),
             })
-            if trial == 0:
+            if trial == 0 and view in selected_images:
                 save_panel(out/'panels'/f'q{tier}'/f'view{view:02d}_{variant}.png',
                            camera.original_image[:3].to(device), target, image)
                 sheets[view].append((LABELS[variant], image.cpu()))
         del scene
     if sheets is not None:
         for view, sheet in enumerate(sheets):
-            save_grid(out/'comparisons'/f'q{tier}_view{view:02d}.png', sheet)
+            if view in selected_images:
+                save_grid(out/'comparisons'/f'q{tier}_view{view:02d}.png', sheet)
     return observations
 
 
@@ -114,6 +117,15 @@ def run(args):
     from .rendering import load_cameras
     training_dir = Path(args.training)
     config = json.loads((training_dir/'training.json').read_text(encoding='utf-8'))
+    scene_name = getattr(args, 'scene', None)
+    if 'selected_scenes' in config:
+        if not scene_name:
+            raise ValueError('multiscene color diagnostic requires --scene')
+        candidates = [s for s in config['selected_scenes'] if s['name'] == scene_name]
+        if len(candidates) != 1:
+            raise ValueError('scene must be present in the recorded training selection')
+        scene_record = json.loads((training_dir/'scenes'/scene_name/'scene.json').read_text(encoding='utf-8'))
+        config = {**config, **scene_record}
     checkpoint = Path(args.checkpoint) if args.checkpoint else training_dir/'codec.pt'
     ply, source_path = args.ply or config['ply'], args.source or config['source']
     out = Path(args.out) if args.out else training_dir/'color_ablation'
@@ -173,7 +185,8 @@ def run(args):
             received = decode_batches(model, groups, qs, config['snr'], config['channel'], geometry, paired_noise=paired)
             if received.shape != raw_device.shape:
                 raise ValueError('Decoded/source row alignment failed')
-            observations = evaluate_decoded(received, raw_device, cameras, degree, white, out, tier, trial)
+            observations = evaluate_decoded(received, raw_device, cameras, degree, white, out, tier, trial,
+                                            image_views=getattr(args, 'image_views', None))
             rows.extend(observations)
             with (out/'metrics.jsonl').open('a', encoding='utf-8') as handle:
                 for row in observations:
@@ -208,12 +221,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--training', required=True, help='Completed run containing training.json')
     parser.add_argument('--checkpoint', help='Defaults to training/codec.pt, NOT best checkpoint')
+    parser.add_argument('--scene', help='required scene name for a multiscene training directory')
     parser.add_argument('--ply', help='Override original PLY path after migration')
     parser.add_argument('--source', help='Override scene path after migration')
     parser.add_argument('--out', help='New directory, defaults to training/color_ablation')
     parser.add_argument('--tiers', type=int, nargs='+', default=[3])
     parser.add_argument('--trials', type=int, default=2)
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--image-views', type=int, help='limit saved panels only; all held-out cameras still measured')
     args = parser.parse_args()
     if args.trials < 1 or len(set(args.tiers)) != len(args.tiers):
         parser.error('trials must be positive and tiers must not repeat')
