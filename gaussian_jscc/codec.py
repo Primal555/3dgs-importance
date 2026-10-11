@@ -45,8 +45,15 @@ class CodecConfig:
     position_compression_level: int = 9
     # Absent in historical checkpoints: preserve their adaptive code semantics.
     prefix_mode: str = 'adaptive'
+    # Opt-in experiment; omitted for direct mode to preserve legacy model/packet IDs.
+    decoder_mode: str = 'direct'
 
     def __post_init__(self):
+        if self.decoder_mode not in ('direct','residual'):
+            raise ValueError('decoder_mode must be direct or residual')
+        if self.decoder_mode == 'residual' and (self.prefix_mode != 'progressive' or
+                self.position_delivery != 'quantized' or len(self.rates) != 4):
+            raise ValueError('residual decoder requires three progressive prefixes and reliable quantized XYZ')
         if self.prefix_mode not in ('adaptive', 'progressive'):
             raise ValueError('prefix_mode must be adaptive or progressive')
         if self.position_compression not in ('none', 'delta_zlib'):
@@ -96,6 +103,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.decoder_mode == 'direct':
+            result.pop('decoder_mode')
         if self.prefix_mode == 'adaptive':
             result.pop('prefix_mode')  # Preserve historical weights/packet hashes.
         if self.position_compression == 'none':
@@ -355,6 +364,8 @@ class GaussianCodec(nn.Module):
         channel noise slots and delivered XYZ are identical to paired hard q.
         q0 existence feedback is supplied separately by the masked renderer.
         """
+        if self.cfg.decoder_mode == 'residual':
+            raise ValueError('residual decoder experiment does not support allocator gradients yet')
         if self.cfg.prefix_mode != 'progressive':
             raise ValueError('per-point prefix gradients require progressive coding')
         if q.shape != features.shape[:2] or probabilities.shape != (*q.shape, len(self.cfg.rates)):

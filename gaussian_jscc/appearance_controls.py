@@ -165,7 +165,7 @@ def summarize(out, plan):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     charts = out/'charts'; charts.mkdir()
-    for section in ('color','directions'):
+    for section in dict.fromkeys(j['section'] for j in plan['jobs'] if j['kind']=='fit'):
         for scene in plan['scenes']:
             data = [h for h in history if h['section'] == section and h['scene'] == scene]
             if not data:

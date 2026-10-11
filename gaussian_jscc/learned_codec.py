@@ -64,6 +64,11 @@ class LearnedCore(nn.Module):
         # a transmitted anchor. Standard small initialization is not zero-init.
         nn.init.normal_(self.heads['xyz'].weight, std=.02)
         nn.init.constant_(self.heads['xyz'].bias, .5)
+        if cfg.decoder_mode == 'residual':
+            from .residual_decoder import AttributeRefinement
+            # Preserve the direct baseline's common weights AND post-init RNG.
+            with torch.random.fork_rng(devices=[]):
+                self.refinements = nn.ModuleList(AttributeRefinement(cfg,sizes) for _ in range(2))
 
     def condition(self, q, snr, dtype):
         snr_col = torch.full((*q.shape, 1), float(snr)/20, device=q.device, dtype=dtype)
@@ -112,6 +117,20 @@ class LearnedCore(nn.Module):
         return z / (energy + self.cfg.power_floor).sqrt()
 
     def decode(self, received, q, snr, choices=None, receive_mask=None):
+        if self.cfg.decoder_mode == 'residual':
+            if choices is not None or receive_mask is not None:
+                raise ValueError('residual decoder experiment requires hard tiers, not allocator gradients')
+            return self.decode_stages(received,q,snr)[0][-1]
+        h = self._decode_hidden(received,q,snr,choices,receive_mask)
+        return torch.cat([head(h) for head in self.heads.values()], -1) * (q>0)[...,None]
+
+    def decode_stages(self, received, q, snr):
+        if self.cfg.decoder_mode != 'residual':
+            raise ValueError('stage predictions require residual decoder mode')
+        from .residual_decoder import decode_stages
+        return decode_stages(self,received,q,snr)
+
+    def _decode_hidden(self, received, q, snr, choices=None, receive_mask=None, previous=None):
         active = q > 0
         mask = (prefix_mask(q.flatten(), self.cfg.rates).reshape_as(received).to(received)
                 if receive_mask is None else receive_mask)
@@ -122,6 +141,8 @@ class LearnedCore(nn.Module):
             snr_col = received.new_full((*q.shape, 1), float(snr)/20)
             condition = choices @ self.tier.weight + self.snr(snr_col)
         h = h + condition
+        if previous is not None:
+            h = h + previous
         # Deterministic offsets restart at every fixed source block. They do not
         # identify a point globally and contain no spatial coordinates.
         pos = torch.arange(q.shape[1], device=q.device, dtype=received.dtype)[:, None]
@@ -134,4 +155,4 @@ class LearnedCore(nn.Module):
         for block in self.dec_blocks:
             h = block(h, active)
         h = self.dec_norm(h)
-        return torch.cat([head(h) for head in self.heads.values()], -1) * active[..., None]
+        return h
