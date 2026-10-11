@@ -127,7 +127,8 @@ def deployment_probabilities(probabilities, draws=DEPLOYMENT_DRAWS):
     shared uniformly, matching seeded random tie breaking in expectation.
     Integer powers keep boundary derivatives finite without log(0) tricks.
     """
-    if probabilities.ndim != 2 or probabilities.shape[-1] != 4 or not 1 <= draws <= 10:
+    if (type(draws) is not int or not 1 <= draws <= DEPLOYMENT_DRAWS or
+            probabilities.ndim != 2 or probabilities.shape[-1] != 4):
         raise ValueError('expected [N,4] probabilities and 1..10 draws')
     counts, coefficients = _count_patterns(draws)
     counts = counts.to(probabilities.device)
@@ -143,7 +144,7 @@ def deployment_probabilities(probabilities, draws=DEPLOYMENT_DRAWS):
 
 
 def _tiers_from_draws(draws, probabilities, tie_random):
-    """Drop only after ten q0 draws; otherwise use the positive modal tier.
+    """Drop only when ALL supplied draws are q0; otherwise positive mode.
 
     Tied positive counts are resolved by their learned probabilities, then by
     seeded random numbers so equal initial tiers remain symmetric.
@@ -155,30 +156,34 @@ def _tiers_from_draws(draws, probabilities, tie_random):
     tied_probabilities = probabilities[:, 1:].masked_fill(~tied, -1)
     tied = tied & (tied_probabilities == tied_probabilities.max(-1, keepdim=True).values)
     positive = tie_random.masked_fill(~tied, -1).argmax(-1) + 1
-    return torch.where(counts[:, 0] == DEPLOYMENT_DRAWS, 0, positive)
+    return torch.where(counts[:, 0] == draws.shape[-1], 0, positive)
 
 
 @torch.no_grad()
-def deployment_tiers(probabilities, seed=42):
-    """Sample one reproducible ten-draw tier map in original source-row order.
+def deployment_tiers(probabilities, seed=42, draws=DEPLOYMENT_DRAWS):
+    """Sample a reproducible tier map; default ten draws remains unchanged.
 
     CPU sampling makes validation, export and transmission agree across devices.
     The resulting hard map must be sent; receivers do not resample it.
+    Diagnostic 3/5-draw maps use prefixes of the SAME ten uniforms and the
+    same tie noise. This preserves paired deletion events across chunks.
     """
+    if type(draws) is not int or not 1 <= draws <= DEPLOYMENT_DRAWS:
+        raise ValueError('deployment draws must be an integer in 1..10')
     probabilities = probabilities.detach().cpu()
     if (probabilities.ndim != 2 or probabilities.shape[1] < 2 or
             not torch.isfinite(probabilities).all() or
             (probabilities < 0).any() or
-            not torch.allclose(probabilities.sum(-1), torch.ones(len(probabilities)), atol=1e-5)):
+            not torch.allclose(probabilities.sum(-1), probabilities.new_ones(len(probabilities)), atol=1e-5)):
         raise ValueError('deployment requires finite categorical probabilities [N,Q]')
     generator = torch.Generator(device='cpu').manual_seed(int(seed))
     parts = []
     for start in range(0, len(probabilities), 65536):
         p = probabilities[start:start+65536]
-        draws = torch.rand((len(p), DEPLOYMENT_DRAWS), generator=generator)
+        uniforms = torch.rand((len(p), DEPLOYMENT_DRAWS), generator=generator)
         cdf = p.cumsum(-1).contiguous()
         cdf[:, -1] = 1.
-        sampled = torch.searchsorted(cdf, draws).clamp_max(p.shape[1]-1)
+        sampled = torch.searchsorted(cdf, uniforms[:, :draws].contiguous()).clamp_max(p.shape[1]-1)
         tie_random = torch.rand((len(p), p.shape[1]-1), generator=generator)
         parts.append(_tiers_from_draws(sampled, p, tie_random))
     return torch.cat(parts) if parts else torch.empty(0, dtype=torch.long)

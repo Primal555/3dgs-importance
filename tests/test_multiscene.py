@@ -119,7 +119,25 @@ class MultiSceneTests(unittest.TestCase):
                     '--validation-trials','1','--blocks-per-batch','2'])
                 train(control_args)
                 self.assertEqual(model_id(a),model_id(load_checkpoint(control/'checkpoints/final/codec.pt','cpu')))
+                complete = json.loads((control/'complete.json').read_text())
+                self.assertTrue(complete['frozen_codec_verified'])
+                self.assertEqual(complete['initializer_codec_id'], model_id(a))
                 self.assertFalse((control/'scenes/fixture_b').exists())
+                draw_evaluation = root/'draw_evaluation'
+                draw_args = eval_parser().parse_args(['--manifest', str(path), '--role', 'train',
+                    '--scenes', 'fixture_a', '--checkpoint', str(control/'checkpoints/final/codec.pt'),
+                    '--device', 'cpu', '--out', str(draw_evaluation), '--trials', '1',
+                    '--test-views', '1', '--draw-counts', '10', '5', '3', '--shuffle-seeds',
+                    '--output-profile', 'compact', '--require-allocations'])
+                evaluate(draw_args)
+                draw_rows = [json.loads(line) for line in (draw_evaluation/'results.jsonl').read_text().splitlines()]
+                draw_maps = {r['deployment_draws']: r for r in draw_rows if 'deployment_draws' in r}
+                self.assertEqual(set(draw_maps), {3, 5, 10})
+                self.assertTrue(all(r['frozen_codec_verified'] for r in draw_maps.values()))
+                self.assertEqual(draw_maps[10]['changed_positive_tiers_vs_ten'], 0)
+                self.assertGreaterEqual(draw_maps[3]['actual_deleted_gaussians'], draw_maps[10]['actual_deleted_gaussians'])
+                saved = list(draw_evaluation.glob('scenes/fixture_a/snr_10/validation_images/000000/*.png'))
+                self.assertEqual({p.name.split('_view')[0] for p in saved}, {'mask', 'draws_5', 'draws_3'})
                 evaluation=eval_parser().parse_args(['--manifest',str(path),'--checkpoint',str(adapt/'checkpoints/final/codec.pt'),
                     '--role','heldout','--device','cpu','--out',str(root/'evaluation'),'--trials','1',
                     '--shuffle-seeds','101','--test-views','1','--snrs','0','10'])

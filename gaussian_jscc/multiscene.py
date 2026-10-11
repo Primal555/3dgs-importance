@@ -275,6 +275,9 @@ def train(args):
         mean, std = shared_statistics([raw for raw,_ in loaded])
         model.attr_mean.copy_(mean.to(device))
         model.attr_std.copy_(std.to(device))
+    frozen_identity = model_id(model) if args.adapt or args.allocation_only else None
+    if frozen_identity is not None:
+        model.requires_grad_(False)
     out.mkdir(parents=True)
     args.total_updates = len(selected)*sum(counts)
     record = {k:v for k,v in vars(args).items()}
@@ -287,8 +290,15 @@ def train(args):
         source_target='original PLY rendering; photos are separate evaluation references',
         checkpoint_semantics='weights/tables, not exact optimizer resume',
         total_updates=len(selected)*sum(counts))
+    if frozen_identity is not None:
+        record.update(initializer_codec_id=frozen_identity, codec_frozen=True,
+                      initialization='same checkpoint; fresh allocator and fresh Adam, NOT continuation')
     scenes = [Scene(spec, raw, d, model, args, out, with_mask=bool(args.allocation_steps or args.joint_steps))
               for spec,(raw,d) in zip(selected,loaded)]
+    # A separate view RNG makes frozen single/deployment/beta controls see the
+    # same cameras even though their mask samplers consume different RNG draws.
+    allocation_view_rng = {s.name:torch.Generator().manual_seed(args.seed+1009*i)
+                           for i,s in enumerate(scenes)} if args.allocation_only or args.adapt else {}
     if args.joint_only:
         from .route2 import load_mask
         folder = Path(args.allocations_dir) if args.allocations_dir else Path(args.checkpoint).parent
@@ -345,7 +355,8 @@ def train(args):
                     loss, details = local_response_loss(pred[q>0], f[q>0], s.geometry, model, args.local_response_views)
                     loss.backward()
                 else:
-                    views = torch.randperm(len(s.cameras))[:args.views_per_step].tolist()
+                    view_generator = allocation_view_rng.get(s.name)
+                    views = torch.randperm(len(s.cameras), generator=view_generator)[:args.views_per_step].tolist()
                     camera_batch = [s.cameras[i] for i in views]
                     if phase == 'render':
                         task = MultiViewRenderTask(camera_batch, s.reference, degree, args.white_background)
@@ -402,8 +413,15 @@ def train(args):
                 save_bundle(out, 'latest', model, scenes, step, record)
         if not (args.joint_only and args.output_profile=='compact'):
             save_bundle(out, 'end_'+phase, model, scenes, step, record)
+    final_identity = model_id(model)
+    if frozen_identity is not None and final_identity != frozen_identity:
+        raise RuntimeError('frozen allocation fitting changed codec weights or statistics; no completion marker saved')
+    if frozen_identity is not None:
+        record['frozen_codec_verified'] = True
     save_bundle(out, 'final', model, scenes, step, record)
-    (out/'complete.json').write_text(json.dumps({'updates':step,'scene_visits':{s.name:s.visits for s in scenes}},indent=2),encoding='utf-8')
+    (out/'complete.json').write_text(json.dumps({'updates':step,'scene_visits':{s.name:s.visits for s in scenes},
+        'codec_id':final_identity, 'initializer_codec_id':frozen_identity,
+        'frozen_codec_verified': final_identity == frozen_identity if frozen_identity is not None else None},indent=2),encoding='utf-8')
 
 
 def parser():

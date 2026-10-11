@@ -32,13 +32,13 @@ def load_mask(path, raw, model, device):
 
 
 @torch.no_grad()
-def hard_tiers(mask, snr, seed=42):
-    """One fixed ten-draw hard map, in original PLY row order."""
+def hard_tiers(mask, snr, seed=42, draws=DEPLOYMENT_DRAWS):
+    """One fixed hard map, in original PLY rows; ten draws by default."""
     device = mask.logits.device
     probabilities = torch.cat([mask.probabilities(
         torch.arange(start, min(start + 65536, len(mask.logits)), device=device), snr).cpu()
         for start in range(0, len(mask.logits), 65536)])
-    return deployment_tiers(probabilities, seed)
+    return deployment_tiers(probabilities, seed, draws=draws)
 
 
 def export_mask(args):

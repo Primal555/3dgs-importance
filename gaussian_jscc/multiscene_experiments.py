@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from .allocation_diagnostics import prior_ranked_tiers
+from .allocation import deployment_tiers
 from .multiscene import Scene, manifest, parser as training_parser
 from .data import read_ply
 from .position_delivery import encode_positions
@@ -24,6 +25,21 @@ def shuffled_tiers(q, seed, positive_only=False):
     permutation = torch.randperm(len(indices), generator=torch.Generator().manual_seed(seed))
     q[indices] = q[indices[permutation]]
     return q
+
+
+def draw_diagnostics(probabilities, tiers, ten_draw_tiers, draws):
+    """Separate deletion changes from positive-vote changes; no causal claims."""
+    both_kept = (tiers > 0) & (ten_draw_tiers > 0)
+    return {
+        'deployment_draws': draws,
+        'expected_deleted_gaussians': float(probabilities[:, 0].double().pow(draws).sum()),
+        'actual_deleted_gaussians': int((tiers == 0).sum()),
+        'changed_deletion_decisions_vs_ten': int(((tiers == 0) != (ten_draw_tiers == 0)).sum()),
+        'changed_positive_tiers_vs_ten': int(((tiers != ten_draw_tiers) & both_kept).sum()),
+        'mean_single_draw_q0_probability': float(probabilities[:, 0].mean()),
+        'single_draw_expected_tier_counts': probabilities.double().sum(0).tolist(),
+        'draw_rule_note': 'all draws q0 deletes; otherwise positive mode. Fewer draws also change positive-tier votes.',
+    }
 
 
 def packet_cost(model, geometry, raw_sorted, q_sorted, snr, channel, net_bits_per_use=2.):
@@ -81,6 +97,13 @@ def evaluate(args):
         opts.resolution = args.resolution
     opts.net_bits_per_use = args.net_bits_per_use
     selected = [s for s in manifest(args.manifest) if args.role=='all' or s['role']==args.role]
+    if args.scenes:
+        if not set(args.scenes).issubset({s['name'] for s in selected}):
+            raise ValueError('--scenes must select existing scenes within the requested role')
+        selected = [s for s in selected if s['name'] in args.scenes]
+    if args.draw_counts and (len(set(args.draw_counts)) != len(args.draw_counts) or
+                            any(not 1 <= n <= 10 for n in args.draw_counts)):
+        raise ValueError('--draw-counts must be distinct integers in 1..10')
     if not selected or args.trials<1 or args.test_views<0 or args.image_views<1 or not args.snrs or not all(math.isfinite(s) for s in args.snrs):
         raise ValueError('invalid scene/trial/view/SNR selection')
     trained_names = {s['name'] for s in training.get('codec_training_scenes',training.get('selected_scenes',[])) if s['role']=='train'}
@@ -108,15 +131,31 @@ def evaluate(args):
         reference = RenderReference(s.raw,degree,opts.white_background,'source')
         folder = Path(args.allocations_dir) if args.allocations_dir else checkpoint.parent
         allocation_path = folder/f'{s.name}.pt'
+        if (args.require_allocations or args.draw_counts) and not allocation_path.is_file():
+            raise FileNotFoundError(f'required allocation table missing: {allocation_path}')
         mask = load_mask(allocation_path,raw,model,device) if allocation_path.exists() else None
         del raw
         # Map sampled ONCE at trained SNR; do not silently reallocate for SNR sweep.
         q = hard_tiers(mask,opts.snr,args.deployment_seed) if mask is not None else None
         def batches(tiers):
             return [torch.where(ids>=0,tiers[ids.clamp_min(0)],0) for ids in s.group_ids]
-        extras, maps = {}, {}
+        extras, maps, diagnostics = {}, {}, {}
         if q is not None:
             maps['mask'] = q
+            if args.draw_counts:
+                with torch.no_grad():
+                    probabilities = torch.cat([mask.probabilities(torch.arange(start,
+                        min(start+65536, len(mask.logits)), device=device), opts.snr).cpu()
+                        for start in range(0, len(mask.logits), 65536)])
+                diagnostics['mask'] = draw_diagnostics(probabilities, q, q, 10)
+                for draws in args.draw_counts:
+                    if draws == 10:
+                        continue  # mask is already the ten-draw baseline; do not render it twice.
+                    name = f'draws_{draws}'
+                    maps[name] = deployment_tiers(probabilities, args.deployment_seed, draws=draws)
+                    extras[name] = batches(maps[name])
+                    diagnostics[name] = draw_diagnostics(probabilities, maps[name], q, draws)
+                del probabilities
             for seed in args.shuffle_seeds:
                 for positive in (False,True):
                     name = ('shuffle_positive_' if positive else 'shuffle_all_')+str(seed)
@@ -133,7 +172,10 @@ def evaluate(args):
                 mask_tiers=q,extra_layouts=extras,white_background=opts.white_background,
                 position_net_bits_per_use=args.net_bits_per_use,position_meter=s.position_meter,
                 image_views=args.image_views if args.output_profile=='compact' else None,
-                image_layouts=('mask','1',str(len(model.cfg.rates)-1),'mixed') if args.output_profile=='compact' else None)
+                image_layouts=tuple(args.image_layouts) if args.image_layouts else
+                    tuple(diagnostics) if diagnostics and args.output_profile=='compact' else
+                    ('mask','1',str(len(model.cfg.rates)-1),'mixed') if args.output_profile=='compact' else None,
+                save_images=not args.no_images)
             full_cost = packet_cost(model,s.geometry,s.raw,torch.full((len(s.raw),),len(model.cfg.rates)-1),
                                     snr,args.channel,args.net_bits_per_use)
             for entry in result['layouts']:
@@ -158,6 +200,11 @@ def evaluate(args):
                     allocation_fit=('scene-adapted table, NOT whole-system zero shot' if mask is not None and spec['role']=='heldout'
                                     else 'scene-trained table' if mask is not None else 'no table'),
                     prior_baseline_available=s.prior is not None)
+                row.update(diagnostics.get(label, {}))
+                if label == 'mask':
+                    row.setdefault('deployment_draws', 10)
+                row.update(allocation_training_sampling=training.get('allocation_sampling', 'unknown'),
+                           frozen_codec_verified=training.get('frozen_codec_verified', False))
                 rows.append(row)
                 append_json(out/'results.jsonl',row)
                 for v in entry['views']:
@@ -181,7 +228,7 @@ def evaluate(args):
     # CSV companions retain metadata, not just the coordinates used by a figure.
     for filename,table in [('results.csv',rows),('per_view.csv',view_rows)]:
         with (out/filename).open('w',newline='',encoding='utf-8') as handle:
-            writer=csv.DictWriter(handle,fieldnames=list(table[0]))
+            writer=csv.DictWriter(handle,fieldnames=list(dict.fromkeys(k for row in table for k in row)))
             writer.writeheader()
             writer.writerows(table)
     from .multiscene_plots import plot_experiments
@@ -189,6 +236,7 @@ def evaluate(args):
     (out/'evaluation.json').write_text(json.dumps({**vars(args),'codec_id':identity,
         'selection':'test cameras never used for optimizer/model selection',
         'paired_noise':'identical full point/slot AWGN per trial across layouts',
+        'paired_draws':'3/5-draw exports take prefixes of the same ten uniforms; common tie noise',
         'shuffle_scope':'exact same tier histogram/payload; compressed side-stream cost can change',
         'uncertainty':'trials/permutations are repeated measurements, not independent scenes'},indent=2),encoding='utf-8')
 
@@ -200,11 +248,16 @@ def parser():
     p.add_argument('--allocations-dir')
     p.add_argument('--out',required=True)
     p.add_argument('--role',choices=['train','heldout','all'],default='all')
+    p.add_argument('--scenes',nargs='+',help='optional named scene subset')
+    p.add_argument('--draw-counts',nargs='+',type=int,help='diagnostic deployment rules, e.g. 10 5 3; does not retrain tables')
+    p.add_argument('--require-allocations',action='store_true',help='fail if a paired scene allocation table is missing')
+    p.add_argument('--no-images',action='store_true',help='metrics only; do not save render panels')
+    p.add_argument('--image-layouts',nargs='+',help='optional panel labels only; does NOT restrict metric layouts')
     p.add_argument('--device',default='cuda')
     p.add_argument('--channel',choices=['awgn','none'],default='awgn')
     p.add_argument('--snrs',nargs='+',type=float,default=[10.])
     p.add_argument('--trials',type=int,default=3)
-    p.add_argument('--shuffle-seeds',nargs='+',type=int,default=[101,202,303])
+    p.add_argument('--shuffle-seeds',nargs='*',type=int,default=[101,202,303],help='empty list disables shuffles for targeted controls')
     p.add_argument('--deployment-seed',type=int,default=42)
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--test-views',type=int,default=0,help='0: ALL test views; positive: explicitly labelled quick subset')

@@ -7,6 +7,35 @@ import gaussian_jscc.allocation as allocation
 
 
 class DeploymentTrainingTests(unittest.TestCase):
+    def test_export_uses_requested_draw_count_and_preserves_default(self):
+        p = torch.tensor([[1., 0., 0., 0.], [0., 0., 1., 0.]])
+        for count in (3, 5, 10):
+            self.assertEqual(allocation.deployment_tiers(p, seed=31, draws=count).tolist(), [0, 2])
+        p = torch.tensor([[.6, .1, .2, .1]]).expand(4096, -1)
+        torch.testing.assert_close(allocation.deployment_tiers(p, seed=31),
+                                   allocation.deployment_tiers(p, seed=31, draws=10))
+
+    def test_paired_draw_exports_have_nested_deletion_events(self):
+        p = torch.tensor([[.8, .1, .05, .05]]).expand(70000, -1)
+        maps = {n: allocation.deployment_tiers(p, seed=17, draws=n) for n in (3, 5, 10)}
+        self.assertTrue(((maps[10] != 0) | (maps[5] == 0)).all())
+        self.assertTrue(((maps[5] != 0) | (maps[3] == 0)).all())
+        self.assertGreater(int((maps[3] == 0).sum()), int((maps[10] == 0).sum()))
+
+    def test_requested_draw_export_matches_exact_marginals(self):
+        p = torch.tensor([[.5, .18, .2, .12]])
+        for count in (3, 5):
+            q = allocation.deployment_tiers(p.expand(60000, -1), seed=31, draws=count)
+            observed = torch.bincount(q, minlength=4).float()/len(q)
+            torch.testing.assert_close(observed, allocation.deployment_probabilities(p, draws=count)[0],
+                                       rtol=0., atol=.006)
+
+    def test_invalid_draw_counts_are_rejected(self):
+        p = torch.tensor([[.5, .2, .2, .1]])
+        for count in (0, 11, 3.5, True):
+            with self.assertRaises(ValueError):
+                allocation.deployment_tiers(p, draws=count)
+
     def test_exact_marginals_match_enumerated_draws(self):
         self.assertTrue(hasattr(allocation, 'deployment_probabilities'))
         p = torch.tensor([[.2, .1, .3, .4]], dtype=torch.float64)
