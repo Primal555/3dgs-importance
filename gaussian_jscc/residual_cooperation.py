@@ -136,7 +136,8 @@ def probe_batch(model, features, q, geometry, snr, kind, variant='normal',
     return raw
 
 
-def render_gradient(model, scene, cameras, tier, snr, kind, seed, white_background):
+def render_gradient(model, scene, cameras, tier, snr, kind, seed, white_background,
+                    collect_snapshot=True):
     from .cli import seed_all
     device = next(model.parameters()).device
     model.zero_grad(set_to_none=True)
@@ -150,7 +151,7 @@ def render_gradient(model, scene, cameras, tier, snr, kind, seed, white_backgrou
         seed_all(seed)
         loss, details = full_scene_step(model, batches, scene.geometry, snr, kind, task,
             attr_weight=0., mode='replay', batch_forward=forward)
-    return float(loss), gradient_snapshot(model), details
+    return float(loss), gradient_snapshot(model) if collect_snapshot else {}, details
 
 
 @torch.no_grad()
