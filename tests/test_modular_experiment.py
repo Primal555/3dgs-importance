@@ -71,4 +71,32 @@ class ModularExperimentTests(unittest.TestCase):
             main(opts)
             self.assertFalse(json.loads((root/'zero/complete.json').read_text())['channel_trained'])
 
+    def test_cli_rejects_bad_paths_and_missing_gpu(self):
+        from gaussian_jscc.modular_experiment import main
+        import os
+        import subprocess
+        with tempfile.TemporaryDirectory() as t:
+            with self.assertRaises(FileNotFoundError): main(self.args(Path(t)/'missing',Path(t)/'out'))
+        bash=Path('C:/softwares/Git/bin/bash.exe')
+        if bash.exists():
+            env=dict(os.environ); env.pop('CUDA_VISIBLE_DEVICES',None)
+            proc=subprocess.run([str(bash),'scripts/test_modular_codec_truck.sh','missing','unused'],env=env,text=True,capture_output=True)
+            self.assertNotEqual(proc.returncode,0); self.assertIn('CUDA_VISIBLE_DEVICES',proc.stderr)
+
+    def test_phase_boundary_resume_and_semantic_fork(self):
+        from gaussian_jscc.modular_experiment import main
+        from gaussian_jscc.transport import load_checkpoint
+        with tempfile.TemporaryDirectory() as t,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
+                patch('gaussian_jscc.rendering.load_cameras',return_value=render_fixture.RenderFirstTests().cameras()):
+            root=Path(t); source=source_fixture(root); out=root/'boundary'
+            main(self.args(source,out),max_updates=4)
+            opts=self.args(source,out); opts.resume=str(out/'checkpoints/latest/codec.pt'); main(opts)
+            rows=[json.loads(l) for l in (out/'metrics/loss.jsonl').read_text().splitlines()]
+            self.assertEqual([r['step'] for r in rows],list(range(1,9)))
+            opts=self.args(source,root/'fork'); opts.init_semantic=str(out/'checkpoints/end_semantic_render/codec.pt')
+            main(opts)
+            rows=[json.loads(l) for l in (root/'fork/metrics/loss.jsonl').read_text().splitlines()]
+            self.assertEqual({r['phase'] for r in rows},{'channel_bootstrap','channel_render'})
+            self.assertEqual(len(rows),4)
+
 if __name__=='__main__': unittest.main()

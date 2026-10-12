@@ -191,7 +191,13 @@ def main(args,max_updates=None):
 
     updated=0
     for phase in PHASES:
-        if progress['completed'][phase]>=counts[phase]: continue
+        if progress['completed'][phase]>=counts[phase]:
+            # A latest checkpoint can be written at the last update just before
+            # interruption, before the phase-end snapshot is materialized.
+            if (counts[phase]>0 and progress['phase']==phase and progress.get('phase_complete') and
+                    not (out/'checkpoints'/('end_'+phase)/'codec.pt').exists()):
+                save('end_'+phase)
+            continue
         continuing=progress['phase']==phase and optimizer is not None and not progress.get('phase_complete')
         if not continuing: optimizer=configure_phase(model,phase,lrs)
         progress.update(phase=phase,phase_step=progress['completed'][phase],phase_complete=False)
@@ -250,6 +256,8 @@ def main(args,max_updates=None):
                     'mean_step_seconds':sum(r['step_seconds'] for r in part)/len(part) if part else None,
                     'optimizer_reset_at_boundary':True} for p in PHASES if (part:=[r for r in rows if r['phase']==p]) or counts[p]==0}
     json_write(out/'metrics/phase_summary.json',summaries)
+    from .modular_plots import plot_run
+    plot_run(out)
     if args.with_direct_control:
         direct_control(args,out)
     json_write(out/'complete.json',dict(progress,status='complete',test_views=len(tests),cuda_render_verified=device.type=='cuda'))

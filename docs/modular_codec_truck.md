@@ -74,3 +74,13 @@ channel_render改变语义解码器，必须看同轮重测clean，不用旧阶�
 clean没有4/12/24传输成本，latent浮点存储不是通信码率。
 
 本机测试使用真实PyTorch网络/信道/包传输与合成可微图像，不能证明Truck CUDA画质已经改善。
+
+结束时自动生成按四阶段分开的loss图、模块梯度/更新图、耗时图、验证三路径曲线和最终PSNR–SNR图。
+也可以在中途只读取现有日志画图，不启动训练或渲染：
+
+```bash
+python -m gaussian_jscc.modular_plots "$OUT"
+```
+
+PSNR为逐视角平均，最终误差棒是两次噪声试验的视角均值标准差；不是相机之间的标准差。
+通信模块未训练时有限预算结果带`channel_trained=false`，不能用初始化结果判断通信模块上限。

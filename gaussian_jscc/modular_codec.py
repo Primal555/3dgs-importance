@@ -55,7 +55,7 @@ class ModularGaussianCodec(nn.Module):
     def forward_clean_batches(self, features, xyz, active):
         if active.dtype != torch.bool or active.shape != features.shape[:2]:
             raise ValueError('active must match batched features')
-        side = delivered_positions(features[...,:3],active.long(),self.cfg)
+        side = delivered_positions(features[...,:3],active.long(),self.cfg).masked_fill(~active[...,None],0)
         y = self.semantic_encoder(features,xyz,active)
         return torch.cat((side,self.semantic_decoder(y,active,side)),-1)
 

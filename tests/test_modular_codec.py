@@ -110,4 +110,11 @@ class ModularPathTests(unittest.TestCase):
         zero=self.model.forward_clean_batches(self.f,self.f[...,:3],torch.zeros_like(active))
         self.assertTrue(torch.isfinite(zero).all()); self.assertEqual(int(zero.count_nonzero()),0)
 
+    def test_nonfinite_padding_does_not_leak_into_clean_coordinates(self):
+        active=self.q>0
+        f=self.f.clone(); f[~active]=float('nan')
+        out=self.model.forward_clean_batches(f,f[...,:3],active)
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(int(out[~active].count_nonzero()),0)
+
 if __name__=='__main__': unittest.main()
