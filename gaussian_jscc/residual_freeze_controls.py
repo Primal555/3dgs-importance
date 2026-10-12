@@ -123,7 +123,10 @@ def prefix_snapshot(model, scene, tier, snr, kind, seed, blocks):
             valid = ids >= 0
             q = torch.where(valid,tier,0)
             signal = model.learned.encode_full(features,features[...,:3],valid,snr)
-            symbols.append(signal[valid, :2*model.cfg.rates[tier]].cpu())
+            # Apply the [blocks, points] mask first, yielding [valid points,
+            # real slots]. Mixing it with a slice in one index expression
+            # slices the point axis on older PyTorch (e.g. 2.4), not slots.
+            symbols.append(signal[valid][:, :2*model.cfg.rates[tier]].cpu())
             predictions.append(probe_batch(model,features,q,scene.geometry,snr,kind).cpu())
             points += int(valid.sum())
             remaining -= take

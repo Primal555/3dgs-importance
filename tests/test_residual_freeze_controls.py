@@ -28,6 +28,56 @@ class FreezeControlsTests(unittest.TestCase):
     def fixture(self):
         return fixtures.CooperationTests().model_scene()
 
+    def server_sized_fixture(self):
+        model, scene = self.fixture()
+        features = scene.groups[0].repeat(4, 32, 1)
+        ids = torch.arange(1024).reshape(4, 256)
+        ids[-1, -2:] = -1
+        scene.groups = [features[:3], features[3:]]
+        scene.group_ids = [ids[:3], ids[3:]]
+        return model, scene
+
+    def test_prefix_snapshot_selects_symbol_axis_after_256_point_mask(self):
+        m = self.module()
+        model, scene = self.server_sized_fixture()
+        rng = torch.get_rng_state().clone()
+        with torch.no_grad():
+            signals = [model.learned.encode_full(f, f[..., :3], ids >= 0, 10.)
+                       for f, ids in zip(scene.groups, scene.group_ids)]
+        for tier, width in ((1, 8), (2, 24), (3, 48)):
+            with self.subTest(tier=tier):
+                snapshot = m.prefix_snapshot(model, scene, tier, 10., 'awgn', 53, 4)
+                expected = torch.stack([signal[block, point, :width]
+                    for signal, ids in zip(signals, scene.group_ids)
+                    for block in range(len(ids)) for point in range(256)
+                    if ids[block, point] >= 0])
+                self.assertEqual(snapshot['symbols'].shape, (1022, width))
+                self.assertEqual(snapshot['points'], 1022)
+                self.assertEqual(snapshot['blocks'], 4)
+                self.assertEqual(len(snapshot['prediction']), 1022)
+                torch.testing.assert_close(snapshot['symbols'], expected, rtol=0, atol=0)
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+
+    def test_server_sized_training_crosses_all_stage_audits(self):
+        m = self.module()
+        model, scene = self.server_sized_fixture()
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('gaussian_jscc.rendering.render', side_effect=synthetic_render):
+            out = Path(temp)/'controls'
+            summary = m.run_controls(model, scene, out, steps=(1, 1, 1),
+                validate_every=1, views_per_step=1, heldout_views=1,
+                validation_trials=1, image_views=0, make_plots=False)
+            self.assertEqual(summary['arms']['joint']['actual_updates'], 3)
+            self.assertEqual(summary['arms']['frozen']['actual_updates'], 3)
+            audits = [json.loads(line) for line in
+                      (out/'frozen/freeze_audits.jsonl').read_text().splitlines()]
+            self.assertEqual([len(row['lower_prefixes']) for row in audits], [0, 1, 2])
+            for row in audits:
+                for prefix in row['lower_prefixes']:
+                    self.assertEqual(prefix['points'], 1022)
+                    self.assertEqual(prefix['prediction_max_abs'], 0.)
+                    self.assertEqual(prefix['symbol_max_abs'], 0.)
+
     def prediction(self, model, scene, tier):
         with torch.no_grad():
             torch.manual_seed(97)
