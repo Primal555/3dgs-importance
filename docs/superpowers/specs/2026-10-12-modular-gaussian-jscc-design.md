@@ -2,7 +2,7 @@
 
 日期：2026-10-12
 
-状态：待用户审核的架构设计；尚未实现训练代码。用户已同意另建模块化实验版本，本文件明确实现边界和检验标准。审核本文件后再编写实施计划。
+状态：用户已确认按本文实施功能拆分，并允许保留接收端 XYZ 输入辅助；尚未实现训练代码。实施计划单独列出接口、测试与执行步骤，审核计划后进入实现。
 
 ## 1. 目标与不变项
 
@@ -37,7 +37,7 @@ f + sender XYZ + valid
   -> incremental power normalization -> prefix selection(q)
   -> channel simulation -> received symbols + prefix mask
   -> ChannelDecoder(received, mask, q, SNR) -> y_hat
-  -> SemanticDecoder(y_hat, active, sequence offset) -> attributes
+  -> SemanticDecoder(y_hat, delivered quantized XYZ, active, sequence offset) -> attributes
   -> fixed delivered XYZ + attributes -> scene renderer
 ```
 
@@ -67,7 +67,9 @@ y 不等于通信符号，不是压缩比或比特率指标，也不作为额外
 
 不输入原始属性、未交付表示 y、SNR 或正档位嵌入。active 掩码只是控制哪些点存在；通信状态由 ChannelDecoder 整理为 y_hat。
 
-首轮不加入 XYZ 几何注意力实验，保持主基线的语义解码骨干。XYZ 只在生成场景时使用可靠交付值，不预测、不微调。代码应避免创建可训练但无实际贡献的 XYZ 输出头。
+按用户追加要求，保留现有 XYZ 辅助输入：逐点坐标嵌入与局部窗口内的相对 XYZ/距离注意力偏置，配置 `decoder_geometry=xyz` 为本实验默认值；允许显式选择 `none` 做对照。两项辅助均位于 SemanticDecoder，不向 ChannelDecoder 输入 XYZ。输入只能是可靠交付的量化坐标，detach 后使用；禁止拿原浮点坐标或源属性代替。
+
+坐标辅助在 clean 与通信路径中使用相同的量化输入，也必须遵守 active/padding 掩码；两条路径均不预测、不微调 XYZ，不创建可训练但无实际贡献的 XYZ 输出头。沿用现有零输出初始化，不将上一轮近乎持平的实验解释为已经证明该辅助有效。首轮不新增空间 KNN、PointNet++ 或新的几何目标。
 
 ## 3. 干净表示路径与训练阶段
 
@@ -127,7 +129,7 @@ semantic 阶段的两个信道模块尚未训练，其有限预算结果必须�
 
 只在模型工厂、checkpoint/packet 加载和参数观测中增加 opt-in 分支；不把旧 learned_joint 改成模块化，不改变旧 checkpoint 的配置序列化或 model_id，不覆盖旧训练脚本。必要的 shared helper 调整必须以回归测试证明不改变基线行为。
 
-不在同一实验中叠加 PointNet++、残差增强解码、XYZ 几何注意力、可学习分配或模型专属新损失。现有分配器以后可接入，但概率表必须在新编解码器下重新拟合，不能默认沿用旧最优分配。
+除已明确保留的 XYZ 辅助输入外，不在同一实验中叠加 PointNet++、残差增强解码、可学习分配或模型专属新损失。现有分配器以后可接入，但概率表必须在新编解码器下重新拟合，不能默认沿用旧最优分配。
 
 ## 7. 验收标准与风险
 
@@ -147,4 +149,4 @@ semantic 阶段的两个信道模块尚未训练，其有限预算结果必须�
 
 性能提升不是代码验收条件。模块化可能引入额外参数与计算，冻结语义编码器也可能限制最优通信表示。48 维干净表示可能仍不够，或对低前缀过难；这必须用 clean 与有限预算无噪声的差距判断，不能预先认定是噪声问题。与旧模型比较时报告参数量和真实训练成本，不宣称容量或 FLOP 严格匹配。
 
-下一步：用户审核此设计，确认后编写并审核实施计划，再实现实验代码。
+下一步：审核 `docs/superpowers/plans/2026-10-12-modular-gaussian-jscc.md`，确认执行方式后实现实验代码。
