@@ -133,7 +133,7 @@ def prefix_snapshot(model, scene, tier, snr, kind, seed, blocks):
             'points':points,'blocks':blocks-remaining}
 
 
-def run_controls(model, scene, out, steps=(300,300,300), lr=1e-5, validate_every=100,
+def run_controls(model, scene, out, steps=(1000,1000,1000), lr=1e-5, validate_every=100,
                  views_per_step=2, heldout_views=4, validation_trials=2, snr=10.,
                  kind='awgn', seed=42, white_background=False, make_plots=True,
                  image_views=1, audit_blocks=4, checkpoint_training=None):
@@ -279,7 +279,7 @@ def plot_controls(out,losses,validations,steps,summary):
     """Static experiment charts: paired same-axis MSE, PSNR/SSIM small multiples.
 
     Chart contract: compare learning/retention, not assume a winning arm; ordered
-    updates (normally 900 loss points and >=10 validation points), blue solid vs
+    updates (normally 3000 loss points and >=31 validation points), blue solid vs
     orange dashed, raw MSE plus within-phase trailing average, same metrics/axes
     within each row. Synthetic smoke runs have too few points for conclusions.
     """
@@ -335,7 +335,7 @@ def parser():
     p.add_argument('--out',required=True,help='NEW directory outside the source run')
     p.add_argument('--checkpoint',help='optional checkpoint inside source checkpoints')
     p.add_argument('--manifest',help='migrated paths allowed, exact original Truck/split required')
-    p.add_argument('--stage-steps',type=int,nargs=3,default=[300,300,300],metavar=('Q1','Q2','Q3'))
+    p.add_argument('--stage-steps',type=int,nargs=3,default=[1000,1000,1000],metavar=('Q1','Q2','Q3'))
     p.add_argument('--lr',type=float,default=1e-5)
     p.add_argument('--validate-every',type=int,default=100)
     p.add_argument('--views-per-step',type=int,default=2)

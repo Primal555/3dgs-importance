@@ -4,7 +4,7 @@
 
 ## 两组只改变更新范围
 
-两组从**同一残差前缀 checkpoint** 初始化，都依次训练 q1 → q2 → q3，每阶段默认 **300 次实际参数更新**，每组 900 次，合计 1800 次。学习率固定 `1e-5`。之前的独立单步测试表明 `1e-4` 容易造成画质大幅下降，因此这次使用较小学习率作为受控起点，并非宣称最优。
+两组从**同一残差前缀 checkpoint** 初始化，都依次训练 q1 → q2 → q3，每阶段默认 **1000 次实际参数更新**，每组 3000 次，合计 6000 次。学习率固定 `1e-5`。之前的独立单步测试表明 `1e-4` 容易造成画质大幅下降，因此这次使用较小学习率作为受控起点，并非宣称最优。
 
 | 阶段 | joint 对照组 | frozen 实验组 |
 |---|---|---|
@@ -49,7 +49,7 @@ tail -n 40 -f "${OUT}.log"
 
 所有结果位于同一个 `OUT` 内，原 checkpoint 不覆盖。`RUN` 既可指向成对实验根目录，也可指向其 `residual` 子目录。默认加载 `residual/checkpoints/final/codec.pt`。
 
-可选环境变量：`STAGE_STEPS="300 300 300"`、`LR=1e-5`、`VALIDATE_EVERY=100`、`VIEWS_PER_STEP=2`、`HELDOUT_VIEWS=4`、`VALIDATION_TRIALS=2`、`IMAGE_VIEWS=1`、`AUDIT_BLOCKS=4`、`BLOCKS_PER_BATCH=64`。默认 batch 配置继承原实验。迁移数据路径时用 `MANIFEST=/absolute/path/manifest.json`；场景指纹及训练/留出相机划分必须与源实验一致。
+可选环境变量：`STAGE_STEPS="1000 1000 1000"`、`LR=1e-5`、`VALIDATE_EVERY=100`、`VIEWS_PER_STEP=2`、`HELDOUT_VIEWS=4`、`VALIDATION_TRIALS=2`、`IMAGE_VIEWS=1`、`AUDIT_BLOCKS=4`、`BLOCKS_PER_BATCH=64`。默认 batch 配置继承原实验。迁移数据路径时用 `MANIFEST=/absolute/path/manifest.json`；场景指纹及训练/留出相机划分必须与源实验一致。
 
 脚本会拒绝覆盖输出或在源实验目录内部保存结果。缺少 CUDA 显卡变量、源文件或场景不匹配会明确报错。`--dry-run` 仅检查元数据与文件路径；实际启动时还会检查模型结构、场景身份和相机划分。
 

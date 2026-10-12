@@ -197,11 +197,21 @@ class FreezeControlsTests(unittest.TestCase):
             bash = Path('C:/softwares/Git/bin/bash.exe')
             if os.name=='nt' and bash.exists():
                 env = dict(os.environ,CUDA_VISIBLE_DEVICES='2',PYTHON_BIN=sys.executable.replace('\\','/'))
+                env.pop('STAGE_STEPS',None)
                 command = [str(bash),'scripts/test_residual_freeze_controls.sh',str(source),str(root/'dry'),'--dry-run']
                 result = subprocess.run(command,env=env,capture_output=True,text=True)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertIn('no historical moments',result.stdout)
+                self.assertEqual(json.loads(result.stdout)['stage_steps'],[1000,1000,1000])
                 self.assertFalse((root/'dry').exists())
+                direct = subprocess.run([sys.executable,'-m','gaussian_jscc.residual_freeze_controls',
+                    '--run',str(source),'--out',str(root/'dry'),'--dry-run'],capture_output=True,text=True)
+                self.assertEqual(direct.returncode,0,direct.stderr)
+                self.assertEqual(json.loads(direct.stdout)['stage_steps'],[1000,1000,1000])
+                env['STAGE_STEPS'] = '2 3 4'
+                overridden = subprocess.run(command,env=env,capture_output=True,text=True)
+                self.assertEqual(overridden.returncode,0,overridden.stderr)
+                self.assertEqual(json.loads(overridden.stdout)['stage_steps'],[2,3,4])
                 env.pop('CUDA_VISIBLE_DEVICES')
                 refused = subprocess.run(command,env=env,capture_output=True,text=True)
                 self.assertNotEqual(refused.returncode,0)

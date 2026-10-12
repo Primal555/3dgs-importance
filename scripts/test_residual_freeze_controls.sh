@@ -6,7 +6,7 @@ SOURCE_RUN="${1:?Usage: test_residual_freeze_controls.sh RESIDUAL_EXPERIMENT_RUN
 CONTROL_OUT="${2:?Supply a NEW output directory outside the source run}"
 shift 2
 PYTHON_BIN="${PYTHON_BIN:-python}"
-read -r -a PHASE_STEPS <<< "${STAGE_STEPS:-300 300 300}"
+read -r -a PHASE_STEPS <<< "${STAGE_STEPS:-1000 1000 1000}"
 ARGS=(--run "$SOURCE_RUN" --out "$CONTROL_OUT" --stage-steps "${PHASE_STEPS[@]}"
       --lr "${LR:-1e-5}" --validate-every "${VALIDATE_EVERY:-100}"
       --views-per-step "${VIEWS_PER_STEP:-2}" --heldout-views "${HELDOUT_VIEWS:-4}"
