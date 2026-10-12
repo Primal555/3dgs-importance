@@ -6,6 +6,9 @@ import torch
 
 
 def parameter_group(name):
+    top = name.split('.')[0]
+    if top in ('semantic_encoder','channel_encoder','channel_decoder','semantic_decoder'):
+        return top
     if name.startswith('learned.'):
         part = name.split('.')[1]
         if part == 'heads':
