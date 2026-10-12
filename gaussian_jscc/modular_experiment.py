@@ -90,7 +90,8 @@ def make_scene(spec,raw,degree,model,source,old,out):
     scene.views_per_step=opts.views_per_step
     scene.record={'fingerprint':scene.fingerprint,'source_gaussians':len(raw),'sh_degree':degree,
                   'geometry':scene.geometry.to_dict(),'train_view_names':tn,'validation_view_names':vn,
-                  'resolution':opts.resolution,'images':opts.images,'white_background':opts.white_background}
+                  'resolution':opts.resolution,'images':opts.images,'white_background':opts.white_background,
+                  'blocks_per_batch':opts.blocks_per_batch,'views_per_step':opts.views_per_step}
     json_write(scene.out/'scene.json',dict(scene.record,**spec))
     return scene
 
@@ -150,6 +151,10 @@ def main(args,max_updates=None):
     resumed_rng=saved_scene=None
     if args.resume:
         previous=json.loads((out/'training.json').read_text(encoding='utf-8'))
+        # A semantic-only fork skips these phases permanently, including when
+        # resumed without the mutually exclusive --init-semantic option.
+        if previous.get('initializer'):
+            counts.update(semantic_bootstrap=0,semantic_render=0)
         for key,current in [('phase_budgets',counts),('module_lrs',lrs),('train_snrs',args.train_snrs),('seed',args.seed)]:
             if previous[key]!=current: raise ValueError('exact resume settings mismatch: '+key)
         model,optimizer,progress,resumed_rng,saved_scene=restore_training_checkpoint(args.resume,device)
