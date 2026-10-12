@@ -20,6 +20,7 @@ import torch
 from .codec import CodecConfig, GaussianCodec, channel
 from .data import Geometry, prepare, to_features, to_raw
 from .position_delivery import encode_positions, decode_positions, position_cost
+from .model_factory import config_from_dict, build_codec
 
 
 def model_id(model):
@@ -41,8 +42,8 @@ def load_checkpoint(path, device):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("version") != 4:
         raise ValueError("Only learned_joint checkpoint v4 is supported; use historical Git for old codecs")
-    cfg = CodecConfig.from_dict(saved["config"])
-    model = GaussianCodec(cfg)
+    cfg = config_from_dict(saved["config"])
+    model = build_codec(cfg)
     model.load_state_dict(saved["state_dict"], strict=True)
     return model.to(device).eval()
 
@@ -211,7 +212,7 @@ def receive(model, packet, return_position_seed=False):
     header, q = decode_metadata((packet / "metadata.bin").read_bytes())
     if header["version"] != 2 or header["model_id"] != model_id(model):
         raise ValueError("packet and shared codec checkpoint do not match")
-    if CodecConfig.from_dict(header["config"]) != model.cfg:
+    if config_from_dict(header["config"]) != model.cfg:
         raise ValueError("codec configuration mismatch")
     delivered_xyz = (decode_positions((packet / 'xyz.bin').read_bytes(), q, model.cfg)
                      if model.cfg.position_delivery != 'learned' else None)
