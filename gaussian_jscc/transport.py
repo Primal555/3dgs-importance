@@ -192,7 +192,9 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
                  position_coding=model.cfg.position_delivery,
                  coordinate_cost_model=stats['metadata_cost_model'])
     if model.cfg.position_delivery != 'learned':
-        stats.update(receiver_context='local received features; explicit XYZ replaces output only',
+        stats.update(receiver_context=('local received features + delivered quantized XYZ embedding/relative attention'
+                                       if model.cfg.decoder_geometry == 'xyz' else
+                                       'local received features; explicit XYZ replaces output only'),
                      per_gaussian_coordinates_in_side_stream=True)
     (output / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats

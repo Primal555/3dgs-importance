@@ -225,6 +225,9 @@ def validate(model, scenes, args, step, phase):
 
 
 def train(args):
+    if args.decoder_geometry == 'xyz' and (args.decoder_mode != 'direct' or
+            args.allocation_steps or args.joint_steps or args.trainable != 'all'):
+        raise ValueError('XYZ geometry experiment supports only direct full-codec bootstrap/render; no allocator')
     from .cli import device_for, seed_all
     if args.decoder_mode == 'residual' and (args.allocation_steps or args.joint_steps or args.adapt or
                                           args.allocation_only or args.joint_only or args.trainable!='all'):
@@ -284,6 +287,8 @@ def train(args):
         model = load_checkpoint(args.checkpoint, device)
         if model.cfg.decoder_mode != args.decoder_mode:
             raise ValueError('decoder mode must match initializer; residual experiment starts randomly, not a silent checkpoint upgrade')
+        if model.cfg.decoder_geometry != args.decoder_geometry:
+            raise ValueError('decoder geometry must match initializer; no silent checkpoint upgrade')
         if model.cfg.sh_degree != degree or model.cfg.prefix_mode != 'progressive' or model.cfg.position_delivery != 'quantized':
             raise ValueError('adaptation requires compatible progressive reliable-coordinate codec')
         source_record = torch.load(args.checkpoint,map_location='cpu',weights_only=True).get('training',{})
@@ -302,7 +307,8 @@ def train(args):
             sh_degree=degree, hidden=args.hidden, depth=args.depth, grid_dim=16, levels=(4,8), planes=False,
             rates=tuple(args.rates), block_size=args.block_size, decoder_window=args.decoder_window,
             attention_heads=4, prefix_mode='progressive', position_delivery='quantized', position_bits=16,
-            position_compression='delta_zlib', position_compression_level=6,decoder_mode=args.decoder_mode)).to(device)
+            position_compression='delta_zlib', position_compression_level=6,decoder_mode=args.decoder_mode,
+            decoder_geometry=args.decoder_geometry)).to(device)
         mean, std = shared_statistics([raw for raw,_ in loaded])
         model.attr_mean.copy_(mean.to(device))
         model.attr_std.copy_(std.to(device))
@@ -516,6 +522,8 @@ def parser():
     p.add_argument('--render-only', action='store_true', help='fixed-layout codec finetune from checkpoint, without allocator')
     p.add_argument('--trainable', choices=['all','color_heads'], default='all')
     p.add_argument('--decoder-mode', choices=['direct','residual'], default='direct',help='opt-in attribute residual experiment; direct is unchanged baseline')
+    p.add_argument('--decoder-geometry', choices=['none','xyz'], default='none',
+                   help='opt-in direct decoder context from reliably delivered 16bit XYZ')
     p.add_argument('--uniform-tier', type=int, help='fixed positive tier for bootstrap/render controls')
     p.add_argument('--bootstrap-directions', choices=['random','camera'], default='random')
     p.add_argument('--paired-training-rng', action='store_true')

@@ -47,8 +47,16 @@ class CodecConfig:
     prefix_mode: str = 'adaptive'
     # Opt-in experiment; omitted for direct mode to preserve legacy model/packet IDs.
     decoder_mode: str = 'direct'
+    # Independent receiver-side geometry experiment; absent in legacy packets.
+    decoder_geometry: str = 'none'
 
     def __post_init__(self):
+        if self.decoder_geometry not in ('none', 'xyz'):
+            raise ValueError('decoder_geometry must be none or xyz')
+        if self.decoder_geometry == 'xyz' and (self.decoder_mode != 'direct' or
+                self.prefix_mode != 'progressive' or self.position_delivery != 'quantized' or
+                self.position_bits != 16):
+            raise ValueError('XYZ decoder geometry requires direct progressive decoding and reliable 16bit XYZ')
         if self.decoder_mode not in ('direct','residual'):
             raise ValueError('decoder_mode must be direct or residual')
         if self.decoder_mode == 'residual' and (self.prefix_mode != 'progressive' or
@@ -103,6 +111,8 @@ class CodecConfig:
 
     def to_dict(self):
         result = asdict(self)
+        if self.decoder_geometry == 'none':
+            result.pop('decoder_geometry')  # Preserve all existing model/packet IDs.
         if self.decoder_mode == 'direct':
             result.pop('decoder_mode')
         if self.prefix_mode == 'adaptive':
@@ -306,7 +316,10 @@ class GaussianCodec(nn.Module):
 
     def decode(self, symbols, q, snr, return_seed=False, delivered_xyz=None):
         validate_tiers(q, len(q), len(self.cfg.rates))
-        result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr)[0]
+        context = {}
+        if self.cfg.decoder_geometry == 'xyz':
+            context['delivered_xyz'] = delivered_xyz[None] if delivered_xyz is not None else None
+        result = self.learned.decode(unpack(symbols, q, self.cfg.rates)[None], q[None], snr, **context)[0]
         result = self.apply_position_delivery(result, q, delivered_xyz)
         # Optional benchmark diagnostic is final XYZ, not a bootstrap decoder.
         return (result, result[:, :3]) if return_seed else result
@@ -326,7 +339,7 @@ class GaussianCodec(nn.Module):
             raise ValueError('explicit position decoder requires delivered XYZ with matching slots')
         if not torch.isfinite(delivered_xyz).all():
             raise ValueError('nonfinite delivered XYZ')
-        # No positional residual or new context input: isolate position bypass.
+        # Coordinates stay fixed even when they also condition attribute decoding.
         side = delivered_xyz.detach().to(result) * (q > 0)[..., None]
         return torch.cat((side, result[..., 3:]), -1)
 
@@ -352,9 +365,11 @@ class GaussianCodec(nn.Module):
         else:
             noisy = channel(latent[mask].reshape(-1, 2), snr, kind)
             received = latent.new_zeros(latent.shape).masked_scatter(mask, noisy.flatten())
-        result = self.learned.decode(received, q, snr)
         from .position_delivery import delivered_positions
-        result = self.apply_position_delivery(result, q, delivered_positions(features[..., :3], q, self.cfg))
+        side = delivered_positions(features[..., :3], q, self.cfg)
+        context = {'delivered_xyz':side} if self.cfg.decoder_geometry == 'xyz' else {}
+        result = self.learned.decode(received, q, snr, **context)
+        result = self.apply_position_delivery(result, q, side)
         return result, result[..., :3], (q > 0).to(features)
 
     def forward_st_prefix_batches(self, features, xyz, q, probabilities, snr, kind="awgn"):
@@ -364,6 +379,8 @@ class GaussianCodec(nn.Module):
         channel noise slots and delivered XYZ are identical to paired hard q.
         q0 existence feedback is supplied separately by the masked renderer.
         """
+        if self.cfg.decoder_geometry != 'none':
+            raise ValueError('XYZ geometry experiment does not support allocator gradients')
         if self.cfg.decoder_mode == 'residual':
             raise ValueError('residual decoder experiment does not support allocator gradients yet')
         if self.cfg.prefix_mode != 'progressive':
