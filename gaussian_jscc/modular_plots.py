@@ -22,10 +22,15 @@ def plot_run(out):
         fig,axes=plt.subplots(2,2,figsize=(12,7),layout='constrained')
         for ax,phase in zip(axes.flat,PHASE_MODULES):
             rows=[r for r in losses if r['phase']==phase]
-            if rows: ax.plot([r['phase_step'] for r in rows],[r['loss'] for r in rows],linewidth=.8)
-            ax.set(title=phase,xlabel='Actual phase optimizer updates',ylabel='Local response MSE' if phase.endswith('bootstrap') else 'Source PLY RGB MSE')
+            if rows: ax.plot([r['phase_step'] for r in rows],[r['loss'] for r in rows],linewidth=.8,label='Total objective')
+            if phase=='channel_render':
+                for key,label in [('render_loss','Render MSE'),('weighted_latent_loss','Weighted latent MSE')]:
+                    selected=[r for r in rows if key in r]
+                    if selected: ax.plot([r['phase_step'] for r in selected],[r[key] for r in selected],linewidth=.8,label=label)
+            if rows: ax.legend(fontsize=8)
+            ax.set(title=phase,xlabel='Actual phase optimizer updates',ylabel='Objective value (phase-specific)')
             ax.grid(alpha=.2)
-        fig.suptitle('Separate objectives: phase boundaries reset Adam, no latent auxiliary loss')
+        fig.suptitle('Phase-specific objectives; communication render loss components shown separately')
         save(fig,'objectives_by_phase.png')
         fig,axes=plt.subplots(2,2,figsize=(12,7),layout='constrained')
         for ax,name in zip(axes.flat,MODULES):
@@ -50,6 +55,21 @@ def plot_run(out):
         ax.set(xlabel='Global real updates',ylabel='Mean per-view source PSNR (dB)',title='Same fixed validation views; clean remeasured every time')
         ax.grid(alpha=.2); ax.legend(fontsize=8,ncol=3)
         save(fig,'validation_paths.png')
+        latent_rows=[r for r in validation if r['path']!='clean' and r['actual_snr']==10 and 'latent_nmse' in r]
+        if latent_rows:
+            fig,axes=plt.subplots(1,2,figsize=(12,4),layout='constrained')
+            for path,layout in dict.fromkeys((r['path'],r['layout']) for r in latent_rows):
+                if path=='finite_noiseless' and layout!='3': continue
+                by_step={r['step']:r for r in latent_rows if r['path']==path and r['layout']==layout}
+                series=[by_step[k] for k in sorted(by_step)]
+                for ax,key in zip(axes,('latent_mse','latent_nmse')):
+                    ax.plot([r['step'] for r in series],[r[key] for r in series],label=f'{path}/{layout}',
+                            linestyle='--' if path=='finite_noiseless' else '-')
+            for ax,key in zip(axes,('latent_mse','latent_nmse')):
+                ax.set(xlabel='Global real updates',ylabel=key)
+                ax.set_yscale('symlog',linthresh=1e-6); ax.grid(alpha=.2); ax.legend(fontsize=8)
+            fig.suptitle('Fixed validation points; NMSE = latent MSE / target mean-square power')
+            save(fig,'latent_reconstruction.png')
     if final:
         fig,axes=plt.subplots(1,2,figsize=(12,4),layout='constrained')
         for ax,metric in zip(axes,('source_psnr','photo_psnr')):

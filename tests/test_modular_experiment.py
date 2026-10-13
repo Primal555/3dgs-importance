@@ -45,7 +45,14 @@ class ModularExperimentTests(unittest.TestCase):
             for r in rows:
                 self.assertEqual(len(r['updates']),4); self.assertIsNone(r['peak_memory_allocated_bytes'])
                 self.assertEqual(r['snr'],r['tx_condition_snr'])
+                if r['phase']=='channel_bootstrap':
+                    self.assertEqual(r['objective'],'latent_mse')
+                    self.assertAlmostEqual(r['loss'],r['latent_mse'],places=6)
+                if r['phase']=='channel_render':
+                    self.assertAlmostEqual(r['loss'],r['render_loss']+r['weighted_latent_loss'],places=6)
+                    self.assertGreater(r['weighted_latent_loss'],0)
             rec=json.loads((out/'training.json').read_text()); self.assertTrue(rec['random_initialization'])
+            self.assertEqual(rec['training_objective']['version'],'latent_reconstruction_v2')
             self.assertTrue(rec['reference_scene_identity_and_splits_verified'])
             self.assertEqual(len(list((out/'images/final').glob('*.png'))),5)  # One heldout view in fixture.
             self.assertTrue((out/'checkpoints/end_semantic_render/codec.pt').exists())
@@ -61,6 +68,14 @@ class ModularExperimentTests(unittest.TestCase):
             main(self.args(source,a)); main(self.args(source,b),max_updates=5)
             self.assertFalse((b/'complete.json').exists())
             opts=self.args(source,b); opts.resume=str(b/'checkpoints/latest/codec.pt')
+            opts.channel_latent_weight=0.5
+            with self.assertRaisesRegex(ValueError,'objective'): main(opts)
+            opts.channel_latent_weight=1.
+            record_path=b/'training.json'; record=json.loads(record_path.read_text())
+            legacy=dict(record); legacy.pop('training_objective')
+            record_path.write_text(json.dumps(legacy))
+            with self.assertRaisesRegex(ValueError,'objective'): main(opts)
+            record_path.write_text(json.dumps(record))
             main(opts)
             ma=load_checkpoint(a/'checkpoints/final/codec.pt','cpu'); mb=load_checkpoint(b/'checkpoints/final/codec.pt','cpu')
             for x,y in zip(ma.parameters(),mb.parameters()): torch.testing.assert_close(x,y,rtol=0,atol=0)
@@ -77,6 +92,9 @@ class ModularExperimentTests(unittest.TestCase):
         import subprocess
         with tempfile.TemporaryDirectory() as t:
             with self.assertRaises(FileNotFoundError): main(self.args(Path(t)/'missing',Path(t)/'out'))
+            for weight in (0,-1,float('nan'),float('inf')):
+                opts=self.args(Path(t)/'missing',Path(t)/'out'); opts.channel_latent_weight=weight
+                with self.assertRaisesRegex(ValueError,'latent weight'): main(opts)
         bash=Path('C:/softwares/Git/bin/bash.exe')
         if bash.exists():
             env=dict(os.environ); env.pop('CUDA_VISIBLE_DEVICES',None)

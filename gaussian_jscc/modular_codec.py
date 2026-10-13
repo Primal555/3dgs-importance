@@ -31,14 +31,18 @@ class ModularGaussianCodec(nn.Module):
         return pack(self.encode_full(features,xyz,q>0,snr),q,self.cfg.rates)
 
     def _decode_dense(self, received, q, snr, delivered_xyz):
+        mask = prefix_mask(q.flatten(),self.cfg.rates).reshape_as(received)
+        y_hat = self.channel_decoder(received,mask,q,snr)
+        return self.decode_representation(y_hat,q,delivered_xyz)
+
+    def decode_representation(self, y_hat, q, delivered_xyz):
+        """Receiver-only attribute synthesis; never reads the clean target y."""
         active = q>0
         if delivered_xyz is None or delivered_xyz.shape != (*q.shape,3):
             raise ValueError('explicit position decoder requires matching delivered XYZ')
         if not torch.isfinite(delivered_xyz[active]).all():
             raise ValueError('nonfinite active delivered XYZ')
-        side = delivered_xyz.detach().to(received).masked_fill(~active[...,None],0)
-        mask = prefix_mask(q.flatten(),self.cfg.rates).reshape_as(received)
-        y_hat = self.channel_decoder(received,mask,q,snr)
+        side = delivered_xyz.detach().to(y_hat).masked_fill(~active[...,None],0)
         return torch.cat((side,self.semantic_decoder(y_hat,active,side)),-1)
 
     def decode(self, symbols, q, snr, return_seed=False, delivered_xyz=None):
@@ -59,7 +63,12 @@ class ModularGaussianCodec(nn.Module):
         y = self.semantic_encoder(features,xyz,active)
         return torch.cat((side,self.semantic_decoder(y,active,side)),-1)
 
-    def forward_tier_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False):
+    def forward_channel_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False):
+        """Training boundary: clean target and differentiable received latent.
+
+        Uses the same channel/prefix path as deployment. No semantic decoding
+        is needed for latent-only channel initialization.
+        """
         if features.ndim != 3 or choices.shape != (*features.shape[:2],len(self.cfg.rates)):
             raise ValueError('invalid batched hard tier choices')
         q = choices.argmax(-1)
@@ -73,8 +82,13 @@ class ModularGaussianCodec(nn.Module):
         else:
             noisy = channel(z[mask].reshape(-1,2),snr,kind)
             received = torch.zeros_like(z).masked_scatter(mask,noisy.flatten())
+        y_hat = self.channel_decoder(received,mask,q,snr)
+        return y,y_hat,q
+
+    def forward_tier_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False):
+        _,y_hat,q = self.forward_channel_batches(features,xyz,choices,snr,kind,paired_noise)
         side = delivered_positions(features[...,:3],q,self.cfg)
-        result = self._decode_dense(received,q,snr,side)
+        result = self.decode_representation(y_hat,q,side)
         return result,result[...,:3],(q>0).to(features)
 
     def forward_tiers(self, features, xyz, choices, snr, kind='awgn'):

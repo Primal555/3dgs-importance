@@ -11,7 +11,7 @@ from .data import read_ply
 from .multiscene import Scene,manifest,shared_statistics,parser as scene_parser
 from .modular_config import ModularCodecConfig
 from .modular_codec import ModularGaussianCodec
-from .modular_training import MODULES,PHASE_MODULES,configure_phase,bootstrap_step,render_step,finish_update
+from .modular_training import MODULES,PHASE_MODULES,configure_phase,bootstrap_step,render_step,finish_update,objective_settings
 from .modular_checkpoint import (capture_rng,restore_rng,save_training_checkpoint,restore_training_checkpoint,
                                 initialize_channel_run,validate_scene)
 from .modular_evaluation import evaluate_paths
@@ -34,6 +34,8 @@ def parser():
     for name in MODULES:
         p.add_argument('--'+name.replace('_','-')+'-lr',type=float,default=1e-4)
     p.add_argument('--train-snrs',nargs='+',type=float,default=[10.])
+    p.add_argument('--channel-latent-weight',type=float,default=1.,
+                   help='positive latent MSE weight in communication render training; tunable engineering coefficient')
     p.add_argument('--validate-every',type=int,default=500)
     p.add_argument('--save-every',type=int,default=500)
     p.add_argument('--seed',type=int,default=42)
@@ -133,6 +135,7 @@ def direct_control(args,out):
 
 def main(args,max_updates=None):
     from .rendering import load_cameras
+    objectives=objective_settings(args.channel_latent_weight)
     counts={phase:getattr(args,phase+'_steps') for phase in PHASES}
     if min(counts.values())<0 or min(args.validate_every,args.save_every,args.cpu_threads)<1 or not args.train_snrs or any(not math.isfinite(s) for s in args.train_snrs):
         raise ValueError('invalid step budgets, intervals or training SNRs')
@@ -151,6 +154,8 @@ def main(args,max_updates=None):
     resumed_rng=saved_scene=None
     if args.resume:
         previous=json.loads((out/'training.json').read_text(encoding='utf-8'))
+        if previous.get('training_objective')!=objectives:
+            raise ValueError('exact resume objective mismatch; start a NEW run with --init-semantic from end_semantic_render instead')
         # A semantic-only fork skips these phases permanently, including when
         # resumed without the mutually exclusive --init-semantic option.
         if previous.get('initializer'):
@@ -158,6 +163,8 @@ def main(args,max_updates=None):
         for key,current in [('phase_budgets',counts),('module_lrs',lrs),('train_snrs',args.train_snrs),('seed',args.seed)]:
             if previous[key]!=current: raise ValueError('exact resume settings mismatch: '+key)
         model,optimizer,progress,resumed_rng,saved_scene=restore_training_checkpoint(args.resume,device)
+        if progress.get('training_objective')!=objectives:
+            raise ValueError('checkpoint objective mismatch')
         if model.cfg!=cfg: raise ValueError('exact resume codec config mismatch')
     else:
         model=initialize_channel_run(args.init_semantic,device) if args.init_semantic else ModularGaussianCodec(cfg).to(device)
@@ -166,7 +173,8 @@ def main(args,max_updates=None):
             mean,std=shared_statistics([raw]); model.attr_mean.copy_(mean.to(device)); model.attr_std.copy_(std.to(device))
         optimizer=None
         progress={'phase':'semantic_bootstrap','phase_step':0,'step':0,'completed':{p:0 for p in PHASES},
-                  'channel_trained':False,'module_lrs':lrs,'phase_complete':False,'phase_budgets':counts,'train_snrs':args.train_snrs}
+                  'channel_trained':False,'module_lrs':lrs,'phase_complete':False,'phase_budgets':counts,'train_snrs':args.train_snrs,
+                  'training_objective':objectives}
     scene=make_scene(spec,raw,degree,model,source,old,out); del raw
     if saved_scene is not None: validate_scene(saved_scene,scene.record)
     if args.init_semantic:
@@ -182,11 +190,15 @@ def main(args,max_updates=None):
             'source_weights_loaded':False,'reference_scene_identity_and_splits_verified':True,
             'scene':scene.record,'step_definition':'one real optimizer update; no accumulation',
             'trainable_modules':PHASE_MODULES,'parameters':{n:sum(p.numel() for p in getattr(model,n).parameters()) for n in MODULES},
-            'losses':'local response MSE for bootstrap; source PLY RGB MSE for render; no latent auxiliary loss',
+            'training_objective':objectives,
+            'losses':{'semantic_bootstrap':'local response MSE','semantic_render':'source PLY RGB MSE',
+                      'channel_bootstrap':'latent MSE against frozen semantic encoder',
+                      'channel_render':'source PLY RGB MSE + channel_latent_weight * latent MSE'},
             'clip_mode':'none','render_backward':'replay','shared_model_cost':'excluded, assumed shared in advance',
             'source_usage':'paths, camera split and model dimensions only; never source checkpoint weights',
             'initialization': 'semantic-only fork; fresh channel modules and Adam' if args.init_semantic else 'all four modules random'})
     scene.channel_trained=progress['channel_trained']
+    print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen in both communication phases.",flush=True)
     if not args.resume:
         evaluate_paths(model,scene,step=0,phase='initial',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out)
 
@@ -223,7 +235,8 @@ def main(args,max_updates=None):
             else:
                 indices=random.sample(range(len(scene.cameras)),scene.views_per_step)
                 task=MultiViewRenderTask([scene.cameras[i] for i in indices],scene.reference,degree,scene.white_background)
-                loss,stats=render_step(model,list(zip(scene.groups,qs)),scene.geometry,snr,'awgn',task,phase)
+                loss,stats=render_step(model,list(zip(scene.groups,qs)),scene.geometry,snr,'awgn',task,phase,
+                                       channel_latent_weight=args.channel_latent_weight)
                 stats.update(task.stats)
             stats.update(finish_update(model,optimizer,before))
             if device.type=='cuda': torch.cuda.synchronize(device)
@@ -231,6 +244,7 @@ def main(args,max_updates=None):
             progress['step']+=1; progress['phase_step']=phase_step; progress['completed'][phase]=phase_step
             if phase.startswith('channel'): progress['channel_trained']=scene.channel_trained=True
             row=dict(stats,step=progress['step'],phase_step=phase_step,phase=phase,loss=float(loss),layout=layout,snr=snr,
+                     objective_version=objectives['version'],
                      actual_snr=snr if phase.startswith('channel') else None,tx_condition_snr=snr,
                      step_seconds=elapsed,training_view_indices=indices,module_lrs={g['name']:g['lr'] for g in optimizer.param_groups},
                      trainable_parameters={n:sum(p.numel() for p in getattr(model,n).parameters() if p.requires_grad) for n in MODULES},
@@ -239,7 +253,9 @@ def main(args,max_updates=None):
                      peak_memory_reserved_bytes=torch.cuda.max_memory_reserved(device) if device.type=='cuda' else None)
             append_json(out/'metrics/loss.jsonl',row)
             if phase_step==1 or phase_step%10==0 or phase_step==counts[phase]:
-                print(f"{phase} {phase_step}/{counts[phase]}: loss={float(loss):.6g}, q={layout}, snr={snr:g}, grad={stats['grad_norm']:.4g}, sec={elapsed:.2f}",flush=True)
+                detail=f", latent_mse={stats['latent_mse']:.6g}, latent_nmse={stats['latent_nmse']:.6g}" if phase.startswith('channel') else ''
+                if phase=='channel_render': detail+=f", render_mse={stats['render_loss']:.6g}, weighted_latent={stats['weighted_latent_loss']:.6g}"
+                print(f"{phase} {phase_step}/{counts[phase]}: loss={float(loss):.6g}, q={layout}, snr={snr:g}, grad={stats['grad_norm']:.4g}, sec={elapsed:.2f}{detail}",flush=True)
             if progress['step']%args.validate_every==0:
                 evaluate_paths(model,scene,step=progress['step'],phase=phase,snrs=[10],trials=2,seed=args.seed,save_images=False,out=out)
             progress['phase_complete']=phase_step==counts[phase]

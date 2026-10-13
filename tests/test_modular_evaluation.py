@@ -29,6 +29,9 @@ class ModularEvaluationTests(unittest.TestCase):
         clean=next(r for r in rows if r['path']=='clean')
         self.assertIsNone(clean['payload_complex_symbols']); self.assertIsNone(clean['total_channel_uses'])
         finite=[r for r in rows if r['path']=='finite_noiseless']
+        self.assertEqual(clean['latent_mse'],0.)
+        for row in rows:
+            self.assertAlmostEqual(row['latent_nmse'],row['latent_mse']/max(row['latent_target_power'],1e-12))
         self.assertEqual(len(finite),4); self.assertFalse(finite[0]['channel_trained'])
         self.assertEqual([r['payload_complex_symbols'] for r in finite[:3]],[64,192,384])
         self.assertGreater(finite[0]['xyz_bytes'],0); self.assertGreater(finite[0]['metadata_bytes'],0)

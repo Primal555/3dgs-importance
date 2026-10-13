@@ -22,7 +22,13 @@ class ModularPlotTests(unittest.TestCase):
             self.assertIn('objectives_by_phase.png',[p.name for p in paths])
             self.assertNotIn('psnr_snr.png',[p.name for p in paths])
             for r in vals: r['channel_trained']=True
+            for r in vals: r.update(latent_mse=.1,latent_nmse=.2)
+            rows[-1].update(render_loss=.04,weighted_latent_loss=.06)
+            (root/'metrics/loss.jsonl').write_text('\n'.join(json.dumps(r) for r in rows))
+            (root/'metrics/validation.jsonl').write_text('\n'.join(json.dumps(r) for r in vals))
             (root/'metrics/test.jsonl').write_text('\n'.join(json.dumps(r) for r in vals))
-            self.assertIn('psnr_snr.png',[p.name for p in plot_run(root)])
+            names=[p.name for p in plot_run(root)]
+            self.assertIn('psnr_snr.png',names)
+            self.assertIn('latent_reconstruction.png',names)
 
 if __name__=='__main__': unittest.main()

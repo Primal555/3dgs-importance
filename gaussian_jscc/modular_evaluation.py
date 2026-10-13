@@ -59,8 +59,10 @@ def decode_path(model,scene,qs,path,snr):
         latent_total+=float(y.sum()); latent_second+=float(y.square().sum())
         latent_error+=float((yh-y).square().sum()); latent_count+=y.numel()
     mean=latent_total/latent_count
+    power=latent_second/latent_count; mse=latent_error/latent_count
     return torch.cat(rows),{'attribute_normalized_mse':{n:v/count for n,v in attr.items()},
-        'latent_mse':latent_error/latent_count,'latent_mean':mean,'latent_std':max(0,latent_second/latent_count-mean**2)**.5}
+        'latent_mse':mse,'latent_target_power':power,'latent_nmse':mse/max(power,1e-12),
+        'latent_mean':mean,'latent_std':max(0,power-mean**2)**.5}
 
 
 @torch.no_grad()
@@ -101,6 +103,8 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out):
                      'tx_condition_snr':None if path=='clean' else snr,'channel_trained':getattr(scene,'channel_trained',False),
                      'views':len(scene.val_cameras),'trials':ntrials,'per_view_trial':per_view,
                      'latent_mse':float(np.mean([d['latent_mse'] for d in diagnostics])),
+                     'latent_target_power':float(np.mean([d['latent_target_power'] for d in diagnostics])),
+                     'latent_nmse':float(np.mean([d['latent_nmse'] for d in diagnostics])),
                      'latent_mean':float(np.mean([d['latent_mean'] for d in diagnostics])),
                      'latent_std':float(np.mean([d['latent_std'] for d in diagnostics])),
                      'attribute_normalized_mse':{n:float(np.mean([d['attribute_normalized_mse'][n] for d in diagnostics])) for n in diagnostics[0]['attribute_normalized_mse']}}
@@ -109,7 +113,7 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out):
                     row[k+'_std_trials']=float(np.std([v[k] for v in measurements]))
                 if path=='clean':
                     row.update(payload_complex_symbols=None,total_channel_uses=None,xyz_bytes=None,metadata_bytes=None,
-                               symbols_per_gaussian=None,rate_scope='clean upper reference; latent float storage is NOT a wire rate')
+                               symbols_per_gaussian=None,rate_scope='clean bypass diagnostic, not a guaranteed upper bound; latent float storage is NOT a wire rate')
                 else:
                     row.update(rate_record(model,scene,qfull,snr,'none' if path=='finite_noiseless' else 'awgn',identity))
                 records.append(row)
