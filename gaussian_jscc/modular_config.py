@@ -1,5 +1,6 @@
 """Opt-in modular experiment configuration; never changes legacy model hashes."""
 from dataclasses import asdict, dataclass
+import math
 from .codec import CodecConfig
 
 
@@ -38,6 +39,10 @@ class ModularCodecConfig:
     sh_weight: float = .25
     geometry_rates: tuple = ()
     geometry_floor: float = 1e-4
+    context_variant: str = 'baseline'
+    context_centers: tuple = (64, 16)
+    context_neighbors: tuple = (16, 32)
+    context_radii: tuple = (2., 4.)
 
     def __post_init__(self):
         if self.architecture != 'modular_jscc_v1':
@@ -51,6 +56,21 @@ class ModularCodecConfig:
         # Composition reuses transport validation without subclassing legacy config.
         values = asdict(self)
         values.pop('latent_dim')
+        for key in ('context_variant','context_centers','context_neighbors','context_radii'):
+            values.pop(key)
+        if self.context_variant not in ('baseline','encoder','decoder','both'):
+            raise ValueError('unknown spatial context variant')
+        if self.context_variant in ('decoder','both') and self.decoder_geometry != 'xyz':
+            raise ValueError('spatial decoder requires reliable XYZ')
+        self.context_centers = tuple(self.context_centers)
+        self.context_neighbors = tuple(self.context_neighbors)
+        self.context_radii = tuple(self.context_radii)
+        if (len(self.context_centers)!=2 or any(type(n) is not int or n<1 for n in self.context_centers)
+                or self.context_centers[0]<self.context_centers[1]
+                or len(self.context_neighbors)!=2 or any(type(n) is not int or n<1 for n in self.context_neighbors)
+                or len(self.context_radii)!=2 or any(not math.isfinite(r) or r<=0 for r in self.context_radii)
+                or self.context_radii[0]>=self.context_radii[1]):
+            raise ValueError('invalid PointNet context centers/neighbors/radii')
         values['architecture'] = 'learned_joint'
         common = CodecConfig(**values)
         self.rates, self.levels, self.geometry_rates = common.rates, common.levels, common.geometry_rates
@@ -60,7 +80,12 @@ class ModularCodecConfig:
         return 8 + 3 * (self.sh_degree + 1) ** 2
 
     def to_dict(self):
-        return asdict(self)
+        values = asdict(self)
+        # Baseline checkpoints/packet identities keep their historical syntax.
+        if self.context_variant == 'baseline':
+            for key in ('context_variant','context_centers','context_neighbors','context_radii'):
+                values.pop(key)
+        return values
 
     @classmethod
     def from_dict(cls, values):

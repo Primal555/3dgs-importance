@@ -29,6 +29,12 @@ def parser():
     p.add_argument('--device',default='cuda')
     p.add_argument('--decoder-geometry',choices=['xyz','none'],default='xyz')
     p.add_argument('--latent-dim',type=int,default=48)
+    p.add_argument('--context-variant',choices=['baseline','encoder','decoder','both'],default='baseline',
+                   help='opt-in PointNet++-style spatial context experiment')
+    p.add_argument('--context-centers',nargs=2,type=int,default=[64,16])
+    p.add_argument('--context-neighbors',nargs=2,type=int,default=[16,32])
+    p.add_argument('--context-radii',nargs=2,type=float,default=[2.,4.])
+    p.add_argument('--blocks-per-batch',type=int,help='override source batch size, identically in all control arms')
     for phase,steps in zip(PHASES,(2000,1000,2000,2000)):
         p.add_argument('--'+phase.replace('_','-')+'-steps',type=int,default=steps)
     for name in MODULES:
@@ -66,7 +72,11 @@ def inputs(args):
     spec=dict(selected[0],prior='none')
     for key in ('ply','source'):
         if not Path(spec[key]).exists(): raise FileNotFoundError(spec[key])
-    old=json.loads((run/'scenes/truck/scene.json').read_text(encoding='utf-8'))
+    if source.get('codec_config',{}).get('architecture')=='modular_jscc_v1':
+        old=source['scene']
+        source={**source,**old}
+    else:
+        old=json.loads((run/'scenes/truck/scene.json').read_text(encoding='utf-8'))
     for key in ('fingerprint','source_gaussians','train_view_names','validation_view_names'):
         if not old.get(key): raise ValueError('source scene lacks '+key)
     return source,source_manifest.resolve(),spec,old
@@ -78,6 +88,7 @@ def make_scene(spec,raw,degree,model,source,old,out):
     for key in ('blocks_per_batch','resolution','images','white_background','views_per_step','net_bits_per_use'):
         if key in source: setattr(opts,key,source[key])
     scene=Scene(spec,raw,degree,model,opts,out/'metrics',with_mask=False,cameras=False)
+    model.set_scene_geometry(scene.geometry)
     if scene.fingerprint!=old['fingerprint'] or len(raw)!=old['source_gaussians']:
         raise ValueError('source PLY differs from recorded Truck')
     cameras=load_cameras(spec['source'],opts.resolution,opts.white_background,opts.images,'train')
@@ -146,10 +157,16 @@ def main(args,max_updates=None):
     if out.exists() and not args.resume: raise FileExistsError(f'use a NEW output directory: {out}')
     if args.resume and not out.exists(): raise FileNotFoundError('resume requires original output directory')
     source,manifest_path,spec,old=inputs(args)
+    if args.blocks_per_batch is not None:
+        if args.blocks_per_batch<1: raise ValueError('blocks per batch must be positive')
+        source=dict(source,blocks_per_batch=args.blocks_per_batch)
     device=device_for(args.device); torch.set_num_threads(args.cpu_threads); seed_all(args.seed)
     raw,degree=read_ply(spec['ply'])
     common=source.get('codec_config',{})
+    context = {} if args.context_variant=='baseline' else dict(context_centers=tuple(args.context_centers),
+        context_neighbors=tuple(args.context_neighbors),context_radii=tuple(args.context_radii))
     cfg=ModularCodecConfig(sh_degree=degree,latent_dim=args.latent_dim,decoder_geometry=args.decoder_geometry,
+        context_variant=args.context_variant,**context,
         **{k:common[k] for k in ('hidden','grid_dim','levels','planes','depth','block_size','morton_bits','decoder_window','attention_heads') if k in common})
     resumed_rng=saved_scene=None
     if args.resume:
@@ -201,6 +218,19 @@ def main(args,max_updates=None):
             'source_usage':'paths, camera split and model dimensions only; never source checkpoint weights',
             'initialization': 'semantic-only fork; fresh channel modules and Adam' if args.init_semantic else 'all four modules random'})
     scene.channel_trained=progress['channel_trained']
+    if cfg.context_variant!='baseline' and not args.resume:
+        from .pointnet_context import geometry_diagnostics
+        from .position_delivery import delivered_positions
+        block_indices=torch.linspace(0,len(scene.blocks)-1,min(16,len(scene.blocks))).round().long().tolist()
+        sampled=[scene.blocks[i] for i in block_indices]
+        f=torch.nn.utils.rnn.pad_sequence(sampled,batch_first=True)
+        active=torch.arange(f.shape[1])[None,:]<torch.tensor([len(b) for b in sampled])[:,None]
+        report={'block_indices':block_indices,'scope':'evenly spaced sample of processing blocks; padding excluded'}
+        for side in ('encoder','decoder'):
+            xyz=f[...,:3] if side=='encoder' else delivered_positions(f[...,:3],active.long(),cfg)
+            report[side]=geometry_diagnostics(xyz,active,scene.geometry,cfg)
+        json_write(out/'metrics/spatial_neighborhoods.json',report)
+    print(f"Spatial context: {cfg.context_variant}; internal centers={cfg.context_centers}; neighbors={cfg.context_neighbors}; radii={cfg.context_radii}",flush=True)
     print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen in both communication phases.",flush=True)
     if not args.resume:
         evaluate_paths(model,scene,step=0,phase='initial',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out)

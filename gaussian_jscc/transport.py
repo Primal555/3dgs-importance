@@ -143,6 +143,7 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
     model.eval()
     device = next(model.parameters()).device
     raw, geometry, q = prepare(raw, model.cfg.morton_bits, q)
+    if hasattr(model,'set_scene_geometry'): model.set_scene_geometry(geometry)
     coordinate_bits = 0
     if model.cfg.position_delivery != 'learned':
         xyz_stream = encode_positions(geometry.normalize(raw[:, :3]), q, model.cfg)
@@ -210,6 +211,8 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
                                        if model.cfg.decoder_geometry == 'xyz' else
                                        'local received features; explicit XYZ replaces output only'),
                      per_gaussian_coordinates_in_side_stream=True)
+    if getattr(model.cfg,'context_variant','baseline') in ('decoder','both'):
+        stats['receiver_context']='PointNet++-style within-block world-metric grouping from delivered XYZ and existing bbox metadata'
     (output / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
 
@@ -234,6 +237,7 @@ def receive(model, packet, return_position_seed=False):
     if z.shape != (expected, 2) or z.dtype != np.float32 or not np.isfinite(z).all():
         raise ValueError("invalid received symbols")
     geometry = Geometry(**header["geometry"])
+    if hasattr(model,'set_scene_geometry'): model.set_scene_geometry(geometry)
     if geometry.bits != model.cfg.morton_bits:
         raise ValueError("geometry/checkpoint Morton quantization mismatch")
     device = next(model.parameters()).device

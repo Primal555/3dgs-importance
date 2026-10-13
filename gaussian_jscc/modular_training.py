@@ -84,6 +84,7 @@ def latent_diagnostics(metrics):
 
 
 def bootstrap_step(model, features, q, geometry, snr, kind, phase, directions=None):
+    model.set_scene_geometry(geometry)
     if phase == 'channel_bootstrap':
         if not (q>0).any(): raise ValueError('channel bootstrap requires active Gaussians')
         y,y_hat,_=model.forward_channel_batches(features,features[...,:3],F.one_hot(q,4).to(features),snr,kind)
@@ -111,6 +112,7 @@ def bootstrap_step(model, features, q, geometry, snr, kind, phase, directions=No
 
 
 def render_step(model, batches, geometry, snr, kind, task, phase, mode='replay',channel_latent_weight=1.):
+    model.set_scene_geometry(geometry)
     objective_settings(channel_latent_weight)
     communication=phase=='channel_render'
     def batch_forward(f,q):

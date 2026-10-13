@@ -18,7 +18,27 @@ class ModularGaussianCodec(nn.Module):
         self.channel_encoder = ChannelEncoder(cfg)
         self.channel_decoder = ChannelDecoder(cfg)
         self.semantic_decoder = SemanticDecoder(cfg)
+        if cfg.context_variant != 'baseline':
+            from .pointnet_context import SpatialPointContext
+            # Common modules and the next training random draw are matched across
+            # variants. Both contexts get identical initialization in all arms.
+            with torch.random.fork_rng(devices=[]):
+                encoder_context = SpatialPointContext(cfg)
+                decoder_context = SpatialPointContext(cfg)
+            for name,context,enabled in (
+                    ('semantic_encoder',encoder_context,cfg.context_variant in ('encoder','both')),
+                    ('semantic_decoder',decoder_context,cfg.context_variant in ('decoder','both'))):
+                if enabled:
+                    module = getattr(self,name)
+                    module.blocks = nn.ModuleList()
+                    module.spatial_context = context
         self.training_snrs = ()  # Runtime checkpoint metadata; not a learned parameter.
+
+    def set_scene_geometry(self, geometry):
+        """Scene metadata, not trained weights; receiver binds from packet bbox."""
+        for module in (self.semantic_encoder,self.semantic_decoder):
+            if hasattr(module,'spatial_context'):
+                module.spatial_context.set_scene_geometry(geometry)
 
     def set_training_snrs(self, values):
         values=tuple(float(v) for v in values)

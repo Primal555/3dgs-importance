@@ -25,9 +25,12 @@ class SemanticEncoder(nn.Module):
         h = self.fuse(torch.cat([layer(x) for layer, x in zip(self.embeddings, pieces)], -1))
         condition = self.condition.expand_as(h)
         h = (h + condition) * active[..., None]
-        plan = self.blocks[0].grid.geometry_plan(xyz, active.to(features))
-        for block in self.blocks:
-            h = block(h, xyz, condition, active.to(features), plan) * active[..., None]
+        if hasattr(self,'spatial_context'):
+            h = self.spatial_context(h,xyz,active)
+        else:
+            plan = self.blocks[0].grid.geometry_plan(xyz, active.to(features))
+            for block in self.blocks:
+                h = block(h, xyz, condition, active.to(features), plan) * active[..., None]
         return self.readout(h) * active[..., None]
 
 
@@ -98,6 +101,9 @@ class SemanticDecoder(nn.Module):
         h = self.input(y_hat.masked_fill(~active[..., None], 0))
         if xyz is not None:
             h = h + self.xyz_embedding(xyz*2-1)
+        if hasattr(self,'spatial_context'):
+            h = self.spatial_context(h,xyz,active)
+            return torch.cat([head(self.norm(h)) for head in self.heads.values()],-1)*active[...,None]
         n, d = h.shape[1:]
         pos = torch.arange(n,device=h.device,dtype=h.dtype)[:,None]
         freq = torch.exp(torch.arange(0,d,2,device=h.device,dtype=h.dtype)*(-math.log(10000)/d))

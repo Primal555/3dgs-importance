@@ -53,6 +53,7 @@ def rate_record(model,scene,q,snr,kind,identity,tx_snr=None,rx_snr=None):
 
 @torch.no_grad()
 def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr=None):
+    model.set_scene_geometry(scene.geometry)
     device=next(model.parameters()).device
     rows=[]; count=0; attr={n:0. for n in ('opacity','scale','rotation','dc','sh')}
     latent_error=latent_total=latent_second=0.; latent_count=0
