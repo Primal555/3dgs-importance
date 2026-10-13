@@ -12,8 +12,8 @@ SemanticDecoder 保留可靠16bit XYZ的嵌入与相对注意力辅助；坐标�
 |---|---:|---|---|
 | semantic_bootstrap | 2000 | 两语义模块 | 原有局部响应 RGB MSE |
 | semantic_render | 1000 | 两语义模块 | 原PLY场景渲染 RGB MSE |
-| channel_bootstrap | 1000 | 两通信模块 | 原始语义特征与恢复特征的 MSE |
-| channel_render | 1000 | 两通信模块、语义解码器 | 原PLY渲染 RGB MSE + λ × 特征 MSE |
+| channel_bootstrap | 2000 | 两通信模块 | 原始语义特征与恢复特征的 MSE |
+| channel_render | 2000 | 两通信模块、语义解码器 | 原PLY渲染 RGB MSE + λ × 特征 MSE |
 
 所有模块默认固定1e-4，不裁剪，无自动衰减。阶段切换重建Adam，阶段内精确续训保留Adam/RNG。
 本版训练目标标记为 `latent_reconstruction_v2`，网络结构与传输格式不变。两个通信阶段均冻结语义编码器，保持目标 `y` 稳定。
@@ -47,7 +47,7 @@ GPU=2仅为示例，启动前确认空闲。nohup运行不依赖本地终端；C
 
 旧目标的训练不能通过 `--resume` 静默切换成新目标；更改特征权重也不能作为精确续训。
 可以复用旧版 `end_semantic_render/codec.pt`，只保留语义模块与属性统计，重新随机初始化两个通信模块与 Adam。
-以下受控实验复用上一轮的同一语义表示，默认只跑 1000 步信道初始化 + 1000 步通信渲染，保持 10 dB 不变：
+以下受控实验复用上一轮的同一语义表示，默认只跑 2000 步信道初始化 + 2000 步通信渲染，保持 10 dB 不变：
 
 ```bash
 OLD="$PWD/output/truck_modular_gpu0_20261012_183141"
@@ -77,6 +77,8 @@ CUDA_VISIBLE_DEVICES=2 nohup bash scripts/test_modular_codec_truck.sh "$RUN" "$N
 ```
 
 四阶段步数用`--semantic-bootstrap-steps`、`--semantic-render-steps`、`--channel-bootstrap-steps`、`--channel-render-steps`调整。
+若已有新目标实验按原来的 1000+1000 步预算启动，精确续训时需显式传入
+`--channel-bootstrap-steps 1000 --channel-render-steps 1000`，保持原预算；改变默认值不会自动延长正在运行的任务。
 四模块LR用`--semantic-encoder-lr`、`--semantic-decoder-lr`、`--channel-encoder-lr`、`--channel-decoder-lr`调整。
 `--decoder-geometry none`为无坐标辅助对照；`--latent-dim`控制表示宽度。
 `--with-direct-control`额外运行原direct骨干3000属性+2000渲染，从头初始化，相同场景与XYZ辅助；不声称容量/FLOP严格匹配。

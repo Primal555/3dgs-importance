@@ -29,7 +29,7 @@ def parser():
     p.add_argument('--device',default='cuda')
     p.add_argument('--decoder-geometry',choices=['xyz','none'],default='xyz')
     p.add_argument('--latent-dim',type=int,default=48)
-    for phase,steps in zip(PHASES,(2000,1000,1000,1000)):
+    for phase,steps in zip(PHASES,(2000,1000,2000,2000)):
         p.add_argument('--'+phase.replace('_','-')+'-steps',type=int,default=steps)
     for name in MODULES:
         p.add_argument('--'+name.replace('_','-')+'-lr',type=float,default=1e-4)

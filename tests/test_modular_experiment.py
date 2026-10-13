@@ -27,6 +27,15 @@ def source_fixture(root):
 
 
 class ModularExperimentTests(unittest.TestCase):
+    def test_default_communication_budgets_and_explicit_overrides(self):
+        from gaussian_jscc.modular_experiment import parser
+        base=['--run','source','--out','new_run']
+        opts=parser().parse_args(base)
+        self.assertEqual((opts.semantic_bootstrap_steps,opts.semantic_render_steps,
+                          opts.channel_bootstrap_steps,opts.channel_render_steps),(2000,1000,2000,2000))
+        opts=parser().parse_args(base+['--channel-bootstrap-steps','1000','--channel-render-steps','1000'])
+        self.assertEqual((opts.channel_bootstrap_steps,opts.channel_render_steps),(1000,1000))
+
     def args(self,source,out):
         from gaussian_jscc.modular_experiment import parser
         return parser().parse_args(['--run',str(source),'--out',str(out),'--device','cpu','--validate-every','2','--save-every','2',
