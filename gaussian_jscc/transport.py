@@ -33,6 +33,9 @@ def model_id(model):
 
 
 def save_checkpoint(path, model, step, training=None):
+    training=dict(training or {})
+    if hasattr(model,'training_snrs') and model.training_snrs:
+        training.setdefault('train_snrs',list(model.training_snrs))
     torch.save({"version": 4,
                 "config": model.cfg.to_dict(), "state_dict": model.state_dict(),
                 "step": step, "training": training or {}}, path)
@@ -45,6 +48,9 @@ def load_checkpoint(path, device):
     cfg = config_from_dict(saved["config"])
     model = build_codec(cfg)
     model.load_state_dict(saved["state_dict"], strict=True)
+    if hasattr(model,'set_training_snrs'):
+        training=saved.get('training',{})
+        model.set_training_snrs(training.get('progress',{}).get('train_snrs',training.get('train_snrs',())))
     return model.to(device).eval()
 
 
@@ -120,13 +126,18 @@ def metadata_channel_uses(bits, snr, code_rate=None, modulation_bits=2):
 
 
 @torch.no_grad()
-def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_bits=2):
+def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_bits=2, *, tx_condition_snr=None,rx_condition_snr=None):
     from .codec import validate_tiers
     validate_tiers(q, len(raw),len(model.cfg.rates))
     if kind not in ("none", "awgn", "rayleigh") or not math.isfinite(float(snr)):
         raise ValueError("invalid channel/SNR")
     # Validate accounting before producing any packet files.
     metadata_channel_uses(8, snr, code_rate, modulation_bits)
+    modular=hasattr(model,'resolve_condition_snr')
+    if not modular and (tx_condition_snr is not None or rx_condition_snr is not None):
+        raise ValueError('independent SNR conditions require a modular codec')
+    tx_snr=model.resolve_condition_snr(snr,tx_condition_snr) if modular else snr
+    rx_snr=model.resolve_condition_snr(snr,rx_condition_snr) if modular else snr
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     model.eval()
@@ -147,13 +158,14 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
             continue
         qb, rb = q[start:end], raw[start:end]
         features, unit = to_features(rb.to(device), geometry, model)
-        z = model.encode(features, unit, qb.to(device), snr)
+        z = model.encode(features, unit, qb.to(device), snr,**({'condition_snr':tx_snr} if modular else {}))
         transmitted_energy += float(z.square().sum())
         received.append(channel(z, snr, kind, generator).cpu())
     received = torch.cat(received) if received else torch.empty((0, 2))
     header = {"version": 2, "config": model.cfg.to_dict(), "model_id": model_id(model),
               "count": int((q > 0).sum()), "source_count": len(raw),
               "geometry": geometry.to_dict(), "snr_db": float(snr), "channel": kind}
+    if modular: header.update(tx_condition_snr_db=tx_snr,rx_condition_snr_db=rx_snr)
     metadata = encode_metadata(header, q.numpy())
     (output / "metadata.bin").write_bytes(metadata)
     np.save(output / "received.npy", received.numpy(), allow_pickle=False)
@@ -179,6 +191,7 @@ def transmit(model, raw, q, snr, kind, seed, output, code_rate=None, modulation_
              "shared_model_tensor_bytes": sum(t.numel() * t.element_size() for t in model.state_dict().values()),
              "disk_payload_bytes": (output / "received.npy").stat().st_size}
     stats["architecture"] = model.cfg.architecture
+    if modular: stats.update(actual_snr=snr,tx_condition_snr=tx_snr,rx_condition_snr=rx_snr)
     stats.update(position_coding='learned_joint', geometry_sub_budget=None,
                  block_reference_in_metadata=False, handcrafted_coordinate_symbols=0,
                  position_seed_is_final=True,
@@ -224,6 +237,10 @@ def receive(model, packet, return_position_seed=False):
     if geometry.bits != model.cfg.morton_bits:
         raise ValueError("geometry/checkpoint Morton quantization mismatch")
     device = next(model.parameters()).device
+    # Legacy packets used snr_db as the decoder condition. Preserve their
+    # interpretation even when a newly loaded checkpoint has a support guard.
+    decode_options=({'condition_snr':header.get('rx_condition_snr_db',header['snr_db'])}
+                    if hasattr(model,'resolve_condition_snr') else {})
     rows, position_seeds = [], []
     i = j = 0
     model.eval()
@@ -238,7 +255,7 @@ def receive(model, packet, return_position_seed=False):
         decoded = model.decode(symbols, qb, header["snr_db"],
                                return_seed=return_position_seed,
                                delivered_xyz=delivered_xyz[start:start+len(qb)].to(device)
-                               if delivered_xyz is not None else None)
+                               if delivered_xyz is not None else None,**decode_options)
         if return_position_seed:
             pred, seed = decoded
             pred,seed=pred[qb>0],seed[qb>0]

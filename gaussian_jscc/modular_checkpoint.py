@@ -48,6 +48,7 @@ def restore_training_checkpoint(path, device):
     saved=_read(path); state=saved['training']; progress=state['progress']
     model=build_codec(config_from_dict(saved['config'])).to(device)
     model.load_state_dict(saved['state_dict'])
+    model.set_training_snrs(progress.get('train_snrs',()))
     optimizer=configure_phase(model,progress['phase'],progress.get('module_lrs',{}))
     if state['optimizer'] is not None: optimizer.load_state_dict(state['optimizer'])
     return model,optimizer,progress,state['rng'],state['scene_record']

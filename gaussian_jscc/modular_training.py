@@ -42,11 +42,12 @@ def configure_phase(model, phase, module_lrs):
     return torch.optim.Adam(groups)
 
 
-def predict(model, features, q, snr, kind, phase, paired_noise=False):
+def predict(model, features, q, snr, kind, phase, paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None):
     if phase not in PHASE_MODULES: raise ValueError('unknown phase')
     if phase.startswith('semantic'):
         return model.forward_clean_batches(features,features[...,:3],q>0)
-    return model.forward_tier_batches(features,features[...,:3],F.one_hot(q,4).to(features),snr,kind,paired_noise)[0]
+    return model.forward_tier_batches(features,features[...,:3],F.one_hot(q,4).to(features),snr,kind,paired_noise,
+                                     tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr)[0]
 
 
 def latent_reconstruction_loss(y, y_hat, q):

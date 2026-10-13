@@ -5,6 +5,7 @@ tier map, NOT a trained allocation. Digital overhead is measured in bytes;
 analogue payload is measured in complex channel uses, not float file sizes.
 """
 import math
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -16,13 +17,28 @@ from .render_validation import save_panel,append_json
 from .transport import model_id,encode_metadata
 from .modular_training import predict
 
+CONDITION_POLICIES=('trained_range','matched','fixed_both','fixed_tx','fixed_rx')
 
-def rate_record(model,scene,q,snr,kind,identity):
+
+def conditioning_pair(model,actual_snr,policy='trained_range',reference_snr=10.):
+    if policy not in CONDITION_POLICIES: raise ValueError('unknown SNR condition policy')
+    actual=model.resolve_condition_snr(actual_snr,actual_snr)
+    reference=model.resolve_condition_snr(actual_snr,reference_snr)
+    if policy=='trained_range':
+        supported=model.resolve_condition_snr(actual)
+        return supported,supported
+    return (reference if policy in ('fixed_both','fixed_tx') else actual,
+            reference if policy in ('fixed_both','fixed_rx') else actual)
+
+
+def rate_record(model,scene,q,snr,kind,identity,tx_snr=None,rx_snr=None):
     if not hasattr(scene,'_modular_xyz_bytes'):
         stream=encode_positions(scene.geometry.normalize(scene.raw[:,:3]),torch.ones(len(scene.raw),dtype=torch.long),model.cfg)
         scene._modular_xyz_bytes=len(stream)
     header={'version':2,'config':model.cfg.to_dict(),'model_id':identity,'count':len(q),'source_count':len(q),
             'geometry':scene.geometry.to_dict(),'snr_db':float(snr),'channel':kind}
+    header.update(tx_condition_snr_db=model.resolve_condition_snr(snr,tx_snr),
+                  rx_condition_snr_db=model.resolve_condition_snr(snr,rx_snr))
     meta=encode_metadata(header,q.numpy())
     payload=int(torch.tensor(model.cfg.rates)[q].sum())
     efficiency=getattr(scene,'net_bits_per_use',2.)
@@ -36,7 +52,7 @@ def rate_record(model,scene,q,snr,kind,identity):
 
 
 @torch.no_grad()
-def decode_path(model,scene,qs,path,snr):
+def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr=None):
     device=next(model.parameters()).device
     rows=[]; count=0; attr={n:0. for n in ('opacity','scale','rotation','dc','sh')}
     latent_error=latent_total=latent_second=0.; latent_count=0
@@ -46,7 +62,8 @@ def decode_path(model,scene,qs,path,snr):
         if path!='clean': hooks.append(model.channel_decoder.register_forward_hook(lambda m,a,o:values.update(y_hat=o)))
         try:
             pred=predict(model,f,q,snr,'none' if path!='awgn' else 'awgn',
-                         'semantic_render' if path=='clean' else 'channel_render',paired_noise=True)
+                         'semantic_render' if path=='clean' else 'channel_render',paired_noise=True,
+                         tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr)
         finally:
             for hook in hooks: hook.remove()
         rows.append(to_raw(pred[active],scene.geometry,model))
@@ -66,11 +83,12 @@ def decode_path(model,scene,qs,path,snr):
 
 
 @torch.no_grad()
-def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out):
+def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,condition_policy='trained_range',reference_snr=10.,verbose=False):
     from .rendering import render
     from .cli import seed_all
     if not scene.val_cameras or trials<1 or not snrs or any(not math.isfinite(s) for s in snrs):
         raise ValueError('validation requires cameras, positive trials and finite SNRs')
+    conditioning_pair(model,snrs[0],condition_policy,reference_snr)
     out=Path(out); (out/'metrics').mkdir(parents=True,exist_ok=True)
     device=next(model.parameters()).device; mode=model.training; records=[]
     identity=model_id(model)
@@ -83,13 +101,15 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out):
             paths += [('finite_noiseless',q,10.,1) for q in ('1','2','3','mixed')]
             paths += [('awgn',q,float(snr),trials) for snr in snrs for q in ('1','2','3','mixed')]
             for path,layout,snr,ntrials in paths:
+                started=time.perf_counter()
+                tx_snr,rx_snr=conditioning_pair(model,snr,condition_policy,reference_snr)
                 qs=mixed if layout=='mixed' else [torch.where(ids>=0,int(layout) if layout!='clean' else 3,0) for ids in scene.group_ids]
                 qfull=torch.cat([q[ids>=0] for q,ids in zip(qs,scene.group_ids)])
                 measurements=[]; diagnostics=[]; per_view=[]
                 for trial in range(ntrials):
                     # Same fixed-slot noise across prefixes and SNRs, per trial.
                     seed_all(seed+1000+trial)
-                    raw,diag=decode_path(model,scene,qs,path,snr); diagnostics.append(diag)
+                    raw,diag=decode_path(model,scene,qs,path,snr,tx_condition_snr=tx_snr,rx_condition_snr=rx_snr); diagnostics.append(diag)
                     views=[]
                     for i,camera in enumerate(scene.val_cameras):
                         image=render(raw,camera,scene.degree,getattr(scene,'white_background',False))
@@ -100,7 +120,10 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out):
                             save_panel(out/'images'/phase/f'{path}_{layout}_view{i:04d}.png',photo,source,image,f'{path} / {layout}')
                     measurements.append({k:float(np.mean([v[k] for v in views])) for k in views[0]})
                 row={'step':step,'phase':phase,'path':path,'layout':layout,'actual_snr':None if path=='clean' else snr,
-                     'tx_condition_snr':None if path=='clean' else snr,'channel_trained':getattr(scene,'channel_trained',False),
+                     'tx_condition_snr':None if path=='clean' else tx_snr,
+                     'rx_condition_snr':None if path=='clean' else rx_snr,'condition_policy':condition_policy,
+                     'training_snrs':list(model.training_snrs),'condition_support_known':bool(model.training_snrs),
+                     'channel_trained':getattr(scene,'channel_trained',False),
                      'views':len(scene.val_cameras),'trials':ntrials,'per_view_trial':per_view,
                      'latent_mse':float(np.mean([d['latent_mse'] for d in diagnostics])),
                      'latent_target_power':float(np.mean([d['latent_target_power'] for d in diagnostics])),
@@ -115,11 +138,14 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out):
                     row.update(payload_complex_symbols=None,total_channel_uses=None,xyz_bytes=None,metadata_bytes=None,
                                symbols_per_gaussian=None,rate_scope='clean bypass diagnostic, not a guaranteed upper bound; latent float storage is NOT a wire rate')
                 else:
-                    row.update(rate_record(model,scene,qfull,snr,'none' if path=='finite_noiseless' else 'awgn',identity))
+                    row.update(rate_record(model,scene,qfull,snr,'none' if path=='finite_noiseless' else 'awgn',identity,tx_snr,rx_snr))
                 records.append(row)
+                if verbose:
+                    print(f"{condition_policy} {path}/q{layout}: actual={row['actual_snr']}, tx={row['tx_condition_snr']}, rx={row['rx_condition_snr']}, "
+                          f"PSNR={row['source_psnr']:.3f}, latent_MSE={row['latent_mse']:.6g}, sec={time.perf_counter()-started:.2f}",flush=True)
     finally:
         model.train(mode)
     for row in records: append_json(out/'metrics'/('test.jsonl' if phase=='test' else 'validation.jsonl'),row)
     summary=', '.join(f"{r['path']}/{r['layout']}={r['source_psnr']:.2f}" for r in records if r['path']=='clean' or r['actual_snr']==10)
-    print(f'validation {step} {phase}: {summary}',flush=True)
+    print(f'validation {step} {phase} [SNR conditions: {condition_policy}]: {summary}',flush=True)
     return records

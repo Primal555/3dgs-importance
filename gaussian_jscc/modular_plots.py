@@ -84,7 +84,8 @@ def plot_run(out):
                         ax.axhline(r[metric],linestyle='--',label=path+('/q3' if path!='clean' else ''))
             ax.set(xlabel='Actual AWGN SNR (dB)',ylabel=metric+' (dB)'); ax.grid(alpha=.2)
             if ax.get_legend_handles_labels()[0]: ax.legend(fontsize=8)
-        fig.suptitle('All test views; error bars = standard deviation across noise-trial view means')
+        policies=', '.join(dict.fromkeys(r.get('condition_policy','matched') for r in final if r['path']=='awgn'))
+        fig.suptitle(f'All test views; SNR conditions: {policies}; error bars = noise-trial view-mean standard deviation')
         save(fig,'psnr_snr.png')
     return paths
 

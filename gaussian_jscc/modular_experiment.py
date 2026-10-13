@@ -175,6 +175,7 @@ def main(args,max_updates=None):
         progress={'phase':'semantic_bootstrap','phase_step':0,'step':0,'completed':{p:0 for p in PHASES},
                   'channel_trained':False,'module_lrs':lrs,'phase_complete':False,'phase_budgets':counts,'train_snrs':args.train_snrs,
                   'training_objective':objectives}
+    model.set_training_snrs(args.train_snrs)
     scene=make_scene(spec,raw,degree,model,source,old,out); del raw
     if saved_scene is not None: validate_scene(saved_scene,scene.record)
     if args.init_semantic:
@@ -188,9 +189,11 @@ def main(args,max_updates=None):
             'selected_scenes':[spec],'codec_config':cfg.to_dict(),'phase_budgets':counts,'module_lrs':lrs,'train_snrs':args.train_snrs,
             'seed':args.seed,'random_initialization':not bool(args.init_semantic),'initializer':args.init_semantic,
             'source_weights_loaded':False,'reference_scene_identity_and_splits_verified':True,
-            'scene':scene.record,'step_definition':'one real optimizer update; no accumulation',
+            'scene':scene.record,'net_bits_per_use':scene.net_bits_per_use,
+            'step_definition':'one real optimizer update; no accumulation',
             'trainable_modules':PHASE_MODULES,'parameters':{n:sum(p.numel() for p in getattr(model,n).parameters()) for n in MODULES},
             'training_objective':objectives,
+            'snr_condition_policy':'trained_range; actual channel SNR remains unchanged',
             'losses':{'semantic_bootstrap':'local response MSE','semantic_render':'source PLY RGB MSE',
                       'channel_bootstrap':'latent MSE against frozen semantic encoder',
                       'channel_render':'source PLY RGB MSE + channel_latent_weight * latent MSE'},
@@ -246,6 +249,7 @@ def main(args,max_updates=None):
             row=dict(stats,step=progress['step'],phase_step=phase_step,phase=phase,loss=float(loss),layout=layout,snr=snr,
                      objective_version=objectives['version'],
                      actual_snr=snr if phase.startswith('channel') else None,tx_condition_snr=snr,
+                     rx_condition_snr=snr,condition_policy='trained_range',
                      step_seconds=elapsed,training_view_indices=indices,module_lrs={g['name']:g['lr'] for g in optimizer.param_groups},
                      trainable_parameters={n:sum(p.numel() for p in getattr(model,n).parameters() if p.requires_grad) for n in MODULES},
                      frozen_parameters_unchanged=True,
