@@ -196,6 +196,8 @@ def main(args,max_updates=None):
     resumed_rng=saved_scene=None
     if args.resume:
         previous=json.loads((out/'training.json').read_text(encoding='utf-8'))
+        if previous.get('inverse_control'):
+            raise ValueError('use channel_inverse_controls --resume-suite to preserve the training channel condition')
         if previous.get('freeze_semantic',False)!=args.freeze_semantic:
             raise ValueError('exact resume freeze-semantic mismatch')
         if previous.get('training_objective')!=objectives:
