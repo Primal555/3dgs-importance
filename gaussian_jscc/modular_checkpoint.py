@@ -64,7 +64,7 @@ def initialize_channel_run(path, device, *, cfg=None):
         a=original.to_dict(); b=cfg.to_dict()
         # These affect only freshly initialized channel modules, not the teacher y.
         # Exact resume still requires the entire config, including rates, to match.
-        for key in ('channel_variant','channel_hidden','rates'):
+        for key in ('channel_variant','channel_hidden','channel_prefix_mode','rates'):
             a.pop(key,None); b.pop(key,None)
         if a!=b: raise ValueError('semantic initialization config mismatch')
     model=build_codec(cfg or original).to(device)

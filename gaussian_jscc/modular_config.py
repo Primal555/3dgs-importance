@@ -45,6 +45,7 @@ class ModularCodecConfig:
     context_radii: tuple = (2., 4.)
     channel_variant: str = 'baseline'
     channel_hidden: int = 192
+    channel_prefix_mode: str = 'suffix'
 
     def __post_init__(self):
         if self.architecture != 'modular_jscc_v1':
@@ -61,10 +62,13 @@ class ModularCodecConfig:
         # Composition reuses transport validation without subclassing legacy config.
         values = asdict(self)
         values.pop('latent_dim')
-        for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden'):
+        for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden','channel_prefix_mode'):
             values.pop(key)
         if self.channel_variant not in ('baseline','residual','progressive'):
             raise ValueError('unknown channel variant')
+        if (self.channel_prefix_mode not in ('suffix','full_prefix') or
+                (self.channel_prefix_mode=='full_prefix' and self.channel_variant!='progressive')):
+            raise ValueError('full-prefix reread requires progressive channel modules')
         if type(self.channel_hidden) is not int or self.channel_hidden<1:
             raise ValueError('channel_hidden must be a positive integer')
         if self.channel_variant=='baseline': self.channel_hidden=192
@@ -97,6 +101,7 @@ class ModularCodecConfig:
                 values.pop(key)
         if self.channel_variant == 'baseline':
             values.pop('channel_variant'); values.pop('channel_hidden')
+        if self.channel_prefix_mode == 'suffix': values.pop('channel_prefix_mode')
         return values
 
     @classmethod

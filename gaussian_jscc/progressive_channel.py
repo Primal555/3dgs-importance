@@ -13,7 +13,7 @@ from .modular_core import ChannelResidualBlock
 
 
 class LatentRefinementStage(nn.Module):
-    def __init__(self, symbols, cfg, *, base=False):
+    def __init__(self, symbols, cfg, *, base=False, earlier_symbols=0):
         super().__init__()
         self.base=base
         hidden=cfg.channel_hidden
@@ -26,11 +26,18 @@ class LatentRefinementStage(nn.Module):
             # gradients into the enhancement trunk on its very first update.
             nn.init.normal_(self.readout[-1].weight,std=1e-3)
             nn.init.zeros_(self.readout[-1].bias)
+        if cfg.channel_prefix_mode=='full_prefix' and earlier_symbols:
+            self.prefix_input=nn.Linear(2*earlier_symbols,hidden,bias=False)
+            nn.init.zeros_(self.prefix_input.weight)
 
-    def forward(self, symbols, previous, snr):
+    def forward(self, symbols, previous, snr, earlier=None):
         inputs=symbols if self.base else torch.cat((symbols,previous),-1)
         condition=self.snr(symbols.new_full((*symbols.shape[:-1],1),float(snr)/20))
         h=self.input(inputs)+condition
+        if hasattr(self,'prefix_input'):
+            if earlier is None or earlier.shape!=(*symbols.shape[:-1],self.prefix_input.in_features):
+                raise ValueError('full-prefix stage requires matching earlier received symbols')
+            h=h+self.prefix_input(earlier)
         for block in self.blocks:
             h=block(h,condition)
         return self.readout(h)
@@ -40,7 +47,7 @@ class ProgressiveChannelDecoder(nn.Module):
     def __init__(self,cfg):
         super().__init__()
         self.cfg=cfg
-        self.stages=nn.ModuleList(LatentRefinementStage(end-start,cfg,base=index==0)
+        self.stages=nn.ModuleList(LatentRefinementStage(end-start,cfg,base=index==0,earlier_symbols=start)
             for index,(start,end) in enumerate(zip(cfg.rates[:-1],cfg.rates[1:])))
 
     def decode_stages(self,received,receive_mask,q,snr):
@@ -64,7 +71,8 @@ class ProgressiveChannelDecoder(nn.Module):
         for tier,(stage,start,end) in enumerate(zip(self.stages,self.cfg.rates[:-1],self.cfg.rates[1:]),1):
             active=q>=tier
             if active.any():
-                delta=stage(masked[...,2*start:2*end][active],previous[active],snr)
+                earlier=masked[...,:2*start][active] if hasattr(stage,'prefix_input') else None
+                delta=stage(masked[...,2*start:2*end][active],previous[active],snr,earlier)
                 correction=torch.zeros_like(previous).masked_scatter(active[...,None].expand_as(previous),delta.flatten())
                 previous=previous+correction
             outputs.append(previous)
@@ -72,3 +80,33 @@ class ProgressiveChannelDecoder(nn.Module):
 
     def forward(self,received,receive_mask,q,snr):
         return self.decode_stages(received,receive_mask,q,snr)[...,-1,:]
+
+
+def enable_full_prefix(model,optimizer=None):
+    """Function-preserving in-memory upgrade; existing tensors/Adam stay intact.
+
+    A separate zero-initialized earlier-prefix projection is linearly equivalent
+    to widening the stage input, but avoids changing old parameter shapes and
+    lets new weights start with their own fresh Adam step counters.
+    """
+    if model.cfg.channel_variant!='progressive' or model.cfg.channel_prefix_mode!='suffix':
+        raise ValueError('upgrade requires an original progressive suffix decoder')
+    group=None
+    if optimizer is not None:
+        groups=[g for g in optimizer.param_groups if g.get('name')=='channel_decoder']
+        if len(groups)!=1 or {id(p) for p in groups[0]['params']}!={id(p) for p in model.channel_decoder.parameters()}:
+            raise ValueError('upgrade requires a complete named channel_decoder optimizer group')
+        group=groups[0]
+    names=[]
+    for index,stage in enumerate(model.channel_decoder.stages[1:],1):
+        earlier_symbols=model.cfg.rates[index]
+        reference=stage.input.weight
+        stage.prefix_input=nn.Linear(2*earlier_symbols,stage.input.out_features,bias=False).to(reference)
+        nn.init.zeros_(stage.prefix_input.weight)
+        names.append(f'channel_decoder.stages.{index}.prefix_input.weight')
+    model.cfg.channel_prefix_mode='full_prefix'
+    if group is not None:
+        # Match fresh factory traversal order exactly so saved Adam state loads
+        # onto the same parameter names on resume, not onto shifted tensors.
+        group['params']=list(model.channel_decoder.parameters())
+    return names

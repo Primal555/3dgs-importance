@@ -23,6 +23,11 @@ from .modular_snr_controls import control_inputs
 from .modular_training import bootstrap_step, finish_update
 
 ARMS={'noiseless':'none','awgn10':'awgn'}
+PREFIX_ARMS={'suffix10':'awgn','full_prefix10':'awgn'}
+
+
+def arms_for(args):
+    return PREFIX_ARMS if args.suite=='prefix' else ARMS
 
 
 def parser():
@@ -43,7 +48,8 @@ def parser():
     p.add_argument('--cpu-threads',type=int,default=4)
     p.add_argument('--resume-suite',action='store_true')
     p.add_argument('--dry-run',action='store_true')
-    p.add_argument('--arm',choices=tuple(ARMS),help='internal single-arm entry; normally omit')
+    p.add_argument('--suite',choices=['inverse','prefix'],default='inverse',help='opt-in full-prefix reread controls')
+    p.add_argument('--arm',choices=(*ARMS,*PREFIX_ARMS),help='internal single-arm entry; normally omit')
     return p
 
 
@@ -73,6 +79,11 @@ def build_plan(args):
             or args.diagnostic_trials<2 or (args.lr is not None and (not math.isfinite(args.lr) or args.lr<=0))):
         raise ValueError('invalid continuation or diagnostic settings')
     run,checkpoint,metadata,saved=source_files(args)
+    arms=arms_for(args)
+    if args.arm is not None and args.arm not in arms: raise ValueError('arm does not belong to selected suite')
+    if args.suite=='prefix' and (metadata['codec_config'].get('channel_variant')!='progressive' or
+                                metadata['codec_config'].get('channel_prefix_mode','suffix')!='suffix'):
+        raise ValueError('prefix controls require an original progressive suffix checkpoint')
     destination=Path(args.out).resolve()
     for protected in (Path(args.run).resolve(),run):
         if destination.is_relative_to(protected) or protected.is_relative_to(destination):
@@ -85,7 +96,8 @@ def build_plan(args):
                 'diagnostic_batch','seed','cpu_threads'):
         value=getattr(args,key)
         if value is not None: common+=['--'+key.replace('_','-'),str(value)]
-    return dict(version=1,source_run=str(run),checkpoint=str(checkpoint),
+    if args.suite!='inverse': common+=['--suite',args.suite]
+    plan=dict(version=1,source_run=str(run),checkpoint=str(checkpoint),
         source_checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),source_step=source_step,
         target_step=source_step+args.steps,additional_updates_per_arm=args.steps,rates=metadata['codec_config']['rates'],
         optimizer='inherit source Adam parameters, step counters and moments; no reset',
@@ -93,7 +105,12 @@ def build_plan(args):
         conditioning_snr=10.,sampling='private deterministic per-update point batch and positive-tier mask; independent of AWGN RNG',
         diagnostics=dict(points=args.diagnostic_points,trials=args.diagnostic_trials,batch_size=args.diagnostic_batch,seed=args.seed),
         jobs=[dict(arm=arm,kind=kind,command=[sys.executable,'-u','-m','gaussian_jscc.channel_inverse_controls',*common,'--arm',arm])
-              for arm,kind in ARMS.items()])
+              for arm,kind in arms.items()])
+    if args.suite=='prefix':
+        plan['prefix_control']=dict(readout=['suffix','full_prefix'],
+            initialization='function-preserving zero earlier-prefix projection; existing Adam retained; new weights have fresh state',
+            parameter_matched=False,transmitted_payload_matched=True)
+    return plan
 
 
 def training_batch(scene, phase_step, seed):
@@ -124,9 +141,10 @@ def evaluate_endpoint(model,scene,folder,phase,step,seed):
 
 
 def run_arm(args,arm,max_updates=None):
-    if arm not in ARMS: raise ValueError('unknown arm')
+    arms=arms_for(args)
+    if arm not in arms: raise ValueError('unknown arm for selected suite')
     plan=build_plan(args); run,checkpoint,metadata,source_saved=source_files(args)
-    folder=Path(args.out).resolve()/arm; kind=ARMS[arm]
+    folder=Path(args.out).resolve()/arm; kind=arms[arm]
     settings=dict(plan=plan,arm=arm,channel_kind=kind)
     if folder.exists() and not args.resume_suite: raise FileExistsError('use a NEW output or --resume-suite')
     resumed=False
@@ -148,7 +166,13 @@ def run_arm(args,arm,max_updates=None):
         loading=checkpoint
     device=device_for(args.device); torch.set_num_threads(args.cpu_threads)
     model,optimizer,progress,rng,saved_scene=restore_training_checkpoint(loading,device)
-    if json.loads(json.dumps(model.cfg.to_dict()))!=metadata['codec_config']: raise ValueError('resume codec mismatch')
+    expected=copy.deepcopy(metadata['codec_config'])
+    if arm=='full_prefix10':
+        expected['channel_prefix_mode']='full_prefix'
+        if not resumed:
+            from .progressive_channel import enable_full_prefix
+            enable_full_prefix(model,optimizer)
+    if json.loads(json.dumps(model.cfg.to_dict()))!=expected: raise ValueError('resume codec mismatch')
     if resumed and progress.get('inverse_control')!=settings: raise ValueError('checkpoint continuation mismatch')
     if args.lr is not None:
         for group in optimizer.param_groups:
@@ -163,6 +187,8 @@ def run_arm(args,arm,max_updates=None):
         progress['phase_budgets']['channel_bootstrap']+=args.steps
         record=copy.deepcopy(metadata)
         record.update(source_run=str(run),manifest=str(manifest_path),inverse_control=settings,
+            codec_config=model.cfg.to_dict(),
+            parameters={name:sum(p.numel() for p in getattr(model,name).parameters()) for name in metadata['parameters']},
             phase_budgets=progress['phase_budgets'],module_lrs=progress['module_lrs'],
             initialization='channel continuation; full source weights AND Adam retained',
             initializer=str(checkpoint),source_weights_loaded=True,random_initialization=False,
@@ -230,16 +256,20 @@ def run_arm(args,arm,max_updates=None):
 def summarize(out):
     from .modular_plots import read_rows
     out=Path(out); destination=out/'comparison'; destination.mkdir(parents=True,exist_ok=True)
-    records={arm:read_rows(out/arm/'metrics/validation.jsonl') for arm in ARMS}
+    arms=PREFIX_ARMS if (out/'full_prefix10').is_dir() else ARMS
+    groups=list(arms); first,second=groups
+    records={arm:read_rows(out/arm/'metrics/validation.jsonl') for arm in arms}
     finals={arm:{(r['path'],r['layout']):r for r in rs if r['phase']=='final'} for arm,rs in records.items()}
     comparison=[]
     for path in ('finite_noiseless','awgn'):
         for tier in ('1','2','3','mixed'):
-            pair={arm:finals[arm][(path,tier)] for arm in ARMS}
+            pair={arm:finals[arm][(path,tier)] for arm in arms}
             row=dict(path=path,tier=tier)
             for arm,r in pair.items():
                 row[arm]={k:r[k] for k in ('source_psnr','photo_psnr','source_ssim','latent_mse','latent_nmse','symbols_per_gaussian')}
-            row['noiseless_minus_awgn10_psnr_db']=pair['noiseless']['source_psnr']-pair['awgn10']['source_psnr']
+            delta_key='full_prefix_minus_suffix_psnr_db' if arms is PREFIX_ARMS else 'noiseless_minus_awgn10_psnr_db'
+            row[delta_key]=(pair[second]['source_psnr']-pair[first]['source_psnr'] if arms is PREFIX_ARMS
+                            else pair[first]['source_psnr']-pair[second]['source_psnr'])
             comparison.append(row)
     # Compare both arms to their identical baseline; do not silently mix view sets.
     for rs in records.values():
@@ -247,14 +277,22 @@ def summarize(out):
         for r in initial:
             final=next(v for v in rs if v['phase']=='final' and v['path']==r['path'] and v['layout']==r['layout'])
             if r['views']!=final['views']: raise ValueError('comparison view count changed')
+    initial={arm:{(r['path'],r['layout']):r for r in records[arm] if r['phase']=='initial'} for arm in arms}
+    matched=True
+    if initial[first].keys()!=initial[second].keys(): matched=False
+    else:
+        for key in initial[first]:
+            for metric in ('latent_mse','source_psnr','photo_psnr'):
+                if not math.isclose(initial[first][key][metric],initial[second][key][metric],rel_tol=1e-6,abs_tol=1e-6): matched=False
+    if not matched: raise ValueError('control initial functions do not match; comparison is not a paired warm start')
     diagnostics={arm:{endpoint:json.loads((out/arm/'diagnostics'/endpoint/'latent_errors.json').read_text(encoding='utf-8'))
-                      for endpoint in ('initial','final')} for arm in ARMS}
+                      for endpoint in ('initial','final')} for arm in arms}
     hashes={d['sample_sha256'] for stages in diagnostics.values() for d in stages.values()}
     if len(hashes)!=1: raise ValueError('diagnostic point sample changed')
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    styles={'noiseless':('#356d9b','-','o'),'awgn10':('#d88931','--','s')}
+    styles={first:('#356d9b','-','o'),second:('#d88931','--','s')}
     fig,axes=plt.subplots(2,3,figsize=(13,7),layout='constrained')
     for arm,rs in records.items():
         color,line,marker=styles[arm]
@@ -278,7 +316,7 @@ def summarize(out):
         ax.bar(range(len(labels)),values_col,color='#356d9b'); ax.set(xticks=range(len(labels)),xticklabels=labels,title=key)
         ax.tick_params(axis='x',labelsize=6); ax.grid(axis='y',alpha=.2)
     fig.savefig(destination/'latent_errors.png',dpi=150); plt.close(fig)
-    result=dict(status='complete',comparison=comparison,diagnostic_sample_sha256=next(iter(hashes)),
+    result=dict(status='complete',groups=groups,matched_initial_function=matched,comparison=comparison,diagnostic_sample_sha256=next(iter(hashes)),
                 warning='one training checkpoint; finite-trial bias estimates are not independent training replications')
     json_write(destination/'summary.json',result)
     return result
@@ -303,7 +341,7 @@ def main(args):
             result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT)
         if result.returncode: raise RuntimeError(f'{arm} failed; inspect {out/(arm+".log")}')
     summary=summarize(out)
-    json_write(out/'complete.json',dict(status='complete',additional_updates_per_arm=args.steps,groups=list(ARMS)))
+    json_write(out/'complete.json',dict(status='complete',additional_updates_per_arm=args.steps,groups=list(arms_for(args))))
     print(f'Complete: {out}/comparison/summary.json',flush=True)
     return summary
 
