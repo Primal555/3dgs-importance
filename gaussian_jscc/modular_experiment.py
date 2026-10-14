@@ -35,6 +35,9 @@ def parser():
     p.add_argument('--context-neighbors',nargs=2,type=int,default=[16,32])
     p.add_argument('--context-radii',nargs=2,type=float,default=[2.,4.])
     p.add_argument('--blocks-per-batch',type=int,help='override source batch size, identically in all control arms')
+    p.add_argument('--channel-variant',choices=['baseline','residual'],default='baseline')
+    p.add_argument('--channel-hidden',type=int,default=192,help='width of opt-in residual channel modules only')
+    p.add_argument('--freeze-semantic',action='store_true',help='channel-only control; freeze both semantic modules in ALL communication updates')
     for phase,steps in zip(PHASES,(2000,1000,2000,2000)):
         p.add_argument('--'+phase.replace('_','-')+'-steps',type=int,default=steps)
     for name in MODULES:
@@ -154,6 +157,8 @@ def main(args,max_updates=None):
     from .rendering import load_cameras
     objectives=objective_settings(args.channel_latent_weight)
     counts={phase:getattr(args,phase+'_steps') for phase in PHASES}
+    if args.freeze_semantic and not (args.init_semantic or args.resume):
+        raise ValueError('freeze-semantic requires a semantic initializer or exact resume')
     if args.clean_only and (counts['channel_bootstrap'] or counts['channel_render'] or args.init_semantic or args.with_direct_control):
         raise ValueError('clean-only requires zero channel budgets, no semantic initializer or direct control')
     if args.semantic_color_every<0 or args.semantic_color_directions<2 or args.semantic_color_directions%2:
@@ -183,11 +188,14 @@ def main(args,max_updates=None):
     context = {} if args.context_variant=='baseline' else dict(context_centers=tuple(args.context_centers),
         context_neighbors=tuple(args.context_neighbors),context_radii=tuple(args.context_radii))
     cfg=ModularCodecConfig(sh_degree=degree,latent_dim=args.latent_dim,decoder_geometry=args.decoder_geometry,
+        channel_variant=args.channel_variant,channel_hidden=args.channel_hidden,
         context_variant=args.context_variant,**context,
         **{k:common[k] for k in ('hidden','grid_dim','levels','planes','depth','block_size','morton_bits','decoder_window','attention_heads') if k in common})
     resumed_rng=saved_scene=None
     if args.resume:
         previous=json.loads((out/'training.json').read_text(encoding='utf-8'))
+        if previous.get('freeze_semantic',False)!=args.freeze_semantic:
+            raise ValueError('exact resume freeze-semantic mismatch')
         if previous.get('training_objective')!=objectives:
             raise ValueError('exact resume objective mismatch; start a NEW run with --init-semantic from end_semantic_render instead')
         # A semantic-only fork skips these phases permanently, including when
@@ -203,7 +211,7 @@ def main(args,max_updates=None):
             raise ValueError('checkpoint objective mismatch')
         if model.cfg!=cfg: raise ValueError('exact resume codec config mismatch')
     else:
-        model=initialize_channel_run(args.init_semantic,device) if args.init_semantic else ModularGaussianCodec(cfg).to(device)
+        model=initialize_channel_run(args.init_semantic,device,cfg=cfg) if args.init_semantic else ModularGaussianCodec(cfg).to(device)
         if model.cfg!=cfg: raise ValueError('semantic initialization config mismatch')
         if not args.init_semantic:
             mean,std=shared_statistics([raw]); model.attr_mean.copy_(mean.to(device)); model.attr_std.copy_(std.to(device))
@@ -211,6 +219,7 @@ def main(args,max_updates=None):
         progress={'phase':'semantic_bootstrap','phase_step':0,'step':0,'completed':{p:0 for p in PHASES},
                   'channel_trained':False,'module_lrs':lrs,'phase_complete':False,'phase_budgets':counts,'train_snrs':args.train_snrs,
                   'training_objective':objectives}
+        if args.freeze_semantic: progress['freeze_semantic']=True
     model.set_training_snrs(args.train_snrs)
     scene=make_scene(spec,raw,degree,model,source,old,out); del raw
     color_camera_centers=None
@@ -230,7 +239,9 @@ def main(args,max_updates=None):
             'source_weights_loaded':False,'reference_scene_identity_and_splits_verified':True,
             'scene':scene.record,'net_bits_per_use':scene.net_bits_per_use,
             'step_definition':'one real optimizer update; no accumulation',
-            'trainable_modules':PHASE_MODULES,'parameters':{n:sum(p.numel() for p in getattr(model,n).parameters()) for n in MODULES},
+            'trainable_modules':{p:[n for n in ns if not (args.freeze_semantic and n.startswith('semantic_'))] for p,ns in PHASE_MODULES.items()},
+            'freeze_semantic':args.freeze_semantic,
+            'parameters':{n:sum(p.numel() for p in getattr(model,n).parameters()) for n in MODULES},
             'training_objective':objectives,
             'clean_only':args.clean_only,'color_metrics':args.color_metrics,'save_semantic_end_images':args.save_semantic_end_images,
             'semantic_color_every':args.semantic_color_every,'semantic_color_directions':args.semantic_color_directions,
@@ -261,10 +272,13 @@ def main(args,max_updates=None):
     if args.clean_only:
         print('CLEAN ONLY: semantic latent is handed directly to semantic decoder; both channel modules unused. Not a communication-rate result.',flush=True)
     else:
-        print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen in both communication phases.",flush=True)
+        print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen; semantic decoder {'FROZEN' if args.freeze_semantic else 'trainable in render'}.",flush=True)
+    print(f'Channel variant: {cfg.channel_variant}; hidden={cfg.hidden if cfg.channel_variant=="baseline" else cfg.channel_hidden}',flush=True)
     if args.semantic_color_every:
         print(f'Color supervision: every {args.semantic_color_every} bootstrap updates; {args.semantic_color_directions} directions, unclipped RGB; all render updates retain scene RGB MSE.',flush=True)
     if not args.resume:
+        # Same data/layout/view/noise stream despite different module sizes.
+        if args.freeze_semantic: seed_all(args.seed+17)
         evaluate_paths(model,scene,step=0,phase='initial',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out,**evaluation_options)
 
     def save(label):
@@ -287,7 +301,7 @@ def main(args,max_updates=None):
                 save('end_'+phase)
             continue
         continuing=progress['phase']==phase and optimizer is not None and not progress.get('phase_complete')
-        if not continuing: optimizer=configure_phase(model,phase,lrs)
+        if not continuing: optimizer=configure_phase(model,phase,lrs,freeze_semantic=args.freeze_semantic)
         progress.update(phase=phase,phase_step=progress['completed'][phase],phase_complete=False)
         model.train()
         evaluate_paths(model,scene,step=progress['step'],phase=phase+'_start',snrs=[10],trials=2,seed=args.seed,save_images=False,out=out,**evaluation_options)

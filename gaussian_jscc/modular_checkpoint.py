@@ -49,16 +49,23 @@ def restore_training_checkpoint(path, device):
     model=build_codec(config_from_dict(saved['config'])).to(device)
     model.load_state_dict(saved['state_dict'])
     model.set_training_snrs(progress.get('train_snrs',()))
-    optimizer=configure_phase(model,progress['phase'],progress.get('module_lrs',{}))
+    optimizer=configure_phase(model,progress['phase'],progress.get('module_lrs',{}),
+                              freeze_semantic=progress.get('freeze_semantic',False))
     if state['optimizer'] is not None: optimizer.load_state_dict(state['optimizer'])
     return model,optimizer,progress,state['rng'],state['scene_record']
 
 
-def initialize_channel_run(path, device):
+def initialize_channel_run(path, device, *, cfg=None):
     saved=_read(path); progress=saved['training']['progress']
     if progress['phase']!='semantic_render' or not progress.get('phase_complete') or not progress.get('completed',{}).get('semantic_render',0):
         raise ValueError('semantic initialization requires completed nonempty semantic_render')
-    model=build_codec(config_from_dict(saved['config'])).to(device)
+    original=config_from_dict(saved['config'])
+    if cfg is not None:
+        a=original.to_dict(); b=cfg.to_dict()
+        for key in ('channel_variant','channel_hidden'):
+            a.pop(key,None); b.pop(key,None)
+        if a!=b: raise ValueError('semantic initialization config mismatch')
+    model=build_codec(cfg or original).to(device)
     values={n:v for n,v in saved['state_dict'].items() if n.startswith(('semantic_encoder.','semantic_decoder.')) or n in ('attr_mean','attr_std')}
     model.load_state_dict(values,strict=False)
     return model

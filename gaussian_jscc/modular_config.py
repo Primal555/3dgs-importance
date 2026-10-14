@@ -43,6 +43,8 @@ class ModularCodecConfig:
     context_centers: tuple = (64, 16)
     context_neighbors: tuple = (16, 32)
     context_radii: tuple = (2., 4.)
+    channel_variant: str = 'baseline'
+    channel_hidden: int = 192
 
     def __post_init__(self):
         if self.architecture != 'modular_jscc_v1':
@@ -56,8 +58,13 @@ class ModularCodecConfig:
         # Composition reuses transport validation without subclassing legacy config.
         values = asdict(self)
         values.pop('latent_dim')
-        for key in ('context_variant','context_centers','context_neighbors','context_radii'):
+        for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden'):
             values.pop(key)
+        if self.channel_variant not in ('baseline','residual'):
+            raise ValueError('unknown channel variant')
+        if type(self.channel_hidden) is not int or self.channel_hidden<1:
+            raise ValueError('channel_hidden must be a positive integer')
+        if self.channel_variant=='baseline': self.channel_hidden=192
         if self.context_variant not in ('baseline','encoder','decoder','both'):
             raise ValueError('unknown spatial context variant')
         if self.context_variant in ('decoder','both') and self.decoder_geometry != 'xyz':
@@ -85,6 +92,8 @@ class ModularCodecConfig:
         if self.context_variant == 'baseline':
             for key in ('context_variant','context_centers','context_neighbors','context_radii'):
                 values.pop(key)
+        if self.channel_variant == 'baseline':
+            values.pop('channel_variant'); values.pop('channel_hidden')
         return values
 
     @classmethod

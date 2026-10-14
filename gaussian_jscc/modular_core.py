@@ -38,14 +38,20 @@ class ChannelEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.input = nn.Linear(cfg.latent_dim, cfg.hidden)
-        self.snr = nn.Sequential(nn.Linear(1, cfg.hidden), nn.GELU(), nn.Linear(cfg.hidden, cfg.hidden))
-        self.readout = nn.Sequential(nn.GELU(), nn.Linear(cfg.hidden, 2*cfg.rates[-1]))
+        h=cfg.channel_hidden if cfg.channel_variant=='residual' else cfg.hidden
+        self.input = nn.Linear(cfg.latent_dim, h)
+        self.snr = nn.Sequential(nn.Linear(1, h), nn.GELU(), nn.Linear(h, h))
+        self.readout = nn.Sequential(nn.GELU(), nn.Linear(h, 2*cfg.rates[-1]))
+        if cfg.channel_variant=='residual':
+            self.blocks=nn.ModuleList(ChannelResidualBlock(h) for _ in range(3))
 
     def forward(self, y, active, snr):
         if not math.isfinite(float(snr)):
             raise ValueError('SNR must be finite')
-        z = self.readout(self.input(y) + self.snr(y.new_full((*active.shape, 1), float(snr)/20)))
+        condition=self.snr(y.new_full((*active.shape, 1), float(snr)/20))
+        h=self.input(y)+condition
+        for block in getattr(self,'blocks',()): h=block(h,condition)
+        z = self.readout(h)
         layers = []
         for start, end in zip(self.cfg.rates[:-1], self.cfg.rates[1:]):
             segment = z[..., 2*start:2*end]
@@ -58,10 +64,13 @@ class ChannelDecoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.input = nn.Linear(4*cfg.rates[-1], cfg.hidden)
-        self.tier = nn.Embedding(len(cfg.rates), cfg.hidden)
-        self.snr = nn.Sequential(nn.Linear(1, cfg.hidden), nn.GELU(), nn.Linear(cfg.hidden, cfg.hidden))
-        self.readout = nn.Sequential(nn.GELU(), nn.Linear(cfg.hidden, cfg.latent_dim))
+        h=cfg.channel_hidden if cfg.channel_variant=='residual' else cfg.hidden
+        self.input = nn.Linear(4*cfg.rates[-1], h)
+        self.tier = nn.Embedding(len(cfg.rates), h)
+        self.snr = nn.Sequential(nn.Linear(1, h), nn.GELU(), nn.Linear(h, h))
+        self.readout = nn.Sequential(nn.GELU(), nn.Linear(h, cfg.latent_dim))
+        if cfg.channel_variant=='residual':
+            self.blocks=nn.ModuleList(ChannelResidualBlock(h) for _ in range(3))
 
     def forward(self, received, receive_mask, q, snr):
         if received.shape != (*q.shape, 2*self.cfg.rates[-1]) or receive_mask.shape != received.shape:
@@ -71,7 +80,28 @@ class ChannelDecoder(nn.Module):
         masked = received.masked_fill(~receive_mask.bool(), 0)
         condition = self.tier(q) + self.snr(received.new_full((*q.shape, 1), float(snr)/20))
         h = self.input(torch.cat((masked, receive_mask.to(received)), -1)) + condition
+        for block in getattr(self,'blocks',()): h=block(h,condition)
         return self.readout(h)*(q>0)[..., None]
+
+
+class ChannelResidualBlock(nn.Module):
+    """Pointwise residual mapping; no sample normalization or extra symbols.
+
+    Bounded affine conditioning at every block preserves feature magnitude.
+    Small final weights initialize a near-identity path without dead gradients.
+    """
+    def __init__(self, hidden):
+        super().__init__()
+        self.modulation=nn.Linear(hidden,2*hidden)
+        self.input=nn.Linear(hidden,2*hidden)
+        self.output=nn.Linear(2*hidden,hidden)
+        nn.init.normal_(self.output.weight,std=1e-3)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self,h,condition):
+        scale,shift=self.modulation(condition).chunk(2,-1)
+        x=h*(1+.1*scale.tanh())+.1*shift.tanh()
+        return h+self.output(torch.nn.functional.gelu(self.input(x)))
 
 
 class SemanticDecoder(nn.Module):

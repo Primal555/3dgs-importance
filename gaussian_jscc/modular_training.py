@@ -26,13 +26,13 @@ PHASE_MODULES = {
 }
 
 
-def configure_phase(model, phase, module_lrs):
+def configure_phase(model, phase, module_lrs, *, freeze_semantic=False):
     if phase not in PHASE_MODULES:
         raise ValueError('unknown modular training phase')
     groups=[]
     for name in MODULES:
         module=getattr(model,name)
-        trainable=name in PHASE_MODULES[phase]
+        trainable=name in PHASE_MODULES[phase] and not (freeze_semantic and name.startswith('semantic_'))
         module.requires_grad_(trainable)
         for p in module.parameters(): p.grad=None
         if trainable:

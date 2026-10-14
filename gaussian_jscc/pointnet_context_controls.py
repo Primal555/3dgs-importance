@@ -44,13 +44,13 @@ def build_plan(args):
             'mixed':'fixed random positive tiers for validation; not a learned allocation'}
 
 
-def comparison_signature(record):
-    cfg={k:v for k,v in record.get('codec_config',{}).items() if not k.startswith('context_')}
+def comparison_signature(record,ignore_config_keys=()):
+    cfg={k:v for k,v in record.get('codec_config',{}).items() if not k.startswith('context_') and k not in ignore_config_keys}
     return {**{k:record.get(k) for k in ('scene','phase_budgets','module_lrs','train_snrs','seed','training_objective')},
             'codec_config':cfg}
 
 
-def summarize(out, groups):
+def summarize(out, groups, *, ignore_config_keys=()):
     """Read saved metrics; no scene rendering, no compression or retraining."""
     out=Path(out); target=out/'comparison'; target.mkdir(parents=True,exist_ok=True)
     records=[]; gains=[]; costs=[]; configurations={}; signatures=[]; states={}
@@ -59,7 +59,7 @@ def summarize(out, groups):
         states[group]='complete' if (folder/'complete.json').exists() else 'incomplete'
         if not (folder/'training.json').exists(): continue
         cfg=json.loads((folder/'training.json').read_text(encoding='utf-8'))
-        configurations[group]=cfg; signatures.append(comparison_signature(cfg))
+        configurations[group]=cfg; signatures.append(comparison_signature(cfg,ignore_config_keys))
         rows=read_rows(folder/'metrics/test.jsonl')
         # Exact-resume after final evaluation can leave duplicate endpoint rows.
         rows=list({(r['path'],r['layout'],r['actual_snr']):r for r in rows}.values())
@@ -88,6 +88,8 @@ def summarize(out, groups):
     keys=['group','path','layout','actual_snr','source_psnr','photo_psnr','source_ssim','photo_ssim',
           'latent_mse','latent_nmse','symbols_per_gaussian','payload_complex_symbols','xyz_bytes','metadata_bytes',
           'total_channel_uses','views','trials','condition_policy']
+    keys += ['source_color_r_bias','source_color_g_bias','source_color_b_bias',
+             'source_color_rg_error_rmse','source_color_gb_error_rmse']
     with (target/'metrics.csv').open('w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=keys,extrasaction='ignore'); writer.writeheader(); writer.writerows(records)
     plot_comparison(out,groups,records,gains,costs)
