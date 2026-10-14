@@ -56,12 +56,16 @@ def build_plan(args):
         value=getattr(args,key)
         if value is not None:
             common+=['--'+key.replace('_','-')]+[str(v) for v in (value if isinstance(value,(list,tuple)) else [value])]
+    # Do not change historical default suite commands/identity.
+    if tuple(args.rates)!=(4,12,24):
+        common+=['--rates',*[str(v) for v in args.rates]]
     jobs=[{'group':group,'command':[sys.executable,'-u','-m','gaussian_jscc.modular_experiment',
            *common,'--out',str(Path(args.out).resolve()/group),'--channel-variant',group]} for group in args.groups]
-    plan={'version':1,'jobs':jobs,'groups':args.groups,'rates':[0,4,12,24],
+    plan={'version':1,'jobs':jobs,'groups':args.groups,'rates':[0,*args.rates],
             'teacher_file_sha256':hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
             'teacher':str(checkpoint),'semantic_modules':'frozen in both communication phases',
-            'losses':'latent MSE then source render MSE + unchanged latent MSE',
+            'losses':('latent MSE then source render MSE + unchanged latent MSE' if args.channel_render_steps
+                      else 'latent MSE only; render evaluation without updates'),
             'training_layout_cycle':['1','2','3','mixed'],'matched_rng_seed':args.seed+17,
             'parameter_and_compute_matched':False,'power_normalization':'unchanged per-point per-segment'}
     if 'progressive' in args.groups:

@@ -60,7 +60,8 @@ def evaluate_probe(model,scene,*,out,snr=10.,trials=2,seed=42):
     tx_snr,rx_snr=conditioning_pair(model,snr)
     cases={1:('baseline','shuffle_all'),2:('baseline','shuffle_2','shuffle_3'),
            3:('baseline','shuffle_2','shuffle_3','shuffle_all')}
-    ranges={'shuffle_2':(4,12),'shuffle_3':(12,24),'shuffle_all':(4,24)}
+    _,base,middle,maximum=model.cfg.rates
+    ranges={'shuffle_2':(base,middle),'shuffle_3':(middle,maximum),'shuffle_all':(base,maximum)}
     try:
         with preserved_rng(device):
             model.eval()
@@ -154,8 +155,8 @@ def main(args):
     saved=torch.load(checkpoint,map_location='cpu',weights_only=True)
     device=device_for(args.device); torch.set_num_threads(args.cpu_threads)
     model=load_checkpoint(checkpoint,device)
-    if model.cfg.architecture!='modular_jscc_v1' or tuple(model.cfg.rates)!=(0,4,12,24):
-        raise ValueError('probe requires modular 4/12/24 prefixes')
+    if model.cfg.architecture!='modular_jscc_v1' or len(model.cfg.rates)!=4:
+        raise ValueError('probe requires modular three-tier progressive prefixes')
     if json.loads(json.dumps(model.cfg.to_dict()))!=config['codec_config']:
         raise ValueError('run/checkpoint config mismatch')
     if not model.training_snrs: model.set_training_snrs(config.get('train_snrs',[]))

@@ -34,6 +34,8 @@ def build_plan(args):
         value=getattr(args,key)
         if value is not None:
             common += ['--'+key.replace('_','-')]+[str(v) for v in (value if isinstance(value,(tuple,list)) else [value])]
+    if tuple(args.rates)!=(4,12,24):
+        common += ['--rates',*[str(v) for v in args.rates]]
     jobs=[{'group':group,'command':[sys.executable,'-u','-m','gaussian_jscc.modular_experiment',*common,
                                   '--out',str(Path(args.out)/group),'--context-variant',group]} for group in args.groups]
     return {'version':1,'groups':args.groups,'jobs':jobs,'scene':'truck','seed':args.seed,
@@ -111,7 +113,9 @@ def plot_comparison(out,groups,records,gains,costs):
                              r['actual_snr']==10 and r['layout'] in ('1','2','3')),key=lambda r:int(r['layout']))
                 if rows: ax.plot([r['symbols_per_gaussian'] for r in rows],[r['source_psnr'] for r in rows],marker='o',label=group)
             ax.set(title='10 dB AWGN' if path=='awgn' else 'Finite noiseless channel',
-                   xlabel='Complex symbols per Gaussian',ylabel='Source PLY PSNR (dB)',xticks=[4,12,24]); ax.grid(alpha=.2)
+                   xlabel='Complex symbols per Gaussian',ylabel='Source PLY PSNR (dB)',
+                   xticks=sorted({r['symbols_per_gaussian'] for r in records if r['path']==path
+                                  and r['actual_snr']==10 and r['layout'] in ('1','2','3')})); ax.grid(alpha=.2)
             if ax.lines: ax.legend(fontsize=8)
         save(fig,'quality_by_tier.png')
     if gains:

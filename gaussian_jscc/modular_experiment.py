@@ -37,6 +37,8 @@ def parser():
     p.add_argument('--blocks-per-batch',type=int,help='override source batch size, identically in all control arms')
     p.add_argument('--channel-variant',choices=['baseline','residual','progressive'],default='baseline')
     p.add_argument('--channel-hidden',type=int,default=192,help='width of opt-in residual/progressive channel modules')
+    p.add_argument('--rates',type=int,nargs=3,default=[4,12,24],metavar=('Q1','Q2','Q3'),
+                   help='cumulative complex-symbol budgets per Gaussian; q0 remains zero')
     p.add_argument('--freeze-semantic',action='store_true',help='channel-only control; freeze both semantic modules in ALL communication updates')
     for phase,steps in zip(PHASES,(2000,1000,2000,2000)):
         p.add_argument('--'+phase.replace('_','-')+'-steps',type=int,default=steps)
@@ -188,7 +190,7 @@ def main(args,max_updates=None):
     context = {} if args.context_variant=='baseline' else dict(context_centers=tuple(args.context_centers),
         context_neighbors=tuple(args.context_neighbors),context_radii=tuple(args.context_radii))
     cfg=ModularCodecConfig(sh_degree=degree,latent_dim=args.latent_dim,decoder_geometry=args.decoder_geometry,
-        channel_variant=args.channel_variant,channel_hidden=args.channel_hidden,
+        channel_variant=args.channel_variant,channel_hidden=args.channel_hidden,rates=(0,*args.rates),
         context_variant=args.context_variant,**context,
         **{k:common[k] for k in ('hidden','grid_dim','levels','planes','depth','block_size','morton_bits','decoder_window','attention_heads') if k in common})
     resumed_rng=saved_scene=None
@@ -274,6 +276,7 @@ def main(args,max_updates=None):
     else:
         print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen; semantic decoder {'FROZEN' if args.freeze_semantic else 'trainable in render'}.",flush=True)
     print(f'Channel variant: {cfg.channel_variant}; hidden={cfg.hidden if cfg.channel_variant=="baseline" else cfg.channel_hidden}',flush=True)
+    print(f'Channel budgets (complex symbols/Gaussian): {cfg.rates[1:]}; latent dimension: {cfg.latent_dim}',flush=True)
     if args.semantic_color_every:
         print(f'Color supervision: every {args.semantic_color_every} bootstrap updates; {args.semantic_color_directions} directions, unclipped RGB; all render updates retain scene RGB MSE.',flush=True)
     if not args.resume:

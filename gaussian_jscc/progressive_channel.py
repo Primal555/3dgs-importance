@@ -1,4 +1,4 @@
-"""Receiver-side latent refinement, with exactly the existing 4/12/24 prefixes.
+"""Receiver-side latent refinement using three configurable progressive prefixes.
 
 The transmitter remains the residual channel encoder. Only received symbol
 segments and earlier recovered latents enter the refinement stages: no clean
@@ -47,7 +47,7 @@ class ProgressiveChannelDecoder(nn.Module):
         """Return cumulative latents; unavailable stages retain the last value.
 
         Lower stages never receive the final tier identity. Thus q3's first
-        recovered latent is identical to q1's under the same first 4 symbols.
+        recovered latent is identical to q1's under the same base prefix.
         Joint gradients into earlier stages are deliberately NOT detached.
         Entirely unused stages are skipped, leaving their gradients None and
         preventing Adam momentum updates on q1-only batches.

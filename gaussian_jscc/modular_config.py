@@ -52,9 +52,12 @@ class ModularCodecConfig:
         if type(self.latent_dim) is not int or self.latent_dim < 1:
             raise ValueError('latent_dim must be a positive integer')
         if (self.position_delivery != 'quantized' or self.position_bits != 16 or
-                self.prefix_mode != 'progressive' or self.decoder_mode != 'direct' or
-                tuple(self.rates) != (0, 4, 12, 24)):
-            raise ValueError('modular experiment requires reliable 16bit XYZ and 4/12/24 progressive prefixes')
+                self.prefix_mode != 'progressive' or self.decoder_mode != 'direct'):
+            raise ValueError('modular experiment requires reliable 16bit XYZ and progressive prefixes')
+        self.rates = tuple(self.rates)
+        if (len(self.rates) != 4 or any(type(r) is not int for r in self.rates)
+                or self.rates[0] != 0 or any(a >= b for a, b in zip(self.rates, self.rates[1:]))):
+            raise ValueError('modular rates require q0=0 and three strictly increasing positive integer budgets')
         # Composition reuses transport validation without subclassing legacy config.
         values = asdict(self)
         values.pop('latent_dim')
