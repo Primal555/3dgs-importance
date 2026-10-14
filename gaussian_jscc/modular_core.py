@@ -38,11 +38,11 @@ class ChannelEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        h=cfg.channel_hidden if cfg.channel_variant=='residual' else cfg.hidden
+        h=cfg.channel_hidden if cfg.channel_variant in ('residual','progressive') else cfg.hidden
         self.input = nn.Linear(cfg.latent_dim, h)
         self.snr = nn.Sequential(nn.Linear(1, h), nn.GELU(), nn.Linear(h, h))
         self.readout = nn.Sequential(nn.GELU(), nn.Linear(h, 2*cfg.rates[-1]))
-        if cfg.channel_variant=='residual':
+        if cfg.channel_variant in ('residual','progressive'):
             self.blocks=nn.ModuleList(ChannelResidualBlock(h) for _ in range(3))
 
     def forward(self, y, active, snr):

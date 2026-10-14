@@ -16,7 +16,11 @@ class ModularGaussianCodec(nn.Module):
         self.register_buffer('attr_std',torch.ones(cfg.attr_dim))
         self.semantic_encoder = SemanticEncoder(cfg)
         self.channel_encoder = ChannelEncoder(cfg)
-        self.channel_decoder = ChannelDecoder(cfg)
+        if cfg.channel_variant == 'progressive':
+            from .progressive_channel import ProgressiveChannelDecoder
+            self.channel_decoder = ProgressiveChannelDecoder(cfg)
+        else:
+            self.channel_decoder = ChannelDecoder(cfg)
         self.semantic_decoder = SemanticDecoder(cfg)
         if cfg.context_variant != 'baseline':
             from .pointnet_context import SpatialPointContext

@@ -60,7 +60,7 @@ class ModularCodecConfig:
         values.pop('latent_dim')
         for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden'):
             values.pop(key)
-        if self.channel_variant not in ('baseline','residual'):
+        if self.channel_variant not in ('baseline','residual','progressive'):
             raise ValueError('unknown channel variant')
         if type(self.channel_hidden) is not int or self.channel_hidden<1:
             raise ValueError('channel_hidden must be a positive integer')

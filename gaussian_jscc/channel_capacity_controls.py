@@ -12,7 +12,7 @@ from .modular_experiment import parser as training_parser, json_write
 from .modular_plots import read_rows
 from .pointnet_context_controls import summarize as summarize_quality
 
-GROUPS=('baseline','residual')
+GROUPS=('baseline','residual','progressive')
 
 
 def parser():
@@ -20,7 +20,7 @@ def parser():
     p.description=__doc__
     p.set_defaults(semantic_bootstrap_steps=0,semantic_render_steps=0,
                    freeze_semantic=True,color_metrics=True)
-    p.add_argument('--groups',nargs='+',choices=GROUPS,default=list(GROUPS))
+    p.add_argument('--groups',nargs='+',choices=GROUPS,default=['baseline','residual'])
     p.add_argument('--resume-suite',action='store_true')
     p.add_argument('--dry-run',action='store_true')
     p.add_argument('--summarize-only',action='store_true')
@@ -58,12 +58,18 @@ def build_plan(args):
             common+=['--'+key.replace('_','-')]+[str(v) for v in (value if isinstance(value,(list,tuple)) else [value])]
     jobs=[{'group':group,'command':[sys.executable,'-u','-m','gaussian_jscc.modular_experiment',
            *common,'--out',str(Path(args.out).resolve()/group),'--channel-variant',group]} for group in args.groups]
-    return {'version':1,'jobs':jobs,'groups':args.groups,'rates':[0,4,12,24],
+    plan={'version':1,'jobs':jobs,'groups':args.groups,'rates':[0,4,12,24],
             'teacher_file_sha256':hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
             'teacher':str(checkpoint),'semantic_modules':'frozen in both communication phases',
             'losses':'latent MSE then source render MSE + unchanged latent MSE',
             'training_layout_cycle':['1','2','3','mixed'],'matched_rng_seed':args.seed+17,
             'parameter_and_compute_matched':False,'power_normalization':'unchanged per-point per-segment'}
+    if 'progressive' in args.groups:
+        plan['progressive_design']={'encoder':'unchanged residual encoder',
+            'decoder':'base latent + suffix-conditioned latent correction + suffix-conditioned latent correction',
+            'previous_latent_gradients':'joint; not detached','permanent_stage_freezing':False,
+            'extra_side_information':False,'monotonic_quality_guarantee':False}
+    return plan
 
 
 def semantic_digest(state):

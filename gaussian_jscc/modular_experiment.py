@@ -35,8 +35,8 @@ def parser():
     p.add_argument('--context-neighbors',nargs=2,type=int,default=[16,32])
     p.add_argument('--context-radii',nargs=2,type=float,default=[2.,4.])
     p.add_argument('--blocks-per-batch',type=int,help='override source batch size, identically in all control arms')
-    p.add_argument('--channel-variant',choices=['baseline','residual'],default='baseline')
-    p.add_argument('--channel-hidden',type=int,default=192,help='width of opt-in residual channel modules only')
+    p.add_argument('--channel-variant',choices=['baseline','residual','progressive'],default='baseline')
+    p.add_argument('--channel-hidden',type=int,default=192,help='width of opt-in residual/progressive channel modules')
     p.add_argument('--freeze-semantic',action='store_true',help='channel-only control; freeze both semantic modules in ALL communication updates')
     for phase,steps in zip(PHASES,(2000,1000,2000,2000)):
         p.add_argument('--'+phase.replace('_','-')+'-steps',type=int,default=steps)
