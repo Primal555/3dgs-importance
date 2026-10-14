@@ -84,7 +84,8 @@ def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr
 
 
 @torch.no_grad()
-def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,condition_policy='trained_range',reference_snr=10.,verbose=False):
+def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,condition_policy='trained_range',reference_snr=10.,verbose=False,
+                   clean_only=False,color_metrics=False,save_phase_images=False):
     from .rendering import render
     from .cli import seed_all
     if not scene.val_cameras or trials<1 or not snrs or any(not math.isfinite(s) for s in snrs):
@@ -92,15 +93,16 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
     conditioning_pair(model,snrs[0],condition_policy,reference_snr)
     out=Path(out); (out/'metrics').mkdir(parents=True,exist_ok=True)
     device=next(model.parameters()).device; mode=model.training; records=[]
-    identity=model_id(model)
+    identity=None if clean_only else model_id(model)
     try:
         with preserved_rng(device):
             model.eval(); seed_all(seed)
             # Generate once on CPU; independent of padding and subsequent noise.
             mixed=[torch.where(ids>=0,torch.randint(1,4,ids.shape),0) for ids in scene.group_ids]
             paths=[('clean','clean',10.,1)]
-            paths += [('finite_noiseless',q,10.,1) for q in ('1','2','3','mixed')]
-            paths += [('awgn',q,float(snr),trials) for snr in snrs for q in ('1','2','3','mixed')]
+            if not clean_only:
+                paths += [('finite_noiseless',q,10.,1) for q in ('1','2','3','mixed')]
+                paths += [('awgn',q,float(snr),trials) for snr in snrs for q in ('1','2','3','mixed')]
             for path,layout,snr,ntrials in paths:
                 started=time.perf_counter()
                 tx_snr,rx_snr=conditioning_pair(model,snr,condition_policy,reference_snr)
@@ -116,9 +118,15 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
                         image=render(raw,camera,scene.degree,getattr(scene,'white_background',False))
                         source=scene.reference.get(camera,device); photo=camera.original_image.to(device)
                         metrics={prefix+'_'+k:v for prefix,target in [('source',source),('photo',photo)] for k,v in image_metrics(image,target).items()}
+                        if color_metrics:
+                            from .appearance_metrics import appearance_metrics
+                            for prefix,target in [('source',source),('photo',photo)]:
+                                metrics.update({prefix+'_color_'+k:v for k,v in appearance_metrics(image,target).items()})
                         views.append(metrics); per_view.append(dict(metrics,trial=trial,view=i,image_name=str(camera.image_name)))
-                        if save_images and phase in ('initial','final') and trial==0 and path in ('clean','awgn') and snr==10 and i in (0,len(scene.val_cameras)-1):
-                            save_panel(out/'images'/phase/f'{path}_{layout}_view{i:04d}.png',photo,source,image,f'{path} / {layout}')
+                        endpoint=phase in ('initial','final') or (save_phase_images and phase=='semantic_bootstrap_end')
+                        if save_images and endpoint and trial==0 and path in ('clean','awgn') and snr==10 and i in (0,len(scene.val_cameras)-1):
+                            folder='end_semantic_bootstrap' if phase=='semantic_bootstrap_end' else phase
+                            save_panel(out/'images'/folder/f'{path}_{layout}_view{i:04d}.png',photo,source,image,f'{path} / {layout}')
                     measurements.append({k:float(np.mean([v[k] for v in views])) for k in views[0]})
                 row={'step':step,'phase':phase,'path':path,'layout':layout,'actual_snr':None if path=='clean' else snr,
                      'tx_condition_snr':None if path=='clean' else tx_snr,

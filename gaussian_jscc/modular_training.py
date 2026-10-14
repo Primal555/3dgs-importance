@@ -3,7 +3,7 @@ import math
 import torch
 from torch.nn import functional as F
 from .data import to_raw
-from .local_response import local_response_loss
+from .local_response import local_response_loss, directional_color_loss, camera_directions
 from .training import full_scene_step
 from .optimization import clip_codec_gradients, update_stats
 from .position_delivery import delivered_positions
@@ -108,6 +108,37 @@ def bootstrap_step(model, features, q, geometry, snr, kind, phase, directions=No
     y=latent['y'][active]
     stats.update(objective='local_response_mse',latent_mean=float(y.mean()),latent_std=float(y.std(unbiased=False)),
                  latent_mse=float((latent.get('y_hat',latent['y'])[active]-y).square().mean()))
+    return loss.detach(),stats
+
+
+def color_bootstrap_step(model, features, q, geometry, training_camera_centers, views=8):
+    """Clean semantic update; half camera directions, half uniform sphere.
+
+    Other attribute heads receive no Adam/momentum update. Shared semantic
+    features do change; consequently non-color predictions are not guaranteed
+    to stay fixed. Both channel modules remain frozen by configure_phase.
+    """
+    if type(views) is not int or views<2 or views%2:
+        raise ValueError('color directions must be an even integer >=2')
+    model.set_scene_geometry(geometry)
+    active=q>0
+    if not active.any(): raise ValueError('color bootstrap requires active Gaussians')
+    centers=torch.as_tensor(training_camera_centers,device=features.device,dtype=features.dtype)
+    if centers.ndim!=2 or centers.shape[-1]!=3 or not len(centers) or not torch.isfinite(centers).all():
+        raise ValueError('finite nonempty training camera centers required')
+    camera_ids=torch.randint(len(centers),(views//2,),device=features.device)
+    selected=centers[camera_ids]
+    points=geometry.denormalize(features[active][:,:3])
+    camera=camera_directions(points,selected)
+    sphere=F.normalize(torch.randn(views//2,3,device=features.device,dtype=features.dtype),dim=-1)
+    directions=torch.cat((camera,sphere[None].expand(len(points),-1,-1)),1)
+    pred=predict(model,features,q,10.,'none','semantic_bootstrap')
+    loss,stats=directional_color_loss(pred[active],features[active],model,directions)
+    loss.backward()
+    for name in ('opacity','scale','rotation'):
+        for p in model.semantic_decoder.heads[name].parameters(): p.grad=None
+    stats.update(color_camera_directions=views//2,color_uniform_directions=views//2,
+                 color_training_camera_indices=camera_ids.cpu().tolist())
     return loss.detach(),stats
 
 

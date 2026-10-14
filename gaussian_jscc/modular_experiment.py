@@ -11,7 +11,7 @@ from .data import read_ply
 from .multiscene import Scene,manifest,shared_statistics,parser as scene_parser
 from .modular_config import ModularCodecConfig
 from .modular_codec import ModularGaussianCodec
-from .modular_training import MODULES,PHASE_MODULES,configure_phase,bootstrap_step,render_step,finish_update,objective_settings
+from .modular_training import MODULES,PHASE_MODULES,configure_phase,bootstrap_step,color_bootstrap_step,render_step,finish_update,objective_settings
 from .modular_checkpoint import (capture_rng,restore_rng,save_training_checkpoint,restore_training_checkpoint,
                                 initialize_channel_run,validate_scene)
 from .modular_evaluation import evaluate_paths
@@ -50,6 +50,12 @@ def parser():
     group.add_argument('--resume',help='exact optimizer/RNG/progress continuation in SAME out directory')
     group.add_argument('--init-semantic',help='completed semantic_render checkpoint; new communication experiment')
     p.add_argument('--with-direct-control',action='store_true',help='additional random 3000+2000 direct control; not FLOP matched')
+    p.add_argument('--clean-only',action='store_true',help='no channel training, invocation or communication evaluation')
+    p.add_argument('--semantic-color-every',type=int,default=0,
+                   help='every Nth semantic bootstrap update uses independent unclipped direction RGB MSE; 0 disables')
+    p.add_argument('--semantic-color-directions',type=int,default=8,help='even number; half training cameras, half uniform sphere')
+    p.add_argument('--color-metrics',action='store_true',help='log uncorrected RGB bias and channel-difference errors')
+    p.add_argument('--save-semantic-end-images',action='store_true',help='also save representative images after semantic bootstrap')
     return p
 
 
@@ -148,6 +154,17 @@ def main(args,max_updates=None):
     from .rendering import load_cameras
     objectives=objective_settings(args.channel_latent_weight)
     counts={phase:getattr(args,phase+'_steps') for phase in PHASES}
+    if args.clean_only and (counts['channel_bootstrap'] or counts['channel_render'] or args.init_semantic or args.with_direct_control):
+        raise ValueError('clean-only requires zero channel budgets, no semantic initializer or direct control')
+    if args.semantic_color_every<0 or args.semantic_color_directions<2 or args.semantic_color_directions%2:
+        raise ValueError('color interval must be nonnegative; direction count must be even and >=2')
+    if args.semantic_color_every:
+        objectives=dict(objectives,semantic_bootstrap_color={'version':'directional_color_mse_unclipped_v1',
+            'every':args.semantic_color_every,'directions':args.semantic_color_directions,
+            'sampling':'half training camera-to-point; half uniform sphere; unclipped; no alpha or footprint'})
+    if args.clean_only: objectives=dict(objectives,clean_only=True)
+    evaluation_options={'clean_only':args.clean_only,'color_metrics':args.color_metrics,
+                        'save_phase_images':args.save_semantic_end_images}
     if min(counts.values())<0 or min(args.validate_every,args.save_every,args.cpu_threads)<1 or not args.train_snrs or any(not math.isfinite(s) for s in args.train_snrs):
         raise ValueError('invalid step budgets, intervals or training SNRs')
     lrs={name:getattr(args,name+'_lr') for name in MODULES}
@@ -179,6 +196,8 @@ def main(args,max_updates=None):
             counts.update(semantic_bootstrap=0,semantic_render=0)
         for key,current in [('phase_budgets',counts),('module_lrs',lrs),('train_snrs',args.train_snrs),('seed',args.seed)]:
             if previous[key]!=current: raise ValueError('exact resume settings mismatch: '+key)
+        for key in ('color_metrics','save_semantic_end_images'):
+            if previous.get(key,False)!=getattr(args,key): raise ValueError('exact resume evaluation settings mismatch: '+key)
         model,optimizer,progress,resumed_rng,saved_scene=restore_training_checkpoint(args.resume,device)
         if progress.get('training_objective')!=objectives:
             raise ValueError('checkpoint objective mismatch')
@@ -194,6 +213,9 @@ def main(args,max_updates=None):
                   'training_objective':objectives}
     model.set_training_snrs(args.train_snrs)
     scene=make_scene(spec,raw,degree,model,source,old,out); del raw
+    color_camera_centers=None
+    if args.semantic_color_every:
+        color_camera_centers=torch.stack([torch.as_tensor(c.camera_center).detach().cpu() for c in scene.cameras]).to(device)
     if saved_scene is not None: validate_scene(saved_scene,scene.record)
     if args.init_semantic:
         init=torch.load(args.init_semantic,map_location='cpu',weights_only=True)
@@ -210,8 +232,13 @@ def main(args,max_updates=None):
             'step_definition':'one real optimizer update; no accumulation',
             'trainable_modules':PHASE_MODULES,'parameters':{n:sum(p.numel() for p in getattr(model,n).parameters()) for n in MODULES},
             'training_objective':objectives,
+            'clean_only':args.clean_only,'color_metrics':args.color_metrics,'save_semantic_end_images':args.save_semantic_end_images,
+            'semantic_color_every':args.semantic_color_every,'semantic_color_directions':args.semantic_color_directions,
+            'color_update_counts':{'directional':counts['semantic_bootstrap']//args.semantic_color_every if args.semantic_color_every else 0,
+                'local_response':counts['semantic_bootstrap']-(counts['semantic_bootstrap']//args.semantic_color_every if args.semantic_color_every else 0)},
             'snr_condition_policy':'trained_range; actual channel SNR remains unchanged',
-            'losses':{'semantic_bootstrap':'local response MSE','semantic_render':'source PLY RGB MSE',
+            'losses':{'semantic_bootstrap':'local response MSE; separately scheduled directional RGB MSE' if args.semantic_color_every else 'local response MSE',
+                      'semantic_render':'source PLY RGB MSE',
                       'channel_bootstrap':'latent MSE against frozen semantic encoder',
                       'channel_render':'source PLY RGB MSE + channel_latent_weight * latent MSE'},
             'clip_mode':'none','render_backward':'replay','shared_model_cost':'excluded, assumed shared in advance',
@@ -231,9 +258,14 @@ def main(args,max_updates=None):
             report[side]=geometry_diagnostics(xyz,active,scene.geometry,cfg)
         json_write(out/'metrics/spatial_neighborhoods.json',report)
     print(f"Spatial context: {cfg.context_variant}; internal centers={cfg.context_centers}; neighbors={cfg.context_neighbors}; radii={cfg.context_radii}",flush=True)
-    print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen in both communication phases.",flush=True)
+    if args.clean_only:
+        print('CLEAN ONLY: semantic latent is handed directly to semantic decoder; both channel modules unused. Not a communication-rate result.',flush=True)
+    else:
+        print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen in both communication phases.",flush=True)
+    if args.semantic_color_every:
+        print(f'Color supervision: every {args.semantic_color_every} bootstrap updates; {args.semantic_color_directions} directions, unclipped RGB; all render updates retain scene RGB MSE.',flush=True)
     if not args.resume:
-        evaluate_paths(model,scene,step=0,phase='initial',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out)
+        evaluate_paths(model,scene,step=0,phase='initial',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out,**evaluation_options)
 
     def save(label):
         save_training_checkpoint(out/'checkpoints'/label/'codec.pt',model,optimizer,progress,capture_rng(),scene.record)
@@ -242,6 +274,12 @@ def main(args,max_updates=None):
     updated=0
     for phase in PHASES:
         if progress['completed'][phase]>=counts[phase]:
+            if (phase=='semantic_bootstrap' and counts[phase]>0 and args.save_semantic_end_images
+                    and progress['phase']==phase and progress.get('phase_complete')
+                    and not (out/'images/end_semantic_bootstrap/complete.json').exists()):
+                evaluate_paths(model,scene,step=progress['step'],phase=phase+'_end',snrs=[10],trials=2,
+                               seed=args.seed,save_images=True,out=out,**evaluation_options)
+                json_write(out/'images/end_semantic_bootstrap/complete.json',{'step':progress['step']})
             # A latest checkpoint can be written at the last update just before
             # interruption, before the phase-end snapshot is materialized.
             if (counts[phase]>0 and progress['phase']==phase and progress.get('phase_complete') and
@@ -252,7 +290,7 @@ def main(args,max_updates=None):
         if not continuing: optimizer=configure_phase(model,phase,lrs)
         progress.update(phase=phase,phase_step=progress['completed'][phase],phase_complete=False)
         model.train()
-        evaluate_paths(model,scene,step=progress['step'],phase=phase+'_start',snrs=[10],trials=2,seed=args.seed,save_images=False,out=out)
+        evaluate_paths(model,scene,step=progress['step'],phase=phase+'_start',snrs=[10],trials=2,seed=args.seed,save_images=False,out=out,**evaluation_options)
         while progress['completed'][phase]<counts[phase]:
             phase_step=progress['completed'][phase]+1
             snr=random.choice(args.train_snrs)  # Exactly one draw per real update, never per block/replay.
@@ -264,7 +302,10 @@ def main(args,max_updates=None):
             start=time.perf_counter(); indices=[]
             if phase.endswith('bootstrap'):
                 index=random.randrange(len(scene.groups)); features=scene.groups[index].to(device); q=qs[index].to(device)
-                loss,stats=bootstrap_step(model,features,q,scene.geometry,snr,'awgn',phase)
+                if phase=='semantic_bootstrap' and args.semantic_color_every and phase_step%args.semantic_color_every==0:
+                    loss,stats=color_bootstrap_step(model,features,q,scene.geometry,color_camera_centers,args.semantic_color_directions)
+                else:
+                    loss,stats=bootstrap_step(model,features,q,scene.geometry,snr,'awgn',phase)
             else:
                 indices=random.sample(range(len(scene.cameras)),scene.views_per_step)
                 task=MultiViewRenderTask([scene.cameras[i] for i in indices],scene.reference,degree,scene.white_background)
@@ -276,10 +317,11 @@ def main(args,max_updates=None):
             elapsed=time.perf_counter()-start
             progress['step']+=1; progress['phase_step']=phase_step; progress['completed'][phase]=phase_step
             if phase.startswith('channel'): progress['channel_trained']=scene.channel_trained=True
-            row=dict(stats,step=progress['step'],phase_step=phase_step,phase=phase,loss=float(loss),layout=layout,snr=snr,
+            row=dict(stats,step=progress['step'],phase_step=phase_step,phase=phase,loss=float(loss),layout=layout,
+                     snr=None if args.clean_only else snr,
                      objective_version=objectives['version'],
-                     actual_snr=snr if phase.startswith('channel') else None,tx_condition_snr=snr,
-                     rx_condition_snr=snr,condition_policy='trained_range',
+                     actual_snr=snr if phase.startswith('channel') else None,tx_condition_snr=None if args.clean_only else snr,
+                     rx_condition_snr=None if args.clean_only else snr,condition_policy='trained_range',
                      step_seconds=elapsed,training_view_indices=indices,module_lrs={g['name']:g['lr'] for g in optimizer.param_groups},
                      trainable_parameters={n:sum(p.numel() for p in getattr(model,n).parameters() if p.requires_grad) for n in MODULES},
                      frozen_parameters_unchanged=True,
@@ -289,22 +331,28 @@ def main(args,max_updates=None):
             if phase_step==1 or phase_step%10==0 or phase_step==counts[phase]:
                 detail=f", latent_mse={stats['latent_mse']:.6g}, latent_nmse={stats['latent_nmse']:.6g}" if phase.startswith('channel') else ''
                 if phase=='channel_render': detail+=f", render_mse={stats['render_loss']:.6g}, weighted_latent={stats['weighted_latent_loss']:.6g}"
-                print(f"{phase} {phase_step}/{counts[phase]}: loss={float(loss):.6g}, q={layout}, snr={snr:g}, grad={stats['grad_norm']:.4g}, sec={elapsed:.2f}{detail}",flush=True)
+                if args.semantic_color_every and phase=='semantic_bootstrap': detail+=f", objective={stats['objective']}"
+                displayed_snr='bypass' if args.clean_only else f'{snr:g}'
+                print(f"{phase} {phase_step}/{counts[phase]}: loss={float(loss):.6g}, q={layout}, snr={displayed_snr}, grad={stats['grad_norm']:.4g}, sec={elapsed:.2f}{detail}",flush=True)
             if progress['step']%args.validate_every==0:
-                evaluate_paths(model,scene,step=progress['step'],phase=phase,snrs=[10],trials=2,seed=args.seed,save_images=False,out=out)
+                evaluate_paths(model,scene,step=progress['step'],phase=phase,snrs=[10],trials=2,seed=args.seed,save_images=False,out=out,**evaluation_options)
             progress['phase_complete']=phase_step==counts[phase]
             if progress['step']%args.save_every==0: save('latest')
             updated+=1
             if max_updates is not None and updated>=max_updates:
                 save('latest'); return progress
-        evaluate_paths(model,scene,step=progress['step'],phase=phase+'_end',snrs=[10],trials=2,seed=args.seed,save_images=False,out=out)
+        evaluate_paths(model,scene,step=progress['step'],phase=phase+'_end',snrs=[10],trials=2,seed=args.seed,
+                       save_images=args.save_semantic_end_images and phase=='semantic_bootstrap',out=out,**evaluation_options)
+        if args.save_semantic_end_images and phase=='semantic_bootstrap':
+            json_write(out/'images/end_semantic_bootstrap/complete.json',{'step':progress['step']})
         save('end_'+phase); save('latest')
     # Final endpoint images use the SAME validation cameras as the initial endpoint.
-    evaluate_paths(model,scene,step=progress['step'],phase='final',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out)
+    evaluate_paths(model,scene,step=progress['step'],phase='final',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out,**evaluation_options)
     tests=load_cameras(spec['source'],scene.record['resolution'],scene.white_background,scene.record['images'],'test')
     if not tests: raise ValueError('no test cameras; refusing to substitute training views for final test')
     scene.val_cameras=tests
-    evaluate_paths(model,scene,step=progress['step'],phase='test',snrs=[0,5,10,15,20],trials=2,seed=args.seed,save_images=False,out=out)
+    evaluate_paths(model,scene,step=progress['step'],phase='test',snrs=[10] if args.clean_only else [0,5,10,15,20],
+                   trials=2,seed=args.seed,save_images=False,out=out,**evaluation_options)
     save('final'); save('latest')
     rows=[json.loads(l) for l in (out/'metrics/loss.jsonl').read_text(encoding='utf-8').splitlines()] if (out/'metrics/loss.jsonl').exists() else []
     summaries={p:{'updates':len(part),'total_step_seconds':sum(r['step_seconds'] for r in part),

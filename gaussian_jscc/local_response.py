@@ -80,6 +80,38 @@ def camera_directions(points, camera_centers):
     return F.normalize(delta, dim=-1)
 
 
+def directional_color_loss(pred, target, model, directions):
+    """Unclipped SH RGB MSE, independent of alpha, scale, rotation and XYZ.
+
+    Inputs are row-aligned normalized [N,D] features. Teacher attributes are
+    detached. Directions are [V,3] or [N,V,3], in the renderer's camera->point
+    convention. This supervision is training-only, never receiver side data.
+    """
+    if (pred.ndim != 2 or pred.shape != target.shape or not len(pred)
+            or pred.shape[1] != 3+model.cfg.attr_dim):
+        raise ValueError('color supervision requires nonempty matching feature rows')
+    if (directions.ndim not in (2,3) or directions.shape[-1] != 3 or directions.shape[-2] < 1
+            or (directions.ndim == 3 and directions.shape[0] != len(pred))
+            or not torch.isfinite(directions).all() or (directions.norm(dim=-1)<1e-8).any()):
+        raise ValueError('finite nonzero [V,3] or [N,V,3] color directions required')
+    directions=F.normalize(directions.detach().to(pred),dim=-1)
+    if directions.ndim == 2: directions=directions[None]
+    degree=model.cfg.sh_degree
+    def colors(features):
+        coefficients=features[:,11:]*model.attr_std[8:]+model.attr_mean[8:]
+        dc=coefficients[:,:3,None]
+        rest=coefficients[:,3:].reshape(len(features),3,(degree+1)**2-1)
+        sh=torch.cat((dc,rest),-1)
+        return eval_sh(degree,sh[:,None],directions)+.5
+    difference=colors(pred)-colors(target.detach()).detach()
+    loss=difference.square().mean()
+    if not torch.isfinite(loss): raise RuntimeError('nonfinite directional color loss')
+    return loss, {'objective':'directional_color_mse_unclipped_v1',
+                  'directional_color_mse':float(loss.detach()),'color_directions':directions.shape[-2],
+                  **{f'directional_color_{c}_bias':float(difference[...,i].detach().mean())
+                     for i,c in enumerate('rgb')}}
+
+
 def local_response_loss(pred, target, geometry, model, views=4, directions=None):
     """Mean RGB response MSE per active Gaussian/view/probe/background.
 

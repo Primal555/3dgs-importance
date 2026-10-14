@@ -22,7 +22,9 @@ def plot_run(out):
         fig,axes=plt.subplots(2,2,figsize=(12,7),layout='constrained')
         for ax,phase in zip(axes.flat,PHASE_MODULES):
             rows=[r for r in losses if r['phase']==phase]
-            if rows: ax.plot([r['phase_step'] for r in rows],[r['loss'] for r in rows],linewidth=.8,label='Total objective')
+            for objective in dict.fromkeys(r.get('objective','Total objective') for r in rows):
+                selected=[r for r in rows if r.get('objective','Total objective')==objective]
+                ax.plot([r['phase_step'] for r in selected],[r['loss'] for r in selected],linewidth=.8,label=objective)
             if phase=='channel_render':
                 for key,label in [('render_loss','Render MSE'),('weighted_latent_loss','Weighted latent MSE')]:
                     selected=[r for r in rows if key in r]
@@ -55,6 +57,30 @@ def plot_run(out):
         ax.set(xlabel='Global real updates',ylabel='Mean per-view source PSNR (dB)',title='Same fixed validation views; clean remeasured every time')
         ax.grid(alpha=.2); ax.legend(fontsize=8,ncol=3)
         save(fig,'validation_paths.png')
+        quality_rows={r['step']:r for r in validation if r['path']=='clean'
+                      and all(k in r for k in ('source_psnr','photo_psnr','source_ssim','photo_ssim'))}
+        if quality_rows:
+            series=[quality_rows[k] for k in sorted(quality_rows)]
+            fig,axes=plt.subplots(1,2,figsize=(12,4),layout='constrained')
+            for ax,metric,label in zip(axes,('psnr','ssim'),('PSNR (dB)','SSIM')):
+                for reference in ('source','photo'):
+                    ax.plot([r['step'] for r in series],[r[reference+'_'+metric] for r in series],label=reference)
+                ax.set(xlabel='Actual optimizer updates',ylabel=label); ax.grid(alpha=.2); ax.legend(fontsize=8)
+            fig.suptitle('Clean reconstruction vs source PLY and photos; fixed held-out validation cameras')
+            save(fig,'clean_quality.png')
+        color_rows={r['step']:r for r in validation if r['path']=='clean' and 'source_color_rg_error_rmse' in r}
+        if color_rows:
+            series=[color_rows[k] for k in sorted(color_rows)]
+            fig,axes=plt.subplots(1,2,figsize=(12,4),layout='constrained')
+            for key,label in [('rg_error_rmse','R-G error RMSE'),('gb_error_rmse','G-B error RMSE')]:
+                axes[0].plot([r['step'] for r in series],[r['source_color_'+key] for r in series],label=label)
+            for channel in 'rgb':
+                axes[1].plot([r['step'] for r in series],[r[f'source_color_{channel}_bias'] for r in series],label=channel.upper()+' bias')
+            axes[1].axhline(0,color='gray',linestyle='--',linewidth=.8)
+            for ax in axes:
+                ax.set(xlabel='Actual optimizer updates',ylabel='RGB units (0-1 scale)'); ax.grid(alpha=.2); ax.legend(fontsize=8)
+            fig.suptitle('Clean color errors vs source PLY; bias may cancel, not perceptual Delta-E')
+            save(fig,'color_errors.png')
         latent_rows=[r for r in validation if r['path']!='clean' and r['actual_snr']==10 and 'latent_nmse' in r]
         if latent_rows:
             fig,axes=plt.subplots(1,2,figsize=(12,4),layout='constrained')
@@ -70,7 +96,7 @@ def plot_run(out):
                 ax.set_yscale('symlog',linthresh=1e-6); ax.grid(alpha=.2); ax.legend(fontsize=8)
             fig.suptitle('Fixed validation points; NMSE = latent MSE / target mean-square power')
             save(fig,'latent_reconstruction.png')
-    if final:
+    if any(r['path']=='awgn' for r in final):
         fig,axes=plt.subplots(1,2,figsize=(12,4),layout='constrained')
         for ax,metric in zip(axes,('source_psnr','photo_psnr')):
             for layout in ('1','2','3','mixed'):
