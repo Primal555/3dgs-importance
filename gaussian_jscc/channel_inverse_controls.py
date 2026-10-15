@@ -1,4 +1,4 @@
-"""Paired channel-only continuation: exact source Adam, no noise vs 10 dB."""
+"""Paired channel-only inverse, prefix reread and receiver cooperation controls."""
 import argparse
 import copy
 import hashlib
@@ -25,9 +25,11 @@ from .modular_training import bootstrap_step, finish_update
 ARMS={'noiseless':'none','awgn10':'awgn'}
 PREFIX_ARMS={'suffix10':'awgn','full_prefix10':'awgn'}
 SPATIAL_ARMS={'pointwise10':'awgn','spatial10':'awgn'}
+COOPERATIVE_ARMS={'stage_spatial10':'awgn','final_pointwise10':'awgn','final_spatial10':'awgn'}
 
 
 def arms_for(args):
+    if args.suite=='cooperative': return COOPERATIVE_ARMS
     return SPATIAL_ARMS if args.suite=='spatial' else PREFIX_ARMS if args.suite=='prefix' else ARMS
 
 
@@ -49,16 +51,16 @@ def parser():
     p.add_argument('--cpu-threads',type=int,default=4)
     p.add_argument('--resume-suite',action='store_true')
     p.add_argument('--dry-run',action='store_true')
-    p.add_argument('--suite',choices=['inverse','prefix','spatial'],default='inverse',help='opt-in channel controls')
+    p.add_argument('--suite',choices=['inverse','prefix','spatial','cooperative'],default='inverse',help='opt-in channel controls')
     p.add_argument('--denoiser-hidden',type=int,default=64)
     p.add_argument('--denoiser-neighbors',type=int,default=16)
-    p.add_argument('--arm',choices=(*ARMS,*PREFIX_ARMS,*SPATIAL_ARMS),help='internal single-arm entry; normally omit')
+    p.add_argument('--arm',choices=(*ARMS,*PREFIX_ARMS,*SPATIAL_ARMS,*COOPERATIVE_ARMS),help='internal single-arm entry; normally omit')
     return p
 
 
 def source_files(args):
     run=Path(args.run).resolve()
-    if args.suite=='spatial' and not (run/'training.json').exists() and (run/'full_prefix10/training.json').exists():
+    if args.suite in ('spatial','cooperative') and not (run/'training.json').exists() and (run/'full_prefix10/training.json').exists():
         run=run/'full_prefix10'
     if not (run/'training.json').exists() and (run/'progressive/training.json').exists(): run=run/'progressive'
     metadata=json.loads((run/'training.json').read_text(encoding='utf-8'))
@@ -89,7 +91,7 @@ def build_plan(args):
     if args.suite=='prefix' and (metadata['codec_config'].get('channel_variant')!='progressive' or
                                 metadata['codec_config'].get('channel_prefix_mode','suffix')!='suffix'):
         raise ValueError('prefix controls require an original progressive suffix checkpoint')
-    if args.suite=='spatial' and (metadata['codec_config'].get('channel_prefix_mode')!='full_prefix' or
+    if args.suite in ('spatial','cooperative') and (metadata['codec_config'].get('channel_prefix_mode')!='full_prefix' or
             metadata['codec_config'].get('channel_denoiser_mode','none')!='none' or metadata.get('channel_kind')!='awgn' or
             min(args.denoiser_hidden,args.denoiser_neighbors)<1):
         raise ValueError('spatial controls require a completed 10 dB full-prefix source without a denoiser')
@@ -106,7 +108,7 @@ def build_plan(args):
         value=getattr(args,key)
         if value is not None: common+=['--'+key.replace('_','-'),str(value)]
     if args.suite!='inverse': common+=['--suite',args.suite]
-    if args.suite=='spatial':common+=['--denoiser-hidden',str(args.denoiser_hidden),'--denoiser-neighbors',str(args.denoiser_neighbors)]
+    if args.suite in ('spatial','cooperative'):common+=['--denoiser-hidden',str(args.denoiser_hidden),'--denoiser-neighbors',str(args.denoiser_neighbors)]
     plan=dict(version=1,source_run=str(run),checkpoint=str(checkpoint),
         source_checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),source_step=source_step,
         target_step=source_step+args.steps,additional_updates_per_arm=args.steps,rates=metadata['codec_config']['rates'],
@@ -120,12 +122,17 @@ def build_plan(args):
         plan['prefix_control']=dict(readout=['suffix','full_prefix'],
             initialization='function-preserving zero earlier-prefix projection; existing Adam retained; new weights have fresh state',
             parameter_matched=False,transmitted_payload_matched=True)
-    if args.suite=='spatial':
+    if args.suite in ('spatial','cooperative'):
         plan['optimizer']='new Adam for zero-output denoiser branches ONLY; original source modules frozen'
         plan['receiver_context']=dict(modes=['pointwise','spatial'],hidden=args.denoiser_hidden,neighbors=args.denoiser_neighbors,
             initialization='identical hidden weights; zero residual outputs; no clean y at receiver',
             scope='original codec blocks; reliable 16bit XYZ; current-stage prefixes only',
             parameter_matched=True,flop_matched=False,transmitted_payload_matched=True)
+        if args.suite=='cooperative':
+            plan['receiver_context'].update(modes=list(COOPERATIVE_ARMS),
+                scope='stage-spatial reference vs final-only pointwise/spatial using every actually received neighbor prefix',
+                parameter_matched=False,final_pair_parameter_matched=True,
+                stage_reference='three stage branches vs one final branch; not a capacity-controlled causal comparison')
     return plan
 
 
@@ -188,15 +195,18 @@ def run_arm(args,arm,max_updates=None):
         if not resumed:
             from .progressive_channel import enable_full_prefix
             enable_full_prefix(model,optimizer)
-    if args.suite=='spatial':
+    if args.suite in ('spatial','cooperative'):
         from .channel_spatial import enable_channel_denoising
         from .modular_training import configure_phase
-        expected.update(channel_denoiser_mode='spatial' if arm=='spatial10' else 'pointwise',
+        expected.update(channel_denoiser_mode='pointwise' if arm in ('pointwise10','final_pointwise10') else 'spatial',
                         channel_denoiser_hidden=args.denoiser_hidden,channel_denoiser_neighbors=args.denoiser_neighbors)
+        scope='final' if arm.startswith('final_') else 'stage'
+        if scope=='final':expected['channel_denoiser_scope']=scope
         if not resumed:
             # New hidden weights are paired across independently launched arms.
             restore_rng(rng)
-            enable_channel_denoising(model,expected['channel_denoiser_mode'],hidden=args.denoiser_hidden,neighbors=args.denoiser_neighbors)
+            enable_channel_denoising(model,expected['channel_denoiser_mode'],hidden=args.denoiser_hidden,
+                                     neighbors=args.denoiser_neighbors,scope=scope)
             progress=copy.deepcopy(progress);progress['channel_denoiser_only']=True
             progress['module_lrs']['channel_denoiser']=args.lr or progress['module_lrs'].get('channel_decoder',1e-4)
             optimizer=configure_phase(model,'channel_bootstrap',progress['module_lrs'],freeze_semantic=True,denoiser_only=True)
@@ -223,8 +233,9 @@ def run_arm(args,arm,max_updates=None):
             source_usage='completed channel weights, Adam and scene identity; source files are read-only',
             channel_kind=kind,clip_mode='none',color_metrics=True)
         json_write(folder/'training.json',record)
-        if args.suite=='spatial':
+        if args.suite in ('spatial','cooperative'):
             record.update(initialization='full-prefix source weights frozen; only new zero-output denoisers have fresh Adam',
+                          source_usage='completed source weights and scene identity; new denoisers use fresh Adam; source files are read-only',
                           channel_denoiser_only=True,
                           trainable_modules={p:(['channel_decoder.denoisers'] if p=='channel_bootstrap' else []) for p in record['trainable_modules']})
             json_write(folder/'training.json',record)
@@ -281,8 +292,8 @@ def run_arm(args,arm,max_updates=None):
     evaluate_endpoint(model,scene,folder,'final',progress['step'],args.seed)
     save('final'); save('latest')
     done=dict(status='complete',source_step=plan['source_step'],additional_updates=args.steps,
-              total_step=progress['step'],channel_kind=kind,optimizer_moments_retained=args.suite!='spatial',semantic_modules_frozen=True)
-    if args.suite=='spatial':done.update(source_modules_frozen=True,only_new_denoisers_trained=True)
+              total_step=progress['step'],channel_kind=kind,optimizer_moments_retained=args.suite not in ('spatial','cooperative'),semantic_modules_frozen=True)
+    if args.suite in ('spatial','cooperative'):done.update(source_modules_frozen=True,only_new_denoisers_trained=True)
     json_write(folder/'complete.json',done)
     return done
 
@@ -290,8 +301,9 @@ def run_arm(args,arm,max_updates=None):
 def summarize(out):
     from .modular_plots import read_rows
     out=Path(out); destination=out/'comparison'; destination.mkdir(parents=True,exist_ok=True)
-    arms=SPATIAL_ARMS if (out/'spatial10').is_dir() else PREFIX_ARMS if (out/'full_prefix10').is_dir() else ARMS
-    groups=list(arms); first,second=groups
+    arms=(COOPERATIVE_ARMS if (out/'stage_spatial10').is_dir() else SPATIAL_ARMS if (out/'spatial10').is_dir()
+          else PREFIX_ARMS if (out/'full_prefix10').is_dir() else ARMS)
+    groups=list(arms); first,second=groups[:2]
     records={arm:read_rows(out/arm/'metrics/validation.jsonl') for arm in arms}
     finals={arm:{(r['path'],r['layout']):r for r in rs if r['phase']=='final'} for arm,rs in records.items()}
     comparison=[]
@@ -301,16 +313,20 @@ def summarize(out):
             row=dict(path=path,tier=tier)
             for arm,r in pair.items():
                 row[arm]={k:r[k] for k in ('source_psnr','photo_psnr','source_ssim','latent_mse','latent_nmse','symbols_per_gaussian')}
-            delta_key=('spatial_minus_pointwise_psnr_db' if arms is SPATIAL_ARMS else
-                       'full_prefix_minus_suffix_psnr_db' if arms is PREFIX_ARMS else 'noiseless_minus_awgn10_psnr_db')
-            row[delta_key]=(pair[second]['source_psnr']-pair[first]['source_psnr'] if arms is not ARMS
-                            else pair[first]['source_psnr']-pair[second]['source_psnr'])
-            if arms is SPATIAL_ARMS:
+            if arms is COOPERATIVE_ARMS:
+                row['final_spatial_minus_final_pointwise_psnr_db']=pair['final_spatial10']['source_psnr']-pair['final_pointwise10']['source_psnr']
+                row['final_spatial_minus_stage_spatial_psnr_db']=pair['final_spatial10']['source_psnr']-pair['stage_spatial10']['source_psnr']
+            else:
+                delta_key=('spatial_minus_pointwise_psnr_db' if arms is SPATIAL_ARMS else
+                           'full_prefix_minus_suffix_psnr_db' if arms is PREFIX_ARMS else 'noiseless_minus_awgn10_psnr_db')
+                row[delta_key]=(pair[second]['source_psnr']-pair[first]['source_psnr'] if arms is not ARMS
+                                else pair[first]['source_psnr']-pair[second]['source_psnr'])
+            if arms is SPATIAL_ARMS or arms is COOPERATIVE_ARMS:
                 baseline=next(r for r in records[first] if r['phase']=='initial' and r['path']==path and r['layout']==tier)
                 row['full_prefix_source']={k:baseline[k] for k in ('source_psnr','photo_psnr','latent_mse','latent_nmse')}
                 for arm,r in pair.items():row[arm+'_minus_source_psnr_db']=r['source_psnr']-baseline['source_psnr']
             comparison.append(row)
-    # Compare both arms to their identical baseline; do not silently mix view sets.
+    # Compare all arms to their identical baseline; do not silently mix view sets.
     for rs in records.values():
         initial=[r for r in rs if r['phase']=='initial']
         for r in initial:
@@ -320,11 +336,12 @@ def summarize(out):
     matched=True
     required={('clean','clean')}|{(p,t) for p in ('finite_noiseless','awgn') for t in ('1','2','3','mixed')}
     if any(set(initial[a])!=required for a in arms):raise ValueError('missing initial control metrics')
-    if initial[first].keys()!=initial[second].keys(): matched=False
-    else:
-        for key in initial[first]:
-            for metric in ('latent_mse','source_psnr','photo_psnr'):
-                if not math.isclose(initial[first][key][metric],initial[second][key][metric],rel_tol=1e-6,abs_tol=1e-6): matched=False
+    for arm in groups[1:]:
+        if initial[first].keys()!=initial[arm].keys(): matched=False
+        else:
+            for key in initial[first]:
+                for metric in ('latent_mse','source_psnr','photo_psnr'):
+                    if not math.isclose(initial[first][key][metric],initial[arm][key][metric],rel_tol=1e-6,abs_tol=1e-6): matched=False
     if not matched: raise ValueError('control initial functions do not match; comparison is not a paired warm start')
     diagnostics={arm:{endpoint:json.loads((out/arm/'diagnostics'/endpoint/'latent_errors.json').read_text(encoding='utf-8'))
                       for endpoint in ('initial','final')} for arm in arms}
@@ -334,11 +351,13 @@ def summarize(out):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     styles={first:('#356d9b','-','o'),second:('#d88931','--','s')}
-    fig,axes=plt.subplots(2,3,figsize=(13,7),layout='constrained')
+    if arms is COOPERATIVE_ARMS:styles[groups[2]]=('#3c9465','-.','^')
+    tiers=('1','2','3','mixed') if arms is COOPERATIVE_ARMS else ('1','2','3')
+    fig,axes=plt.subplots(2,len(tiers),figsize=(4*len(tiers)+1,7),layout='constrained')
     for arm,rs in records.items():
         color,line,marker=styles[arm]
         for row,path in enumerate(('finite_noiseless','awgn')):
-            for col,tier in enumerate(('1','2','3')):
+            for col,tier in enumerate(tiers):
                 series={r['step']:r for r in rs if r['path']==path and r['layout']==tier}
                 steps=sorted(series)
                 axes[row,col].plot(steps,[series[s]['source_psnr'] for s in steps],color=color,linestyle=line,marker=marker,label=arm)
@@ -359,6 +378,12 @@ def summarize(out):
     fig.savefig(destination/'latent_errors.png',dpi=150); plt.close(fig)
     result=dict(status='complete',groups=groups,matched_initial_function=matched,comparison=comparison,diagnostic_sample_sha256=next(iter(hashes)),
                 warning='one training checkpoint; finite-trial bias estimates are not independent training replications')
+    if arms is COOPERATIVE_ARMS:
+        result['mixed_latent_by_tier']={arm:{endpoint:dict(overall=d['mixed']['overall']['summary'],
+            by_tier=[dict(tier=v['tier'],points=v['points'],summary=v['summary']) for v in d['mixed']['by_tier']],
+            sampling=d['mixed']['sampling'],symbols_per_sampled_gaussian=d['mixed']['symbols_per_sampled_gaussian'])
+            for endpoint,d in stages.items()} for arm,stages in diagnostics.items()}
+        result['control_scope']='final pair: equal nominal parameters and initialization; stage reference has three branches, final pair one'
     json_write(destination/'summary.json',result)
     return result
 

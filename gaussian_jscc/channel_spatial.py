@@ -1,4 +1,4 @@
-"""Receiver-only, stage-causal residual denoising within original codec blocks."""
+"""Receiver-only residual denoising within original codec blocks."""
 import math
 import torch
 from torch import nn
@@ -58,7 +58,8 @@ class ChannelSpatialDenoiser(nn.Module):
         if received.shape!=receive_mask.shape or received.shape[:2]!=active.shape or previous.shape[:2]!=active.shape:
             raise ValueError('invalid receiver denoiser shapes')
         ids,valid,relative=self.neighborhood(xyz,active)
-        # Even in mixed maps no neighboring point can expose a future prefix.
+        # Stage branches cap all donors at their current prefix. The final
+        # branch uses tier=3 and therefore retains every actually received slot.
         stage_mask=receive_mask.bool().clone(); stage_mask[...,2*self.symbols:]=False
         stage_mask &= active[...,None]
         signal=received.masked_fill(~stage_mask,0)
@@ -74,19 +75,21 @@ class ChannelSpatialDenoiser(nn.Module):
         return correction.masked_fill(~active[...,None],0)
 
 
-def enable_channel_denoising(model,mode,*,hidden=64,neighbors=16):
+def enable_channel_denoising(model,mode,*,hidden=64,neighbors=16,scope='stage'):
     from .modular_config import ModularCodecConfig
     if model.cfg.channel_denoiser_mode!='none': raise ValueError('receiver denoiser already enabled')
     values=model.cfg.to_dict()
-    values.update(channel_denoiser_mode=mode,channel_denoiser_hidden=hidden,channel_denoiser_neighbors=neighbors)
+    values.update(channel_denoiser_mode=mode,channel_denoiser_hidden=hidden,channel_denoiser_neighbors=neighbors,
+                  channel_denoiser_scope=scope)
     cfg=ModularCodecConfig.from_dict(values)
     # Preserve the shared initialization/random stream across control modes.
     reference=next(model.parameters())
     with torch.random.fork_rng(devices=[]):
-        blocks=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in (1,2,3)).to(reference)
+        blocks=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in ((3,) if scope=='final' else (1,2,3))).to(reference)
     model.channel_decoder.denoisers=blocks
     model.cfg.channel_denoiser_mode=mode; model.cfg.channel_denoiser_hidden=hidden
     model.cfg.channel_denoiser_neighbors=neighbors
+    model.cfg.channel_denoiser_scope=scope
 
 
 @torch.no_grad()
@@ -106,7 +109,8 @@ def diagnose_context(model,scene,out,*,points,trials,batch_size,seed,snr):
     if total<1:raise ValueError('diagnostics requires active scene points')
     selected=torch.randperm(total,generator=torch.Generator().manual_seed(seed))[:min(points,total)].sort().values
     device=next(model.parameters()).device;mode=model.training;identity=model_id(model)
-    targets=[];signals=[];raw_signals=[];predictions=[[[] for _ in range(trials+1)] for _ in range(3)]
+    targets=[];signals=[];raw_signals=[];predictions=[[[] for _ in range(trials+1)] for _ in range(4)]
+    mixed_tiers=[]
     offset=0
     try:
         with preserved_rng(device):
@@ -123,23 +127,39 @@ def diagnose_context(model,scene,out,*,points,trials,batch_size,seed,snr):
                 targets.append(y[active][local].cpu());signals.append(z[active][local].cpu())
                 raw_signals.append(values['raw'][active][local].cpu())
                 side=delivered_positions(f[...,:3],active.long(),model.cfg)
-                for tier in (1,2,3):
-                    q=active.long()*tier;mask=prefix_mask(q.flatten(),model.cfg.rates).reshape_as(z)
+                for index,tier in enumerate((1,2,3,'mixed')):
+                    if tier=='mixed':
+                        q=torch.randint(1,4,active.shape,generator=torch.Generator().manual_seed(seed+5000003*group)).to(device)
+                        q=q.masked_fill(~active,0)
+                        mixed_tiers.append(q[active][local].cpu())
+                    else: q=active.long()*tier
+                    mask=prefix_mask(q.flatten(),model.cfg.rates).reshape_as(z)
                     for trial in range(-1,trials):
                         generator=torch.Generator(device=device).manual_seed(seed+1000+max(trial,0)+1000003*group)
                         received=channel(z.reshape(-1,2),snr,'none' if trial<0 else 'awgn',generator).reshape_as(z)
                         yh=model.channel_decoder(received,mask,q,snr,delivered_xyz=side)
-                        predictions[tier-1][trial+1].append(yh[active][local].cpu())
+                        predictions[index][trial+1].append(yh[active][local].cpu())
     finally:model.train(mode)
     if model_id(model)!=identity:raise RuntimeError('diagnostic changed model state')
     target=torch.cat(targets);signal=torch.cat(signals);raw=torch.cat(raw_signals)
     reports=[];energies=[]
-    for tier,outputs in enumerate(predictions,1):
+    for tier,outputs in enumerate(predictions[:3],1):
         decoded=[torch.cat(v) for v in outputs]
         record=error_moments(target,decoded[0],torch.stack(decoded[1:]));record.update(tier=tier,symbols=model.cfg.rates[tier])
         reports.append(record)
         print(f"context diagnostic q{tier}: finite NMSE={record['summary']['noiseless_nmse']:.6g}, "
               f"10dB NMSE={record['summary']['noisy_nmse']:.6g}",flush=True)
+    mixed_q=torch.cat(mixed_tiers)
+    mixed_predictions=[torch.cat(v) for v in predictions[3]]
+    mixed=dict(overall=error_moments(target,mixed_predictions[0],torch.stack(mixed_predictions[1:])),by_tier=[],
+               sampling='fixed random positive q1/q2/q3 map on original blocks; not a trained allocator',
+               symbols_per_sampled_gaussian=float(torch.tensor(model.cfg.rates)[mixed_q].double().mean()))
+    for tier in (1,2,3):
+        chosen=mixed_q==tier
+        if not chosen.any():continue
+        row=error_moments(target[chosen],mixed_predictions[0][chosen],torch.stack(mixed_predictions[1:])[:,chosen])
+        row.update(tier=tier,points=int(chosen.sum()))
+        mixed['by_tier'].append(row)
     for start,end in zip(model.cfg.rates[:-1],model.cfg.rates[1:]):
         pre=raw[:,2*start:2*end].double().square().sum(-1)/(end-start)
         post=signal[:,2*start:2*end].double().square().sum(-1)/(end-start)
@@ -149,7 +169,7 @@ def diagnose_context(model,scene,out,*,points,trials,batch_size,seed,snr):
     result=dict(version=1,sample_points=len(target),population_points=total,
         sample_sha256=hashlib.sha256(selected.numpy().tobytes()).hexdigest(),trials=trials,batch_size=batch_size,
         actual_snr=snr,tx_condition_snr=snr,rx_condition_snr=snr,parameters_unchanged=True,
-        tiers=reports,segment_power=energies,
+        tiers=reports,mixed=mixed,segment_power=energies,
         scope='original full codec blocks; delivered quantized XYZ; uniform point selection AFTER receiver context',
         batching='diagnostic_batch does not regroup points; original scene codec batches retained',
         variance_definition='finite-trial population variance with divisor T',

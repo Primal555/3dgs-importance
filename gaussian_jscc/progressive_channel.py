@@ -51,7 +51,8 @@ class ProgressiveChannelDecoder(nn.Module):
             for index,(start,end) in enumerate(zip(cfg.rates[:-1],cfg.rates[1:])))
         if cfg.channel_denoiser_mode!='none':
             from .channel_spatial import ChannelSpatialDenoiser
-            self.denoisers=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in (1,2,3))
+            tiers=(3,) if cfg.channel_denoiser_scope=='final' else (1,2,3)
+            self.denoisers=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in tiers)
 
     def decode_stages(self,received,receive_mask,q,snr,*,delivered_xyz=None):
         """Return cumulative latents; unavailable stages retain the last value.
@@ -59,6 +60,7 @@ class ProgressiveChannelDecoder(nn.Module):
         Lower stages never receive the final tier identity. Thus q3's first
         recovered latent is identical to q1's under the same base prefix.
         Joint gradients into earlier stages are deliberately NOT detached.
+        Final-scope cooperation is separate: these base stages stay autonomous.
         Entirely unused stages are skipped, leaving their gradients None and
         preventing Adam momentum updates on q1-only batches.
         """
@@ -78,13 +80,18 @@ class ProgressiveChannelDecoder(nn.Module):
                 delta=stage(masked[...,2*start:2*end][active],previous[active],snr,earlier)
                 correction=torch.zeros_like(previous).masked_scatter(active[...,None].expand_as(previous),delta.flatten())
                 previous=previous+correction
-                if hasattr(self,'denoisers'):
+                if hasattr(self,'denoisers') and self.cfg.channel_denoiser_scope=='stage':
                     previous=previous+self.denoisers[tier-1](previous,masked,receive_mask,delivered_xyz,active,snr)
             outputs.append(previous)
         return torch.stack(outputs,-2)
 
     def forward(self,received,receive_mask,q,snr,*,delivered_xyz=None):
-        return self.decode_stages(received,receive_mask,q,snr,delivered_xyz=delivered_xyz)[...,-1,:]
+        previous=self.decode_stages(received,receive_mask,q,snr,delivered_xyz=delivered_xyz)[...,-1,:]
+        if hasattr(self,'denoisers') and self.cfg.channel_denoiser_scope=='final':
+            # All received prefixes may help all retained points. Own unsent
+            # slots remain masked; q0/padding never become donors or queries.
+            previous=previous+self.denoisers[0](previous,received,receive_mask,delivered_xyz,q>0,snr)
+        return previous
 
 
 def enable_full_prefix(model,optimizer=None):

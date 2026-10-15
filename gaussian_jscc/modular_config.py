@@ -49,6 +49,7 @@ class ModularCodecConfig:
     channel_denoiser_mode: str = 'none'
     channel_denoiser_hidden: int = 64
     channel_denoiser_neighbors: int = 16
+    channel_denoiser_scope: str = 'stage'
 
     def __post_init__(self):
         if self.architecture != 'modular_jscc_v1':
@@ -66,7 +67,7 @@ class ModularCodecConfig:
         values = asdict(self)
         values.pop('latent_dim')
         for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden','channel_prefix_mode',
-                    'channel_denoiser_mode','channel_denoiser_hidden','channel_denoiser_neighbors'):
+                    'channel_denoiser_mode','channel_denoiser_hidden','channel_denoiser_neighbors','channel_denoiser_scope'):
             values.pop(key)
         if (self.channel_denoiser_mode not in ('none','pointwise','spatial') or
                 type(self.channel_denoiser_hidden) is not int or self.channel_denoiser_hidden<1 or
@@ -74,6 +75,9 @@ class ModularCodecConfig:
             raise ValueError('invalid receiver denoiser settings')
         if self.channel_denoiser_mode!='none' and (self.channel_variant!='progressive' or self.channel_prefix_mode!='full_prefix'):
             raise ValueError('receiver denoising requires full-prefix progressive channel modules')
+        if (self.channel_denoiser_scope not in ('stage','final') or
+                (self.channel_denoiser_scope=='final' and self.channel_denoiser_mode=='none')):
+            raise ValueError('final receiver denoising requires an enabled denoiser')
         if self.channel_variant not in ('baseline','residual','progressive'):
             raise ValueError('unknown channel variant')
         if (self.channel_prefix_mode not in ('suffix','full_prefix') or
@@ -114,6 +118,7 @@ class ModularCodecConfig:
         if self.channel_prefix_mode == 'suffix': values.pop('channel_prefix_mode')
         if self.channel_denoiser_mode=='none':
             for key in ('channel_denoiser_mode','channel_denoiser_hidden','channel_denoiser_neighbors'): values.pop(key)
+        if self.channel_denoiser_scope=='stage': values.pop('channel_denoiser_scope')
         return values
 
     @classmethod
