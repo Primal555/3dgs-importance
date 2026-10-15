@@ -77,6 +77,21 @@ def initialize_channel_run(path, device, *, cfg=None):
     return model
 
 
+def initialize_codec_run(path, device):
+    """Keep every trained tensor/config, but not the source Adam or schedule.
+
+    Unlike exact resume, the caller selects a new optimization scope. In
+    particular, neighbor-only/frozen-semantic source flags must not leak into
+    the new channel-then-joint experiment.
+    """
+    saved=_read(path); state=saved['training']; progress=state['progress']
+    if not progress.get('channel_trained'):
+        raise ValueError('full codec initialization requires a trained channel')
+    model=build_codec(config_from_dict(saved['config'])).to(device)
+    model.load_state_dict(saved['state_dict'])
+    return model,progress,state['scene_record']
+
+
 def validate_scene(saved, current):
     if saved!=current:
         raise ValueError('scene fingerprint, settings or camera split mismatch; refusing silent resume/init')

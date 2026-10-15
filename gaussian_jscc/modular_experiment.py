@@ -1,4 +1,4 @@
-"""Truck-only modular JSCC: random representation, then finite channel training."""
+"""Truck-only modular JSCC: representation, channel recovery and joint rendering."""
 import argparse
 import json
 import math
@@ -13,7 +13,7 @@ from .modular_config import ModularCodecConfig
 from .modular_codec import ModularGaussianCodec
 from .modular_training import MODULES,PHASE_MODULES,configure_phase,bootstrap_step,color_bootstrap_step,render_step,finish_update,objective_settings
 from .modular_checkpoint import (capture_rng,restore_rng,save_training_checkpoint,restore_training_checkpoint,
-                                initialize_channel_run,validate_scene)
+                                initialize_channel_run,initialize_codec_run,validate_scene)
 from .modular_evaluation import evaluate_paths
 from .render_objective import MultiViewRenderTask
 from .render_validation import append_json
@@ -23,7 +23,7 @@ PHASES=tuple(PHASE_MODULES)
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--run',required=True,help='source metadata only; no pretrained codec is loaded')
+    p.add_argument('--run',required=True,help='source scene metadata; weights load ONLY with an explicit initializer/resume')
     p.add_argument('--out',required=True)
     p.add_argument('--manifest',help='override scene paths after migration; identity/split must match')
     p.add_argument('--device',default='cuda')
@@ -54,6 +54,7 @@ def parser():
     group=p.add_mutually_exclusive_group()
     group.add_argument('--resume',help='exact optimizer/RNG/progress continuation in SAME out directory')
     group.add_argument('--init-semantic',help='completed semantic_render checkpoint; new communication experiment')
+    group.add_argument('--init-codec',help='trained full modular checkpoint; keep ALL weights/config, new channel-then-joint schedule and Adam')
     p.add_argument('--with-direct-control',action='store_true',help='additional random 3000+2000 direct control; not FLOP matched')
     p.add_argument('--clean-only',action='store_true',help='no channel training, invocation or communication evaluation')
     p.add_argument('--semantic-color-every',type=int,default=0,
@@ -159,8 +160,10 @@ def main(args,max_updates=None):
     from .rendering import load_cameras
     objectives=objective_settings(args.channel_latent_weight)
     counts={phase:getattr(args,phase+'_steps') for phase in PHASES}
-    if args.freeze_semantic and not (args.init_semantic or args.resume):
+    if args.freeze_semantic and not (args.init_semantic or args.init_codec or args.resume):
         raise ValueError('freeze-semantic requires a semantic initializer or exact resume')
+    if args.init_codec and (args.clean_only or args.with_direct_control or args.semantic_color_every):
+        raise ValueError('init-codec is a channel-then-joint fork; no clean-only, direct control or semantic color schedule')
     if args.clean_only and (counts['channel_bootstrap'] or counts['channel_render'] or args.init_semantic or args.with_direct_control):
         raise ValueError('clean-only requires zero channel budgets, no semantic initializer or direct control')
     if args.semantic_color_every<0 or args.semantic_color_directions<2 or args.semantic_color_directions%2:
@@ -176,7 +179,7 @@ def main(args,max_updates=None):
         raise ValueError('invalid step budgets, intervals or training SNRs')
     lrs={name:getattr(args,name+'_lr') for name in MODULES}
     if any(not math.isfinite(v) or v<=0 for v in lrs.values()): raise ValueError('invalid module learning rate')
-    if args.init_semantic: counts.update(semantic_bootstrap=0,semantic_render=0)
+    if args.init_semantic or args.init_codec: counts.update(semantic_bootstrap=0,semantic_render=0)
     out=Path(args.out).resolve()
     if out.exists() and not args.resume: raise FileExistsError(f'use a NEW output directory: {out}')
     if args.resume and not out.exists(): raise FileNotFoundError('resume requires original output directory')
@@ -194,6 +197,7 @@ def main(args,max_updates=None):
         context_variant=args.context_variant,**context,
         **{k:common[k] for k in ('hidden','grid_dim','levels','planes','depth','block_size','morton_bits','decoder_window','attention_heads') if k in common})
     resumed_rng=saved_scene=None
+    initial_progress=None
     if args.resume:
         previous=json.loads((out/'training.json').read_text(encoding='utf-8'))
         if previous.get('inverse_control'):
@@ -206,6 +210,10 @@ def main(args,max_updates=None):
         # resumed without the mutually exclusive --init-semantic option.
         if previous.get('initializer'):
             counts.update(semantic_bootstrap=0,semantic_render=0)
+        if previous.get('initializer_kind')=='full_codec':
+            # Default CLI architecture flags must not erase saved refiners,
+            # spatial context or the actual cumulative symbol budgets.
+            cfg=ModularCodecConfig.from_dict(previous['codec_config'])
         for key,current in [('phase_budgets',counts),('module_lrs',lrs),('train_snrs',args.train_snrs),('seed',args.seed)]:
             if previous[key]!=current: raise ValueError('exact resume settings mismatch: '+key)
         for key in ('color_metrics','save_semantic_end_images'):
@@ -215,13 +223,18 @@ def main(args,max_updates=None):
             raise ValueError('checkpoint objective mismatch')
         if model.cfg!=cfg: raise ValueError('exact resume codec config mismatch')
     else:
-        model=initialize_channel_run(args.init_semantic,device,cfg=cfg) if args.init_semantic else ModularGaussianCodec(cfg).to(device)
+        if args.init_codec:
+            model,initial_progress,saved_scene=initialize_codec_run(args.init_codec,device)
+            cfg=model.cfg
+            if cfg.sh_degree!=degree: raise ValueError('full initializer SH degree differs from source PLY')
+        else:
+            model=initialize_channel_run(args.init_semantic,device,cfg=cfg) if args.init_semantic else ModularGaussianCodec(cfg).to(device)
         if model.cfg!=cfg: raise ValueError('semantic initialization config mismatch')
-        if not args.init_semantic:
+        if not (args.init_semantic or args.init_codec):
             mean,std=shared_statistics([raw]); model.attr_mean.copy_(mean.to(device)); model.attr_std.copy_(std.to(device))
         optimizer=None
         progress={'phase':'semantic_bootstrap','phase_step':0,'step':0,'completed':{p:0 for p in PHASES},
-                  'channel_trained':False,'module_lrs':lrs,'phase_complete':False,'phase_budgets':counts,'train_snrs':args.train_snrs,
+                  'channel_trained':bool(args.init_codec),'module_lrs':lrs,'phase_complete':False,'phase_budgets':counts,'train_snrs':args.train_snrs,
                   'training_objective':objectives}
         if args.freeze_semantic: progress['freeze_semantic']=True
     model.set_training_snrs(args.train_snrs)
@@ -239,8 +252,11 @@ def main(args,max_updates=None):
         for folder in ('metrics','checkpoints','charts','images'): (out/folder).mkdir(parents=True,exist_ok=True)
         json_write(out/'training.json',{'source_run':str(Path(args.run).resolve()),'manifest':str(manifest_path),
             'selected_scenes':[spec],'codec_config':cfg.to_dict(),'phase_budgets':counts,'module_lrs':lrs,'train_snrs':args.train_snrs,
-            'seed':args.seed,'random_initialization':not bool(args.init_semantic),'initializer':args.init_semantic,
-            'source_weights_loaded':False,'reference_scene_identity_and_splits_verified':True,
+            'seed':args.seed,'random_initialization':not bool(args.init_semantic or args.init_codec),
+            'initializer':args.init_codec or args.init_semantic,
+            'initializer_kind':'full_codec' if args.init_codec else 'semantic_only' if args.init_semantic else None,
+            'source_step':initial_progress['step'] if initial_progress is not None else None,
+            'source_weights_loaded':bool(args.init_codec),'reference_scene_identity_and_splits_verified':True,
             'scene':scene.record,'net_bits_per_use':scene.net_bits_per_use,
             'step_definition':'one real optimizer update; no accumulation',
             'trainable_modules':{p:[n for n in ns if not (args.freeze_semantic and n.startswith('semantic_'))] for p,ns in PHASE_MODULES.items()},
@@ -257,8 +273,8 @@ def main(args,max_updates=None):
                       'channel_bootstrap':'latent MSE against frozen semantic encoder',
                       'channel_render':'source PLY RGB MSE + channel_latent_weight * latent MSE'},
             'clip_mode':'none','render_backward':'replay','shared_model_cost':'excluded, assumed shared in advance',
-            'source_usage':'paths, camera split and model dimensions only; never source checkpoint weights',
-            'initialization': 'semantic-only fork; fresh channel modules and Adam' if args.init_semantic else 'all four modules random'})
+            'source_usage':'all trained codec weights/config and verified scene metadata; source files read-only' if args.init_codec else 'paths, camera split and model dimensions only; never source checkpoint weights',
+            'initialization': 'full trained codec fork; fresh Adam and local step schedule; no architecture changes' if args.init_codec else 'semantic-only fork; fresh channel modules and Adam' if args.init_semantic else 'all four modules random'})
     scene.channel_trained=progress['channel_trained']
     if cfg.context_variant!='baseline' and not args.resume:
         from .pointnet_context import geometry_diagnostics
@@ -279,6 +295,8 @@ def main(args,max_updates=None):
         print(f"Channel objective: bootstrap=latent MSE; render=RGB MSE + {args.channel_latent_weight:g} * latent MSE; semantic encoder frozen; semantic decoder {'FROZEN' if args.freeze_semantic else 'trainable in render'}.",flush=True)
     print(f'Channel variant: {cfg.channel_variant}; hidden={cfg.hidden if cfg.channel_variant=="baseline" else cfg.channel_hidden}',flush=True)
     print(f'Channel budgets (complex symbols/Gaussian): {cfg.rates[1:]}; latent dimension: {cfg.latent_dim}',flush=True)
+    if args.init_codec:
+        print(f'FULL trained initializer: {args.init_codec}; source step={initial_progress["step"]}; all weights retained; fresh Adam, new local steps.',flush=True)
     if args.semantic_color_every:
         print(f'Color supervision: every {args.semantic_color_every} bootstrap updates; {args.semantic_color_directions} directions, unclipped RGB; all render updates retain scene RGB MSE.',flush=True)
     if not args.resume:
@@ -289,6 +307,8 @@ def main(args,max_updates=None):
     def save(label):
         save_training_checkpoint(out/'checkpoints'/label/'codec.pt',model,optimizer,progress,capture_rng(),scene.record)
         json_write(out/'progress.json',dict(progress,status='running'))
+
+    if args.init_codec: save('initial')
 
     updated=0
     for phase in PHASES:
