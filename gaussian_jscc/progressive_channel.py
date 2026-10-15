@@ -49,8 +49,11 @@ class ProgressiveChannelDecoder(nn.Module):
         self.cfg=cfg
         self.stages=nn.ModuleList(LatentRefinementStage(end-start,cfg,base=index==0,earlier_symbols=start)
             for index,(start,end) in enumerate(zip(cfg.rates[:-1],cfg.rates[1:])))
+        if cfg.channel_denoiser_mode!='none':
+            from .channel_spatial import ChannelSpatialDenoiser
+            self.denoisers=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in (1,2,3))
 
-    def decode_stages(self,received,receive_mask,q,snr):
+    def decode_stages(self,received,receive_mask,q,snr,*,delivered_xyz=None):
         """Return cumulative latents; unavailable stages retain the last value.
 
         Lower stages never receive the final tier identity. Thus q3's first
@@ -75,11 +78,13 @@ class ProgressiveChannelDecoder(nn.Module):
                 delta=stage(masked[...,2*start:2*end][active],previous[active],snr,earlier)
                 correction=torch.zeros_like(previous).masked_scatter(active[...,None].expand_as(previous),delta.flatten())
                 previous=previous+correction
+                if hasattr(self,'denoisers'):
+                    previous=previous+self.denoisers[tier-1](previous,masked,receive_mask,delivered_xyz,active,snr)
             outputs.append(previous)
         return torch.stack(outputs,-2)
 
-    def forward(self,received,receive_mask,q,snr):
-        return self.decode_stages(received,receive_mask,q,snr)[...,-1,:]
+    def forward(self,received,receive_mask,q,snr,*,delivered_xyz=None):
+        return self.decode_stages(received,receive_mask,q,snr,delivered_xyz=delivered_xyz)[...,-1,:]
 
 
 def enable_full_prefix(model,optimizer=None):

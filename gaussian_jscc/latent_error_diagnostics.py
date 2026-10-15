@@ -78,6 +78,9 @@ def sample_latents(model, scene, points, seed):
 def diagnose(model, scene, out, *, points=32768, trials=8, batch_size=2048, seed=42, snr=10.):
     if min(points,batch_size)<1 or trials<2 or not math.isfinite(snr):
         raise ValueError('positive sample/batch sizes, >=2 trials and finite SNR required')
+    if getattr(model.cfg,'channel_denoiser_mode','none')!='none':
+        from .channel_spatial import diagnose_context
+        return diagnose_context(model,scene,out,points=points,trials=trials,batch_size=batch_size,seed=seed,snr=snr)
     out=Path(out); out.mkdir(parents=True,exist_ok=True)
     device=next(model.parameters()).device; mode=model.training; identity=model_id(model)
     reports=[]; energies=[]

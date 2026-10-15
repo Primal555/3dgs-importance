@@ -43,6 +43,7 @@ class ModularGaussianCodec(nn.Module):
         for module in (self.semantic_encoder,self.semantic_decoder):
             if hasattr(module,'spatial_context'):
                 module.spatial_context.set_scene_geometry(geometry)
+        for module in getattr(self.channel_decoder,'denoisers',()): module.set_scene_geometry(geometry)
 
     def set_training_snrs(self, values):
         values=tuple(float(v) for v in values)
@@ -76,7 +77,8 @@ class ModularGaussianCodec(nn.Module):
 
     def _decode_dense(self, received, q, snr, delivered_xyz, *, condition_snr=None):
         mask = prefix_mask(q.flatten(),self.cfg.rates).reshape_as(received)
-        y_hat = self.channel_decoder(received,mask,q,self.resolve_condition_snr(snr,condition_snr))
+        options={'delivered_xyz':delivered_xyz} if self.cfg.channel_denoiser_mode!='none' else {}
+        y_hat = self.channel_decoder(received,mask,q,self.resolve_condition_snr(snr,condition_snr),**options)
         return self.decode_representation(y_hat,q,delivered_xyz)
 
     def decode_representation(self, y_hat, q, delivered_xyz):
@@ -129,7 +131,9 @@ class ModularGaussianCodec(nn.Module):
         else:
             noisy = channel(z[mask].reshape(-1,2),snr,kind)
             received = torch.zeros_like(z).masked_scatter(mask,noisy.flatten())
-        y_hat = self.channel_decoder(received,mask,q,rx_snr)
+        options=({'delivered_xyz':delivered_positions(features[...,:3],q,self.cfg)}
+                 if self.cfg.channel_denoiser_mode!='none' else {})
+        y_hat = self.channel_decoder(received,mask,q,rx_snr,**options)
         return y,y_hat,q
 
     def forward_tier_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None):

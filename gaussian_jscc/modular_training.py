@@ -26,9 +26,18 @@ PHASE_MODULES = {
 }
 
 
-def configure_phase(model, phase, module_lrs, *, freeze_semantic=False):
+def configure_phase(model, phase, module_lrs, *, freeze_semantic=False,denoiser_only=False):
     if phase not in PHASE_MODULES:
         raise ValueError('unknown modular training phase')
+    if denoiser_only:
+        if phase!='channel_bootstrap' or not freeze_semantic or not hasattr(model.channel_decoder,'denoisers'):
+            raise ValueError('denoiser-only optimization requires frozen-semantic channel bootstrap with denoisers')
+        model.requires_grad_(False)
+        for p in model.parameters(): p.grad=None
+        model.channel_decoder.denoisers.requires_grad_(True)
+        lr=float(module_lrs.get('channel_denoiser',1e-4))
+        if not math.isfinite(lr) or lr<=0: raise ValueError('learning rates must be positive and finite')
+        return torch.optim.Adam([{'params':list(model.channel_decoder.denoisers.parameters()),'lr':lr,'name':'channel_denoiser'}])
     groups=[]
     for name in MODULES:
         module=getattr(model,name)

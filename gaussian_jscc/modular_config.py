@@ -46,6 +46,9 @@ class ModularCodecConfig:
     channel_variant: str = 'baseline'
     channel_hidden: int = 192
     channel_prefix_mode: str = 'suffix'
+    channel_denoiser_mode: str = 'none'
+    channel_denoiser_hidden: int = 64
+    channel_denoiser_neighbors: int = 16
 
     def __post_init__(self):
         if self.architecture != 'modular_jscc_v1':
@@ -62,8 +65,15 @@ class ModularCodecConfig:
         # Composition reuses transport validation without subclassing legacy config.
         values = asdict(self)
         values.pop('latent_dim')
-        for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden','channel_prefix_mode'):
+        for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden','channel_prefix_mode',
+                    'channel_denoiser_mode','channel_denoiser_hidden','channel_denoiser_neighbors'):
             values.pop(key)
+        if (self.channel_denoiser_mode not in ('none','pointwise','spatial') or
+                type(self.channel_denoiser_hidden) is not int or self.channel_denoiser_hidden<1 or
+                type(self.channel_denoiser_neighbors) is not int or self.channel_denoiser_neighbors<1):
+            raise ValueError('invalid receiver denoiser settings')
+        if self.channel_denoiser_mode!='none' and (self.channel_variant!='progressive' or self.channel_prefix_mode!='full_prefix'):
+            raise ValueError('receiver denoising requires full-prefix progressive channel modules')
         if self.channel_variant not in ('baseline','residual','progressive'):
             raise ValueError('unknown channel variant')
         if (self.channel_prefix_mode not in ('suffix','full_prefix') or
@@ -102,6 +112,8 @@ class ModularCodecConfig:
         if self.channel_variant == 'baseline':
             values.pop('channel_variant'); values.pop('channel_hidden')
         if self.channel_prefix_mode == 'suffix': values.pop('channel_prefix_mode')
+        if self.channel_denoiser_mode=='none':
+            for key in ('channel_denoiser_mode','channel_denoiser_hidden','channel_denoiser_neighbors'): values.pop(key)
         return values
 
     @classmethod
