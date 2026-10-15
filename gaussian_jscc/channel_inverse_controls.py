@@ -26,9 +26,11 @@ ARMS={'noiseless':'none','awgn10':'awgn'}
 PREFIX_ARMS={'suffix10':'awgn','full_prefix10':'awgn'}
 SPATIAL_ARMS={'pointwise10':'awgn','spatial10':'awgn'}
 COOPERATIVE_ARMS={'stage_spatial10':'awgn','final_pointwise10':'awgn','final_spatial10':'awgn'}
+GATED_ARMS={'neighbor_plain10':'awgn','neighbor_gated10':'awgn'}
 
 
 def arms_for(args):
+    if args.suite=='gated':return GATED_ARMS
     if args.suite=='cooperative': return COOPERATIVE_ARMS
     return SPATIAL_ARMS if args.suite=='spatial' else PREFIX_ARMS if args.suite=='prefix' else ARMS
 
@@ -51,15 +53,24 @@ def parser():
     p.add_argument('--cpu-threads',type=int,default=4)
     p.add_argument('--resume-suite',action='store_true')
     p.add_argument('--dry-run',action='store_true')
-    p.add_argument('--suite',choices=['inverse','prefix','spatial','cooperative'],default='inverse',help='opt-in channel controls')
+    p.add_argument('--suite',choices=['inverse','prefix','spatial','cooperative','gated'],default='inverse',help='opt-in channel controls')
     p.add_argument('--denoiser-hidden',type=int,default=64)
     p.add_argument('--denoiser-neighbors',type=int,default=16)
-    p.add_argument('--arm',choices=(*ARMS,*PREFIX_ARMS,*SPATIAL_ARMS,*COOPERATIVE_ARMS),help='internal single-arm entry; normally omit')
+    p.add_argument('--sensitivity-blocks',type=int,default=4)
+    p.add_argument('--sensitivity-views',type=int,default=8)
+    p.add_argument('--sensitivity-step',type=float,default=.01)
+    p.add_argument('--probe-source',action='store_true',help=argparse.SUPPRESS)
+    p.add_argument('--arm',choices=(*ARMS,*PREFIX_ARMS,*SPATIAL_ARMS,*COOPERATIVE_ARMS,*GATED_ARMS),help='internal single-arm entry; normally omit')
     return p
 
 
 def source_files(args):
     run=Path(args.run).resolve()
+    if args.suite=='gated' and not (run/'training.json').exists():
+        for candidate in ('final_pointwise10','pointwise10'):
+            if (run/candidate/'training.json').exists():
+                run=run/candidate
+                break
     if args.suite in ('spatial','cooperative') and not (run/'training.json').exists() and (run/'full_prefix10/training.json').exists():
         run=run/'full_prefix10'
     if not (run/'training.json').exists() and (run/'progressive/training.json').exists(): run=run/'progressive'
@@ -95,6 +106,13 @@ def build_plan(args):
             metadata['codec_config'].get('channel_denoiser_mode','none')!='none' or metadata.get('channel_kind')!='awgn' or
             min(args.denoiser_hidden,args.denoiser_neighbors)<1):
         raise ValueError('spatial controls require a completed 10 dB full-prefix source without a denoiser')
+    if args.suite=='gated':
+        cfg=metadata['codec_config']
+        if (cfg.get('channel_prefix_mode')!='full_prefix' or cfg.get('channel_denoiser_mode')!='pointwise' or
+                cfg.get('channel_neighbor_mode','none')!='none' or metadata.get('channel_kind')!='awgn' or
+                min(args.denoiser_hidden,args.denoiser_neighbors,args.sensitivity_blocks,args.sensitivity_views)<1 or
+                not math.isfinite(args.sensitivity_step) or args.sensitivity_step<=0):
+            raise ValueError('gated controls require a completed 10 dB self-only pointwise source and valid probe settings')
     destination=Path(args.out).resolve()
     for protected in (Path(args.run).resolve(),run):
         if destination.is_relative_to(protected) or protected.is_relative_to(destination):
@@ -108,7 +126,9 @@ def build_plan(args):
         value=getattr(args,key)
         if value is not None: common+=['--'+key.replace('_','-'),str(value)]
     if args.suite!='inverse': common+=['--suite',args.suite]
-    if args.suite in ('spatial','cooperative'):common+=['--denoiser-hidden',str(args.denoiser_hidden),'--denoiser-neighbors',str(args.denoiser_neighbors)]
+    if args.suite in ('spatial','cooperative','gated'):common+=['--denoiser-hidden',str(args.denoiser_hidden),'--denoiser-neighbors',str(args.denoiser_neighbors)]
+    if args.suite=='gated':
+        for key in ('sensitivity_blocks','sensitivity_views','sensitivity_step'):common+=['--'+key.replace('_','-'),str(getattr(args,key))]
     plan=dict(version=1,source_run=str(run),checkpoint=str(checkpoint),
         source_checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),source_step=source_step,
         target_step=source_step+args.steps,additional_updates_per_arm=args.steps,rates=metadata['codec_config']['rates'],
@@ -133,7 +153,41 @@ def build_plan(args):
                 scope='stage-spatial reference vs final-only pointwise/spatial using every actually received neighbor prefix',
                 parameter_matched=False,final_pair_parameter_matched=True,
                 stage_reference='three stage branches vs one final branch; not a capacity-controlled causal comparison')
+    if args.suite=='gated':
+        plan['optimizer']='fresh Adam for new neighbor refiner ONLY; trained self-only source, semantic and transmitter weights frozen'
+        plan['receiver_context']=dict(modes=list(GATED_ARMS),hidden=args.denoiser_hidden,neighbors=args.denoiser_neighbors,
+            parameter_matched=True,effective_capacity_matched=False,transmitted_payload_matched=True,
+            initialization='identical hidden and gate weights; zero residual output; gated arm starts at gate=0.5',
+            scope='one final neighbor increment on frozen trained self base; all actually received prefixes')
+        plan['error_geometry']=dict(blocks=args.sensitivity_blocks,views=args.sensitivity_views,relative_step=args.sensitivity_step,
+            target='frozen clean semantic decoder directional RGB; no rendering or hand-weighted loss',
+            transmitter='unchanged; direction candidates are diagnostic only, not an automatic adaptation decision')
+        plan['geometry_job']=dict(command=[*plan['jobs'][0]['command'][:-2],'--probe-source'],
+                                  log='source_geometry.log',scope='separate worker releases its GPU context before training arms')
     return plan
+
+
+def run_source_geometry(args,plan):
+    """A read-only source probe once per gated suite, including diagnostic resume."""
+    if args.suite!='gated':raise ValueError('source geometry probe belongs to gated controls')
+    from .channel_error_geometry import diagnose_geometry
+    folder=Path(args.out).resolve()/'source_geometry'
+    marker=folder/'source_complete.json'
+    identity=dict(checkpoint_sha256=plan['source_checkpoint_sha256'],settings=plan['error_geometry'],
+                  seed=args.seed,trials=args.diagnostic_trials)
+    if marker.exists():
+        if json.loads(marker.read_text(encoding='utf-8'))!=identity:raise ValueError('source geometry probe identity mismatch')
+        return
+    run,checkpoint,metadata,_=source_files(args)
+    device=device_for(args.device);torch.set_num_threads(args.cpu_threads)
+    model,_,_,_,saved_scene=restore_training_checkpoint(checkpoint,device)
+    source,_,spec,old,_=control_inputs(metadata,args.manifest)
+    raw,degree=read_ply(spec['ply']);scene=make_scene(spec,raw,degree,model,source,old,folder);del raw
+    validate_scene(saved_scene,scene.record)
+    diagnose_geometry(model,scene,folder,blocks=args.sensitivity_blocks,trials=args.diagnostic_trials,
+        color_views=args.sensitivity_views,relative_step=args.sensitivity_step,seed=args.seed)
+    json_write(marker,identity)
+    del model,scene
 
 
 def training_batch(scene, phase_step, seed):
@@ -210,6 +264,17 @@ def run_arm(args,arm,max_updates=None):
             progress=copy.deepcopy(progress);progress['channel_denoiser_only']=True
             progress['module_lrs']['channel_denoiser']=args.lr or progress['module_lrs'].get('channel_decoder',1e-4)
             optimizer=configure_phase(model,'channel_bootstrap',progress['module_lrs'],freeze_semantic=True,denoiser_only=True)
+    if args.suite=='gated':
+        from .channel_spatial import enable_neighbor_refinement
+        from .modular_training import configure_phase
+        expected.update(channel_neighbor_mode='feature' if arm=='neighbor_gated10' else 'plain',
+                        channel_neighbor_hidden=args.denoiser_hidden,channel_neighbor_neighbors=args.denoiser_neighbors)
+        if not resumed:
+            restore_rng(rng)
+            enable_neighbor_refinement(model,expected['channel_neighbor_mode'],hidden=args.denoiser_hidden,neighbors=args.denoiser_neighbors)
+            progress=copy.deepcopy(progress);progress['channel_denoiser_only']=False;progress['channel_neighbor_only']=True
+            progress['module_lrs']['channel_neighbor']=args.lr or 1e-4
+            optimizer=configure_phase(model,'channel_bootstrap',progress['module_lrs'],freeze_semantic=True,neighbor_only=True)
     if json.loads(json.dumps(model.cfg.to_dict()))!=expected: raise ValueError('resume codec mismatch')
     if resumed and progress.get('inverse_control')!=settings: raise ValueError('checkpoint continuation mismatch')
     if args.lr is not None:
@@ -239,6 +304,12 @@ def run_arm(args,arm,max_updates=None):
                           channel_denoiser_only=True,
                           trainable_modules={p:(['channel_decoder.denoisers'] if p=='channel_bootstrap' else []) for p in record['trainable_modules']})
             json_write(folder/'training.json',record)
+        if args.suite=='gated':
+            record.update(initialization='trained self-only source frozen; only new neighbor increment uses fresh Adam',
+                source_usage='source weights and scene identity only; source files read-only',channel_denoiser_only=False,
+                channel_neighbor_only=True,
+                trainable_modules={p:(['channel_decoder.neighbor_refiner'] if p=='channel_bootstrap' else []) for p in record['trainable_modules']})
+            json_write(folder/'training.json',record)
     else: repair_logs(folder,progress['step'])
     restore_rng(rng)
 
@@ -264,6 +335,11 @@ def run_arm(args,arm,max_updates=None):
         if device.type=='cuda': torch.cuda.synchronize(device)
         started=time.perf_counter()
         loss,stats=bootstrap_step(model,features.to(device),q.to(device),scene.geometry,10.,kind,'channel_bootstrap')
+        if args.suite=='gated':
+            gates=model.channel_decoder.neighbor_refiner.last_gates
+            stats['neighbor_gates_by_tier']={str(t):dict(points=int((q==t).sum()),
+                mean=float(gates[q.to(device)==t].mean()),
+                feature_means=gates[q.to(device)==t].mean(0).cpu().tolist()) for t in (1,2,3) if (q==t).any()}
         stats.update(finish_update(model,optimizer,before))
         if device.type=='cuda': torch.cuda.synchronize(device)
         progress['step']+=1; progress['phase_step']=phase_step; progress['completed']['channel_bootstrap']=phase_step
@@ -289,11 +365,16 @@ def run_arm(args,arm,max_updates=None):
     save('end_channel_bootstrap'); save('latest')
     diagnose(model,scene,folder/'diagnostics/final',points=args.diagnostic_points,trials=args.diagnostic_trials,
              batch_size=args.diagnostic_batch,seed=args.seed)
+    if args.suite=='gated':
+        from .channel_error_geometry import diagnose_geometry
+        diagnose_geometry(model,scene,folder/'diagnostics/final/geometry',blocks=args.sensitivity_blocks,
+            trials=args.diagnostic_trials,color_views=args.sensitivity_views,relative_step=args.sensitivity_step,seed=args.seed)
     evaluate_endpoint(model,scene,folder,'final',progress['step'],args.seed)
     save('final'); save('latest')
     done=dict(status='complete',source_step=plan['source_step'],additional_updates=args.steps,
-              total_step=progress['step'],channel_kind=kind,optimizer_moments_retained=args.suite not in ('spatial','cooperative'),semantic_modules_frozen=True)
+              total_step=progress['step'],channel_kind=kind,optimizer_moments_retained=args.suite not in ('spatial','cooperative','gated'),semantic_modules_frozen=True)
     if args.suite in ('spatial','cooperative'):done.update(source_modules_frozen=True,only_new_denoisers_trained=True)
+    if args.suite=='gated':done.update(source_modules_frozen=True,only_new_neighbor_refiner_trained=True)
     json_write(folder/'complete.json',done)
     return done
 
@@ -301,7 +382,7 @@ def run_arm(args,arm,max_updates=None):
 def summarize(out):
     from .modular_plots import read_rows
     out=Path(out); destination=out/'comparison'; destination.mkdir(parents=True,exist_ok=True)
-    arms=(COOPERATIVE_ARMS if (out/'stage_spatial10').is_dir() else SPATIAL_ARMS if (out/'spatial10').is_dir()
+    arms=(GATED_ARMS if (out/'neighbor_plain10').is_dir() else COOPERATIVE_ARMS if (out/'stage_spatial10').is_dir() else SPATIAL_ARMS if (out/'spatial10').is_dir()
           else PREFIX_ARMS if (out/'full_prefix10').is_dir() else ARMS)
     groups=list(arms); first,second=groups[:2]
     records={arm:read_rows(out/arm/'metrics/validation.jsonl') for arm in arms}
@@ -317,13 +398,13 @@ def summarize(out):
                 row['final_spatial_minus_final_pointwise_psnr_db']=pair['final_spatial10']['source_psnr']-pair['final_pointwise10']['source_psnr']
                 row['final_spatial_minus_stage_spatial_psnr_db']=pair['final_spatial10']['source_psnr']-pair['stage_spatial10']['source_psnr']
             else:
-                delta_key=('spatial_minus_pointwise_psnr_db' if arms is SPATIAL_ARMS else
+                delta_key=('gated_minus_plain_psnr_db' if arms is GATED_ARMS else 'spatial_minus_pointwise_psnr_db' if arms is SPATIAL_ARMS else
                            'full_prefix_minus_suffix_psnr_db' if arms is PREFIX_ARMS else 'noiseless_minus_awgn10_psnr_db')
                 row[delta_key]=(pair[second]['source_psnr']-pair[first]['source_psnr'] if arms is not ARMS
                                 else pair[first]['source_psnr']-pair[second]['source_psnr'])
-            if arms is SPATIAL_ARMS or arms is COOPERATIVE_ARMS:
+            if arms is SPATIAL_ARMS or arms is COOPERATIVE_ARMS or arms is GATED_ARMS:
                 baseline=next(r for r in records[first] if r['phase']=='initial' and r['path']==path and r['layout']==tier)
-                row['full_prefix_source']={k:baseline[k] for k in ('source_psnr','photo_psnr','latent_mse','latent_nmse')}
+                row['self_source' if arms is GATED_ARMS else 'full_prefix_source']={k:baseline[k] for k in ('source_psnr','photo_psnr','latent_mse','latent_nmse')}
                 for arm,r in pair.items():row[arm+'_minus_source_psnr_db']=r['source_psnr']-baseline['source_psnr']
             comparison.append(row)
     # Compare all arms to their identical baseline; do not silently mix view sets.
@@ -352,7 +433,7 @@ def summarize(out):
     import matplotlib.pyplot as plt
     styles={first:('#356d9b','-','o'),second:('#d88931','--','s')}
     if arms is COOPERATIVE_ARMS:styles[groups[2]]=('#3c9465','-.','^')
-    tiers=('1','2','3','mixed') if arms is COOPERATIVE_ARMS else ('1','2','3')
+    tiers=('1','2','3','mixed') if arms is COOPERATIVE_ARMS or arms is GATED_ARMS else ('1','2','3')
     fig,axes=plt.subplots(2,len(tiers),figsize=(4*len(tiers)+1,7),layout='constrained')
     for arm,rs in records.items():
         color,line,marker=styles[arm]
@@ -384,6 +465,10 @@ def summarize(out):
             sampling=d['mixed']['sampling'],symbols_per_sampled_gaussian=d['mixed']['symbols_per_sampled_gaussian'])
             for endpoint,d in stages.items()} for arm,stages in diagnostics.items()}
         result['control_scope']='final pair: equal nominal parameters and initialization; stage reference has three branches, final pair one'
+    if arms is GATED_ARMS:
+        result['control_scope']='identical frozen trained self base and zero-output neighbor initialization; plain gate fixed at one vs learned feature gates'
+        result['last_training_gate_stats']={arm:read_rows(out/arm/'metrics/loss.jsonl')[-1]['neighbor_gates_by_tier'] for arm in arms}
+        result['geometry_files']={arm:str(Path(arm)/'diagnostics/final/geometry/error_geometry.json') for arm in arms}
     json_write(destination/'summary.json',result)
     return result
 
@@ -393,11 +478,19 @@ def main(args):
     if args.dry_run:
         if args.arm: plan=dict(plan,jobs=[j for j in plan['jobs'] if j['arm']==args.arm])
         print(json.dumps(plan,indent=2)); return plan
+    if args.probe_source:
+        if args.suite!='gated' or args.arm is not None:raise ValueError('source probe requires gated suite without --arm')
+        return run_source_geometry(args,plan)
     if args.arm: return run_arm(args,args.arm)
     if out.exists():
         if not args.resume_suite: raise FileExistsError('use a NEW suite directory or --resume-suite')
         if json.loads((out/'plan.json').read_text(encoding='utf-8'))!=plan: raise ValueError('suite plan differs')
     else: json_write(out/'plan.json',plan)
+    if args.suite=='gated':
+        print(f'Source error/sensitivity probe; log: {out/"source_geometry.log"}',flush=True)
+        with (out/'source_geometry.log').open('a',encoding='utf-8') as log:
+            result=subprocess.run(plan['geometry_job']['command'],stdout=log,stderr=subprocess.STDOUT)
+        if result.returncode:raise RuntimeError(f'source geometry probe failed; inspect {out/"source_geometry.log"}')
     for job in plan['jobs']:
         arm=job['arm']; command=list(job['command'])
         if (out/arm/'complete.json').exists(): continue

@@ -51,7 +51,8 @@ def restore_training_checkpoint(path, device):
     model.set_training_snrs(progress.get('train_snrs',()))
     optimizer=configure_phase(model,progress['phase'],progress.get('module_lrs',{}),
                               freeze_semantic=progress.get('freeze_semantic',False),
-                              denoiser_only=progress.get('channel_denoiser_only',False))
+                              denoiser_only=progress.get('channel_denoiser_only',False),
+                              neighbor_only=progress.get('channel_neighbor_only',False))
     if state['optimizer'] is not None: optimizer.load_state_dict(state['optimizer'])
     return model,optimizer,progress,state['rng'],state['scene_record']
 
@@ -66,7 +67,8 @@ def initialize_channel_run(path, device, *, cfg=None):
         # These affect only freshly initialized channel modules, not the teacher y.
         # Exact resume still requires the entire config, including rates, to match.
         for key in ('channel_variant','channel_hidden','channel_prefix_mode','channel_denoiser_mode',
-                    'channel_denoiser_hidden','channel_denoiser_neighbors','channel_denoiser_scope','rates'):
+                    'channel_denoiser_hidden','channel_denoiser_neighbors','channel_denoiser_scope',
+                    'channel_neighbor_mode','channel_neighbor_hidden','channel_neighbor_neighbors','rates'):
             a.pop(key,None); b.pop(key,None)
         if a!=b: raise ValueError('semantic initialization config mismatch')
     model=build_codec(cfg or original).to(device)

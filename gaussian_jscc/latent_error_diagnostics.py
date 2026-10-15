@@ -51,8 +51,22 @@ def error_moments(target, noiseless, noisy):
         decomposition_residual=float((mse-point_bias-variance).mean()))
     summary['noiseless_nmse'] = summary['noiseless_mse']/max(summary['target_power'],1e-12)
     summary['noisy_nmse'] = summary['noisy_mse']/max(summary['target_power'],1e-12)
+    # Joint moments retain off-diagonal errors. Divisor T matches the empirical
+    # decomposition, not an unbiased population noise-covariance estimate.
+    flat=errors.flatten(0,1)
+    random=(errors-mean_error).flatten(0,1)
+    second=flat.T@flat/len(flat)
+    mean_second=mean_error.T@mean_error/len(y)
+    noise_cov=random.T@random/len(random)
+    scales=noise_cov.diag().clamp_min(0).sqrt()
+    denominator=scales[:,None]*scales[None,:]
+    correlation=torch.where(denominator>0,noise_cov/denominator.clamp_min(1e-30),0)
+    joint=dict(error_second_moment=second.tolist(),point_mean_error_second_moment=mean_second.tolist(),
+        noise_covariance=noise_cov.tolist(),noise_correlation=correlation.tolist(),
+        decomposition_max_abs_residual=float((second-mean_second-noise_cov).abs().max()),
+        definition='empirical point/trial moments; noise divisor T; point means contain finite-trial sampling noise')
     return dict(summary=summary, dimensions=dims,
-        point_mean_error_covariance=(centered.T@centered/len(y)).tolist())
+        point_mean_error_covariance=(centered.T@centered/len(y)).tolist(),joint_error=joint)
 
 
 @torch.no_grad()
@@ -78,7 +92,7 @@ def sample_latents(model, scene, points, seed):
 def diagnose(model, scene, out, *, points=32768, trials=8, batch_size=2048, seed=42, snr=10.):
     if min(points,batch_size)<1 or trials<2 or not math.isfinite(snr):
         raise ValueError('positive sample/batch sizes, >=2 trials and finite SNR required')
-    if getattr(model.cfg,'channel_denoiser_mode','none')!='none':
+    if getattr(model.cfg,'channel_denoiser_mode','none')!='none' or getattr(model.cfg,'channel_neighbor_mode','none')!='none':
         from .channel_spatial import diagnose_context
         return diagnose_context(model,scene,out,points=points,trials=trials,batch_size=batch_size,seed=seed,snr=snr)
     out=Path(out); out.mkdir(parents=True,exist_ok=True)

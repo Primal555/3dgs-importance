@@ -72,6 +72,11 @@ class ChannelSpatialDenoiser(nn.Module):
         weights=logits.softmax(-1)*valid
         context=(values.masked_fill(~valid[...,None],0)*weights[...,None]).sum(2)
         correction=self.readout(self.fuse(torch.cat((h,context),-1)))
+        if hasattr(self,'feature_gate'):
+            gates=self.feature_gate(torch.cat((h,context),-1)).sigmoid()
+            if self.gated:correction=correction*gates
+            else:gates=torch.ones_like(gates)
+            self.last_gates=gates.detach().masked_fill(~active[...,None],0)
         return correction.masked_fill(~active[...,None],0)
 
 
@@ -90,6 +95,31 @@ def enable_channel_denoising(model,mode,*,hidden=64,neighbors=16,scope='stage'):
     model.cfg.channel_denoiser_mode=mode; model.cfg.channel_denoiser_hidden=hidden
     model.cfg.channel_denoiser_neighbors=neighbors
     model.cfg.channel_denoiser_scope=scope
+
+
+class ChannelNeighborRefiner(ChannelSpatialDenoiser):
+    """One independent final residual over a frozen trained self-only base."""
+    def __init__(self,cfg):
+        from dataclasses import replace
+        local=replace(cfg,channel_denoiser_mode='spatial',channel_denoiser_scope='final',
+                      channel_denoiser_hidden=cfg.channel_neighbor_hidden,channel_denoiser_neighbors=cfg.channel_neighbor_neighbors)
+        super().__init__(local,3)
+        self.feature_gate=nn.Linear(2*local.channel_denoiser_hidden,cfg.latent_dim)
+        nn.init.zeros_(self.feature_gate.weight);nn.init.zeros_(self.feature_gate.bias)
+        # Gate=0.5 and correction=0: exact warm start without a dead gate/output pair.
+        self.gated=cfg.channel_neighbor_mode=='feature'
+        self.last_gates=None
+
+
+def enable_neighbor_refinement(model,mode,*,hidden=64,neighbors=16):
+    from .modular_config import ModularCodecConfig
+    if model.cfg.channel_neighbor_mode!='none' or mode=='none':raise ValueError('neighbor refinement must be newly enabled')
+    values=model.cfg.to_dict()
+    values.update(channel_neighbor_mode=mode,channel_neighbor_hidden=hidden,channel_neighbor_neighbors=neighbors)
+    cfg=ModularCodecConfig.from_dict(values);reference=next(model.parameters())
+    with torch.random.fork_rng(devices=[]):block=ChannelNeighborRefiner(cfg).to(reference)
+    model.channel_decoder.neighbor_refiner=block
+    model.cfg.channel_neighbor_mode=mode;model.cfg.channel_neighbor_hidden=hidden;model.cfg.channel_neighbor_neighbors=neighbors
 
 
 @torch.no_grad()

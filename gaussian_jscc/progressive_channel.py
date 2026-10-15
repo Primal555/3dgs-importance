@@ -53,6 +53,9 @@ class ProgressiveChannelDecoder(nn.Module):
             from .channel_spatial import ChannelSpatialDenoiser
             tiers=(3,) if cfg.channel_denoiser_scope=='final' else (1,2,3)
             self.denoisers=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in tiers)
+        if cfg.channel_neighbor_mode!='none':
+            from .channel_spatial import ChannelNeighborRefiner
+            self.neighbor_refiner=ChannelNeighborRefiner(cfg)
 
     def decode_stages(self,received,receive_mask,q,snr,*,delivered_xyz=None):
         """Return cumulative latents; unavailable stages retain the last value.
@@ -91,6 +94,8 @@ class ProgressiveChannelDecoder(nn.Module):
             # All received prefixes may help all retained points. Own unsent
             # slots remain masked; q0/padding never become donors or queries.
             previous=previous+self.denoisers[0](previous,received,receive_mask,delivered_xyz,q>0,snr)
+        if hasattr(self,'neighbor_refiner'):
+            previous=previous+self.neighbor_refiner(previous,received,receive_mask,delivered_xyz,q>0,snr)
         return previous
 
 
