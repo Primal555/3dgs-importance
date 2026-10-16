@@ -90,6 +90,9 @@ CUDA_VISIBLE_DEVICES=2 nohup bash scripts/test_modular_codec_truck.sh "$RUN" "$N
 
 ## 如何读结果
 
+图像评估增加 LPIPS/VGG v0.1，并将已有 SSIM 纳入各档位控制台摘要与质量图；只用于评估，不改变损失。
+新版启动脚本默认启用；首次需预热权重。详见 [图像质量评估与补算](modular_image_quality.md)。
+
 metrics/loss.jsonl按阶段记录真实更新、四模块梯度/更新/冻结检查、SNR和秒数。
 metrics/validation.jsonl与test.jsonl明确标记clean、finite_noiseless、awgn；通信未训练时channel_trained=false。
 若clean本身弱，优先修表示；若clean强而finite_noiseless弱，检查通信映射/预算；后者强而AWGN弱才主要检查抗噪。

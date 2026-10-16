@@ -11,6 +11,20 @@ import test_render_first as render_fixture
 
 
 class ModularSNRControlTests(unittest.TestCase):
+    def test_lpips_control_option_and_comparison_preserve_both_references(self):
+        from gaussian_jscc.modular_snr_controls import parser,comparisons
+        args=parser().parse_args(['--run','trained','--out','new','--lpips'])
+        self.assertTrue(args.lpips)
+        r=dict(path='awgn',actual_snr=10.,layout='3',condition_policy='matched',views=4,
+               source_psnr=27.,photo_psnr=24.,source_ssim=.9,photo_ssim=.85,
+               source_lpips=.1,photo_lpips=.2,latent_mse=.001,latent_nmse=.03,
+               tx_condition_snr=10.,rx_condition_snr=10.)
+        records=[dict(r,layout=tier) for tier in ('1','2','3','mixed')]
+        measured=next(x for x in comparisons(records) if x['layout']=='3')['matched']
+        self.assertEqual(measured['source_lpips'],.1)
+        self.assertEqual(measured['photo_lpips'],.2)
+        self.assertEqual(measured['photo_ssim'],.85)
+
     def test_existing_checkpoint_four_conditions_without_training(self):
         from gaussian_jscc.modular_experiment import main as fit
         from gaussian_jscc.modular_snr_controls import main,parser

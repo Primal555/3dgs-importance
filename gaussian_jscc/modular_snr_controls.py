@@ -31,6 +31,8 @@ def parser():
     p.add_argument('--test-views',type=int,default=0,help='0: all original test cameras; positive: evenly spaced subset')
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--cpu-threads',type=int,default=4)
+    p.add_argument('--lpips',action=argparse.BooleanOptionalAction,default=False,
+                   help='evaluate pretrained VGG LPIPS v0.1 without any optimizer updates')
     return p
 
 
@@ -45,6 +47,7 @@ def comparisons(records):
                 row[policy]=dict(source_psnr=r['source_psnr'],photo_psnr=r['photo_psnr'],
                     source_ssim=r['source_ssim'],latent_mse=r['latent_mse'],latent_nmse=r['latent_nmse'],
                     tx_condition_snr=r['tx_condition_snr'],rx_condition_snr=r['rx_condition_snr'])
+                row[policy].update({k:r[k] for k in ('photo_ssim','source_lpips','photo_lpips') if k in r})
             if 'matched' in group:
                 row['gain_over_matched_db']={p:r['source_psnr']-group['matched']['source_psnr'] for p,r in group.items()}
             result.append(row)
@@ -131,7 +134,9 @@ def main(args):
     completed=json.loads((run/'complete.json').read_text(encoding='utf-8')) if (run/'complete.json').exists() else {}
     scene.channel_trained=saved.get('training',{}).get('progress',{}).get('channel_trained',completed.get('channel_trained',False))
     identity=model_id(model); model.eval()
-    metadata=dict(source_run=str(run),checkpoint=str(checkpoint),manifest=str(manifest_path),model_id=identity,
+    from .perceptual_metrics import image_metric_protocol
+    metadata=dict(image_metric_protocol=image_metric_protocol(args.lpips),
+                  source_run=str(run),checkpoint=str(checkpoint),manifest=str(manifest_path),model_id=identity,
                   reference_snr=reference,training_snrs=list(model.training_snrs),physical_snrs=args.snrs,policies=args.policies,
                   test_view_names=[str(c.image_name) for c in cameras],trials=args.trials,seed=args.seed,
                   net_bits_per_use=scene.net_bits_per_use,net_bits_per_use_origin=rate_origin,
@@ -143,7 +148,8 @@ def main(args):
         started=time.perf_counter()
         print(f'SNR control: {policy}; {len(cameras)} test views; {args.trials} trials; reference={reference:g} dB',flush=True)
         records+=evaluate_paths(model,scene,step=int(saved['step']),phase='test',snrs=args.snrs,trials=args.trials,
-                                seed=args.seed,save_images=False,out=out,condition_policy=policy,reference_snr=reference,verbose=True)
+                                seed=args.seed,save_images=False,out=out,condition_policy=policy,reference_snr=reference,verbose=True,
+                                lpips_metrics=args.lpips)
         timings[policy]=time.perf_counter()-started
         if model_id(model)!=identity: raise RuntimeError('evaluation changed checkpoint parameters')
     comparison=comparisons(records)

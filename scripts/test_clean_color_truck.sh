@@ -15,4 +15,4 @@ python -u -m gaussian_jscc.modular_experiment \
   --channel-bootstrap-steps 0 --channel-render-steps 0 \
   --semantic-color-every 4 --semantic-color-directions 8 \
   --semantic-encoder-lr 1e-4 --semantic-decoder-lr 1e-4 \
-  --color-metrics --save-semantic-end-images --validate-every 500 --save-every 500 "$@"
+  --color-metrics --save-semantic-end-images --validate-every 500 --save-every 500 --lpips "$@"

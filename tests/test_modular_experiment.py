@@ -27,6 +27,37 @@ def source_fixture(root):
 
 
 class ModularExperimentTests(unittest.TestCase):
+    def test_evaluation_lpips_reaches_every_stage_and_preserves_training(self):
+        from gaussian_jscc.modular_experiment import main
+        from gaussian_jscc.transport import load_checkpoint
+        from test_perceptual_metrics import backend
+        with tempfile.TemporaryDirectory() as t,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
+                patch('gaussian_jscc.rendering.load_cameras',return_value=render_fixture.RenderFirstTests().cameras()):
+            root=Path(t); source=source_fixture(root)
+            opts=self.args(source,root/'baseline')
+            opts.semantic_bootstrap_steps=1; opts.semantic_render_steps=0
+            opts.channel_bootstrap_steps=1; opts.channel_render_steps=1
+            main(opts)
+            opts.out=str(root/'perceptual'); opts.lpips=True
+            with patch('gaussian_jscc.perceptual_metrics._load_lpips_model',side_effect=backend):
+                main(opts)
+            baseline=load_checkpoint(root/'baseline/checkpoints/final/codec.pt','cpu')
+            measured=load_checkpoint(root/'perceptual/checkpoints/final/codec.pt','cpu')
+            for name,tensor in baseline.state_dict().items():
+                torch.testing.assert_close(tensor,measured.state_dict()[name],rtol=0,atol=0)
+            metadata=json.loads((root/'perceptual/training.json').read_text())
+            self.assertTrue(metadata['lpips_metrics'])
+            for name in ('validation','test'):
+                records=[json.loads(line) for line in (root/f'perceptual/metrics/{name}.jsonl').read_text().splitlines()]
+                self.assertTrue(all('source_lpips' in r and 'photo_lpips' in r for r in records))
+
+    def test_lpips_is_explicit_and_can_be_disabled_for_offline_legacy_runs(self):
+        from gaussian_jscc.modular_experiment import parser
+        base=['--run','source','--out','new_run']
+        opts=parser().parse_args(base+['--lpips'])
+        self.assertTrue(opts.lpips)
+        self.assertFalse(parser().parse_args(base+['--lpips','--no-lpips']).lpips)
+
     def test_default_communication_budgets_and_explicit_overrides(self):
         from gaussian_jscc.modular_experiment import parser
         base=['--run','source','--out','new_run']

@@ -1,4 +1,8 @@
 import tempfile
+import contextlib
+import io
+import json
+import statistics
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +21,35 @@ def scene_fixture(model,g,f):
 
 
 class ModularEvaluationTests(unittest.TestCase):
+    def test_ssim_and_lpips_cover_all_paths_references_and_trial_aggregation(self):
+        from gaussian_jscc.modular_evaluation import evaluate_paths
+        from test_perceptual_metrics import backend
+        m,g,f,q=setup(); scene=scene_fixture(m,g,f)
+        before={n:p.clone() for n,p in m.named_parameters()}; rng=torch.get_rng_state().clone()
+        with tempfile.TemporaryDirectory() as t,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render):
+            base=evaluate_paths(m,scene,step=0,phase='initial',snrs=[10],trials=2,seed=42,save_images=False,out=Path(t))
+            with patch('gaussian_jscc.perceptual_metrics._load_lpips_model',side_effect=backend), contextlib.redirect_stdout(io.StringIO()) as stream:
+                measured=evaluate_paths(m,scene,step=0,phase='final',snrs=[10],trials=2,seed=42,
+                                        save_images=False,out=Path(t),lpips_metrics=True)
+            self.assertIn('SSIM=',stream.getvalue()); self.assertIn('LPIPS=',stream.getvalue())
+            saved=[json.loads(line) for line in (Path(t)/'metrics/validation.jsonl').read_text().splitlines()]
+            self.assertEqual(len(saved),18)
+        self.assertTrue(torch.equal(rng,torch.get_rng_state())); self.assertTrue(m.training)
+        for n,p in m.named_parameters(): torch.testing.assert_close(p,before[n],rtol=0,atol=0)
+        for a,b in zip(base,measured):
+            self.assertEqual(a['source_psnr'],b['source_psnr'])
+            self.assertEqual(a['source_ssim'],b['source_ssim'])
+            self.assertEqual(a['latent_mse'],b['latent_mse'])
+            self.assertNotIn('source_lpips',a)
+            self.assertEqual(b['image_metric_protocol']['lpips']['network'],'vgg')
+            for ref in ('source','photo'):
+                key=ref+'_lpips'
+                self.assertTrue(all(key in x for x in b['per_view_trial']))
+                self.assertAlmostEqual(b[key],statistics.mean(x[key] for x in b['per_view_trial']))
+                trial_means=[statistics.mean(x[key] for x in b['per_view_trial'] if x['trial']==trial)
+                             for trial in range(b['trials'])]
+                self.assertAlmostEqual(b[key+'_std_trials'],statistics.pstdev(trial_means))
+
     def test_validation_is_rng_and_parameter_neutral(self):
         from gaussian_jscc.modular_evaluation import evaluate_paths
         m,g,f,q=setup(); scene=scene_fixture(m,g,f)

@@ -1,5 +1,10 @@
 # 信道恢复后联合微调（Truck，2000＋1000）
 
+图像评估现默认启用 SSIM 和 LPIPS/VGG v0.1；它们不加入训练损失。
+首次启动前先运行 `python -m gaussian_jscc.perceptual_metrics --device cpu` 缓存预训练权重。
+完整口径、关闭方式和旧 checkpoint 补算方法见 [图像质量评估](modular_image_quality.md)。
+末尾参数 `--channel-render-steps 2000` 可覆盖本脚本原来的 1000 步联合预算。
+
 本实验不改变网络结构。从已经训练好的完整 modular checkpoint 接续，
 保留语义两端、信道两端、空间上下文、去噪/邻居修正分支以及实际符号预算。
 不是随机初始化，也不是仅加载语义教师、重建随机信道网络。

@@ -85,9 +85,10 @@ def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr
 
 @torch.no_grad()
 def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,condition_policy='trained_range',reference_snr=10.,verbose=False,
-                   clean_only=False,color_metrics=False,save_phase_images=False):
+                   clean_only=False,color_metrics=False,save_phase_images=False,lpips_metrics=False):
     from .rendering import render
     from .cli import seed_all
+    from .perceptual_metrics import LPIPSEvaluator,image_metric_protocol
     if not scene.val_cameras or trials<1 or not snrs or any(not math.isfinite(s) for s in snrs):
         raise ValueError('validation requires cameras, positive trials and finite SNRs')
     conditioning_pair(model,snrs[0],condition_policy,reference_snr)
@@ -97,6 +98,7 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
     try:
         with preserved_rng(device):
             model.eval(); seed_all(seed)
+            perceptual=LPIPSEvaluator(device) if lpips_metrics else None
             # Generate once on CPU; independent of padding and subsequent noise.
             mixed=[torch.where(ids>=0,torch.randint(1,4,ids.shape),0) for ids in scene.group_ids]
             paths=[('clean','clean',10.,1)]
@@ -118,6 +120,9 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
                         image=render(raw,camera,scene.degree,getattr(scene,'white_background',False))
                         source=scene.reference.get(camera,device); photo=camera.original_image.to(device)
                         metrics={prefix+'_'+k:v for prefix,target in [('source',source),('photo',photo)] for k,v in image_metrics(image,target).items()}
+                        if perceptual is not None:
+                            for prefix,target in [('source',source),('photo',photo)]:
+                                metrics[prefix+'_lpips']=perceptual(image,target)
                         if color_metrics:
                             from .appearance_metrics import appearance_metrics
                             for prefix,target in [('source',source),('photo',photo)]:
@@ -133,6 +138,7 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
                      'rx_condition_snr':None if path=='clean' else rx_snr,'condition_policy':condition_policy,
                      'training_snrs':list(model.training_snrs),'condition_support_known':bool(model.training_snrs),
                      'channel_trained':getattr(scene,'channel_trained',False),
+                     'image_metric_protocol':image_metric_protocol(lpips_metrics),
                      'views':len(scene.val_cameras),'trials':ntrials,'per_view_trial':per_view,
                      'latent_mse':float(np.mean([d['latent_mse'] for d in diagnostics])),
                      'latent_target_power':float(np.mean([d['latent_target_power'] for d in diagnostics])),
@@ -150,11 +156,14 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
                     row.update(rate_record(model,scene,qfull,snr,'none' if path=='finite_noiseless' else 'awgn',identity,tx_snr,rx_snr))
                 records.append(row)
                 if verbose:
+                    quality=f", SSIM={row['source_ssim']:.4f}" + (f", LPIPS={row['source_lpips']:.4f}" if lpips_metrics else '')
                     print(f"{condition_policy} {path}/q{layout}: actual={row['actual_snr']}, tx={row['tx_condition_snr']}, rx={row['rx_condition_snr']}, "
-                          f"PSNR={row['source_psnr']:.3f}, latent_MSE={row['latent_mse']:.6g}, sec={time.perf_counter()-started:.2f}",flush=True)
+                          f"PSNR={row['source_psnr']:.3f}{quality}, latent_MSE={row['latent_mse']:.6g}, sec={time.perf_counter()-started:.2f}",flush=True)
     finally:
         model.train(mode)
     for row in records: append_json(out/'metrics'/('test.jsonl' if phase=='test' else 'validation.jsonl'),row)
-    summary=', '.join(f"{r['path']}/{r['layout']}={r['source_psnr']:.2f}" for r in records if r['path']=='clean' or r['actual_snr']==10)
+    summary=', '.join(f"{r['path']}/{r['layout']}: PSNR={r['source_psnr']:.2f}, SSIM={r['source_ssim']:.4f}"
+                      +(f", LPIPS={r['source_lpips']:.4f}" if lpips_metrics else '')
+                      for r in records if r['path']=='clean' or r['actual_snr']==10)
     print(f'validation {step} {phase} [SNR conditions: {condition_policy}]: {summary}',flush=True)
     return records

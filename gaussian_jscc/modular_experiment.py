@@ -61,6 +61,8 @@ def parser():
                    help='every Nth semantic bootstrap update uses independent unclipped direction RGB MSE; 0 disables')
     p.add_argument('--semantic-color-directions',type=int,default=8,help='even number; half training cameras, half uniform sphere')
     p.add_argument('--color-metrics',action='store_true',help='log uncorrected RGB bias and channel-difference errors')
+    p.add_argument('--lpips',action=argparse.BooleanOptionalAction,default=False,
+                   help='evaluation-only pretrained VGG LPIPS v0.1 for source PLY and photos; scripts enable by default')
     p.add_argument('--save-semantic-end-images',action='store_true',help='also save representative images after semantic bootstrap')
     return p
 
@@ -174,7 +176,7 @@ def main(args,max_updates=None):
             'sampling':'half training camera-to-point; half uniform sphere; unclipped; no alpha or footprint'})
     if args.clean_only: objectives=dict(objectives,clean_only=True)
     evaluation_options={'clean_only':args.clean_only,'color_metrics':args.color_metrics,
-                        'save_phase_images':args.save_semantic_end_images}
+                        'save_phase_images':args.save_semantic_end_images,'lpips_metrics':args.lpips}
     if min(counts.values())<0 or min(args.validate_every,args.save_every,args.cpu_threads)<1 or not args.train_snrs or any(not math.isfinite(s) for s in args.train_snrs):
         raise ValueError('invalid step budgets, intervals or training SNRs')
     lrs={name:getattr(args,name+'_lr') for name in MODULES}
@@ -264,6 +266,7 @@ def main(args,max_updates=None):
             'parameters':{n:sum(p.numel() for p in getattr(model,n).parameters()) for n in MODULES},
             'training_objective':objectives,
             'clean_only':args.clean_only,'color_metrics':args.color_metrics,'save_semantic_end_images':args.save_semantic_end_images,
+            'lpips_metrics':args.lpips,
             'semantic_color_every':args.semantic_color_every,'semantic_color_directions':args.semantic_color_directions,
             'color_update_counts':{'directional':counts['semantic_bootstrap']//args.semantic_color_every if args.semantic_color_every else 0,
                 'local_response':counts['semantic_bootstrap']-(counts['semantic_bootstrap']//args.semantic_color_every if args.semantic_color_every else 0)},
@@ -276,6 +279,12 @@ def main(args,max_updates=None):
             'source_usage':'all trained codec weights/config and verified scene metadata; source files read-only' if args.init_codec else 'paths, camera split and model dimensions only; never source checkpoint weights',
             'initialization': 'full trained codec fork; fresh Adam and local step schedule; no architecture changes' if args.init_codec else 'semantic-only fork; fresh channel modules and Adam' if args.init_semantic else 'all four modules random'})
     scene.channel_trained=progress['channel_trained']
+    # Evaluation can be enabled on an old exact-resume without altering Adam,
+    # RNG, objectives, or the historical metrics. Each row also stores protocol.
+    from .perceptual_metrics import image_metric_protocol
+    json_write(out/'metrics/image_metric_protocol.json',image_metric_protocol(args.lpips))
+    print('Evaluation: PSNR (higher), SSIM (higher), '+
+          ('LPIPS/VGG v0.1 (lower); evaluation only' if args.lpips else 'LPIPS disabled (--lpips enables it)'),flush=True)
     if cfg.context_variant!='baseline' and not args.resume:
         from .pointnet_context import geometry_diagnostics
         from .position_delivery import delivered_positions

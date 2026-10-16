@@ -32,4 +32,4 @@ python -u -m gaussian_jscc.modular_experiment \
   --channel-bootstrap-steps 2000 --channel-render-steps 1000 \
   --channel-encoder-lr 1e-4 --channel-decoder-lr 1e-4 --semantic-decoder-lr 1e-5 \
   --train-snrs 10 --channel-latent-weight 1 \
-  --validate-every 500 --save-every 500 --color-metrics "$@"
+  --validate-every 500 --save-every 500 --color-metrics --lpips "$@"

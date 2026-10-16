@@ -1,11 +1,80 @@
 """Plots from saved metrics only; no rerendering or coordinate compression."""
 import argparse
 import json
+import math
 from pathlib import Path
 
 
 def read_rows(path):
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()] if path.exists() else []
+
+
+def quality_series(rows,path,layout,key):
+    """Last measured value per step; missing legacy metrics are NOT zero."""
+    selected={r['step']:r for r in rows if r['path']==path and r['layout']==layout
+              and r['actual_snr'] in (None,10) and _finite_metric(r,key)}
+    return [selected[k] for k in sorted(selected)]
+
+
+def _finite_metric(row,key):
+    return isinstance(row.get(key),(int,float)) and math.isfinite(row[key])
+
+
+def _plot_perceptual_quality(validation,final,save):
+    """Chart contract: observed updates/SNR vs quality, separate references.
+
+    Six validation panels separate clean/noiseless/AWGN rather than mixing
+    nine traces. Tiers keep explicit categorical colors and distinct markers;
+    sparse checkpoint series use dots, not an invented smooth training curve.
+    Noise error bars are trial view-mean std, never a training-seed CI.
+    """
+    import matplotlib.pyplot as plt
+    styles={'1':('#356d9b','o'),'2':('#d88931','s'),'3':('#7b8139','^'),
+            'mixed':('#b06a8e','D'),'clean':('#444444','x')}
+    for metric,label in (('ssim','SSIM (higher is better)'),('lpips','LPIPS/VGG v0.1 (lower is better)')):
+        keys=[ref+'_'+metric for ref in ('source','photo')]
+        if any(_finite_metric(r,key) for r in validation for key in keys):
+            fig,axes=plt.subplots(3,2,figsize=(12,10),layout='constrained')
+            for row,path in enumerate(('clean','finite_noiseless','awgn')):
+                layouts=('clean',) if path=='clean' else ('1','2','3','mixed')
+                for ax,ref,key in zip(axes[row],('Source PLY','Photos'),keys):
+                    for layout in layouts:
+                        series=quality_series(validation,path,layout,key)
+                        if not series: continue
+                        color,marker=styles[layout]
+                        ax.plot([r['step'] for r in series],[r[key] for r in series],color=color,marker=marker,
+                                linestyle='-' if len(series)>=8 else 'None',markersize=4,
+                                label='clean' if layout=='clean' else 'q'+layout if layout!='mixed' else 'mixed')
+                    ax.set(title=f'{path} vs {ref}',xlabel='Global real optimizer updates',ylabel=label)
+                    ax.grid(alpha=.2)
+                    if ax.get_legend_handles_labels()[0]: ax.legend(fontsize=8,ncol=2)
+                    else: ax.text(.5,.5,'No recorded metric',ha='center',va='center',transform=ax.transAxes)
+            fig.suptitle('Fixed validation views; physical AWGN 10 dB; dots = measured checkpoints')
+            save(fig,f'validation_{metric}.png')
+        awgn=[r for r in final if r['path']=='awgn']
+        if any(_finite_metric(r,key) for r in awgn for key in keys):
+            fig,axes=plt.subplots(1,2,figsize=(12,4),layout='constrained')
+            for ax,ref,key in zip(axes,('Source PLY','Photos'),keys):
+                for layout in ('1','2','3','mixed'):
+                    rows=sorted((r for r in awgn if r['layout']==layout and _finite_metric(r,key)),
+                                key=lambda r:r['actual_snr'])
+                    if not rows: continue
+                    color,marker=styles[layout]
+                    ax.errorbar([r['actual_snr'] for r in rows],[r[key] for r in rows],
+                                yerr=[r.get(key+'_std_trials',0.) for r in rows],color=color,marker=marker,
+                                capsize=3,label='q'+layout if layout!='mixed' else 'mixed')
+                for path in ('clean','finite_noiseless'):
+                    reference=next((r for r in final if r['path']==path and _finite_metric(r,key)
+                                    and (path=='clean' or r['layout']=='3')),None)
+                    if reference:
+                        ax.axhline(reference[key],color='#444444',linestyle=':' if path=='clean' else '--',
+                                   label='clean' if path=='clean' else 'noiseless q3')
+                ax.set(title=f'vs {ref}',xlabel='Physical AWGN SNR (dB)',ylabel=label)
+                ax.grid(alpha=.2)
+                if ax.get_legend_handles_labels()[0]: ax.legend(fontsize=8)
+            policies=', '.join(dict.fromkeys(r.get('condition_policy','matched') for r in awgn))
+            fig.suptitle(f'Test views; conditions: {policies}; bars = noise-trial view-mean std')
+            save(fig,f'{metric}_snr.png')
 
 
 def plot_run(out):
@@ -113,6 +182,7 @@ def plot_run(out):
         policies=', '.join(dict.fromkeys(r.get('condition_policy','matched') for r in final if r['path']=='awgn'))
         fig.suptitle(f'All test views; SNR conditions: {policies}; error bars = noise-trial view-mean standard deviation')
         save(fig,'psnr_snr.png')
+    _plot_perceptual_quality(validation,final,save)
     return paths
 
 
