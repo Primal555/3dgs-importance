@@ -111,7 +111,7 @@ class ModularGaussianCodec(nn.Module):
         y = self.semantic_encoder(features,xyz,active)
         return torch.cat((side,self.semantic_decoder(y,active,side)),-1)
 
-    def forward_channel_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None):
+    def forward_channel_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None):
         """Training boundary: clean target and differentiable received latent.
 
         Uses the same channel/prefix path as deployment. No semantic decoding
@@ -128,7 +128,14 @@ class ModularGaussianCodec(nn.Module):
         z = self.channel_encoder(y,q>0,tx_snr)
         mask = prefix_mask(q.flatten(),self.cfg.rates).reshape_as(z)
         if paired_noise:
-            received = channel(z.reshape(-1,2),snr,kind).reshape_as(z)*mask
+            # A suite can use common virtual slots even when arm maxima differ.
+            # Padding is noise pairing only: these slots are never transmitted.
+            width=self.cfg.rates[-1] if noise_reference_symbols is None else noise_reference_symbols
+            if type(width) is not int or width<self.cfg.rates[-1]:
+                raise ValueError('noise reference must cover the largest symbol budget')
+            padded=F.pad(z,(0,2*width-z.shape[-1]))
+            noisy=channel(padded.reshape(-1,2),snr,kind).reshape_as(padded)
+            received=noisy[...,:z.shape[-1]]*mask
         else:
             noisy = channel(z[mask].reshape(-1,2),snr,kind)
             received = torch.zeros_like(z).masked_scatter(mask,noisy.flatten())
@@ -137,9 +144,10 @@ class ModularGaussianCodec(nn.Module):
         y_hat = self.channel_decoder(received,mask,q,rx_snr,**options)
         return y,y_hat,q
 
-    def forward_tier_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None):
+    def forward_tier_batches(self, features, xyz, choices, snr, kind='awgn', paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None):
         _,y_hat,q = self.forward_channel_batches(features,xyz,choices,snr,kind,paired_noise,
-                                                tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr)
+                                                tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr,
+                                                noise_reference_symbols=noise_reference_symbols)
         side = delivered_positions(features[...,:3],q,self.cfg)
         result = self.decode_representation(y_hat,q,side)
         return result,result[...,:3],(q>0).to(features)

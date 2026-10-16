@@ -59,7 +59,7 @@ class ChannelSpatialDenoiser(nn.Module):
             raise ValueError('invalid receiver denoiser shapes')
         ids,valid,relative=self.neighborhood(xyz,active)
         # Stage branches cap all donors at their current prefix. The final
-        # branch uses tier=3 and therefore retains every actually received slot.
+        # branch uses the maximum tier and retains every received slot.
         stage_mask=receive_mask.bool().clone(); stage_mask[...,2*self.symbols:]=False
         stage_mask &= active[...,None]
         signal=received.masked_fill(~stage_mask,0)
@@ -90,7 +90,7 @@ def enable_channel_denoising(model,mode,*,hidden=64,neighbors=16,scope='stage'):
     # Preserve the shared initialization/random stream across control modes.
     reference=next(model.parameters())
     with torch.random.fork_rng(devices=[]):
-        blocks=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in ((3,) if scope=='final' else (1,2,3))).to(reference)
+        blocks=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in ((len(cfg.rates)-1,) if scope=='final' else range(1,len(cfg.rates)))).to(reference)
     model.channel_decoder.denoisers=blocks
     model.cfg.channel_denoiser_mode=mode; model.cfg.channel_denoiser_hidden=hidden
     model.cfg.channel_denoiser_neighbors=neighbors
@@ -103,7 +103,7 @@ class ChannelNeighborRefiner(ChannelSpatialDenoiser):
         from dataclasses import replace
         local=replace(cfg,channel_denoiser_mode='spatial',channel_denoiser_scope='final',
                       channel_denoiser_hidden=cfg.channel_neighbor_hidden,channel_denoiser_neighbors=cfg.channel_neighbor_neighbors)
-        super().__init__(local,3)
+        super().__init__(local,len(local.rates)-1)
         self.feature_gate=nn.Linear(2*local.channel_denoiser_hidden,cfg.latent_dim)
         nn.init.zeros_(self.feature_gate.weight);nn.init.zeros_(self.feature_gate.bias)
         # Gate=0.5 and correction=0: exact warm start without a dead gate/output pair.

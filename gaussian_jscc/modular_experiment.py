@@ -202,6 +202,8 @@ def main(args,max_updates=None):
     initial_progress=None
     if args.resume:
         previous=json.loads((out/'training.json').read_text(encoding='utf-8'))
+        if previous.get('rate_sweep'):
+            raise ValueError('use channel_rate_sweep --resume with the suite root for variable-prefix experiments')
         if previous.get('inverse_control'):
             raise ValueError('use channel_inverse_controls --resume-suite to preserve the training channel condition')
         if previous.get('freeze_semantic',False)!=args.freeze_semantic:
@@ -228,6 +230,8 @@ def main(args,max_updates=None):
         if args.init_codec:
             model,initial_progress,saved_scene=initialize_codec_run(args.init_codec,device)
             cfg=model.cfg
+            if cfg.experimental_multirate:
+                raise ValueError('variable-prefix checkpoints require the independent channel_rate_sweep experiment')
             if cfg.sh_degree!=degree: raise ValueError('full initializer SH degree differs from source PLY')
         else:
             model=initialize_channel_run(args.init_semantic,device,cfg=cfg) if args.init_semantic else ModularGaussianCodec(cfg).to(device)

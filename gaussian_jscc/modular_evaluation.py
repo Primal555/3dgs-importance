@@ -52,7 +52,7 @@ def rate_record(model,scene,q,snr,kind,identity,tx_snr=None,rx_snr=None):
 
 
 @torch.no_grad()
-def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr=None):
+def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None):
     model.set_scene_geometry(scene.geometry)
     device=next(model.parameters()).device
     rows=[]; count=0; attr={n:0. for n in ('opacity','scale','rotation','dc','sh')}
@@ -64,7 +64,8 @@ def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr
         try:
             pred=predict(model,f,q,snr,'none' if path!='awgn' else 'awgn',
                          'semantic_render' if path=='clean' else 'channel_render',paired_noise=True,
-                         tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr)
+                         tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr,
+                         noise_reference_symbols=noise_reference_symbols)
         finally:
             for hook in hooks: hook.remove()
         rows.append(to_raw(pred[active],scene.geometry,model))
@@ -85,7 +86,7 @@ def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr
 
 @torch.no_grad()
 def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,condition_policy='trained_range',reference_snr=10.,verbose=False,
-                   clean_only=False,color_metrics=False,save_phase_images=False,lpips_metrics=False):
+                   clean_only=False,color_metrics=False,save_phase_images=False,lpips_metrics=False,noise_reference_symbols=None):
     from .rendering import render
     from .cli import seed_all
     from .perceptual_metrics import LPIPSEvaluator,image_metric_protocol
@@ -99,22 +100,25 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
         with preserved_rng(device):
             model.eval(); seed_all(seed)
             perceptual=LPIPSEvaluator(device) if lpips_metrics else None
+            maximum=len(model.cfg.rates)-1
             # Generate once on CPU; independent of padding and subsequent noise.
-            mixed=[torch.where(ids>=0,torch.randint(1,4,ids.shape),0) for ids in scene.group_ids]
+            mixed=[torch.where(ids>=0,torch.randint(1,maximum+1,ids.shape),0) for ids in scene.group_ids]
             paths=[('clean','clean',10.,1)]
             if not clean_only:
-                paths += [('finite_noiseless',q,10.,1) for q in ('1','2','3','mixed')]
-                paths += [('awgn',q,float(snr),trials) for snr in snrs for q in ('1','2','3','mixed')]
+                layouts=tuple(map(str,range(1,maximum+1)))+('mixed',)
+                paths += [('finite_noiseless',q,10.,1) for q in layouts]
+                paths += [('awgn',q,float(snr),trials) for snr in snrs for q in layouts]
             for path,layout,snr,ntrials in paths:
                 started=time.perf_counter()
                 tx_snr,rx_snr=conditioning_pair(model,snr,condition_policy,reference_snr)
-                qs=mixed if layout=='mixed' else [torch.where(ids>=0,int(layout) if layout!='clean' else 3,0) for ids in scene.group_ids]
+                qs=mixed if layout=='mixed' else [torch.where(ids>=0,int(layout) if layout!='clean' else maximum,0) for ids in scene.group_ids]
                 qfull=torch.cat([q[ids>=0] for q,ids in zip(qs,scene.group_ids)])
                 measurements=[]; diagnostics=[]; per_view=[]
                 for trial in range(ntrials):
                     # Same fixed-slot noise across prefixes and SNRs, per trial.
                     seed_all(seed+1000+trial)
-                    raw,diag=decode_path(model,scene,qs,path,snr,tx_condition_snr=tx_snr,rx_condition_snr=rx_snr); diagnostics.append(diag)
+                    raw,diag=decode_path(model,scene,qs,path,snr,tx_condition_snr=tx_snr,rx_condition_snr=rx_snr,
+                                         noise_reference_symbols=noise_reference_symbols); diagnostics.append(diag)
                     views=[]
                     for i,camera in enumerate(scene.val_cameras):
                         image=render(raw,camera,scene.degree,getattr(scene,'white_background',False))
@@ -138,6 +142,7 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
                      'rx_condition_snr':None if path=='clean' else rx_snr,'condition_policy':condition_policy,
                      'training_snrs':list(model.training_snrs),'condition_support_known':bool(model.training_snrs),
                      'channel_trained':getattr(scene,'channel_trained',False),
+                     'noise_reference_complex_symbols':noise_reference_symbols or model.cfg.rates[-1],
                      'image_metric_protocol':image_metric_protocol(lpips_metrics),
                      'views':len(scene.val_cameras),'trials':ntrials,'per_view_trial':per_view,
                      'latent_mse':float(np.mean([d['latent_mse'] for d in diagnostics])),

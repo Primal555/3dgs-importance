@@ -1,4 +1,4 @@
-"""Receiver-side latent refinement using three configurable progressive prefixes.
+"""Receiver-side latent refinement using configurable progressive prefixes.
 
 The transmitter remains the residual channel encoder. Only received symbol
 segments and earlier recovered latents enter the refinement stages: no clean
@@ -51,7 +51,7 @@ class ProgressiveChannelDecoder(nn.Module):
             for index,(start,end) in enumerate(zip(cfg.rates[:-1],cfg.rates[1:])))
         if cfg.channel_denoiser_mode!='none':
             from .channel_spatial import ChannelSpatialDenoiser
-            tiers=(3,) if cfg.channel_denoiser_scope=='final' else (1,2,3)
+            tiers=(len(cfg.rates)-1,) if cfg.channel_denoiser_scope=='final' else range(1,len(cfg.rates))
             self.denoisers=nn.ModuleList(ChannelSpatialDenoiser(cfg,t) for t in tiers)
         if cfg.channel_neighbor_mode!='none':
             from .channel_spatial import ChannelNeighborRefiner

@@ -53,6 +53,7 @@ class ModularCodecConfig:
     channel_neighbor_mode: str = 'none'
     channel_neighbor_hidden: int = 64
     channel_neighbor_neighbors: int = 16
+    experimental_multirate: bool = False
 
     def __post_init__(self):
         if self.architecture != 'modular_jscc_v1':
@@ -63,12 +64,18 @@ class ModularCodecConfig:
                 self.prefix_mode != 'progressive' or self.decoder_mode != 'direct'):
             raise ValueError('modular experiment requires reliable 16bit XYZ and progressive prefixes')
         self.rates = tuple(self.rates)
-        if (len(self.rates) != 4 or any(type(r) is not int for r in self.rates)
+        if type(self.experimental_multirate) is not bool:
+            raise ValueError('experimental_multirate must be a bool')
+        if self.experimental_multirate and self.channel_variant!='progressive':
+            raise ValueError('multirate experiment requires progressive channel decoding')
+        if ((not self.experimental_multirate and len(self.rates) != 4)
+                or not 2<=len(self.rates)<=256 or any(type(r) is not int for r in self.rates)
                 or self.rates[0] != 0 or any(a >= b for a, b in zip(self.rates, self.rates[1:]))):
-            raise ValueError('modular rates require q0=0 and three strictly increasing positive integer budgets')
+            raise ValueError('modular rates require q0=0 and increasing positive integer budgets; non-three-tier tables require experimental_multirate')
         # Composition reuses transport validation without subclassing legacy config.
         values = asdict(self)
         values.pop('latent_dim')
+        values.pop('experimental_multirate')
         for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden','channel_prefix_mode',
                     'channel_denoiser_mode','channel_denoiser_hidden','channel_denoiser_neighbors','channel_denoiser_scope',
                     'channel_neighbor_mode','channel_neighbor_hidden','channel_neighbor_neighbors'):
@@ -119,6 +126,7 @@ class ModularCodecConfig:
 
     def to_dict(self):
         values = asdict(self)
+        if not self.experimental_multirate: values.pop('experimental_multirate')
         # Baseline checkpoints/packet identities keep their historical syntax.
         if self.context_variant == 'baseline':
             for key in ('context_variant','context_centers','context_neighbors','context_radii'):

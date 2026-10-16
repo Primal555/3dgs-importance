@@ -60,15 +60,16 @@ def configure_phase(model, phase, module_lrs, *, freeze_semantic=False,denoiser_
     return torch.optim.Adam(groups)
 
 
-def predict(model, features, q, snr, kind, phase, paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None):
+def predict(model, features, q, snr, kind, phase, paired_noise=False, *, tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None):
     if phase not in PHASE_MODULES: raise ValueError('unknown phase')
     if phase.startswith('semantic'):
         return model.forward_clean_batches(features,features[...,:3],q>0)
-    return model.forward_tier_batches(features,features[...,:3],F.one_hot(q,4).to(features),snr,kind,paired_noise,
-                                     tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr)[0]
+    return model.forward_tier_batches(features,features[...,:3],F.one_hot(q,len(model.cfg.rates)).to(features),snr,kind,paired_noise,
+                                     tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr,
+                                     noise_reference_symbols=noise_reference_symbols)[0]
 
 
-def latent_reconstruction_loss(y, y_hat, q):
+def latent_reconstruction_loss(y, y_hat, q, tier_count=4):
     """Mean squared error per active point and latent dimension.
 
     The target is stop-gradient, not batch-normalized or rescaled. Statistics
@@ -77,6 +78,8 @@ def latent_reconstruction_loss(y, y_hat, q):
     """
     if y.shape != y_hat.shape or y.shape[:-1] != q.shape or y.shape[-1] < 1:
         raise ValueError('latent target/prediction/tier shapes do not match')
+    if not 2<=tier_count<=256 or ((q<0)|(q>=tier_count)).any():
+        raise ValueError('latent loss tiers outside configured rate table')
     active=q>0
     target=y.detach()[active]
     received=y_hat[active]
@@ -85,7 +88,7 @@ def latent_reconstruction_loss(y, y_hat, q):
     loss=errors.sum()/count
     metrics={'latent_mse':loss.detach(),
              'latent_target_power':target.square().sum()/max(target.numel(),1)}
-    for tier in (1,2,3):
+    for tier in range(1,tier_count):
         chosen=q[active]==tier
         metrics[f'latent_q{tier}_error']=errors.detach()[chosen].sum()/count
         metrics[f'latent_q{tier}_fraction']=chosen.sum().to(y.dtype)/count
@@ -95,18 +98,19 @@ def latent_reconstruction_loss(y, y_hat, q):
 def latent_diagnostics(metrics):
     values={key:float(value) for key,value in metrics.items()}
     mse=values['latent_mse']; power=values['latent_target_power']
+    tiers=sorted(int(k[len('latent_q'):-len('_fraction')]) for k in values if k.startswith('latent_q') and k.endswith('_fraction'))
     return {'latent_mse':mse,'latent_target_power':power,
             'latent_nmse':mse/max(power,1e-12),
             'latent_mse_by_tier':{str(t):values[f'latent_q{t}_error']/values[f'latent_q{t}_fraction']
-                if values[f'latent_q{t}_fraction']>0 else None for t in (1,2,3)}}
+                if values[f'latent_q{t}_fraction']>0 else None for t in tiers}}
 
 
 def bootstrap_step(model, features, q, geometry, snr, kind, phase, directions=None):
     model.set_scene_geometry(geometry)
     if phase == 'channel_bootstrap':
         if not (q>0).any(): raise ValueError('channel bootstrap requires active Gaussians')
-        y,y_hat,_=model.forward_channel_batches(features,features[...,:3],F.one_hot(q,4).to(features),snr,kind)
-        loss,metrics=latent_reconstruction_loss(y,y_hat,q)
+        y,y_hat,_=model.forward_channel_batches(features,features[...,:3],F.one_hot(q,len(model.cfg.rates)).to(features),snr,kind)
+        loss,metrics=latent_reconstruction_loss(y,y_hat,q,len(model.cfg.rates))
         if not torch.isfinite(loss): raise RuntimeError('nonfinite latent loss; no optimizer step performed')
         loss.backward()
         return loss.detach(),dict(latent_diagnostics(metrics),objective='latent_mse',
@@ -166,8 +170,8 @@ def render_step(model, batches, geometry, snr, kind, task, phase, mode='replay',
     communication=phase=='channel_render'
     def batch_forward(f,q):
         if communication:
-            y,y_hat,_=model.forward_channel_batches(f,f[...,:3],F.one_hot(q,4).to(f),snr,kind)
-            auxiliary,metrics=latent_reconstruction_loss(y,y_hat,q)
+            y,y_hat,_=model.forward_channel_batches(f,f[...,:3],F.one_hot(q,len(model.cfg.rates)).to(f),snr,kind)
+            auxiliary,metrics=latent_reconstruction_loss(y,y_hat,q,len(model.cfg.rates))
             pred=model.decode_representation(y_hat,q,delivered_positions(f[...,:3],q,model.cfg))
         else:
             pred=predict(model,f,q,snr,kind,phase)
