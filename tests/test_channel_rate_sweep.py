@@ -124,10 +124,13 @@ class RateSweepExperimentTests(unittest.TestCase):
             fit(opts)
             checkpoint=teacher/'checkpoints/final/codec.pt'; original=checkpoint.read_bytes()
             reference=load_checkpoint(checkpoint,'cpu')
-            def options(out):
-                return parser().parse_args(['--run',str(teacher),'--out',str(out),'--device','cpu',
+            def options(out,default_arms=False):
+                argv=['--run',str(teacher),'--out',str(out),'--device','cpu',
                     '--updates-per-rate','1','--validate-every','100','--save-every','2','--channel-hidden','16',
-                    '--no-lpips','--no-save-images','--test-views','1','--trials','1'])
+                    '--no-lpips','--no-save-images','--test-views','1','--trials','1']
+                # Historical two-arm resume remains explicitly reproducible.
+                if not default_arms: argv+=['--arms','three_tier','fine_tiers']
+                return parser().parse_args(argv)
             summary=main(options(root/'full'))
             self.assertEqual(summary['status'],'complete')
             self.assertTrue((root/'full/comparison/rate_distortion.csv').exists())
@@ -163,8 +166,12 @@ class RateSweepExperimentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'settings'): main(bad)
             from test_perceptual_metrics import backend
             with patch('gaussian_jscc.perceptual_metrics._load_lpips_model',side_effect=backend):
-                perceptual=options(root/'perceptual'); perceptual.arms=['fine_tiers']; perceptual.lpips=True
+                perceptual=options(root/'perceptual',default_arms=True); perceptual.lpips=True
                 report=main(perceptual)
+            self.assertFalse((root/'perceptual/three_tier').exists())
+            self.assertEqual(report['plan']['expected_updates'],{'fine_tiers':8})
+            self.assertEqual(len((root/'perceptual/fine_tiers/metrics/loss.jsonl').read_text().splitlines()),8)
+            self.assertTrue((root/'perceptual/comparison/training_history.png').exists())
             self.assertTrue(all(r['source_lpips'] is not None and r['photo_lpips'] is not None for r in report['final_test']))
 
 
