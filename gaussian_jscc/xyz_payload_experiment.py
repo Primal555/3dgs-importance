@@ -4,13 +4,14 @@ import json
 import math
 import random
 import time
+import uuid
 from pathlib import Path
 import torch
 from .cli import seed_all,device_for
 from .data import read_ply
 from .multiscene import shared_statistics
 from .modular_checkpoint import restore_rng,validate_scene
-from .modular_experiment import json_write,repair_logs,tier_batches
+from .modular_experiment import json_write,tier_batches
 from .modular_training import MODULES,PHASE_MODULES
 from .render_objective import MultiViewRenderTask
 from .render_validation import append_json
@@ -23,6 +24,26 @@ from .xyz_payload_checkpoint import save_checkpoint,restore_checkpoint,read_chec
 from .xyz_payload_evaluation import evaluate_paths
 
 PHASES=tuple(PHASE_MODULES)
+
+
+def repair_payload_logs(out,step):
+    """Archive uncheckpointed/torn tail records, including the empty-log case."""
+    for name in ('loss','validation','test'):
+        path=Path(out)/'metrics'/(name+'.jsonl')
+        if not path.exists(): continue
+        lines=path.read_text(encoding='utf-8').splitlines(); kept=[]; removed=[]
+        last=next((i for i in range(len(lines)-1,-1,-1) if lines[i].strip()),-1)
+        for i,line in enumerate(lines):
+            if not line.strip(): removed.append(line); continue
+            try: record=json.loads(line)
+            except json.JSONDecodeError:
+                if i!=last: raise ValueError('corrupt non-tail training log: '+str(path))
+                removed.append(line); continue
+            (kept if record['step']<=step else removed).append(line)
+        if removed:
+            path.with_name(f'{name}.uncheckpointed_{time.time_ns()}.txt').write_text('\n'.join(removed),encoding='utf-8')
+            temporary=path.with_suffix('.repair.tmp')
+            temporary.write_text(''.join(line+'\n' for line in kept),encoding='utf-8'); temporary.replace(path)
 
 
 def parser():
@@ -91,6 +112,12 @@ def main(args,max_updates=None):
     signature=json.loads(json.dumps(signature))
     if args.resume:
         if previous.get('resume_signature')!=signature: raise ValueError('exact resume settings/objective mismatch')
+        checkpoint=read_checkpoint(args.resume); saved_progress=checkpoint['progress']
+        if (saved_progress.get('run_id')!=previous.get('run_id') or not previous.get('run_id')
+                or saved_progress.get('resume_signature')!=signature
+                or saved_progress.get('phase_budgets')!=budgets or saved_progress.get('module_lrs')!=lrs
+                or saved_progress.get('joint_semantic_encoder')!=args.joint_semantic_encoder):
+            raise ValueError('exact resume requires the same-run identity and checkpoint settings signature')
         model,optimizer,progress,rng,saved_scene=restore_checkpoint(args.resume,device)
         if model.cfg!=cfg or progress['training_objective']!=objectives:
             raise ValueError('checkpoint settings/objective mismatch')
@@ -103,26 +130,46 @@ def main(args,max_updates=None):
             if previous_cfg!=cfg: raise ValueError('initializer config mismatch; explicit compatible architecture required')
             saved_scene=saved['scene_record']
             if args.init_semantic:
-                if not saved['progress']['completed'].get('semantic_render') or not saved['progress'].get('phase_complete'):
+                if (saved['progress']['phase']!='semantic_render' or not saved['progress']['completed'].get('semantic_render')
+                        or not saved['progress'].get('phase_complete')):
                     raise ValueError('semantic initializer must complete semantic render')
                 state={k:v for k,v in saved['state_dict'].items() if k.startswith('semantic_') or k in ('attr_mean','attr_std')}
+                expected={k for k in model.state_dict() if k.startswith('semantic_') or k in ('attr_mean','attr_std')}
+                if set(state)!=expected: raise ValueError('incomplete or unexpected semantic initializer keys')
                 model.load_state_dict(state,strict=False)
             else:
                 if not saved['progress'].get('channel_trained'): raise ValueError('initializer has no trained channel')
                 model.load_state_dict(saved['state_dict']); trained=True
         progress=dict(phase=PHASES[0],phase_step=0,step=0,phase_complete=False,completed={p:0 for p in PHASES},
                       phase_budgets=budgets,module_lrs=lrs,training_objective=objectives,
-                      joint_semantic_encoder=args.joint_semantic_encoder,train_snrs=[10.],channel_trained=trained)
+                      joint_semantic_encoder=args.joint_semantic_encoder,train_snrs=[10.],channel_trained=trained,
+                      run_id=uuid.uuid4().hex,resume_signature=signature)
     model.set_training_snrs([10.])
     scene=make_scene(spec,raw,degree,model,source,old,args); del raw
     if saved_scene is not None: validate_scene(saved_scene,scene.record)
     scene.channel_trained=progress['channel_trained']
     centers=torch.stack([torch.as_tensor(c.camera_center).detach().cpu() for c in scene.cameras]).to(device)
     if args.resume:
-        repair_logs(out,progress['step']); restore_rng(rng)
+        stamp=str(time.time_ns())
+        for name in ('complete','failure'):
+            marker=out/(name+'.json')
+            if marker.exists(): marker.rename(out/f'{name}.before_resume_{stamp}.json')
+        if progress['step']<sum(budgets.values()):
+            future={'packet','charts','checkpoints/final','images/final'}
+            end_step=0
+            for phase in PHASES:
+                end_step+=budgets[phase]
+                if end_step>progress['step']:
+                    future.update(('checkpoints/end_'+phase,'images/'+phase+'_end'))
+            for relative in sorted(future):
+                path=out/relative
+                if path.exists():
+                    archived=out/'archive'/('before_resume_'+stamp)/relative
+                    archived.parent.mkdir(parents=True,exist_ok=True); path.rename(archived)
+        repair_payload_logs(out,progress['step']); restore_rng(rng)
     else:
         for folder in ('metrics','charts','checkpoints','images'): (out/folder).mkdir(parents=True,exist_ok=True)
-        json_write(out/'training.json',dict(resume_signature=signature,**signature,source_run=str(Path(args.run).resolve()),
+        json_write(out/'training.json',dict(run_id=progress['run_id'],resume_signature=signature,**signature,source_run=str(Path(args.run).resolve()),
             manifest=str(manifest_path),selected_scenes=[spec],scene=scene.record,initializer=initializer,
             random_initialization=not bool(initializer),source_weights_loaded=bool(args.init_codec),
             metadata_only_source=not bool(initializer),position_delivery='inside_analogue_payload',
@@ -140,9 +187,8 @@ def main(args,max_updates=None):
 
     def endpoint(phase):
         label='end_'+phase
-        if not (out/'checkpoints'/label/'codec.pt').exists():
-            evaluate(phase+'_end',images=phase in ('semantic_render','channel_bootstrap'))
-            save(label)
+        evaluate(phase+'_end',images=phase in ('semantic_render','channel_bootstrap'))
+        save(label)
         save('latest')
 
     if not args.resume:

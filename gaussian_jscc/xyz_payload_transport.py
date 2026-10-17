@@ -1,7 +1,10 @@
 """Self-contained simulated XYZ-payload packet; no reliable coordinate stream."""
 import json
+import hashlib
 import math
+import struct
 import tempfile
+import zlib
 from pathlib import Path
 import numpy as np
 import torch
@@ -10,6 +13,25 @@ from .data import Geometry,prepare,to_features,to_raw
 from .optimization import preserved_rng
 from .transport import encode_metadata,decode_metadata,model_id
 from .xyz_payload_config import XYZPayloadConfig
+
+
+def encode_packet_metadata(header,q,digest=bytes(32)):
+    """Fixed 40-byte integrity envelope; checksum bytes are not compressed.
+
+    Outer CRC binds header/framing and expected SHA256 together. SHA256 detects
+    corruption of stored simulated received values, NOT real channel errors/FEC.
+    """
+    if len(digest)!=32: raise ValueError('invalid payload checksum')
+    body=digest+encode_metadata(header,q)
+    return b'XYP1'+struct.pack('<I',zlib.crc32(body))+body
+
+
+def decode_packet_metadata(data):
+    if len(data)<48 or data[:4]!=b'XYP1': raise ValueError('invalid XYZ packet integrity framing')
+    body=data[8:]
+    if zlib.crc32(body)!=struct.unpack('<I',data[4:8])[0]: raise ValueError('packet metadata CRC failure')
+    header,q=decode_metadata(body[32:])
+    return header,q,body[:32]
 
 
 def packet_header(model,geometry,q,snr,kind,identity=None):
@@ -24,11 +46,11 @@ def rate_record(model,geometry,q,snr,kind,net_bits_per_use=2.,identity=None):
         raise ValueError('net bits/use must be positive finite')
     q=q.detach().cpu()
     header=packet_header(model,geometry,q,snr,kind,identity)
-    metadata=encode_metadata(header,q.numpy())
+    metadata=encode_packet_metadata(header,q.numpy())
     payload=int(torch.tensor(model.cfg.rates)[q].sum())
     overhead=math.ceil(8*len(metadata)/net_bits_per_use)
     return dict(payload_complex_symbols=payload,symbols_per_gaussian=payload/max(len(q),1),
-                xyz_bytes=0,coordinate_channel_uses=0,metadata_bytes=len(metadata),
+                xyz_bytes=0,coordinate_channel_uses=0,metadata_bytes=len(metadata),packet_integrity_bytes=40,
                 metadata_channel_uses=overhead,total_channel_uses=payload+overhead,
                 net_bits_per_use_assumption=float(net_bits_per_use),
                 reliability='global metadata assumed reliable; no FEC or packet errors simulated',
@@ -58,13 +80,14 @@ def export_packet(model,raw,q,snr,kind,seed,out,net_bits_per_use=2.):
                 received.append(channel(z,snr,kind).cpu())
     finally: model.train(was_training)
     header=packet_header(model,geometry,q,snr,kind)
-    metadata=encode_metadata(header,q.numpy())
+    values=torch.cat(received).numpy()
+    metadata=encode_packet_metadata(header,q.numpy(),hashlib.sha256(values.tobytes()).digest())
     cost=rate_record(model,geometry,q,snr,kind,net_bits_per_use,header['model_id'])
     out.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.xyz-packet-',dir=out.parent) as temporary:
         staged=Path(temporary)/'packet'; staged.mkdir()
         (staged/'metadata.bin').write_bytes(metadata)
-        np.save(staged/'received.npy',torch.cat(received).numpy(),allow_pickle=False)
+        np.save(staged/'received.npy',values,allow_pickle=False)
         (staged/'cost.json').write_text(json.dumps(cost,indent=2,allow_nan=False),encoding='utf-8')
         staged.rename(out)
     return cost
@@ -74,7 +97,7 @@ def export_packet(model,raw,q,snr,kind,seed,out,net_bits_per_use=2.):
 def receive_packet(model,folder):
     folder=Path(folder)
     if (folder/'xyz.bin').exists(): raise ValueError('coordinate side stream forbidden')
-    header,q=decode_metadata((folder/'metadata.bin').read_bytes())
+    header,q,digest=decode_packet_metadata((folder/'metadata.bin').read_bytes())
     if (header.get('experiment')!='xyz_payload_jscc_v1' or header.get('version')!=1
             or header.get('xyz_delivery')!='in_payload' or header.get('coordinate_bytes')!=0):
         raise ValueError('not a source-free XYZ payload packet')
@@ -86,6 +109,8 @@ def receive_packet(model,folder):
     values=np.load(folder/'received.npy',allow_pickle=False)
     if values.shape!=(expected,2) or values.dtype!=np.float32 or not np.isfinite(values).all():
         raise ValueError('invalid received symbol length/values')
+    if hashlib.sha256(values.tobytes()).digest()!=digest:
+        raise ValueError('received payload integrity checksum mismatch')
     geometry=Geometry(**header['geometry']); model.set_scene_geometry(geometry)
     device=next(model.parameters()).device; was_training=model.training
     rows=[]; offset=0

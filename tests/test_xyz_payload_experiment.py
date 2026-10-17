@@ -109,5 +109,59 @@ class PayloadExperimentTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('Set CUDA_VISIBLE_DEVICES',result.stderr)
 
+    def test_resume_rejects_foreign_run(self):
+        from gaussian_jscc.xyz_payload_experiment import main
+        with tempfile.TemporaryDirectory() as t,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
+             patch('gaussian_jscc.rendering.load_cameras',return_value=cameras()):
+            root=Path(t); source=source_fixture(root)
+            a=root/'a'; b=root/'b'
+            main(self.options(source,a),max_updates=1)
+            options=self.options(source,b); options.semantic_encoder_lr=.05
+            main(options,max_updates=1)
+            options=self.options(source,a); options.resume=str(b/'checkpoints/latest/codec.pt')
+            with self.assertRaisesRegex(ValueError,'same.run|identity|signature'):
+                main(options,max_updates=1)
+
+    def test_rollback_resume_invalidates_completion_and_regenerates_endpoints(self):
+        from gaussian_jscc.xyz_payload_experiment import main
+        with tempfile.TemporaryDirectory() as t,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
+             patch('gaussian_jscc.rendering.load_cameras',return_value=cameras()):
+            root=Path(t); source=source_fixture(root)
+            main(self.options(source,root/'completed'))
+            out=root/'completed'; options=self.options(source,out)
+            (out/'checkpoints/end_semantic_bootstrap/codec.pt').write_bytes(b'partial checkpoint')
+            options.resume=str(out/'checkpoints/initial/codec.pt')
+            main(options,max_updates=1)
+            self.assertFalse((out/'complete.json').exists())
+            self.assertTrue(list(out.glob('complete.before_resume_*.json')))
+            options.resume=str(out/'checkpoints/latest/codec.pt'); main(options)
+            checkpoint=torch.load(out/'checkpoints/end_semantic_bootstrap/codec.pt',weights_only=True)
+            self.assertEqual(checkpoint['progress']['step'],4)
+
+    def test_semantic_initializer_rejects_missing_semantic_weights(self):
+        from gaussian_jscc.xyz_payload_experiment import main
+        with tempfile.TemporaryDirectory() as t,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render), \
+             patch('gaussian_jscc.rendering.load_cameras',return_value=cameras()):
+            root=Path(t); source=source_fixture(root); out=root/'semantic'
+            options=self.options(source,out); options.channel_bootstrap_steps=0; options.channel_render_steps=0
+            main(options)
+            path=out/'checkpoints/end_semantic_render/codec.pt'; state=torch.load(path,weights_only=True)
+            del state['state_dict'][next(k for k in state['state_dict'] if k.startswith('semantic_encoder.'))]
+            torch.save(state,path)
+            options=self.options(source,root/'fork'); options.init_semantic=str(path)
+            with self.assertRaisesRegex(ValueError,'incomplete|semantic.*keys'): main(options)
+
+    def test_log_recovery_preserves_only_checkpointed_rows_and_archives_torn_tail(self):
+        from gaussian_jscc.xyz_payload_experiment import repair_payload_logs
+        with tempfile.TemporaryDirectory() as t:
+            out=Path(t); (out/'metrics').mkdir()
+            path=out/'metrics/loss.jsonl'
+            path.write_text('{"step":1}\n\n{"step":2}\n{"step":',encoding='utf-8')
+            repair_payload_logs(out,1)
+            self.assertEqual(path.read_text(encoding='utf-8'),'{"step":1}\n')
+            self.assertTrue(list(path.parent.glob('loss.uncheckpointed_*.txt')))
+            repair_payload_logs(out,0); repair_payload_logs(out,0)
+            self.assertEqual(path.read_text(encoding='utf-8'),'')
+
 
 if __name__=='__main__': unittest.main()

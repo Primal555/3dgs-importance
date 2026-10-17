@@ -53,5 +53,23 @@ class PayloadTransportTests(unittest.TestCase):
                     export_packet(model,raw,torch.ones(8,dtype=torch.long),10.,'none',42,root)
             self.assertFalse(root.exists())
 
+    def test_shape_preserving_symbol_corruption_is_rejected_before_decode(self):
+        from gaussian_jscc.xyz_payload_transport import export_packet,receive_packet
+        model=codec_fixture.XYZPayloadCodecTests().model(); raw,_=fixture(8,1)
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t)/'packet'
+            cost=export_packet(model,raw,torch.ones(8,dtype=torch.long),10.,'none',42,root)
+            values=np.load(root/'received.npy'); values[0,0]+=.01
+            np.save(root/'received.npy',values)
+            with self.assertRaisesRegex(ValueError,'checksum|integrity'):
+                receive_packet(model,root)
+            self.assertEqual(cost['metadata_bytes'],(root/'metadata.bin').stat().st_size)
+            self.assertEqual(cost['packet_integrity_bytes'],40)
+            other=root.parent/'another'
+            shifted=raw.clone(); shifted[:,:3]+=3
+            export_packet(model,shifted,torch.ones(8,dtype=torch.long),10.,'awgn',43,other)
+            (root/'received.npy').write_bytes((other/'received.npy').read_bytes())
+            with self.assertRaisesRegex(ValueError,'checksum|integrity'): receive_packet(model,root)
+
 
 if __name__=='__main__': unittest.main()
