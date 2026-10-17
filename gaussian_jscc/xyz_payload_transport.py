@@ -1,6 +1,7 @@
 """Self-contained simulated XYZ-payload packet; no reliable coordinate stream."""
 import json
 import math
+import tempfile
 from pathlib import Path
 import numpy as np
 import torch
@@ -59,10 +60,13 @@ def export_packet(model,raw,q,snr,kind,seed,out,net_bits_per_use=2.):
     header=packet_header(model,geometry,q,snr,kind)
     metadata=encode_metadata(header,q.numpy())
     cost=rate_record(model,geometry,q,snr,kind,net_bits_per_use,header['model_id'])
-    out.mkdir(parents=True)
-    (out/'metadata.bin').write_bytes(metadata)
-    np.save(out/'received.npy',torch.cat(received).numpy(),allow_pickle=False)
-    (out/'cost.json').write_text(json.dumps(cost,indent=2,allow_nan=False),encoding='utf-8')
+    out.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.xyz-packet-',dir=out.parent) as temporary:
+        staged=Path(temporary)/'packet'; staged.mkdir()
+        (staged/'metadata.bin').write_bytes(metadata)
+        np.save(staged/'received.npy',torch.cat(received).numpy(),allow_pickle=False)
+        (staged/'cost.json').write_text(json.dumps(cost,indent=2,allow_nan=False),encoding='utf-8')
+        staged.rename(out)
     return cost
 
 

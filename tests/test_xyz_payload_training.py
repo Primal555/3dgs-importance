@@ -49,6 +49,21 @@ class XYZPayloadTrainingTests(unittest.TestCase):
         self.assertGreater(sum(float(p.grad.norm()) for p in model.channel_decoder.parameters() if p.grad is not None),0)
         self.assertAlmostEqual(float(loss),stats['render_loss']+stats['weighted_latent_loss'],places=4)
 
+    def test_color_update_does_not_move_shape_heads_with_adam_momentum(self):
+        from gaussian_jscc.xyz_payload_training import configure_phase,bootstrap_step,color_bootstrap_step,finish_update
+        helper=codec_fixture.XYZPayloadCodecTests(); model=helper.model(); f,active=helper.features(); q=active.long()*3
+        optimizer=configure_phase(model,'semantic_bootstrap',{})
+        before={n:p.detach().clone() for n,p in model.named_parameters()}
+        bootstrap_step(model,f,q,model_geometry(),10.,'none','semantic_bootstrap')
+        finish_update(model,optimizer,before); optimizer.zero_grad(set_to_none=True)
+        before={n:p.detach().clone() for n,p in model.named_parameters()}
+        color_bootstrap_step(model,f,q,model_geometry(),torch.tensor([[3.,4.,5.]]),8)
+        finish_update(model,optimizer,before)
+        for n,p in model.named_parameters():
+            if n.startswith('channel_') or any('heads.'+head+'.' in n for head in ('opacity','scale','rotation')):
+                torch.testing.assert_close(p,before[n],rtol=0,atol=0)
+        self.assertTrue(any(not torch.equal(p,before[n]) for n,p in model.named_parameters() if 'heads.dc.' in n))
+
     def test_checkpoint_restores_optimizer_rng_and_rejects_legacy(self):
         from gaussian_jscc.xyz_payload_training import configure_phase,bootstrap_step,finish_update
         from gaussian_jscc.xyz_payload_checkpoint import save_checkpoint,restore_checkpoint

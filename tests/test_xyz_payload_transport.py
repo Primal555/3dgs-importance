@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import numpy as np
 import torch
 from test_gaussian_jscc import fixture
@@ -41,6 +42,16 @@ class PayloadTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'CRC'): receive_packet(model,root)
             (root/'metadata.bin').write_bytes(original); (root/'xyz.bin').write_bytes(b'forbidden')
             with self.assertRaisesRegex(ValueError,'side|coordinate'): receive_packet(model,root)
+
+    def test_failed_packet_export_does_not_leave_a_complete_looking_directory(self):
+        from gaussian_jscc.xyz_payload_transport import export_packet
+        model=codec_fixture.XYZPayloadCodecTests().model(); raw,_=fixture(8,1)
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t)/'packet'
+            with patch('gaussian_jscc.xyz_payload_transport.np.save',side_effect=OSError('disk full')):
+                with self.assertRaisesRegex(OSError,'disk full'):
+                    export_packet(model,raw,torch.ones(8,dtype=torch.long),10.,'none',42,root)
+            self.assertFalse(root.exists())
 
 
 if __name__=='__main__': unittest.main()
