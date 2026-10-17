@@ -155,3 +155,29 @@ class ModularGaussianCodec(nn.Module):
     def forward_tiers(self, features, xyz, choices, snr, kind='awgn', *, tx_condition_snr=None,rx_condition_snr=None):
         return tuple(v[0] for v in self.forward_tier_batches(features[None],xyz[None],choices[None],snr,kind,
                        tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr))
+
+    def forward_st_prefix_batches(self, features, xyz, q, probabilities, snr, kind='awgn'):
+        """Hard deployed modular path, with biased local allocator derivatives.
+
+        No new weights/configuration. q0 is absent from live spatial context;
+        its keep derivative is supplied by local_mask_step's zero-mask shadow.
+        Never use this surrogate to measure wire rate or as a soft deployment.
+        """
+        if self.cfg.channel_variant!='progressive' or self.cfg.prefix_mode!='progressive':
+            raise ValueError('modular allocation requires progressive channel decoding')
+        if q.shape!=features.shape[:2] or probabilities.shape!=(*q.shape,len(self.cfg.rates)):
+            raise ValueError('invalid tier/probability shape')
+        hard=F.one_hot(q,len(self.cfg.rates)).to(features)
+        choices=hard+(probabilities-probabilities.detach())
+        boundary=torch.as_tensor(self.cfg.rates,device=q.device)
+        templates=(torch.arange(2*self.cfg.rates[-1],device=q.device)[None,:]<2*boundary[:,None]).to(features)
+        receive_mask=choices@templates
+        active=q>0
+        y=self.semantic_encoder(features,xyz,active)
+        condition=self.resolve_condition_snr(snr)
+        z=self.channel_encoder(y,active,condition)
+        received=channel(z.reshape(-1,2),snr,kind).reshape_as(z)*receive_mask
+        side=delivered_positions(features[...,:3],q,self.cfg)
+        gates=torch.stack([choices[...,tier:].sum(-1) for tier in range(1,len(self.cfg.rates))],-1)
+        y_hat=self.channel_decoder(received,receive_mask,q,condition,delivered_xyz=side,stage_gates=gates)
+        return self.decode_representation(y_hat,q,side)

@@ -57,7 +57,7 @@ class ProgressiveChannelDecoder(nn.Module):
             from .channel_spatial import ChannelNeighborRefiner
             self.neighbor_refiner=ChannelNeighborRefiner(cfg)
 
-    def decode_stages(self,received,receive_mask,q,snr,*,delivered_xyz=None):
+    def decode_stages(self,received,receive_mask,q,snr,*,delivered_xyz=None,stage_gates=None):
         """Return cumulative latents; unavailable stages retain the last value.
 
         Lower stages never receive the final tier identity. Thus q3's first
@@ -73,23 +73,38 @@ class ProgressiveChannelDecoder(nn.Module):
             raise ValueError('invalid receiver tiers')
         if not math.isfinite(float(snr)):
             raise ValueError('SNR must be finite')
+        if stage_gates is not None and stage_gates.shape != (*q.shape,len(self.stages)):
+            raise ValueError('allocator stage gates must match receiver tiers')
         masked=received.masked_fill(~receive_mask.bool(),0)
         previous=received.new_zeros(*q.shape,self.cfg.latent_dim)
         outputs=[]
         for tier,(stage,start,end) in enumerate(zip(self.stages,self.cfg.rates[:-1],self.cfg.rates[1:]),1):
             active=q>=tier
+            correction=torch.zeros_like(previous)
             if active.any():
                 earlier=masked[...,:2*start][active] if hasattr(stage,'prefix_input') else None
                 delta=stage(masked[...,2*start:2*end][active],previous[active],snr,earlier)
-                correction=torch.zeros_like(previous).masked_scatter(active[...,None].expand_as(previous),delta.flatten())
+                correction=correction.masked_scatter(active[...,None].expand_as(previous),delta.flatten())
+            if stage_gates is not None:
+                # Hypothetical lower-tier queries supply ONLY gate derivatives.
+                # Detach their branch so a completely unused stage has grad=None,
+                # not grad=0 (which would still advance old Adam moments).
+                hypothetical=(q>0)&~active
+                if hypothetical.any():
+                    with torch.no_grad():
+                        earlier=masked[...,:2*start][hypothetical] if hasattr(stage,'prefix_input') else None
+                        delta=stage(masked[...,2*start:2*end][hypothetical],previous[hypothetical],snr,earlier)
+                    correction=correction.masked_scatter(hypothetical[...,None].expand_as(previous),delta.flatten())
+                correction=correction*stage_gates[...,tier-1,None]
+            if active.any() or stage_gates is not None:
                 previous=previous+correction
-                if hasattr(self,'denoisers') and self.cfg.channel_denoiser_scope=='stage':
+                if active.any() and hasattr(self,'denoisers') and self.cfg.channel_denoiser_scope=='stage':
                     previous=previous+self.denoisers[tier-1](previous,masked,receive_mask,delivered_xyz,active,snr)
             outputs.append(previous)
         return torch.stack(outputs,-2)
 
-    def forward(self,received,receive_mask,q,snr,*,delivered_xyz=None):
-        previous=self.decode_stages(received,receive_mask,q,snr,delivered_xyz=delivered_xyz)[...,-1,:]
+    def forward(self,received,receive_mask,q,snr,*,delivered_xyz=None,stage_gates=None):
+        previous=self.decode_stages(received,receive_mask,q,snr,delivered_xyz=delivered_xyz,stage_gates=stage_gates)[...,-1,:]
         if hasattr(self,'denoisers') and self.cfg.channel_denoiser_scope=='final':
             # All received prefixes may help all retained points. Own unsent
             # slots remain masked; q0/padding never become donors or queries.

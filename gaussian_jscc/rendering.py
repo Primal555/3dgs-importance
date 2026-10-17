@@ -76,7 +76,7 @@ def load_cameras(source, resolution=2, white_background=False, images="images", 
     return cameraList_from_camInfos(infos, 1.0, args)
 
 
-def render(raw, camera, degree, white_background=False, existence=None):
+def render(raw, camera, degree, white_background=False, existence=None, colors=None):
     if existence is None:
         from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
     else:
@@ -86,6 +86,8 @@ def render(raw, camera, degree, white_background=False, existence=None):
             raise ValueError('existence must have one value per Gaussian')
 
     bg = raw.new_full((3,), float(white_background))
+    if colors is not None and (colors.shape!=(len(raw),3) or not torch.isfinite(colors).all()):
+        raise ValueError('precomputed colors must be finite [N,3]')
     if not len(raw):
         return bg[:, None, None].expand(3, camera.image_height, camera.image_width)
     settings = GaussianRasterizationSettings(
@@ -99,7 +101,9 @@ def render(raw, camera, degree, white_background=False, existence=None):
     sh = torch.cat((dc, rest), 1).contiguous()
     image, _ = GaussianRasterizer(raster_settings=settings)(
         means3D=raw[:, :3].contiguous(), means2D=torch.zeros_like(raw[:, :3]),
-        shs=sh, colors_precomp=None, opacities=raw[:, 3:4].sigmoid().contiguous(),
+        shs=sh if colors is None else None,
+        colors_precomp=None if colors is None else colors.to(raw).contiguous(),
+        opacities=raw[:, 3:4].sigmoid().contiguous(),
         scales=raw[:, 4:7].clamp(-20, 10).exp().contiguous(),
         rotations=torch.nn.functional.normalize(raw[:, 7:11], dim=-1).contiguous(),
         cov3D_precomp=None,
