@@ -120,14 +120,14 @@ class SemanticDecoder(nn.Module):
             nn.init.zeros_(self.xyz_embedding[-1].weight)
             nn.init.zeros_(self.xyz_embedding[-1].bias)
 
-    def forward(self, y_hat, active, delivered_xyz=None):
+    def forward(self, y_hat, active, delivered_xyz=None, *, detach_geometry=True):
         xyz = None
         if self.cfg.decoder_geometry == 'xyz':
             if delivered_xyz is None or delivered_xyz.shape != (*active.shape, 3):
                 raise ValueError('semantic decoder requires matching delivered XYZ')
             if not torch.isfinite(delivered_xyz[active]).all():
                 raise ValueError('nonfinite active delivered XYZ')
-            xyz = delivered_xyz.detach().to(y_hat).masked_fill(~active[..., None], 0)
+            xyz = (delivered_xyz.detach() if detach_geometry else delivered_xyz).to(y_hat).masked_fill(~active[..., None], 0)
         h = self.input(y_hat.masked_fill(~active[..., None], 0))
         if xyz is not None:
             h = h + self.xyz_embedding(xyz*2-1)

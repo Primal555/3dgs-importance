@@ -122,6 +122,15 @@ def local_response_loss(pred, target, geometry, model, views=4, directions=None)
     """
     if model.cfg.position_delivery == 'learned':
         raise ValueError('local response requires float32 or quantized XYZ delivery; it does not train XYZ')
+    return isolated_attribute_response_loss(pred,target,geometry,model,views,directions)
+
+
+def isolated_attribute_response_loss(pred, target, geometry, model, views=4, directions=None):
+    """Attribute-only isolated response; explicitly ignores predicted centers.
+
+    Unlike the legacy guarded entrypoint this is also valid for XYZ carried
+    inside a payload, but MUST NOT be described as supervising its position.
+    """
     if views < 1 or pred.ndim != 2 or pred.shape != target.shape or not len(pred):
         raise ValueError('local response needs nonempty matching [N,D] inputs and positive views')
     target = target.detach()
