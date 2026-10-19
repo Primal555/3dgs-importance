@@ -90,6 +90,33 @@ CUDA_VISIBLE_DEVICES=2 RESUME=1 nohup bash scripts/test_perceptual_training.sh \
 
 这两组之间是相同初始化和预算的目标对照。历史纯 MSE 的后续训练轮次及优化历史不完全相同，可作性能参考，**不包装成严格匹配的全流程三组消融**；按要求不重复启动第三组。
 
+## SSIM 低学习率通信重跑（2026-10-19）
+
+独立入口 `scripts/test_ssim_low_lr_truck.sh SSIM_RUN NEW_OUT` 复用 SSIM 组的
+`checkpoints/end_semantic_render/codec.pt`，不使用已退化的联合训练最终权重。
+新实验只复制语义权重和标准化参数，信道模块重新随机初始化，Adam 从头开始。
+保留来源的完整结构、8/24/48 档位、16bit 坐标和空间上下文配置，不重新训练语义表示。
+
+两阶段分别为 2000 步信道 latent MSE 恢复、2000 步通信联合渲染。
+**信道编码器、信道解码器均固定 LR=1e-5，联合阶段语义解码器也固定 LR=1e-5**；
+语义编码器全程冻结。联合目标保持 `MSE + (1/3)(1-SSIM) + latent MSE`，
+10 dB、seed=42、每 500 步验证/保存，记录 PSNR、SSIM、LPIPS 与颜色误差。
+不新增梯度裁剪，旧实验入口及其默认学习率保持不变。
+
+```bash
+RUN="$PWD/output/truck_perceptual_training_gpu2_20261019_101631/mse_ssim"
+OUT="$PWD/output/truck_ssim_lr1e5_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES=2 nohup bash scripts/test_ssim_low_lr_truck.sh \
+  "$RUN" "$OUT" >"${OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}.pid"
+tail -n 30 -F "${OUT}.log"
+```
+
+GPU 2 仅为示例，启动前自行确认空闲。中断后保留相同 RUN/OUT 并加 `RESUME=1`，
+读取该新实验 latest 中的 Adam/RNG 精确恢复，不重新初始化信道。
+这不是修改旧运行的学习率后直接续训；同时降低两个信道模块的学习率，
+可能减慢有限步数内的收敛，需要结合曲线判断稳定性和最终质量。
+
 ## 本机验证范围
 
 36 项针对性 CPU 检查通过，覆盖共同属性初始化、两个 render 阶段的真实 VGG-LPIPS/SSIM 梯度、信道 latent 目标、阶段冻结、精确续训、旧 MSE 入口、图表，以及真实子进程并行和失败后继续监督。另通过 Bash 语法检查及实际历史 checkpoint 的只读预检查；未运行全量回归或真实场景 CUDA 训练，不据此宣称画质改善、显存或并跑速度。
