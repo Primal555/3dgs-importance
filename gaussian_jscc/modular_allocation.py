@@ -42,6 +42,10 @@ def parser():
     p.add_argument('--keep-lr',type=float,default=.01)
     p.add_argument('--mask-adam-eps',type=float,default=1e-15)
     p.add_argument('--codec-lr',type=float,default=1e-5,help='joint-only LR for all four trained modules')
+    p.add_argument('--image-objective',choices=['mse','mse_ssim','mse_lpips'],default='mse',
+                   help='opt-in fixed-deployment finetuning only; evaluation metrics remain unchanged')
+    p.add_argument('--image-aux-weight',type=float,
+                   help='positive SSIM/LPIPS coefficient; default paper-relative 1/3 (SSIM) or 1 (LPIPS); ignored for mse')
     p.add_argument('--snr',type=float,default=10.)
     p.add_argument('--prefix-anchor-every',type=int,default=4,help='joint-only uniform q1/q2/q3 anchor, cycling independently')
     p.add_argument('--validate-every',type=int,default=250)
@@ -186,6 +190,14 @@ def save_state(out,label,model,mask,mask_optimizer,codec_optimizer,progress,scen
 
 
 def main(args,max_updates=None):
+    if args.image_objective!='mse':
+        if not args.fixed_deployment:
+            raise ValueError('perceptual objectives require --fixed-deployment')
+        if args.image_aux_weight is None:
+            from .perceptual_objective import PAPER_WEIGHTS
+            args.image_aux_weight=PAPER_WEIGHTS[args.image_objective]
+        if not math.isfinite(args.image_aux_weight) or args.image_aux_weight<=0:
+            raise ValueError('image-aux-weight must be finite and positive')
     if (args.fixed_deployment or args.continue_allocation) and args.allocation_steps!=0:
         raise ValueError('finetuning a completed allocation requires --allocation-steps 0')
     if (min(args.allocation_steps,args.joint_steps,args.test_views,args.prefix_anchor_every)<0 or
@@ -206,6 +218,9 @@ def main(args,max_updates=None):
     # False opt-ins must not invalidate exact resume of historical runs.
     for flag in ('fixed_deployment','continue_allocation'):
         if not settings[flag]:settings.pop(flag)
+    if args.image_objective=='mse':
+        # Preserve exact resume compatibility with pre-experiment MSE states.
+        settings.pop('image_objective');settings.pop('image_aux_weight')
     settings.update(source_codec_id=source_id,manifest=str(manifest_path))
     fixed_q=None
     if args.fixed_deployment or args.continue_allocation:
@@ -228,6 +243,18 @@ def main(args,max_updates=None):
         return
     if out.exists() and not args.resume:raise FileExistsError('use a NEW output directory or --resume')
     if args.resume and not (out/'checkpoints/latest/state.pt').exists():raise FileNotFoundError('missing latest allocation state')
+    image_objective=None
+    if args.image_objective!='mse':
+        from .perceptual_objective import PerceptualImageObjective
+        image_objective=PerceptualImageObjective(args.image_objective,args.image_aux_weight,device)
+
+    def render_task(cameras):
+        if image_objective is not None:
+            from .perceptual_objective import PerceptualMultiViewRenderTask
+            return PerceptualMultiViewRenderTask(cameras,scene.reference,degree,scene.white_background,image_objective)
+        return (MultiViewRenderTask if args.fixed_deployment else MaskedMultiViewRenderTask)(
+            cameras,scene.reference,degree,scene.white_background)
+
     raw,degree=read_ply(spec['ply'])
     scene=make_scene(spec,raw,degree,model,source,old,out)
     for key in ('fingerprint','source_gaussians','geometry','train_view_names','validation_view_names','resolution','images','white_background'):
@@ -278,8 +305,13 @@ def main(args,max_updates=None):
             selected_scenes=[spec],scene=scene.record,**settings,
             allocation_sampling='fixed_saved_deployment' if args.fixed_deployment else 'single',deployment_draws=None if args.fixed_deployment else 10,render_backward='replay',
             joint_trainable_modules=list(MODULES),lpips_metrics=args.lpips,
-            objective='source PLY RGB MSE; fixed budget, no rate/latent/attribute loss' if args.fixed_deployment else 'source PLY RGB MSE + beta * normalized expected payload/XYZ/tier proxy',
+            objective=('source PLY '+image_objective.protocol()['formula']+'; fixed budget, no rate/latent/attribute loss'
+                if image_objective is not None else
+                'source PLY RGB MSE; fixed budget, no rate/latent/attribute loss' if args.fixed_deployment else
+                'source PLY RGB MSE + beta * normalized expected payload/XYZ/tier proxy'),
             prefix_anchor='joint: every N steps, cyclic uniform q1/q2/q3, equal codec image gradient mean; mask gradients unchanged',
+            **(dict(render_objective=image_objective.protocol())
+               if image_objective is not None else {}),
             initialization=('full trained codec; saved deployment map; fresh Adam' if args.fixed_deployment else
                 'full trained codec and learned allocation table; fresh Adam' if args.continue_allocation else
                 'full trained codec; new .99-keep / uniform-positive scene table; fresh Adam')))
@@ -306,7 +338,7 @@ def main(args,max_updates=None):
             before={n:p.detach().clone() for n,p in model.named_parameters()}
             views=random.sample(range(len(scene.cameras)),scene.views_per_step)
             cameras=[scene.cameras[i] for i in views]
-            task=(MultiViewRenderTask if args.fixed_deployment else MaskedMultiViewRenderTask)(cameras,scene.reference,degree,scene.white_background)
+            task=render_task(cameras)
             start=time.perf_counter()
             if device.type=='cuda':torch.cuda.synchronize(device);torch.cuda.reset_peak_memory_stats(device)
             if args.fixed_deployment:
@@ -320,8 +352,15 @@ def main(args,max_updates=None):
                     sampling='single',rate_chunk_size=args.rate_chunk_size)
             stats.update(task.stats)
             if phase=='joint':
+                # For the historical nonfixed mode the anchor has no existence column.
+                anchor_task=render_task(cameras) if args.fixed_deployment else MultiViewRenderTask(cameras,scene.reference,degree,scene.white_background)
                 stats.update(preserve_prefix(model,scene.groups,scene.group_ids,scene.geometry,args.snr,'awgn',
-                    MultiViewRenderTask(cameras,scene.reference,degree,scene.white_background),visit,args.prefix_anchor_every,3))
+                    anchor_task,visit,args.prefix_anchor_every,3))
+                if image_objective is not None:
+                    if stats['prefix_anchor_applied']:
+                        stats.update({'prefix_anchor_'+key:value for key,value in anchor_task.stats.items()})
+                    stats['optimization_image_loss']=((stats['render_loss']+stats['prefix_anchor_render_loss'])/2
+                        if stats['prefix_anchor_applied'] else stats['render_loss'])
             norm,gradient_stats=clip_codec_gradients(model,mode='none')
             if not torch.isfinite(loss) or (mask is not None and any(p.grad is not None and not torch.isfinite(p.grad).all() for p in mask.parameters())):
                 raise RuntimeError('nonfinite loss/allocation gradient; no update performed')
@@ -337,7 +376,9 @@ def main(args,max_updates=None):
                 peak_memory_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type=='cuda' else None)
             append_json(out/'metrics/loss.jsonl',row)
             if visit==1 or visit%10==0 or visit==budget:
-                print(f"{phase} {visit}/{budget}: render={stats['render_loss']:.6g}, rate={stats['rate_loss']:.6g}, counts={stats['sampled_tier_counts']}, sec={row['step_seconds']:.2f}",flush=True)
+                detail=(f", mse={stats['image_mse']:.6g}, weighted_aux={stats['image_aux_weighted']:.6g}"
+                    if image_objective is not None else '')
+                print(f"{phase} {visit}/{budget}: render={stats['render_loss']:.6g}{detail}, rate={stats['rate_loss']:.6g}, counts={stats['sampled_tier_counts']}, sec={row['step_seconds']:.2f}",flush=True)
             if progress['step']%args.validate_every==0 or visit==budget:
                 evaluate(model,scene,mask,out,progress['step'],phase,args,fixed_tiers=fixed_q)
             if progress['step']%args.save_every==0 or visit==budget:save('latest')
