@@ -24,11 +24,17 @@ def restore_rng(rng):
         torch.cuda.set_rng_state_all([s.cpu() for s in rng['cuda']])
 
 
-def save_training_checkpoint(path, model, optimizer, progress, rng, scene_record):
+def save_training_checkpoint(path, model, optimizer, progress, rng, scene_record, *, adversarial_state=None):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
     saved={'version':4,'config':model.cfg.to_dict(),'state_dict':model.state_dict(),
            'step':progress['step'],'training':{'modular_version':1,'progress':progress,
            'optimizer':optimizer.state_dict() if optimizer is not None else None,'rng':rng,'scene_record':scene_record}}
+    gan=progress.get('training_objective',{}).get('render_image_objective',{}).get('kind')=='mse_gan'
+    if gan and adversarial_state is None:
+        raise ValueError('adversarial checkpoint requires discriminator and optimizer state')
+    if adversarial_state is not None:
+        if not gan:raise ValueError('discriminator state supplied for non-adversarial checkpoint')
+        saved['training']['adversarial']=adversarial_state
     temporary=path.with_name(path.name+'.tmp')
     try:
         torch.save(saved,temporary)
@@ -46,6 +52,9 @@ def _read(path):
 
 def restore_training_checkpoint(path, device):
     saved=_read(path); state=saved['training']; progress=state['progress']
+    if (progress.get('training_objective',{}).get('render_image_objective',{}).get('kind')=='mse_gan'
+            and not state.get('adversarial')):
+        raise ValueError('adversarial checkpoint missing discriminator and optimizer state')
     model=build_codec(config_from_dict(saved['config'])).to(device)
     model.load_state_dict(saved['state_dict'])
     model.set_training_snrs(progress.get('train_snrs',()))

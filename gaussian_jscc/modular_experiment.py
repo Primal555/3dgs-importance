@@ -48,10 +48,13 @@ def parser():
     p.add_argument('--test-snrs',nargs='+',type=float,help='optional final physical SNR subset; default keeps legacy 0/5/10/15/20 sweep')
     p.add_argument('--channel-latent-weight',type=float,default=1.,
                    help='positive latent MSE weight in communication render training; tunable engineering coefficient')
-    p.add_argument('--image-objective',choices=['mse','mse_ssim','mse_lpips'],default='mse',
+    p.add_argument('--image-objective',choices=['mse','mse_ssim','mse_lpips','mse_gan'],default='mse',
                    help='image loss in BOTH semantic_render and channel_render; bootstrap losses are unchanged')
     p.add_argument('--image-aux-weight',type=float,
                    help='SSIM/LPIPS relative weight; paper-based defaults 1/3 or 1; ignored for MSE')
+    p.add_argument('--gan-weight',type=float,default=.001,help='opt-in mse_gan coefficient; engineering starting point, NOT a paper optimum')
+    p.add_argument('--discriminator-lr',type=float,default=1e-4)
+    p.add_argument('--discriminator-betas',type=float,nargs=2,default=[.5,.999])
     p.add_argument('--use-source-config',action='store_true',
                    help='copy full modular architecture/config from source metadata, NOT its weights')
     p.add_argument('--validate-every',type=int,default=500)
@@ -171,11 +174,15 @@ def main(args,max_updates=None):
     objectives=objective_settings(args.channel_latent_weight)
     if args.image_objective!='mse':
         from .perceptual_objective import PAPER_WEIGHTS
-        if args.image_aux_weight is None:args.image_aux_weight=PAPER_WEIGHTS[args.image_objective]
+        if args.image_aux_weight is None:args.image_aux_weight=PAPER_WEIGHTS['mse_lpips' if args.image_objective=='mse_gan' else args.image_objective]
         if not math.isfinite(args.image_aux_weight) or args.image_aux_weight<=0:
             raise ValueError('image-aux-weight must be finite and positive')
         objectives=dict(objectives,render_image_objective=dict(version='perceptual_rgb_v1',
             kind=args.image_objective,aux_weight=args.image_aux_weight))
+        if args.image_objective=='mse_gan':
+            from .adversarial_objective import adversarial_settings
+            objectives['render_image_objective']['adversarial']=adversarial_settings(
+                args.gan_weight,args.discriminator_lr,args.discriminator_betas)
     counts={phase:getattr(args,phase+'_steps') for phase in PHASES}
     if args.freeze_semantic and not (args.init_semantic or args.init_codec or args.resume):
         raise ValueError('freeze-semantic requires a semantic initializer or exact resume')
@@ -283,7 +290,17 @@ def main(args,max_updates=None):
         init=torch.load(args.init_semantic,map_location='cpu',weights_only=True)
         validate_scene(init['training']['scene_record'],scene.record)
     image_objective=None
-    if args.image_objective!='mse':
+    if args.image_objective=='mse_gan':
+        from .adversarial_objective import AdversarialImageObjective
+        image_objective=AdversarialImageObjective(args.image_aux_weight,args.gan_weight,device,
+            discriminator_lr=args.discriminator_lr,discriminator_betas=args.discriminator_betas)
+        if args.resume:
+            saved=torch.load(args.resume,map_location='cpu',weights_only=True)
+            image_objective.restore_training_state(saved['training'].get('adversarial'))
+            expected=progress['completed']['semantic_render']+progress['completed']['channel_render']
+            if image_objective.updates!=expected:raise ValueError('adversarial update count differs from completed render steps')
+            del saved
+    elif args.image_objective!='mse':
         from .perceptual_objective import PerceptualImageObjective
         image_objective=PerceptualImageObjective(args.image_objective,args.image_aux_weight,device)
     render_description=image_objective.protocol()['formula'] if image_objective is not None else 'RGB MSE'
@@ -362,7 +379,9 @@ def main(args,max_updates=None):
         evaluate_paths(model,scene,step=0,phase='initial',snrs=[10],trials=2,seed=args.seed,save_images=True,out=out,**evaluation_options)
 
     def save(label):
-        save_training_checkpoint(out/'checkpoints'/label/'codec.pt',model,optimizer,progress,capture_rng(),scene.record)
+        state=image_objective.training_state() if args.image_objective=='mse_gan' else None
+        save_training_checkpoint(out/'checkpoints'/label/'codec.pt',model,optimizer,progress,capture_rng(),scene.record,
+                                 adversarial_state=state)
         json_write(out/'progress.json',dict(progress,status='running'))
 
     if args.init_codec or args.init_bootstrap: save('initial')
@@ -406,6 +425,9 @@ def main(args,max_updates=None):
                 indices=random.sample(range(len(scene.cameras)),scene.views_per_step)
                 if image_objective is None:
                     task=MultiViewRenderTask([scene.cameras[i] for i in indices],scene.reference,degree,scene.white_background)
+                elif args.image_objective=='mse_gan':
+                    from .adversarial_objective import AdversarialMultiViewRenderTask
+                    task=AdversarialMultiViewRenderTask([scene.cameras[i] for i in indices],scene.reference,degree,scene.white_background,image_objective)
                 else:
                     from .perceptual_objective import PerceptualMultiViewRenderTask
                     task=PerceptualMultiViewRenderTask([scene.cameras[i] for i in indices],scene.reference,degree,scene.white_background,image_objective)
@@ -413,6 +435,13 @@ def main(args,max_updates=None):
                                        channel_latent_weight=args.channel_latent_weight)
                 stats.update(task.stats)
             stats.update(finish_update(model,optimizer,before))
+            if args.image_objective=='mse_gan' and phase.endswith('render'):
+                if device.type=='cuda':torch.cuda.synchronize(device)
+                stats['generator_seconds']=time.perf_counter()-start
+                stats.update(task.finish_discriminator())
+                stats.update(gan_weight=args.gan_weight,
+                             gan_to_mse_ratio=stats['image_gan_weighted']/max(stats['image_mse'],1e-12),
+                             gan_to_other_image_ratio=stats['image_gan_weighted']/max(stats['image_mse']+stats['image_lpips_weighted'],1e-12))
             if device.type=='cuda': torch.cuda.synchronize(device)
             elapsed=time.perf_counter()-start
             progress['step']+=1; progress['phase_step']=phase_step; progress['completed'][phase]=phase_step
@@ -432,6 +461,8 @@ def main(args,max_updates=None):
                 detail=f", latent_mse={stats['latent_mse']:.6g}, latent_nmse={stats['latent_nmse']:.6g}" if phase.startswith('channel') else ''
                 if phase=='channel_render': detail+=f", render_distortion={stats['render_loss']:.6g}, weighted_latent={stats['weighted_latent_loss']:.6g}"
                 if 'image_mse' in stats:detail+=f", image_mse={stats['image_mse']:.6g}, weighted_image_aux={stats['image_aux_weighted']:.6g}"
+                if 'discriminator_loss' in stats:
+                    detail+=f", gan={stats['image_gan_weighted']:.6g}, D={stats['discriminator_loss']:.6g}, D_sec={stats['discriminator_seconds']:.2f}"
                 if args.semantic_color_every and phase=='semantic_bootstrap': detail+=f", objective={stats['objective']}"
                 displayed_snr='bypass' if args.clean_only else f'{snr:g}'
                 print(f"{phase} {phase_step}/{counts[phase]}: loss={float(loss):.6g}, q={layout}, snr={displayed_snr}, grad={stats['grad_norm']:.4g}, sec={elapsed:.2f}{detail}",flush=True)

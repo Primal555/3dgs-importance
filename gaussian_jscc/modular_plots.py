@@ -98,7 +98,8 @@ def plot_run(out):
                 for key,label in [('render_loss','Render distortion'),('weighted_latent_loss','Weighted latent MSE')]:
                     selected=[r for r in rows if key in r]
                     if selected: ax.plot([r['phase_step'] for r in selected],[r[key] for r in selected],linewidth=.8,label=label)
-            for key,label in [('image_mse','Image MSE'),('image_aux_weighted','Weighted image perceptual loss')]:
+            for key,label in [('image_mse','Image MSE'),('image_aux_weighted','Weighted image perceptual loss'),
+                              ('image_lpips_weighted','Weighted LPIPS'),('image_gan_weighted','Weighted GAN')]:
                 selected=[r for r in rows if key in r]
                 if selected:ax.plot([r['phase_step'] for r in selected],[r[key] for r in selected],linewidth=.8,label=label)
             if rows: ax.legend(fontsize=8)
@@ -118,6 +119,24 @@ def plot_run(out):
             if rows: ax.plot([r['step'] for r in rows],[r['step_seconds'] for r in rows],label=phase)
         ax.set(xlabel='Global real updates',ylabel='Seconds per optimizer update'); ax.grid(alpha=.2); ax.legend(fontsize=8)
         save(fig,'step_seconds.png')
+        adversarial=[r for r in losses if 'discriminator_loss' in r]
+        if adversarial:
+            fig,axes=plt.subplots(2,2,figsize=(12,7),layout='constrained')
+            panels=[(('image_mse','image_lpips_weighted','image_gan_weighted'),'Generator image terms'),
+                    (('discriminator_loss','discriminator_real_logit','discriminator_fake_logit'),'D loss and logits (not quality metrics)'),
+                    (('discriminator_grad_norm','discriminator_update_norm'),'D gradient/update norms'),
+                    (('generator_seconds','discriminator_seconds'),'Seconds per G/D update')]
+            for ax,(keys,title) in zip(axes.flat,panels):
+                for phase in ('semantic_render','channel_render'):
+                    for key in keys:
+                        rows=[r for r in adversarial if r['phase']==phase and _finite_metric(r,key)]
+                        if rows:ax.plot([r['step'] for r in rows],[r[key] for r in rows],linewidth=.8,
+                                        label=phase+'/'+key)
+                ax.set(title=title,xlabel='Global real updates');ax.grid(alpha=.2)
+                if ax is axes[0,0] or ax is axes[1,0]:ax.set_yscale('symlog',linthresh=1e-6)
+                ax.legend(fontsize=6)
+            fig.suptitle('Unconditional rendered-image GAN; G then D, no D updates during latent bootstrap')
+            save(fig,'adversarial_diagnostics.png')
     if validation:
         fig,ax=plt.subplots(figsize=(11,5),layout='constrained')
         for path,layout in dict.fromkeys((r['path'],r['layout']) for r in validation):
