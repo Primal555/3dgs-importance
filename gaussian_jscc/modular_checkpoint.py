@@ -61,6 +61,25 @@ def initialize_channel_run(path, device, *, cfg=None):
     saved=_read(path); progress=saved['training']['progress']
     if progress['phase']!='semantic_render' or not progress.get('phase_complete') or not progress.get('completed',{}).get('semantic_render',0):
         raise ValueError('semantic initialization requires completed nonempty semantic_render')
+    return _initialize_semantic_weights(saved,device,cfg=cfg)
+
+
+def initialize_bootstrap_run(path, device, *, cfg=None):
+    """Fork BEFORE any render optimization; copy semantic tensors only.
+
+    Later semantic/channel weights and source Adam must not leak into the two
+    loss arms. Channel architecture/rates may differ without changing y.
+    """
+    saved=_read(path); state=saved['training']; progress=state['progress']
+    completed=progress.get('completed',{})
+    if (progress['phase']!='semantic_bootstrap' or not progress.get('phase_complete')
+            or completed.get('semantic_bootstrap',0)<=0 or progress.get('channel_trained')
+            or any(completed.get(p,0) for p in ('semantic_render','channel_bootstrap','channel_render'))):
+        raise ValueError('initializer requires completed nonempty semantic_bootstrap BEFORE any render/channel training')
+    return _initialize_semantic_weights(saved,device,cfg=cfg),progress,state['scene_record']
+
+
+def _initialize_semantic_weights(saved, device, *, cfg=None):
     original=config_from_dict(saved['config'])
     if cfg is not None:
         a=original.to_dict(); b=cfg.to_dict()

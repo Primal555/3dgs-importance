@@ -181,10 +181,11 @@ def render_step(model, batches, geometry, snr, kind, task, phase, mode='replay',
     loss,stats=full_scene_step(model,batches,geometry,snr,kind,task,
                                attr_weight=channel_latent_weight if communication else 0,mode=mode,
                                profile=True,batch_forward=batch_forward)
-    stats.update(objective='source_ply_rgb_mse')
+    image_kind=getattr(getattr(task,'objective',None),'kind','mse')
+    stats.update(objective='source_ply_rgb_'+image_kind)
     if communication:
         metrics={key[:-5]:stats.pop(key) for key in list(stats) if key.startswith('latent_') and key.endswith('_loss')}
-        stats.update(latent_diagnostics(metrics),objective='source_ply_rgb_mse+latent_mse',
+        stats.update(latent_diagnostics(metrics),objective='source_ply_rgb_'+image_kind+'+latent_mse',
                      channel_latent_weight=channel_latent_weight,
                      weighted_latent_loss=channel_latent_weight*stats['aux_loss'])
     return loss,stats

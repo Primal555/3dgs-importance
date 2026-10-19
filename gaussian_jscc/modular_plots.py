@@ -95,9 +95,12 @@ def plot_run(out):
                 selected=[r for r in rows if r.get('objective','Total objective')==objective]
                 ax.plot([r['phase_step'] for r in selected],[r['loss'] for r in selected],linewidth=.8,label=objective)
             if phase=='channel_render':
-                for key,label in [('render_loss','Render MSE'),('weighted_latent_loss','Weighted latent MSE')]:
+                for key,label in [('render_loss','Render distortion'),('weighted_latent_loss','Weighted latent MSE')]:
                     selected=[r for r in rows if key in r]
                     if selected: ax.plot([r['phase_step'] for r in selected],[r[key] for r in selected],linewidth=.8,label=label)
+            for key,label in [('image_mse','Image MSE'),('image_aux_weighted','Weighted image perceptual loss')]:
+                selected=[r for r in rows if key in r]
+                if selected:ax.plot([r['phase_step'] for r in selected],[r[key] for r in selected],linewidth=.8,label=label)
             if rows: ax.legend(fontsize=8)
             ax.set(title=phase,xlabel='Actual phase optimizer updates',ylabel='Objective value (phase-specific)')
             ax.grid(alpha=.2)
