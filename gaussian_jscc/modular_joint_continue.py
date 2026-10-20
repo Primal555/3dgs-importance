@@ -121,7 +121,13 @@ def main(args,max_updates=None):
           f'joint {info["parent_joint_step"]} -> {info["target_joint_step"]}; '
           'Adam/RNG retained; semantic encoder stays frozen; no bootstrap.',flush=True)
     print(f'Learning rates unchanged: {record["module_lrs"]}; validation every {args.validate_every} steps',flush=True)
-    return train(training_options(args,record,out),max_updates=max_updates)
+    result=train(training_options(args,record,out),max_updates=max_updates)
+    summary_path=out/'metrics/phase_summary.json'
+    if summary_path.exists() and result['completed']['channel_render']==record['phase_budgets']['channel_render']:
+        summary=json.loads(summary_path.read_text(encoding='utf-8'))
+        summary['channel_render'].update(optimizer_reset_at_boundary=False,optimizer_state_inherited=True)
+        json_write(summary_path,summary)
+    return result
 
 
 if __name__=='__main__':main(parser().parse_args())

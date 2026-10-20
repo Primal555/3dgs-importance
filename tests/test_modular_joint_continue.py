@@ -61,6 +61,8 @@ class JointContinuationTests(unittest.TestCase):
             record=json.loads((out/'training.json').read_text())
             self.assertTrue(record['continuation']['optimizer_preserved'])
             self.assertEqual(record['continuation']['additional_steps'],2)
+            summary=json.loads((out/'metrics/phase_summary.json').read_text())
+            self.assertFalse(summary['channel_render']['optimizer_reset_at_boundary'])
 
     def test_invalid_budget_and_missing_source_fail_before_output_creation(self):
         from gaussian_jscc.modular_joint_continue import parser, main
