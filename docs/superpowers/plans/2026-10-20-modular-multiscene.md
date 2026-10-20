@@ -50,4 +50,10 @@
 - [x] Observe failures; implement script and document server launch commands.
 - [x] Verify Python CLI help, Bash syntax, targeted tests and scoped git diff.
 - [x] Independent final review of new files; two important findings reproduced and fixed with regression tests (camera content identity; interrupted evaluation recovery).
-- [ ] Commit scoped changes and push to origin main as user requested; report exact verification limits.
+- [x] Commit scoped changes and push to origin main as user requested; implementation pushed as `954fb06` and `8e6b01c`.
+
+## Verification record
+
+31 targeted tests passed after the review fixes (39.801s): new multi-scene/launcher tests plus existing modular training, checkpoint, evaluation and SSIM launcher tests.
+Architecture config matched the actual Truck SSIM metadata with no differences.
+Bash syntax and Python CLI help passed. No full local scene training or repeated whole-project regression suite was run; synthetic CPU render results do not establish CUDA quality or convergence.
