@@ -21,6 +21,8 @@ class ModularCodecConfig:
     attention_heads: int = 4
     decoder_geometry: str = 'xyz'
     power_floor: float = .01
+    channel_power_mode: str = 'point'
+    channel_power_momentum: float = .01
     position_delivery: str = 'quantized'
     position_bits: int = 16
     position_compression: str = 'delta_zlib'
@@ -76,6 +78,11 @@ class ModularCodecConfig:
         values = asdict(self)
         values.pop('latent_dim')
         values.pop('experimental_multirate')
+        values.pop('channel_power_mode')
+        values.pop('channel_power_momentum')
+        if (self.channel_power_mode not in ('point','statistical','block') or
+                not math.isfinite(self.channel_power_momentum) or not 0<self.channel_power_momentum<=1):
+            raise ValueError('invalid channel power normalization mode/momentum')
         for key in ('context_variant','context_centers','context_neighbors','context_radii','channel_variant','channel_hidden','channel_prefix_mode',
                     'channel_denoiser_mode','channel_denoiser_hidden','channel_denoiser_neighbors','channel_denoiser_scope',
                     'channel_neighbor_mode','channel_neighbor_hidden','channel_neighbor_neighbors'):
@@ -126,6 +133,8 @@ class ModularCodecConfig:
 
     def to_dict(self):
         values = asdict(self)
+        if self.channel_power_mode == 'point': values.pop('channel_power_mode')
+        if self.channel_power_momentum == .01: values.pop('channel_power_momentum')
         if not self.experimental_multirate: values.pop('experimental_multirate')
         # Baseline checkpoints/packet identities keep their historical syntax.
         if self.context_variant == 'baseline':

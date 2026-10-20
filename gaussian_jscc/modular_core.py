@@ -44,14 +44,25 @@ class ChannelEncoder(nn.Module):
         self.readout = nn.Sequential(nn.GELU(), nn.Linear(h, 2*cfg.rates[-1]))
         if cfg.channel_variant in ('residual','progressive'):
             self.blocks=nn.ModuleList(ChannelResidualBlock(h) for _ in range(3))
+        if cfg.channel_power_mode != 'point':
+            from .channel_power import SegmentPowerNormalizer
+            self.normalizer = SegmentPowerNormalizer(cfg.rates, cfg.channel_power_mode,
+                floor=cfg.power_floor, momentum=cfg.channel_power_momentum)
 
-    def forward(self, y, active, snr):
+    def raw_signal(self, y, active, snr):
         if not math.isfinite(float(snr)):
             raise ValueError('SNR must be finite')
         condition=self.snr(y.new_full((*active.shape, 1), float(snr)/20))
         h=self.input(y)+condition
         for block in getattr(self,'blocks',()): h=block(h,condition)
-        z = self.readout(h)
+        return self.readout(h)
+
+    def forward(self, y, active, snr):
+        z = self.raw_signal(y, active, snr)
+        if hasattr(self, 'normalizer'):
+            if y.shape[1] > self.cfg.block_size:
+                raise ValueError('power controls require original codec blocks, not regrouped points')
+            return self.normalizer(z, active)
         layers = []
         for start, end in zip(self.cfg.rates[:-1], self.cfg.rates[1:]):
             segment = z[..., 2*start:2*end]

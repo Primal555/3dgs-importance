@@ -96,7 +96,8 @@ def _initialize_semantic_weights(saved, device, *, cfg=None):
         # Exact resume still requires the entire config, including rates, to match.
         for key in ('channel_variant','channel_hidden','channel_prefix_mode','channel_denoiser_mode',
                     'channel_denoiser_hidden','channel_denoiser_neighbors','channel_denoiser_scope',
-                    'channel_neighbor_mode','channel_neighbor_hidden','channel_neighbor_neighbors','rates'):
+                    'channel_neighbor_mode','channel_neighbor_hidden','channel_neighbor_neighbors','rates',
+                    'channel_power_mode','channel_power_momentum'):
             a.pop(key,None); b.pop(key,None)
         if a!=b: raise ValueError('semantic initialization config mismatch')
     model=build_codec(cfg or original).to(device)

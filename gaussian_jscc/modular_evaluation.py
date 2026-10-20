@@ -86,7 +86,8 @@ def decode_path(model,scene,qs,path,snr,*,tx_condition_snr=None,rx_condition_snr
 
 @torch.no_grad()
 def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,condition_policy='trained_range',reference_snr=10.,verbose=False,
-                   clean_only=False,color_metrics=False,save_phase_images=False,lpips_metrics=False,noise_reference_symbols=None):
+                   clean_only=False,color_metrics=False,save_phase_images=False,lpips_metrics=False,noise_reference_symbols=None,
+                   save_noiseless_images=False):
     from .rendering import render
     from .cli import seed_all
     from .perceptual_metrics import LPIPSEvaluator,image_metric_protocol
@@ -133,7 +134,8 @@ def evaluate_paths(model,scene,*,step,phase,snrs,trials,seed,save_images,out,con
                                 metrics.update({prefix+'_color_'+k:v for k,v in appearance_metrics(image,target).items()})
                         views.append(metrics); per_view.append(dict(metrics,trial=trial,view=i,image_name=str(camera.image_name)))
                         endpoint=phase in ('initial','final') or (save_phase_images and phase=='semantic_bootstrap_end')
-                        if save_images and endpoint and trial==0 and path in ('clean','awgn') and snr==10 and i in (0,len(scene.val_cameras)-1):
+                        image_paths=('clean','awgn','finite_noiseless') if save_noiseless_images else ('clean','awgn')
+                        if save_images and endpoint and trial==0 and path in image_paths and snr==10 and i in (0,len(scene.val_cameras)-1):
                             folder='end_semantic_bootstrap' if phase=='semantic_bootstrap_end' else phase
                             save_panel(out/'images'/folder/f'{path}_{layout}_view{i:04d}.png',photo,source,image,f'{path} / {layout}')
                     measurements.append({k:float(np.mean([v[k] for v in views])) for k in views[0]})
