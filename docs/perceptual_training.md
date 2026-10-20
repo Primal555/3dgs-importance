@@ -117,6 +117,36 @@ GPU 2 仅为示例，启动前自行确认空闲。中断后保留相同 RUN/OUT
 这不是修改旧运行的学习率后直接续训；同时降低两个信道模块的学习率，
 可能减慢有限步数内的收敛，需要结合曲线判断稳定性和最终质量。
 
+## SSIM 分模块学习率联合重跑（2026-10-20）
+
+独立入口 `scripts/test_ssim_joint_lr_truck.sh SSIM_RUN NEW_OUT`，来源使用原 SSIM 组：
+`output/truck_perceptual_training_gpu2_20261019_101631/mse_ssim`。
+从其 `checkpoints/end_channel_bootstrap/codec.pt` 复制**全部四个模块**和完整配置，
+不使用最终退化的联合权重，也不使用信道 LR=1e-5 那组的初始化。
+信道已经完成 2000 步 LR=1e-4 的恢复；新实验不再重复训练它。
+
+只进行 **2000 步联合训练**：信道编码器/解码器 LR=1e-4，语义解码器 LR=1e-5，
+语义编码器冻结。保留 `MSE + (1/3)(1-SSIM) + latent MSE`、10 dB、seed=42、
+q1/q2/q3/mixed 轮换、每 500 步验证/保存及初始/最终代表图。
+记录原 PLY/照片的 PSNR、SSIM、LPIPS、颜色误差和 latent 恢复误差。
+结构、档位、坐标交付和无梯度裁剪设置均不改变。
+
+新 OUT 的 Adam 和本轮步数从头开始，旧 checkpoint 的训练权重不重置；
+它是重做联合阶段，不是从上轮最终模型续训。中断时使用相同 RUN/OUT 加 `RESUME=1`，
+恢复该新实验 latest 内的 Adam/RNG/进度。旧低学习率入口保留用于对照。
+
+```bash
+RUN="$PWD/output/truck_perceptual_training_gpu2_20261019_101631/mse_ssim"
+OUT="$PWD/output/truck_ssim_joint_lr_split_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES=2 nohup bash scripts/test_ssim_joint_lr_truck.sh \
+  "$RUN" "$OUT" >"${OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}.pid"
+tail -n 30 -F "${OUT}.log"
+```
+
+GPU 2 为示例，启动前确认空闲。与历史最终模型比较时应注明初始化和优化历史差异；
+本入口不会自动声称学习率改动改善了画质，也不启动分配器或对抗训练。
+
 ## 本机验证范围
 
 36 项针对性 CPU 检查通过，覆盖共同属性初始化、两个 render 阶段的真实 VGG-LPIPS/SSIM 梯度、信道 latent 目标、阶段冻结、精确续训、旧 MSE 入口、图表，以及真实子进程并行和失败后继续监督。另通过 Bash 语法检查及实际历史 checkpoint 的只读预检查；未运行全量回归或真实场景 CUDA 训练，不据此宣称画质改善、显存或并跑速度。
