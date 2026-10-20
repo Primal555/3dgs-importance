@@ -34,7 +34,7 @@
 
 ### Task 2: Resume, evaluation and output
 
-**Files:** above trainer/tests; new `gaussian_jscc/modular_multiscene_report.py`.
+**Files:** above trainer/tests; new `gaussian_jscc/modular_multiscene_report.py`, `gaussian_jscc/modular_multiscene_state.py`.
 **Interfaces:** existing modular checkpoints carry nested scene records; existing evaluate_paths writes per-scene validation/test rows; report reads these and root losses.
 
 - [x] Add tests for exact mid-round and boundary continuation, objective/identity mismatch, per-scene/macro metrics and initial/final images only.
@@ -49,5 +49,5 @@
 - [x] Add executable launcher tests using a recording Python command (GPU requirement, positional arguments, resume forwarding).
 - [x] Observe failures; implement script and document server launch commands.
 - [x] Verify Python CLI help, Bash syntax, targeted tests and scoped git diff.
-- [ ] Independent final review of new files; fix important findings with regression tests.
+- [x] Independent final review of new files; two important findings reproduced and fixed with regression tests (camera content identity; interrupted evaluation recovery).
 - [ ] Commit scoped changes and push to origin main as user requested; report exact verification limits.

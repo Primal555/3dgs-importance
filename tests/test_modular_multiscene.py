@@ -206,5 +206,53 @@ class ModularMultisceneTests(unittest.TestCase):
             opts.resume=str(external)
             with self.assertRaisesRegex(ValueError,'original output'):main(opts)
 
+    def test_resume_rejects_changed_camera_content_even_with_same_names(self):
+        from gaussian_jscc.modular_multiscene import main
+        with tempfile.TemporaryDirectory() as t,patch('gaussian_jscc.rendering.render',side_effect=synthetic_render):
+            root=Path(t);scene_fixture(root);opts=options(root,root/'run')
+            with patch('gaussian_jscc.rendering.load_cameras',side_effect=cameras):main(opts,max_updates=1)
+            opts.resume=str(root/'run/checkpoints/latest/codec.pt')
+            for changed in ('train_photo','train_pose','test_photo'):
+                def loader(*args):
+                    rows=cameras(*args)
+                    if args[-1]==changed.split('_')[0]:
+                        if changed.endswith('photo'):rows[0].original_image+=.1
+                        else:rows[0].camera_center+=10
+                    return rows
+                with self.subTest(changed=changed),patch('gaussian_jscc.rendering.load_cameras',side_effect=loader):
+                    with self.assertRaisesRegex(ValueError,'scene'):main(opts,max_updates=1)
+
+    def test_partial_initial_boundary_and_test_evaluation_are_recovered_once(self):
+        from gaussian_jscc import modular_multiscene as training
+        real_evaluate=training.evaluate_paths
+        class PlannedStop(Exception):pass
+        for phase,stop_step in (('initial',0),('semantic_bootstrap',3),('semantic_bootstrap',6),('test',3)):
+            with self.subTest(phase=phase,step=stop_step),tempfile.TemporaryDirectory() as t,\
+                    patch('gaussian_jscc.rendering.render',side_effect=synthetic_render),\
+                    patch('gaussian_jscc.rendering.load_cameras',side_effect=cameras):
+                root=Path(t);scene_fixture(root);out=root/'run';opts=options(root,out)
+                opts.semantic_bootstrap_steps=2 if phase!='test' else 0
+                opts.semantic_render_steps=0;opts.channel_bootstrap_steps=1 if phase=='test' else 0
+                opts.channel_render_steps=0;opts.save_every=1;opts.validate_every=1
+                def fail_after_one_scene(model,scene,**kwargs):
+                    rows=real_evaluate(model,scene,**kwargs)
+                    if kwargs['phase']==phase and kwargs['step']==stop_step and scene.name=='train':raise PlannedStop()
+                    return rows
+                with patch.object(training,'evaluate_paths',side_effect=fail_after_one_scene):
+                    with self.assertRaises(PlannedStop):training.main(opts)
+                self.assertTrue((out/'checkpoints/latest/codec.pt').is_file())
+                label='initial' if phase=='initial' else 'latest'
+                opts.resume=str(out/f'checkpoints/{label}/codec.pt');training.main(opts)
+                for name in ('train','truck','playroom'):
+                    for file in ('validation','test'):
+                        rows=[json.loads(x) for x in (out/f'scenes/{name}/metrics/{file}.jsonl').read_text().splitlines()]
+                        keys=[tuple(r[k] for k in ('step','phase','path','layout','actual_snr')) for r in rows]
+                        self.assertEqual(len(keys),len(set(keys)),f'{name}/{file}')
+                        if file=='validation':self.assertTrue(any(r['phase']=='initial' for r in rows))
+                    self.assertTrue(list((out/f'scenes/{name}/images/initial').glob('*.png')))
+                macro=[json.loads(x) for x in (out/'metrics/macro_validation.jsonl').read_text().splitlines()]
+                self.assertTrue(any(r['phase']==phase and r['step']==stop_step for r in macro) if phase!='test' else
+                                (out/'metrics/macro_test.jsonl').exists())
+
 
 if __name__=='__main__':unittest.main()

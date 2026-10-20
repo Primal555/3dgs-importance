@@ -32,6 +32,8 @@ pointwise 去噪与 plain 邻居修正，16bit delta-zlib 可靠 XYZ。
 仅初始／最终验证保存代表图；过程只存数值，最终使用全部测试相机、不以训练视角替代。
 checkpoint 保留四个网络、共享统计、Adam、随机状态、场景轮换游标和相机／PLY 指纹。
 准确续训须使用原输出目录和相同配置；恢复时归档超出 checkpoint 的日志。
+相机指纹覆盖训练／验证／测试的位姿、投影矩阵及实际加载的 RGB，不只检查文件名。
+评估另有完成日志：初始、周期验证或最终测试中断后，会归档未完成快照并补齐三场景，避免重复计入结果。
 CPU 合成测试只验证流程与梯度实现，不作为真实 CUDA 画质或收敛证据。
 
 ## 服务器启动
@@ -81,6 +83,7 @@ tail -n 50 -f "${OUT}.log"
 - `scenes/<name>/metrics/{validation,test}.jsonl`：分场景 clean、无噪声、10dB 各前缀指标。
 - `scenes/<name>/images/{initial,final}`：只保留两个端点的代表图。
 - `metrics/macro_{validation,test}.jsonl`：三个场景等权宏平均；PSNR 是 dB 指标的平均，不是池化像素 MSE 转 PSNR。
+- `metrics/evaluations.json`：评估快照是否已完成；`*.partial_*.jsonl` 是异常中断时保留的未完成记录，不参与画图或统计。
 - `charts/`：分场景阶段损失与场景／宏平均画质曲线；`metrics/phase_summary.json` 记录耗时。
 - `checkpoints/{initial,latest,end_<phase>,final}/codec.pt`：共享模型及准确续训状态。
 - `complete.json`：全部阶段与最终测试完成的标志；仅进程退出不等于训练完成。

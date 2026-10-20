@@ -108,18 +108,27 @@ def validate_options(args):
 def make_scene(spec, raw, degree, model, args, out):
     from .rendering import load_cameras, RenderReference
     from .render_objective import split_cameras
+    from .modular_multiscene_state import camera_fingerprint
     s = Scene(spec, raw, degree, model, args, out, with_mask=False, cameras=False)
     all_cameras = load_cameras(spec['source'], args.resolution, args.white_background, args.images, 'train')
     names = [str(c.image_name) for c in all_cameras]
     if len(set(names)) != len(names): raise ValueError(f'{s.name}: duplicate camera names')
     s.cameras, s.val_cameras, _, _ = split_cameras(all_cameras, args.validation_views)
     if len(s.cameras) < args.views_per_step: raise ValueError(f'{s.name}: insufficient training cameras')
+    s.test_cameras = load_cameras(spec['source'], args.resolution, args.white_background, args.images, 'test')
+    if not s.test_cameras: raise ValueError(f'{s.name}: no test views; never substitute training views')
+    test_names = [str(c.image_name) for c in s.test_cameras]
+    if len(set(test_names)) != len(test_names) or set(names)&set(test_names):
+        raise ValueError(f'{s.name}: test cameras must have unique names disjoint from training/validation')
     s.reference = RenderReference(s.raw, degree, args.white_background, 'source')
     s.white_background, s.views_per_step = args.white_background, args.views_per_step
     s.net_bits_per_use = args.net_bits_per_use
     s.record = dict(fingerprint=s.fingerprint, source_gaussians=len(raw), sh_degree=degree,
         geometry=s.geometry.to_dict(), train_view_names=[str(c.image_name) for c in s.cameras],
         validation_view_names=[str(c.image_name) for c in s.val_cameras],
+        test_view_names=test_names, camera_fingerprints={
+            'train':camera_fingerprint(s.cameras),'validation':camera_fingerprint(s.val_cameras),
+            'test':camera_fingerprint(s.test_cameras)},
         resolution=args.resolution, images=args.images, white_background=args.white_background,
         blocks_per_batch=args.blocks_per_batch, views_per_step=args.views_per_step)
     s.color_centers = torch.stack([torch.as_tensor(c.camera_center).detach().cpu() for c in s.cameras])
@@ -204,22 +213,26 @@ def main(args, max_updates=None):
             model_cost='shared model excluded from wire rate; net_bits_per_use is an explicit overhead assumption'))
     print(f'Random four-module backbone; {len(scenes)} scenes; budgets PER SCENE: {counts}; '
           f'total real updates={len(scenes)*sum(counts.values())}', flush=True)
+    from .modular_multiscene_state import EvaluationJournal
+    journal = EvaluationJournal(out,[s.name for s in scenes],progress['step'])
 
     def save(label, status='running'):
         save_training_checkpoint(out/'checkpoints'/label/'codec.pt',model,optimizer,progress,capture_rng(),scene_records)
         json_write(out/'progress.json',dict(progress,status=status))
 
     def evaluate(phase, images=False, test=False):
-        from .rendering import load_cameras
         from .modular_multiscene_report import macro_metrics
+        from .transport import model_id
+        identity = model_id(model)
+        if journal.is_complete(progress['step'],phase,identity): return
+        journal.start(progress['step'],phase,identity)
         measured = {}
         for s in scenes:
             s.channel_trained = progress['channel_trained']
             original_cameras = s.val_cameras
             try:
                 if test:
-                    s.val_cameras = load_cameras(s.spec['source'],args.resolution,args.white_background,args.images,'test')
-                    if not s.val_cameras: raise ValueError(f'{s.name}: no test views; never substitute training views')
+                    s.val_cameras = s.test_cameras
                 print(f'Evaluate scene={s.name}; global step={progress["step"]}; phase={phase}',flush=True)
                 measured[s.name] = evaluate_paths(model,s,step=progress['step'],phase=phase,snrs=[args.snr],
                     trials=args.trials,seed=args.seed,save_images=images,out=s.out,
@@ -228,15 +241,18 @@ def main(args, max_updates=None):
                 s.val_cameras = original_cameras
         for row in macro_metrics(measured):
             append_json(out/'metrics'/('macro_test.jsonl' if test else 'macro_validation.jsonl'),row)
+        journal.complete(progress['step'],phase)
 
     if not args.resume:
-        save('initial'); evaluate('initial',images=True)
+        save('initial'); save('latest')
+    if progress['step']==0: evaluate('initial',images=True)
     updated = 0
     for phase in PHASES:
         target = counts[phase]*len(scenes)
         if progress['completed'][phase] >= target:
-            if target and progress['phase'] == phase and not (out/'checkpoints'/('end_'+phase)/'codec.pt').exists():
-                save('end_'+phase)
+            if target and progress['phase'] == phase:
+                evaluate(phase if counts[phase]%args.validate_every==0 else phase+'_end')
+                if not (out/'checkpoints'/('end_'+phase)/'codec.pt').exists(): save('end_'+phase)
             continue
         continuing = progress['phase'] == phase and optimizer is not None and not progress['phase_complete']
         lrs = phase_lrs(args,phase)
@@ -245,6 +261,9 @@ def main(args, max_updates=None):
             progress['next_scene'] = 0
         progress.update(phase=phase,phase_step=progress['completed'][phase],module_lrs=lrs,phase_complete=False)
         model.train()
+        if (progress['phase_step']>0 and progress['next_scene']==0 and
+                (progress['phase_step']//len(scenes))%args.validate_every==0):
+            evaluate(phase)
         while progress['completed'][phase] < target:
             index = progress['next_scene']; s = scenes[index]
             visit = progress['scene_completed'][s.name][phase]+1
