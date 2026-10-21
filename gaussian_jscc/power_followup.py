@@ -61,8 +61,12 @@ def encoder_digest(state):
     return semantic_digest(selected)
 
 
-def joint_optimizer(model, previous, channel_lr, decoder_lr):
-    """Preserve real channel Adam step/moments; introduce only semantic decoder state."""
+def joint_optimizer(model, previous, channel_lr, decoder_lr, *, reset_channel_adam=False):
+    """Preserve channel Adam by default; optionally reset all state for a control.
+
+    Group hyperparameters and weights stay unchanged in either case. Resetting
+    removes first/second moments AND counters, not just the momentum direction.
+    """
     if {g['name'] for g in previous.param_groups} != {'channel_encoder', 'channel_decoder'}:
         raise ValueError('joint transition requires a complete channel optimizer')
     lrs = dict(channel_encoder=channel_lr, channel_decoder=channel_lr, semantic_decoder=decoder_lr)
@@ -75,7 +79,8 @@ def joint_optimizer(model, previous, channel_lr, decoder_lr):
                 raise ValueError('channel parameter order differs at joint transition')
             for key, value in source.items():
                 if key not in ('params', 'lr', 'name'): group[key] = value
-    for parameter, state in previous.state.items(): optimizer.state[parameter] = state
+    if not reset_channel_adam:
+        for parameter, state in previous.state.items(): optimizer.state[parameter] = state
     return optimizer
 
 
