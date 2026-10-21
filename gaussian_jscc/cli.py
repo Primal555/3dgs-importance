@@ -18,7 +18,9 @@ def device_for(name):
 
 def seed_all(seed):
     random.seed(seed)
-    np.random.seed(seed)
+    # NumPy's legacy generator accepts uint32, unlike Python/PyTorch. Preserve
+    # their full derived seed, and preserve old NumPy sequences within uint32.
+    np.random.seed(int(seed) % (2**32))
     torch.manual_seed(seed)
 
 

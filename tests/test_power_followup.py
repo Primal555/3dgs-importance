@@ -131,6 +131,37 @@ class PowerFollowupTests(unittest.TestCase):
             c.run_worker(opts, 'block')
             repaired = torch.load(root/'failed_evaluation/block/checkpoints/final/codec.pt', weights_only=True)
             for key, value in a['state_dict'].items(): torch.testing.assert_close(value, repaired['state_dict'][key], rtol=0, atol=0)
+            opts.out = str(root/'channel_only'); opts.resume_suite = False; opts.joint_steps = 0
+            c.run_worker(opts, 'block')
+            only = torch.load(root/'channel_only/block/checkpoints/final/codec.pt', weights_only=True)
+            self.assertEqual(only['step'], 6)
+            self.assertEqual(only['training']['progress']['phase'], 'channel_bootstrap')
+            self.assertEqual(only['training']['progress']['completed']['channel_render'], 0)
+            self.assertEqual([g['name'] for g in only['training']['optimizer']['param_groups']], ['channel_encoder', 'channel_decoder'])
+            for key, value in parent['state_dict'].items():
+                if key.startswith(('semantic_encoder.', 'semantic_decoder.')):
+                    torch.testing.assert_close(value, only['state_dict'][key], rtol=0, atol=0)
+            from gaussian_jscc import power_stability_controls as suite
+            audit_args = suite.parser().parse_args(['--power-run', str(root/'power'), '--followup', str(root/'full'),
+                '--out', str(root/'stability'), '--channel-steps', '3', '--audit-steps', '2', '--device', 'cpu', '--no-lpips'])
+            plan = suite.build_plan(audit_args)
+            self.assertEqual(plan['target_channel_step'], 6)
+            self.assertIn('end_channel_bootstrap', plan['point_checkpoint'])
+            self.assertFalse((root/'stability').exists())
+            suite.audit_worker(audit_args, 'point')
+            audit_folder = root/'stability/audit/point'
+            for arm in ('plain', 'instrumented'):
+                done = json.loads((audit_folder/arm/'complete.json').read_text())
+                self.assertEqual(done['updates'], 2)
+                records = [json.loads(s) for s in (audit_folder/arm/'steps.jsonl').read_text().splitlines()]
+                self.assertEqual([r['phase_step'] for r in records], [1, 2])
+                self.assertGreater(records[0]['updates']['channel_encoder']['update_norm'], 0)
+            audit_args.resume_suite = True
+            failed_marker = audit_folder/'plain/complete.json'
+            failed_marker.write_text(json.dumps(dict(status='probe_error', updates=1)), encoding='utf-8')
+            suite.audit_worker(audit_args, 'point')
+            self.assertEqual(json.loads(failed_marker.read_text())['status'], 'complete')
+            self.assertEqual(source_path.read_bytes(), source_bytes)
 
 
 if __name__ == '__main__': unittest.main()

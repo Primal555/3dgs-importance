@@ -164,7 +164,7 @@ def color_bootstrap_step(model, features, q, geometry, training_camera_centers, 
     return loss.detach(),stats
 
 
-def render_step(model, batches, geometry, snr, kind, task, phase, mode='replay',channel_latent_weight=1.):
+def render_step(model, batches, geometry, snr, kind, task, phase, mode='replay',channel_latent_weight=1.,replay_observer=None):
     model.set_scene_geometry(geometry)
     objective_settings(channel_latent_weight)
     communication=phase=='channel_render'
@@ -180,7 +180,7 @@ def render_step(model, batches, geometry, snr, kind, task, phase, mode='replay',
         return raw,auxiliary,metrics
     loss,stats=full_scene_step(model,batches,geometry,snr,kind,task,
                                attr_weight=channel_latent_weight if communication else 0,mode=mode,
-                               profile=True,batch_forward=batch_forward)
+                               profile=True,batch_forward=batch_forward,replay_observer=replay_observer)
     image_kind=getattr(getattr(task,'objective',None),'kind','mse')
     stats.update(objective='source_ply_rgb_'+image_kind)
     if communication:

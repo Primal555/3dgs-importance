@@ -80,9 +80,9 @@ def joint_optimizer(model, previous, channel_lr, decoder_lr):
 
 
 def build_plan(args):
-    if (min(args.channel_steps, args.joint_steps, args.validate_every, args.joint_validate_every,
+    if (min(args.channel_steps, args.validate_every, args.joint_validate_every,
             args.save_every, args.test_views, args.diagnostic_blocks, args.response_blocks, args.cpu_threads) < 1
-            or args.render_trials < 2 or args.trials < 2
+            or args.joint_steps < 0 or args.render_trials < 2 or args.trials < 2
             or any(not math.isfinite(v) or v <= 0 for v in (args.channel_lr, args.semantic_decoder_lr))):
         raise ValueError('invalid follow-up training/evaluation budget')
     if len(set(args.modes)) != len(args.modes) or (args.mode and args.mode not in args.modes):
@@ -170,8 +170,7 @@ def channel_update(model, optimizer, cache, step, args):
                                objective='original_y_mse')
 
 
-def joint_update(model, scene, step, phase_step, args):
-    device = next(model.parameters()).device
+def joint_inputs(scene, step, phase_step, args):
     layout = ('1', '2', '3', 'mixed')[(phase_step-1) % 4]
     qs = []
     for index, ids in enumerate(scene.group_ids):
@@ -179,15 +178,23 @@ def joint_update(model, scene, step, phase_step, args):
                   if layout == 'mixed' else torch.full_like(ids, int(layout)))
         qs.append(values.masked_fill(ids < 0, 0))
     indices = random.Random(args.seed+400009*step).sample(range(len(scene.cameras)), scene.views_per_step)
+    return list(zip(scene.groups, qs)), indices, layout
+
+
+def joint_update(model, scene, step, phase_step, args, *, task_factory=None, replay_observer=None):
+    device = next(model.parameters()).device
+    batches, indices, layout = joint_inputs(scene, step, phase_step, args)
     objective = PerceptualImageObjective('mse_ssim', 1/3, device)
-    task = PerceptualMultiViewRenderTask([scene.cameras[i] for i in indices], scene.reference,
-                                        scene.degree, scene.white_background, objective)
+    factory = task_factory or PerceptualMultiViewRenderTask
+    task = factory([scene.cameras[i] for i in indices], scene.reference,
+                   scene.degree, scene.white_background, objective)
     # Keep full-scene replay noise paired between modes without consuming the
     # continuation's RNG stream a second time during replay.
     with preserved_rng(device):
         seed_all(args.seed+500009*step)
-        loss, stats = render_step(model, list(zip(scene.groups, qs)), scene.geometry,
-                                  10., 'awgn', task, 'channel_render', mode='replay', channel_latent_weight=1.)
+        loss, stats = render_step(model, batches, scene.geometry,
+                                  10., 'awgn', task, 'channel_render', mode='replay', channel_latent_weight=1.,
+                                  replay_observer=replay_observer)
     stats.update(task.stats, layout=layout, training_view_indices=indices)
     return loss, stats
 
@@ -286,7 +293,7 @@ def run_worker(args, mode, max_updates=None):
             raise RuntimeError('frozen semantic teacher changed during channel recovery')
         evaluate_saved('channel_end')
         progress['channel_endpoint_done'] = True; save('end_channel_bootstrap'); save()
-    if progress['phase'] != 'channel_render':
+    if args.joint_steps and progress['phase'] != 'channel_render':
         optimizer = joint_optimizer(model, optimizer, args.channel_lr, args.semantic_decoder_lr)
         progress.update(phase='channel_render', phase_step=0, phase_complete=False, freeze_semantic=False)
         save('joint_initial'); save()

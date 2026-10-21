@@ -55,7 +55,7 @@ def codec_batch(model, features, q, snr, kind, geometry, seed_weight, return_met
 
 def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
                     attr_weight=.1, seed_weight=.2, mode="replay", profile=False,
-                    batch_forward=None, gradient_observer=None):
+                    batch_forward=None, gradient_observer=None, replay_observer=None):
     """Compute AND backpropagate one loss; caller clips/steps the optimizer.
 
     batches is a nonempty list of (padded_features, int64_tiers), each containing
@@ -66,11 +66,15 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
     each recomputed batch. It may use autograd.grad(retain_graph=True), but must
     not mutate .grad, parameters, or RNG. Summed observations are full-scene
     parameter gradients (the render objective here is its exact VJP surrogate).
+    replay_observer(raw, weighted_aux, offset) is a generic read-only observer
+    before the original replay backward; it must not mutate .grad or RNG.
     """
     if mode not in ("replay", "checkpoint"):
         raise ValueError("render backward must be replay or checkpoint")
     if gradient_observer is not None and mode != "replay":
         raise ValueError("gradient observer requires replay")
+    if replay_observer is not None and mode != 'replay':
+        raise ValueError('replay observer requires replay')
     device = next(model.parameters()).device
     timer = PhaseTimer(device, profile)
     if profile and device.type == "cuda":
@@ -142,6 +146,10 @@ def full_scene_step(model, batches, geometry, snr, kind, distortion_fn,
                 # VJP through the codec, plus the original weighted auxiliary.
                 render_objective = (raw * upstream[offset:offset + count]).sum()
                 weighted_aux = attr_weight * aux * count / total_count
+                if replay_observer is not None:
+                    # Read-only diagnostics may use autograd.grad with
+                    # retain_graph=True; actual .grad accumulation is unchanged.
+                    replay_observer(raw, weighted_aux, offset)
                 if gradient_observer is not None:
                     weighted_geometry = (metrics["geometry"] * model.cfg.geometry_weight
                                          * attr_weight * count / total_count)
