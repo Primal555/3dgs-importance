@@ -110,7 +110,7 @@ def directions(count,seed,device):
     return F.normalize(torch.randn(count,3,generator=torch.Generator().manual_seed(seed)),dim=-1).to(device)
 
 
-def response_loss(model,teacher,y,y_hat,q,xyz,geometry,views):
+def teacher_feature_pair(model,teacher,y,y_hat,q,xyz):
     active=q>0
     if not active.any(): raise ValueError('response loss requires retained points')
     side=xyz.detach().to(y_hat).masked_fill(~active[...,None],0)
@@ -118,7 +118,12 @@ def response_loss(model,teacher,y,y_hat,q,xyz,geometry,views):
     # before spatial context. Only the isolated-response evaluation flattens it.
     with torch.no_grad(): target=torch.cat((side,teacher(y.detach(),active,side)),-1)
     pred=torch.cat((side,teacher(y_hat,active,side)),-1)
-    return local_response_loss(pred[active],target[active],geometry,model,directions=views)
+    return pred[active],target[active]
+
+
+def response_loss(model,teacher,y,y_hat,q,xyz,geometry,views):
+    pred,target=teacher_feature_pair(model,teacher,y,y_hat,q,xyz)
+    return local_response_loss(pred,target,geometry,model,directions=views)
 
 
 def channel_loss(model,teacher,y,y_hat,q,xyz,geometry,views,weight):
@@ -151,14 +156,15 @@ def transmit(model,y,q,xyz,seed):
     return model.channel_decoder(received,mask,q,10.,**options)
 
 
-def batch_inputs(model,cache,args,local,*,calibration=False):
+def batch_inputs(model,cache,args,local,*,calibration=False,layout_override=None):
     device=next(model.parameters()).device
     # Calibration and training use disjoint deterministic draws, but identical rules.
     step=local+(100000000 if calibration else 0)
     index=random.Random(args.seed+100003*step).randrange(len(cache))
     batch=cache[index]
     y,active,xyz=[batch[k].to(device) for k in ('y','active','xyz')]
-    layout=('1','2','3','mixed')[(local-1)%4]
+    layout=layout_override or ('1','2','3','mixed')[(local-1)%4]
+    if layout not in ('1','2','3','mixed'): raise ValueError('unknown positive-tier layout')
     if layout=='mixed':
         q=torch.randint(1,4,active.shape,generator=torch.Generator().manual_seed(args.seed+300007*step)).to(device)
     else: q=torch.full(active.shape,int(layout),dtype=torch.long,device=device)
@@ -210,8 +216,9 @@ def summarize(out):
     write_csv(out/'comparison/endpoints.csv',rows)
 
 
-def main(args,max_updates=None):
+def main(args,max_updates=None,supervision=None):
     plan=build_plan(args)
+    if supervision is not None: supervision.add_to_plan(plan)
     if args.dry_run: print(json.dumps(plan,indent=2)); return plan
     out=Path(args.out).resolve(); existed=out.exists()
     if existed:
@@ -246,12 +253,15 @@ def main(args,max_updates=None):
         progress.update(phase='channel_bootstrap',phase_step=0,phase_complete=False,freeze_semantic=True,
             semantic_decoder_only=False,channel_denoiser_only=False,channel_neighbor_only=False,response_updates=0,
             module_lrs={'channel_encoder':args.lr,'channel_decoder':args.lr},initial_done=False,final_done=False,
-            source_step=plan['source_step'],train_snrs=[10.],training_objective=dict(version='channel_response_v1',
-                channel_bootstrap='latent_mse+frozen_teacher_local_response',response_directions=args.response_directions))
+            source_step=plan['source_step'],train_snrs=[10.],training_objective=copy.deepcopy(plan.get('training_objective',
+                dict(version='channel_response_v1',channel_bootstrap='latent_mse+frozen_teacher_local_response',
+                     response_directions=args.response_directions))))
         progress['phase_budgets']['channel_bootstrap']=start_step+args.steps
         progress['phase_budgets']['channel_render']=0
+        if supervision is not None: progress['supervision_updates']={}
     else:
-        if progress['training_objective']['version']!='channel_response_v1': raise ValueError('not a response experiment checkpoint')
+        expected_version=plan.get('training_objective',{}).get('version','channel_response_v1')
+        if progress['training_objective']['version']!=expected_version: raise ValueError('not a matching response experiment checkpoint')
         repair_logs(out,progress['step'])
     if semantic_digest(model.state_dict())!=plan['semantic_sha256']: raise RuntimeError('semantic teacher changed')
     metadata=json.loads((Path(plan['source_run'])/'training.json').read_text(encoding='utf8'))
@@ -264,6 +274,7 @@ def main(args,max_updates=None):
     # Scene-span/context buffers are runtime-only, absent from state_dict.
     # Snapshot AFTER geometry binding, including on exact resume.
     teacher=frozen_teacher(model)
+    if supervision is not None: supervision.bind(scene,device)
     restore_rng(rng)
     training=dict(source_run=plan['source_run'],manifest=str(manifest),selected_scenes=[spec],scene=scene.record,
         codec_config=model.cfg.to_dict(),channel_response=plan,test_view_names=names,
@@ -303,9 +314,14 @@ def main(args,max_updates=None):
         before={n:p.detach().clone() for n,p in model.named_parameters()}
         if device.type=='cuda': torch.cuda.reset_peak_memory_stats(device); torch.cuda.synchronize(device)
         started=time.perf_counter()
-        y,q,xyz,views,index,layout,noise_step=batch_inputs(model,cache,args,local)
+        selection=supervision.selection(local) if supervision is not None else None
+        y,q,xyz,views,index,layout,noise_step=batch_inputs(model,cache,args,local,
+            layout_override=selection[1] if selection else None)
         recovered=transmit(model,y,q,xyz,args.seed+200003*noise_step)
-        loss,stats=channel_loss(model,teacher,y,recovered,q,xyz,scene.geometry,views,weight)
+        if supervision is None:
+            loss,stats=channel_loss(model,teacher,y,recovered,q,xyz,scene.geometry,views,weight)
+        else:
+            loss,stats=supervision.loss(model,teacher,y,recovered,q,xyz,scene.geometry,views,weight,local,selection)
         loss.backward(); stats.update(finish_update(model,optimizer,before))
         if device.type=='cuda':
             torch.cuda.synchronize(device)
@@ -314,12 +330,21 @@ def main(args,max_updates=None):
         progress.update(step=step,phase_step=local,response_updates=local,phase_complete=local==args.steps)
         progress['completed']['channel_bootstrap']=step
         progress['channel_trained']=True; scene.channel_trained=True
+        if supervision is not None:
+            counts=progress['supervision_updates']
+            counts[stats['task']]=counts.get(stats['task'],0)+1
         append_json(out/'metrics/loss.jsonl',dict(stats,loss=float(loss.detach()),step=step,phase='channel_response',phase_step=local,
             layout=layout,batch_index=index,lr=args.lr,snr=10.,step_seconds=time.perf_counter()-started))
-        if local==1 or local%10==0:
+        # 10 aliases with a four-task cycle (only tasks2/4 appear). A coprime
+        # interval lets console users see all tasks/tiers; legacy stays at10.
+        log_every=25 if supervision is not None else 10
+        if local==1 or local%log_every==0 or (supervision is not None and local<=4):
             print(f'channel {local}/{args.steps}: q={layout}, loss={float(loss.detach()):.6g}, '
                   f'y_mse={stats["latent_mse"]:.6g}, response={stats["response_mse"]:.6g}, '
                   f'weighted_response={stats["weighted_response_mse"]:.6g}, grad={stats["grad_norm"]:.5g}',flush=True)
+            if supervision is not None:
+                print(f'  task={stats["task"]} #{stats["task_step"]}; color={stats["directional_color_mse"]:.6g}, '
+                      f'shape={stats["shape_mse"]:.6g}, opacity={stats["opacity_mse"]:.6g}',flush=True)
         if local%args.validate_every==0 and not progress['phase_complete']:
             evaluate(f'response_{local:06d}',scope='validation')
         if local%args.save_every==0 or local%args.validate_every==0 or progress['phase_complete']: save()
@@ -333,6 +358,8 @@ def main(args,max_updates=None):
     result=dict(status='complete',step=progress['step'],channel_updates=args.steps,joint_updates=0,
         response_weight=weight,frozen_semantic_state_unchanged=True,source_step=plan['source_step'])
     if args.channel_init=='random': result.update(channel_initialization='random',training_start_step=0)
+    if supervision is not None:
+        result.update(supervision_variant=supervision.variant,supervision_updates=progress['supervision_updates'])
     json_write(out/'complete.json',result)
     return result
 
