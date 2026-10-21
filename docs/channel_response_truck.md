@@ -22,6 +22,39 @@
 q1→q2→q3→mixed均衡轮换；mixed是随机正档位，不是学习后的分配。
 可用 `--steps 4000`、`--lr 1e-5` 等显式覆盖。无联合训练参数或自动后续阶段。
 
+### 信道从头8000步（新增独立启动脚本）
+
+`scripts/test_channel_response_scratch_truck.sh` 显式传入 `--channel-init random --steps 8000`。
+默认旧脚本仍使用 `--channel-init retain`，原2000步续训及其断点恢复不变。
+
+从同一个源检查点**只复制语义编码器、语义解码器和attr_mean/attr_std**；
+源文件仍要求是已验证的逐块信道结束端点，以保持同一配置、教师和数据划分，
+但其信道编码器、信道解码器（含所有补偿支路）、功率状态、Adam和已完成步数
+均不复制。信道完整结构用原配置按 `--seed` 重新初始化，建立新Adam。
+随机初始化后的原始训练步数、channel_bootstrap计数均从0开始，最终为8000，
+不是8000＋8000=16000。日志 `source_step=8000` 只表示教师来源记录，不表示继承信道训练。
+`plan.json`明确记录 `training_start_step=0`、`source_channel_weights_loaded=false`；
+`initialization.json`保存初始化种子、两类权重摘要和空Adam状态计数。
+
+在本轮随机初值上重新执行一次梯度尺度校准，不读取上次续训的lambda或校准结果。
+语义两端全程冻结，不加热身阶段，不接联合渲染微调，损失从第1步就是y MSE＋局部响应。
+无噪声/10dB渲染仅评估；仍每500步保存验证数值，只保存初始/最终图像。
+训练批次、噪声及方向按本轮step1开始采样，精确续训只恢复本轮latest，
+不会再次随机化信道或重新校准。恢复时必须保留 `--channel-init random`；专用脚本自动保留。
+
+启动方式（GPU0仅为示例）：
+
+```bash
+RUN="$PWD/output/truck_power_stability_20261021_100748"
+OUT="$PWD/output/truck_channel_response_scratch_gpu0_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES=0 nohup bash scripts/test_channel_response_scratch_truck.sh "$RUN" "$OUT" >"${OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}.pid"
+tail -n 40 -f "${OUT}.log"
+```
+
+这验证新损失从随机信道权重学习的能力，不是新增一组旧MSE控制。
+历史8000步组可作实用参照，但因采样/优化路径不同，不应宣称严格单变量损失消融。
+
 ## 损失及教师
 
 `L = MSE(y_hat, stop_gradient(y)) + lambda * L_response`。

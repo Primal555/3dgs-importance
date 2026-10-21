@@ -15,7 +15,8 @@ from torch.nn import functional as F
 
 from .channel_capacity_controls import semantic_digest
 from .channel_normalization_metrics import cache_teacher
-from .cli import device_for
+from .channel_normalization_controls import fresh_model, channel_digest
+from .cli import device_for, seed_all
 from .codec import channel, prefix_mask
 from .data import read_ply
 from .decoder_adaptation import build_plan as source_plan, parser as source_parser, evaluate_saved
@@ -36,6 +37,8 @@ def parser():
     p.add_argument('--out',required=True,help='NEW output directory')
     p.add_argument('--manifest',help='relocated paths; same PLY identity and camera split')
     p.add_argument('--steps',type=int,default=2000,help='additional channel updates; no joint phase')
+    p.add_argument('--channel-init',choices=('retain','random'),default='retain',
+                   help='retain source channel weights, or copy semantics ONLY and train fresh channels from step0')
     p.add_argument('--lr',type=float,default=1e-4)
     p.add_argument('--response-directions',type=int,default=8)
     p.add_argument('--calibration-batches',type=int,default=4)
@@ -66,7 +69,7 @@ def build_plan(args):
     saved=torch.load(old['checkpoint'],map_location='cpu',weights_only=True)
     if saved['config'].get('channel_power_mode')!='block':
         raise ValueError('this controlled experiment requires the block-normalized channel endpoint')
-    return dict(version=1,source_run=old['source_run'],checkpoint=old['checkpoint'],
+    plan=dict(version=1,source_run=old['source_run'],checkpoint=old['checkpoint'],
         source_sha256=old['source_sha256'],source_step=old['source_step'],
         semantic_sha256=semantic_digest(saved['state_dict']),
         settings={k:getattr(args,k) for k in ('steps','lr','response_directions','calibration_batches',
@@ -78,6 +81,22 @@ def build_plan(args):
         calibration='RMS gradients w.r.t. recovered y on initial training batches; ratio pooled across batches; fixed thereafter',
         training='10dB AWGN; 8/24/48; q1/q2/q3/mixed; original blocks; NEW channel Adam',
         rendering='evaluation only; no joint phase, no allocator, no gradient clipping')
+    # Leave legacy retain plans unchanged so existing response runs can resume.
+    if args.channel_init=='random':
+        plan.update(channel_initialization='random',training_start_step=0,
+            copied_source_state='semantic encoder/decoder and attribute normalization ONLY',
+            source_channel_weights_loaded=False,source_optimizer_loaded=False,
+            initialization_seed=args.seed,training_rng_seed=args.seed+17)
+    return plan
+
+
+def initialize_random_channel(saved,seed,lr,device):
+    """Never load a pretrained channel tensor or its Adam state."""
+    model=fresh_model(saved,saved['config'].get('channel_power_mode','point'),seed,
+                      saved['config'].get('channel_power_momentum',.01),device)
+    optimizer=configure_phase(model,'channel_bootstrap',{'channel_encoder':lr,'channel_decoder':lr},freeze_semantic=True)
+    seed_all(seed+17)
+    return model,optimizer
 
 
 def frozen_teacher(model):
@@ -204,7 +223,23 @@ def main(args,max_updates=None):
         out.mkdir(parents=True); json_write(out/'plan.json',plan)
     device=device_for(args.device); torch.set_num_threads(args.cpu_threads)
     latest=out/'checkpoints/latest/codec.pt'; fresh=not latest.exists()
-    model,optimizer,progress,rng,record=restore_training_checkpoint(latest if not fresh else plan['checkpoint'],device)
+    start_step=plan.get('training_start_step',plan['source_step'])
+    if fresh and args.channel_init=='random':
+        source=torch.load(plan['checkpoint'],map_location='cpu',weights_only=True)
+        model,optimizer=initialize_random_channel(source,args.seed,args.lr,device)
+        record=source['training']['scene_record']
+        phases=('semantic_bootstrap','semantic_render','channel_bootstrap','channel_render')
+        # Do not inherit a source response lambda, pending evaluator, counters,
+        # or any other channel-training cursor. Resume restores OUR latest only.
+        progress=dict(step=0,completed={k:0 for k in phases},
+                      phase_budgets={k:0 for k in phases},channel_trained=False)
+        rng=capture_rng()
+        json_write(out/'initialization.json',dict(channel_initialization='random',seed=args.seed,
+            channel_sha256=channel_digest(model),semantic_sha256=semantic_digest(model.state_dict()),
+            optimizer_state_entries=len(optimizer.state),source_channel_weights_loaded=False,source_optimizer_loaded=False))
+        del source
+    else:
+        model,optimizer,progress,rng,record=restore_training_checkpoint(latest if not fresh else plan['checkpoint'],device)
     if fresh:
         optimizer=configure_phase(model,'channel_bootstrap',{'channel_encoder':args.lr,'channel_decoder':args.lr},freeze_semantic=True)
         progress=copy.deepcopy(progress)
@@ -213,7 +248,7 @@ def main(args,max_updates=None):
             module_lrs={'channel_encoder':args.lr,'channel_decoder':args.lr},initial_done=False,final_done=False,
             source_step=plan['source_step'],train_snrs=[10.],training_objective=dict(version='channel_response_v1',
                 channel_bootstrap='latent_mse+frozen_teacher_local_response',response_directions=args.response_directions))
-        progress['phase_budgets']['channel_bootstrap']=plan['source_step']+args.steps
+        progress['phase_budgets']['channel_bootstrap']=start_step+args.steps
         progress['phase_budgets']['channel_render']=0
     else:
         if progress['training_objective']['version']!='channel_response_v1': raise ValueError('not a response experiment checkpoint')
@@ -222,7 +257,7 @@ def main(args,max_updates=None):
     metadata=json.loads((Path(plan['source_run'])/'training.json').read_text(encoding='utf8'))
     original,manifest,spec,old,_=control_inputs(metadata,args.manifest)
     raw,degree=read_ply(spec['ply']); scene=make_scene(spec,raw,degree,model,original,old,out); del raw
-    validate_scene(record,scene.record); scene.channel_trained=True
+    validate_scene(record,scene.record); scene.channel_trained=progress['completed']['channel_bootstrap']>0
     names=bind_test_cameras(scene,spec,args.test_views)
     model.set_training_snrs([10.])
     with preserved_rng(device): cache=cache_teacher(model,scene)
@@ -259,11 +294,11 @@ def main(args,max_updates=None):
     if not progress['initial_done']:
         evaluate('initial',images=True); progress['initial_done']=True; save()
     weight=progress['response_weight']
-    print(f'Channel-only response: +{args.steps} updates, lr={args.lr}, lambda={weight:.8g}; '
+    print(f'Channel-only response: init={args.channel_init}, start={start_step}, +{args.steps} updates, lr={args.lr}, lambda={weight:.8g}; '
           'both semantic modules FROZEN; rendered images evaluation-only',flush=True)
     updates=0
     while progress['response_updates']<args.steps:
-        local=progress['response_updates']+1; step=plan['source_step']+local
+        local=progress['response_updates']+1; step=start_step+local
         training_mode(model); optimizer.zero_grad(set_to_none=True)
         before={n:p.detach().clone() for n,p in model.named_parameters()}
         if device.type=='cuda': torch.cuda.reset_peak_memory_stats(device); torch.cuda.synchronize(device)
@@ -278,6 +313,7 @@ def main(args,max_updates=None):
                          peak_reserved_mib=torch.cuda.max_memory_reserved(device)/2**20)
         progress.update(step=step,phase_step=local,response_updates=local,phase_complete=local==args.steps)
         progress['completed']['channel_bootstrap']=step
+        progress['channel_trained']=True; scene.channel_trained=True
         append_json(out/'metrics/loss.jsonl',dict(stats,loss=float(loss.detach()),step=step,phase='channel_response',phase_step=local,
             layout=layout,batch_index=index,lr=args.lr,snr=10.,step_seconds=time.perf_counter()-started))
         if local==1 or local%10==0:
@@ -296,6 +332,7 @@ def main(args,max_updates=None):
     summarize(out); save('final'); save()
     result=dict(status='complete',step=progress['step'],channel_updates=args.steps,joint_updates=0,
         response_weight=weight,frozen_semantic_state_unchanged=True,source_step=plan['source_step'])
+    if args.channel_init=='random': result.update(channel_initialization='random',training_start_step=0)
     json_write(out/'complete.json',result)
     return result
 

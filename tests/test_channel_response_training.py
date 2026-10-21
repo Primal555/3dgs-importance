@@ -90,6 +90,27 @@ class ChannelResponseTests(unittest.TestCase):
         b=c.channel_loss(m,teacher,y,altered,q,xyz,g,c.directions(2,17,y.device),.5)[0]
         torch.testing.assert_close(a,b,rtol=0,atol=0)
 
+    def test_random_channel_copies_only_semantics_and_has_fresh_optimizer(self):
+        c,m,teacher,g,f,q,y=self.fixture()
+        self.assertTrue(hasattr(c,'initialize_random_channel'),'random-channel initializer is missing')
+        saved=dict(config=m.cfg.to_dict(),state_dict={n:v.clone() for n,v in m.state_dict().items()})
+        first,opt=c.initialize_random_channel(saved,42,1e-4,'cpu')
+        self.assertEqual(len(opt.state),0)
+        self.assertEqual({n.split('.')[0] for n,p in first.named_parameters() if p.requires_grad},
+                         {'channel_encoder','channel_decoder'})
+        for name,value in saved['state_dict'].items():
+            if name.startswith(('semantic_encoder.','semantic_decoder.')) or name in ('attr_mean','attr_std'):
+                torch.testing.assert_close(value,first.state_dict()[name],rtol=0,atol=0)
+            elif name.startswith(('channel_encoder.','channel_decoder.')) and value.is_floating_point():
+                value.add_(1000)
+        # Changing only the pretrained channel must have NO effect on the seeded initializer.
+        second,_=c.initialize_random_channel(saved,42,1e-4,'cpu')
+        third,_=c.initialize_random_channel(saved,43,1e-4,'cpu')
+        for name,value in first.state_dict().items():
+            torch.testing.assert_close(value,second.state_dict()[name],rtol=0,atol=0)
+        self.assertTrue(any(not torch.equal(value,third.state_dict()[name])
+                            for name,value in first.state_dict().items() if name.startswith('channel_encoder.')))
+
     def test_complete_and_exact_resume_freeze_both_semantic_modules(self):
         c = self.entry()
         import test_modular_experiment as fixture
@@ -162,6 +183,39 @@ class ChannelResponseTests(unittest.TestCase):
             self.assertTrue((root/'full/checkpoints/end_channel_bootstrap/codec.pt').exists())
             self.assertFalse((root/'full/evaluation/response_000002/images').exists())
             self.assertTrue((root/'full/evaluation/final/images/final').exists())
+            # A response-trained source carries an old lambda. Even then a new
+            # random run must honor its OWN calibration/explicit override.
+            args.run=str(root/'full'); args.response_weight=.125
+            args.channel_init='random'; args.resume=False; args.out=str(root/'scratch')
+            result=c.main(args)
+            self.assertEqual(result['step'],4)
+            self.assertEqual(result['response_weight'],.125)
+            initial=torch.load(root/'scratch/checkpoints/initial/codec.pt',weights_only=True)
+            self.assertEqual(initial['step'],0)
+            self.assertEqual(initial['training']['progress']['completed']['channel_bootstrap'],0)
+            self.assertEqual(initial['training']['optimizer']['state'],{})
+            self.assertTrue(any(not torch.equal(value,initial['state_dict'][name])
+                                for name,value in teacher['state_dict'].items() if name.startswith('channel_encoder.')))
+            for name,value in teacher['state_dict'].items():
+                if name.startswith(('semantic_encoder.','semantic_decoder.')) or name in ('attr_mean','attr_std'):
+                    torch.testing.assert_close(value,initial['state_dict'][name],rtol=0,atol=0)
+            scratch=torch.load(root/'scratch/checkpoints/final/codec.pt',weights_only=True)
+            self.assertEqual(scratch['training']['progress']['completed']['channel_render'],0)
+            log=[json.loads(s) for s in (root/'scratch/metrics/loss.jsonl').read_text().splitlines()]
+            self.assertEqual([r['step'] for r in log],[1,2,3,4])
+            args.out=str(root/'scratch_resumed'); c.main(args,max_updates=2)
+            args.resume=True; c.main(args)
+            restored=torch.load(root/'scratch_resumed/checkpoints/final/codec.pt',weights_only=True)
+            for name,value in scratch['state_dict'].items():
+                torch.testing.assert_close(value,restored['state_dict'][name],rtol=0,atol=0)
+            self.assertEqual(scratch['training']['progress']['response_calibration'],
+                             restored['training']['progress']['response_calibration'])
+            for key,state in scratch['training']['optimizer']['state'].items():
+                for field,value in state.items():
+                    torch.testing.assert_close(value,restored['training']['optimizer']['state'][key][field],rtol=0,atol=0)
+            args.channel_init='retain'
+            with self.assertRaisesRegex(ValueError,'resume settings/source differ'): c.main(args)
+            self.assertEqual(endpoint.read_bytes(),original)
 
 
 if __name__=='__main__': unittest.main()
