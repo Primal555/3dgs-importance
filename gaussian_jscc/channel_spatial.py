@@ -101,7 +101,9 @@ class ChannelNeighborRefiner(ChannelSpatialDenoiser):
     """One independent final residual over a frozen trained self-only base."""
     def __init__(self,cfg):
         from dataclasses import replace
-        local=replace(cfg,channel_denoiser_mode='spatial',channel_denoiser_scope='final',
+        # This local config describes only the reusable spatial residual block.
+        local=replace(cfg,channel_variant='progressive' if cfg.channel_variant=='successive' else cfg.channel_variant,
+                      channel_denoiser_mode='spatial',channel_denoiser_scope='final',
                       channel_denoiser_hidden=cfg.channel_neighbor_hidden,channel_denoiser_neighbors=cfg.channel_neighbor_neighbors)
         super().__init__(local,len(local.rates)-1)
         self.feature_gate=nn.Linear(2*local.channel_denoiser_hidden,cfg.latent_dim)

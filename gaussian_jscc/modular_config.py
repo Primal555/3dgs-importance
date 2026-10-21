@@ -91,7 +91,7 @@ class ModularCodecConfig:
                 type(self.channel_neighbor_hidden) is not int or self.channel_neighbor_hidden<1 or
                 type(self.channel_neighbor_neighbors) is not int or self.channel_neighbor_neighbors<1):
             raise ValueError('invalid receiver neighbor refinement settings')
-        if self.channel_neighbor_mode!='none' and (self.channel_variant!='progressive' or self.channel_prefix_mode!='full_prefix'):
+        if self.channel_neighbor_mode!='none' and (self.channel_variant not in ('progressive','successive') or self.channel_prefix_mode!='full_prefix'):
             raise ValueError('neighbor refinement requires full-prefix progressive channel modules')
         if (self.channel_denoiser_mode not in ('none','pointwise','spatial') or
                 type(self.channel_denoiser_hidden) is not int or self.channel_denoiser_hidden<1 or
@@ -102,10 +102,14 @@ class ModularCodecConfig:
         if (self.channel_denoiser_scope not in ('stage','final') or
                 (self.channel_denoiser_scope=='final' and self.channel_denoiser_mode=='none')):
             raise ValueError('final receiver denoising requires an enabled denoiser')
-        if self.channel_variant not in ('baseline','residual','progressive'):
+        if self.channel_variant not in ('baseline','residual','progressive','successive'):
             raise ValueError('unknown channel variant')
+        if self.channel_variant=='successive' and (self.channel_power_mode!='block'
+                or self.channel_denoiser_mode!='none' or self.channel_prefix_mode!='full_prefix'
+                or len(self.rates)!=4 or self.channel_neighbor_mode!='plain'):
+            raise ValueError('successive channel requires block scales, full prefixes, three tiers and one plain neighbor refiner')
         if (self.channel_prefix_mode not in ('suffix','full_prefix') or
-                (self.channel_prefix_mode=='full_prefix' and self.channel_variant!='progressive')):
+                (self.channel_prefix_mode=='full_prefix' and self.channel_variant not in ('progressive','successive'))):
             raise ValueError('full-prefix reread requires progressive channel modules')
         if type(self.channel_hidden) is not int or self.channel_hidden<1:
             raise ValueError('channel_hidden must be a positive integer')

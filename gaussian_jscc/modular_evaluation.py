@@ -44,11 +44,16 @@ def rate_record(model,scene,q,snr,kind,identity,tx_snr=None,rx_snr=None):
     efficiency=getattr(scene,'net_bits_per_use',2.)
     if not math.isfinite(efficiency) or efficiency<=0: raise ValueError('invalid digital efficiency assumption')
     xyz_uses=math.ceil(8*scene._modular_xyz_bytes/efficiency); meta_uses=math.ceil(8*len(meta)/efficiency)
-    return {'payload_complex_symbols':payload,'symbols_per_gaussian':payload/len(q),
+    record={'payload_complex_symbols':payload,'symbols_per_gaussian':payload/len(q),
             'xyz_bytes':scene._modular_xyz_bytes,'metadata_bytes':len(meta),'total_channel_uses':payload+xyz_uses+meta_uses,
             'coordinate_channel_uses':xyz_uses,'metadata_channel_uses':meta_uses,'net_bits_per_use_assumption':efficiency,
             'reliability':'XYZ/metadata assumed reliable; no FEC or packet errors simulated',
             'rate_scope':'analogue payload + measured XYZ and metadata framing; shared model excluded'}
+    if hasattr(model,'scale_rate_record'):
+        record.update(model.scale_rate_record(scene,q,efficiency))
+        record['total_channel_uses']+=record['scale_channel_uses']
+        record['rate_scope']='analogue payload + measured XYZ, tier/model framing and reliable binary16 block-scale frames; shared model excluded'
+    return record
 
 
 @torch.no_grad()

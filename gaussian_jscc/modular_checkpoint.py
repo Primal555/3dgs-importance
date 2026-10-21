@@ -58,7 +58,11 @@ def restore_training_checkpoint(path, device):
     model=build_codec(config_from_dict(saved['config'])).to(device)
     model.load_state_dict(saved['state_dict'])
     model.set_training_snrs(progress.get('train_snrs',()))
-    optimizer=configure_phase(model,progress['phase'],progress.get('module_lrs',{}),
+    if model.cfg.channel_variant=='successive':
+        from .successive_training import configure_optimizer
+        optimizer=configure_optimizer(model,progress['successive_phase'],progress['module_lrs'])
+    else:
+        optimizer=configure_phase(model,progress['phase'],progress.get('module_lrs',{}),
                               freeze_semantic=progress.get('freeze_semantic',False),
                               denoiser_only=progress.get('channel_denoiser_only',False),
                               neighbor_only=progress.get('channel_neighbor_only',False),

@@ -12,6 +12,9 @@ def config_from_dict(values):
 
 def build_codec(cfg):
     if isinstance(cfg, ModularCodecConfig):
+        if cfg.channel_variant=='successive':
+            from .successive_codec import SuccessiveGaussianCodec
+            return SuccessiveGaussianCodec(cfg)
         return ModularGaussianCodec(cfg)
     if isinstance(cfg, CodecConfig):
         return GaussianCodec(cfg)
