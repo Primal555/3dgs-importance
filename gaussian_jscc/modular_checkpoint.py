@@ -61,7 +61,8 @@ def restore_training_checkpoint(path, device):
     optimizer=configure_phase(model,progress['phase'],progress.get('module_lrs',{}),
                               freeze_semantic=progress.get('freeze_semantic',False),
                               denoiser_only=progress.get('channel_denoiser_only',False),
-                              neighbor_only=progress.get('channel_neighbor_only',False))
+                              neighbor_only=progress.get('channel_neighbor_only',False),
+                              semantic_decoder_only=progress.get('semantic_decoder_only',False))
     if state['optimizer'] is not None: optimizer.load_state_dict(state['optimizer'])
     return model,optimizer,progress,state['rng'],state['scene_record']
 

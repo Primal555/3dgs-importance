@@ -26,9 +26,20 @@ PHASE_MODULES = {
 }
 
 
-def configure_phase(model, phase, module_lrs, *, freeze_semantic=False,denoiser_only=False,neighbor_only=False):
+def configure_phase(model, phase, module_lrs, *, freeze_semantic=False,denoiser_only=False,neighbor_only=False,
+                    semantic_decoder_only=False):
     if phase not in PHASE_MODULES:
         raise ValueError('unknown modular training phase')
+    if semantic_decoder_only:
+        if phase != 'channel_render' or freeze_semantic or denoiser_only or neighbor_only:
+            raise ValueError('semantic-decoder-only optimization requires exclusive channel render scope')
+        model.requires_grad_(False)
+        for p in model.parameters(): p.grad = None
+        model.semantic_decoder.requires_grad_(True)
+        lr = float(module_lrs.get('semantic_decoder', 1e-5))
+        if not math.isfinite(lr) or lr <= 0: raise ValueError('learning rates must be positive and finite')
+        return torch.optim.Adam([dict(params=list(model.semantic_decoder.parameters()),
+                                      lr=lr, name='semantic_decoder')])
     if neighbor_only:
         if denoiser_only or phase!='channel_bootstrap' or not freeze_semantic or not hasattr(model.channel_decoder,'neighbor_refiner'):
             raise ValueError('neighbor-only optimization requires frozen-semantic channel bootstrap and a neighbor refiner')
