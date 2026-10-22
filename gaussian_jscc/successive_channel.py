@@ -35,8 +35,11 @@ def normalize_segment(raw,donors,floor):
     if not torch.isfinite(gain).all() or (gain>65504).any():
         raise ValueError('block scale outside finite binary16; cannot silently clip')
     rounded=gain.detach().to(torch.float16)
-    upper=torch.nextafter(rounded,torch.full_like(rounded,float('inf')))
-    rounded=torch.where(rounded.float()<gain.detach(),upper,rounded).to(gain)
+    # Positive binary16 bit patterns are ordered. Increment only values rounded
+    # down, including zero/subnormals; exact values and 65504 stay unchanged.
+    # Some CUDA PyTorch builds do not implement nextafter for float16.
+    increment=(rounded.to(gain)<gain.detach()).to(torch.int16)
+    rounded=(rounded.view(torch.int16)+increment).view(torch.float16).to(gain)
     gain=gain+(rounded-gain).detach()
     gain=torch.where(donors.any(1),gain,torch.ones_like(gain))
     return raw/gain[:,None,None],gain

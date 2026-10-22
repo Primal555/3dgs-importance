@@ -2,6 +2,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -43,6 +44,41 @@ class SuccessiveChannelTests(unittest.TestCase):
         recovered.square().sum().backward()
         self.assertGreater(float(raw.grad[:,:2].abs().sum()),0.)
         self.assertEqual(float(raw.grad[:,2].abs().sum()),0.)
+
+    def test_binary16_round_up_works_without_half_nextafter_backend(self):
+        from gaussian_jscc.successive_channel import normalize_segment
+        original_nextafter=torch.nextafter
+
+        def unsupported_half(value,direction,*args,**kwargs):
+            # Reproduce the server backend limitation while running real math.
+            if value.dtype==torch.float16:
+                raise RuntimeError('"nextafter_cuda" not implemented for Half')
+            return original_nextafter(value,direction,*args,**kwargs)
+
+        devices=['cpu']+(['cuda'] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device),patch('torch.nextafter',side_effect=unsupported_half):
+                raw=torch.tensor([0.,1.,2.,255.,65503.],dtype=torch.float64,device=device)
+                raw=torch.stack((raw,torch.zeros_like(raw)),-1)[:,None,:].requires_grad_()
+                donors=torch.ones((5,1),device=device,dtype=torch.bool)
+                signal,gain=normalize_segment(raw,donors,1.)
+                # ceil_binary16(sqrt(raw**2+1)), hand-checked representable values.
+                expected=torch.tensor([1.,1.4150390625,2.236328125,255.125,65504.],
+                                      dtype=torch.float64,device=device)
+                torch.testing.assert_close(gain,expected,rtol=0,atol=0)
+                self.assertTrue(bool((signal.square().sum((1,2))<=1.).all()))
+                recovered=signal*gain[:,None,None]
+                torch.testing.assert_close(recovered,raw)
+                recovered.sum().backward()
+                torch.testing.assert_close(raw.grad,torch.ones_like(raw))
+                for target,want in ((1e-8,2**-24),(.01,.01000213623046875),
+                                    (1.,1.),(1.0002,1.0009765625),(1.0007,1.0009765625),
+                                    (65504.,65504.)):
+                    _,actual=normalize_segment(torch.zeros((1,1,2),dtype=torch.float64,device=device),
+                                               donors[:1],target**2)
+                    self.assertEqual(float(actual),want)
+                with self.assertRaises(ValueError):
+                    normalize_segment(raw,donors,65505.**2)
 
     def test_receiver_packet_matches_training_and_lower_tiers_ignore_future_slots(self):
         model=self.model().eval()
