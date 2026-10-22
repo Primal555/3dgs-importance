@@ -1,5 +1,6 @@
 """Joint A conditional codec -> 2000 allocation + 1000 encoder-frozen joint."""
 import csv
+import argparse
 import hashlib
 import json
 import math
@@ -26,6 +27,7 @@ from .render_objective import MaskedMultiViewRenderTask,MultiViewRenderTask
 from .render_validation import append_json
 from .successive_joint import encoder_digest
 from .transport import model_id
+from .allocation_reuse import AllocationTimings
 
 JOINT_MODULES=('channel_encoder','channel_decoder','semantic_decoder')
 
@@ -90,6 +92,10 @@ def parser():
     p.set_defaults(allocation_steps=2000,joint_steps=1000,beta=.005,test_views=32,trials=4)
     p.add_argument('--channel-latent-weight',type=float,default=1.,
                    help='joint-only actual retained-channel latent anchor; no allocator gradient')
+    p.add_argument('--allocation-reuse',action=argparse.BooleanOptionalAction,default=True,
+                   help='reuse frozen semantic y and same-step outputs; disable for a timing/equivalence control')
+    p.add_argument('--profile-every',type=int,default=10,
+                   help='detailed synchronized timings every N updates, also first/last; 0 disables profiling')
     return p
 
 
@@ -111,6 +117,7 @@ class SuccessiveAllocationCostMeter(AllocationCostMeter):
 
 
 def source_plan(args):
+    if args.profile_every<0:raise ValueError('profile-every must be nonnegative')
     if (min(args.allocation_steps,args.joint_steps,args.test_views,args.prefix_anchor_every)<0
             or args.allocation_steps+args.joint_steps<1
             or min(args.validate_every,args.save_every,args.trials,args.image_views,args.cpu_threads,args.rate_chunk_size)<1
@@ -168,7 +175,10 @@ def main(args,max_updates=None):
     torch.set_num_threads(args.cpu_threads);seed_all(args.seed)
     model,_,record=initialize_codec_run(plan['source_checkpoint'],device)
     initial_id=model_id(model)
-    settings={k:v for k,v in vars(args).items() if k not in ('out','run','resume','dry_run','manifest','device')}
+    # These exact-equivalence execution controls may change on an old run's
+    # resume without changing its model/table/Adam/RNG or training protocol.
+    settings={k:v for k,v in vars(args).items() if k not in (
+        'out','run','resume','dry_run','manifest','device','allocation_reuse','profile_every')}
     settings.update(plan,manifest=str(manifest),initial_codec_id=initial_id)
     if args.dry_run:
         result=dict(settings=settings,rates=list(model.cfg.rates),writes_output=False)
@@ -226,6 +236,10 @@ def main(args,max_updates=None):
     if (out/'training.json').exists() and json.loads((out/'training.json').read_text(encoding='utf-8'))!=json.loads(json.dumps(training)):
         raise ValueError('training/test protocol changed')
     json_write(out/'training.json',training)
+    json_write(out/'allocation_runtime.json',dict(version='step_reuse_v1',
+        allocation_reuse=args.allocation_reuse,profile_every=args.profile_every,
+        cache_scope='one update only; no cache is saved in checkpoints',
+        optimization_only=True))
 
     def save(label='latest'):
         if encoder_digest(model.state_dict())!=plan['frozen_encoder_sha256']:
@@ -300,20 +314,26 @@ def main(args,max_updates=None):
             task=MaskedMultiViewRenderTask(cameras,scene.reference,degree,scene.white_background)
             if device.type=='cuda':torch.cuda.synchronize(device);torch.cuda.reset_peak_memory_stats(device)
             started=time.perf_counter()
+            profile=bool(args.profile_every and (visit==1 or visit%args.profile_every==0 or visit==budget))
+            timings=AllocationTimings(device,profile)
             loss,stats=local_mask_step(model,mask,scene.groups,scene.group_ids,scene.geometry,10.,'awgn',
                 task,args.beta,scene.rate_meter,train_codec=phase=='joint',mode='replay',
                 sampling='single',rate_chunk_size=args.rate_chunk_size,
-                channel_latent_weight=args.channel_latent_weight if phase=='joint' else 0.)
+                channel_latent_weight=args.channel_latent_weight if phase=='joint' else 0.,
+                reuse_codec=args.allocation_reuse,profile=profile)
             stats.update(task.stats)
             if phase=='joint':
                 anchor=MultiViewRenderTask(cameras,scene.reference,degree,scene.white_background)
-                stats.update(preserve_prefix(model,scene.groups,scene.group_ids,scene.geometry,10.,'awgn',
-                    anchor,visit,args.prefix_anchor_every,3))
+                with timings.measure('prefix_anchor_seconds'):
+                    stats.update(preserve_prefix(model,scene.groups,scene.group_ids,scene.geometry,10.,'awgn',
+                        anchor,visit,args.prefix_anchor_every,3))
             norm,gradient=clip_codec_gradients(model,mode='none')
             if not torch.isfinite(loss) or any(p.grad is not None and not torch.isfinite(p.grad).all() for p in mask.parameters()):
                 raise RuntimeError('nonfinite loss/probability gradient; no update')
-            mask_optimizer.step()
-            if codec_optimizer is not None:codec_optimizer.step()
+            with timings.measure('optimizer_step_seconds'):
+                mask_optimizer.step()
+                if codec_optimizer is not None:codec_optimizer.step()
+            stats.update(timings.summary(),allocation_profiled=profile)
             changes=update_stats(model,before)
             if changes['semantic_encoder']['update_norm']!=0:raise RuntimeError('frozen encoder updated')
             if phase=='allocation' and any(v['update_norm']!=0 for v in changes.values()):raise RuntimeError('frozen codec updated')
@@ -326,9 +346,16 @@ def main(args,max_updates=None):
                 step_seconds=time.perf_counter()-started,
                 peak_memory_allocated_bytes=torch.cuda.max_memory_allocated(device) if device.type=='cuda' else None)
             append_json(out/'metrics/loss.jsonl',row)
-            if visit==1 or visit%10==0 or visit==budget:
+            if visit==1 or visit%10==0 or visit==budget or profile:
                 print(f'{phase} {visit}/{budget}: render={stats["render_loss"]:.6g}, rate={stats["rate_loss"]:.6g}, '
                       f'counts={stats["sampled_tier_counts"]}, sec={row["step_seconds"]:.2f}',flush=True)
+                if profile:
+                    print('  timings: '+', '.join(f'{key}={stats[key]:.3f}' for key in (
+                        'semantic_encode_seconds','candidate_decode_seconds','actual_decode_seconds',
+                        'q0_shadow_seconds','codec_forward_seconds','render_forward_seconds',
+                        'render_backward_seconds','codec_replay_backward_seconds','rate_accounting_seconds',
+                        'deployment_rate_gradient_seconds','prefix_anchor_seconds','optimizer_step_seconds')
+                        if key in stats)+f'; cache={stats["allocation_cache_peak_mib"]:.1f} MiB',flush=True)
             if progress['step']%args.validate_every==0 and visit<budget:validation(f'{phase}_{visit:06d}')
             if progress['step']%args.save_every==0 or visit==budget:save()
             updates+=1

@@ -8,17 +8,20 @@ surrogates, not derivatives of zlib bytes or exact finite differences.
 """
 import time
 import math
+from contextlib import nullcontext
 
 import torch
 
 from .data import to_raw
 from .training import full_scene_step
 from .allocation import deployment_probabilities
+from .allocation_reuse import AllocationStepCache, AllocationTimings
 
 
 def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kind,
                     distortion_fn, beta, rate_meter, train_codec=True, mode='replay',
-                    sampling='single', rate_chunk_size=1024, channel_latent_weight=0.):
+                    sampling='single', rate_chunk_size=1024, channel_latent_weight=0.,
+                    reuse_codec=False, profile=False):
     if not math.isfinite(channel_latent_weight) or channel_latent_weight<0:
         raise ValueError('channel latent weight must be finite and nonnegative')
     latent_weight=channel_latent_weight if train_codec else 0.
@@ -30,6 +33,14 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         raise ValueError('invalid allocator sampling or rate chunk size')
     if sampling == 'deployment' and len(model.cfg.rates) != 4:
         raise ValueError('exact ten-draw training currently supports q0 plus three positive tiers')
+    if reuse_codec:
+        from .successive_codec import SuccessiveGaussianCodec
+        if mode != 'replay':raise ValueError('allocation reuse requires replay')
+        if not isinstance(model,SuccessiveGaussianCodec):raise ValueError('allocation reuse requires successive codec')
+        if any(m.training for m in model.semantic_encoder.modules()):
+            raise ValueError('allocation reuse requires an eval-mode semantic encoder')
+        if train_codec and any(p.requires_grad for p in model.semantic_encoder.parameters()):
+            raise ValueError('allocation reuse requires a frozen semantic encoder')
     device = next(model.parameters()).device
     started = time.perf_counter()
     batches, flat_tiers = [], []
@@ -57,8 +68,10 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
     measured = rate_meter.details(torch.cat(flat_tiers))
     rate_seconds = time.perf_counter() - started
     counts = torch.bincount(torch.cat(flat_tiers), minlength=len(model.cfg.rates))
+    cache = AllocationStepCache(len(batches)) if reuse_codec else None
+    timings = AllocationTimings(device,profile)
 
-    def forward(features, packed):
+    def forward_batch(features, packed, entry):
         q, ids = packed[..., 0].long(), packed[..., 1].long()
         valid = ids >= 0
         if sampling == 'deployment':
@@ -74,14 +87,25 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         probabilities = torch.cat(((q == 0).to(conditional)[..., None],
                                    conditional * (q > 0)[..., None]), -1)
         values={};hooks=[]
+        options={'_timings':timings} if profile and getattr(model.cfg,'channel_variant',None)=='successive' else {}
+        if entry is not None:
+            if 'y' not in entry:
+                with torch.no_grad(),timings.measure('semantic_encode_seconds'):
+                    entry['y']=model.semantic_encoder(features,features[...,:3],q>0).detach()
+            options=dict(_semantic_y=entry['y'],_timings=timings)
+            if not train_codec:options['_cached_actual']=entry.get('actual')
+            values['y']=entry['y']
         if latent_weight:
-            hooks=[model.semantic_encoder.register_forward_hook(lambda m,a,o:values.update(y=o)),
-                   model.channel_decoder.register_forward_hook(lambda m,a,o:values.update(y_hat=o))]
+            hooks=[model.channel_decoder.register_forward_hook(lambda m,a,o:values.update(y_hat=o))]
+            if entry is None:
+                hooks.append(model.semantic_encoder.register_forward_hook(lambda m,a,o:values.update(y=o)))
         try:
             pred = model.forward_st_prefix_batches(features, features[..., :3], q,
-                                                   probabilities, snr, kind)
+                                                   probabilities, snr, kind,**options)
         finally:
             for hook in hooks:hook.remove()
+        if entry is not None and not train_codec and 'actual' not in entry:
+            entry['actual']=pred.detach()
         auxiliary=pred.sum()*0
         if latent_weight:
             # q is detached and proxy candidates have no graph. The anchor
@@ -93,14 +117,23 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         rows, gates = [to_raw(pred[keep], geometry, model)], [st_presence[keep]]
         if absent.any():
             shadow_q = torch.where(absent, positive, q)
-            with torch.no_grad():
-                choices = torch.nn.functional.one_hot(shadow_q, len(model.cfg.rates)).to(features)
-                shadow, _, _ = model.forward_tier_batches(features, features[..., :3], choices,
-                                                          snr, kind, paired_noise=True)
-            rows.append(to_raw(shadow[absent], geometry, model))
+            if entry is not None and 'shadow' in entry:
+                shadow_rows=entry['shadow']
+            else:
+                with torch.no_grad(),timings.measure('q0_shadow_seconds'):
+                    choices = torch.nn.functional.one_hot(shadow_q, len(model.cfg.rates)).to(features)
+                    shadow, _, _ = model.forward_tier_batches(features, features[..., :3], choices,
+                                                              snr, kind, paired_noise=True)
+                    shadow_rows=to_raw(shadow[absent], geometry, model)
+                if entry is not None:entry['shadow']=shadow_rows.detach()
+            rows.append(shadow_rows)
             gates.append(st_presence[absent])
         scene = torch.cat((torch.cat(rows), torch.cat(gates)[:, None]), -1)
         return scene, auxiliary, {}
+
+    def forward(features,packed):
+        with cache.batch() if cache else nullcontext(None) as entry:
+            return forward_batch(features,packed,entry)
 
     original_flags = [p.requires_grad for p in model.parameters()]
     if not train_codec:
@@ -109,8 +142,9 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         # Every sampled q0 source row has a hard-zero counterfactual splat.
         scene_loss, stats = full_scene_step(
             model, list(zip(feature_batches, batches)), geometry, snr, kind,
-            distortion_fn, attr_weight=latent_weight, mode=mode, batch_forward=forward)
+            distortion_fn, attr_weight=latent_weight, mode=mode, batch_forward=forward,profile=profile)
     finally:
+        if cache:cache.clear()
         if not train_codec:
             for parameter, flag in zip(model.parameters(), original_flags):
                 parameter.requires_grad_(flag)
@@ -199,6 +233,8 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
                  tier_map_compression_seconds=measured.get('tier_map_compression_seconds', 0.),
                  sampled_retained_gaussians=retained, codec_updated=train_codec)
     stats['sampled_q0_shadow_candidates'] = shadow_count
+    stats.update(timings.summary(),allocation_reuse_enabled=reuse_codec,
+                 allocation_cache_peak_mib=cache.peak_bytes/2**20 if cache else 0.)
     if channel_latent_weight:
         stats.update(channel_latent_weight=latent_weight,weighted_latent_loss=latent_weight*stats['aux_loss'],
                      latent_normalization='sum over retained rows / all valid source rows and dimensions')

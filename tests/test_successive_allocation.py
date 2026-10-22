@@ -208,7 +208,13 @@ class SuccessiveAllocationEntryTests(unittest.TestCase):
                         raise RuntimeError('simulated evaluation interruption')
                     with patch.object(entry,'evaluate',side_effect=interrupt):
                         with self.assertRaisesRegex(RuntimeError,'simulated evaluation'):entry.main(args)
-                else:entry.main(args,max_updates=stop)
+                else:
+                    if stop==3:
+                        # Resume a legacy execution path mid-joint using the
+                        # new cache/timing controls, preserving both Adams.
+                        args.allocation_reuse=False;args.profile_every=0
+                    entry.main(args,max_updates=stop)
+                args.allocation_reuse=True;args.profile_every=1
                 args.resume=True;entry.main(args)
                 resumed=torch.load(dest/'checkpoints/final/state.pt',weights_only=True)
                 for n,v in final['state_dict'].items():torch.testing.assert_close(v,resumed['state_dict'][n],rtol=0,atol=0)

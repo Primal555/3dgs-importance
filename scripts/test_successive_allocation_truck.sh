@@ -13,6 +13,7 @@ echo '2000 allocator-only updates: freeze ALL codec modules; new hierarchical ke
 echo '1000 joint updates: semantic encoder FROZEN; train table + channel E/D + semantic D.'
 echo 'beta=0.005; 8/24/48; 10dB; reliable16 XYZ + delivered binary16 scale frames.'
 echo 'Source-PLY RGB MSE; joint channel latent anchor=1; independent uniform-prefix anchor every 4 updates.'
+echo 'Step-local reuse ON by default; timings every 10 updates. --no-allocation-reuse selects the original path.'
 exec "$PYTHON" -u -m gaussian_jscc.successive_allocation \
   --run "$RUN" --out "$OUT" --allocation-steps 2000 --joint-steps 1000 \
   --beta 0.005 --codec-lr 1e-5 --channel-latent-weight 1 \

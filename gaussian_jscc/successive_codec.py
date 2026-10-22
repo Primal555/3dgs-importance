@@ -1,5 +1,6 @@
 """Opt-in modular codec with an explicit reliable scale-frame boundary."""
 import math
+from contextlib import nullcontext
 import torch
 from torch.nn import functional as F
 
@@ -28,12 +29,15 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
         return self.channel_decoder(signal,mask,q,snr,scales=scales,delivered_xyz=delivered_xyz)
 
     def forward_channel_batches(self,features,xyz,choices,snr,kind='awgn',paired_noise=False,*,
-                                tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None):
+                                tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None,
+                                _semantic_y=None):
         if features.ndim!=3 or choices.shape!=(*features.shape[:2],4):raise ValueError('invalid original batched choices')
         q=choices.argmax(-1)
         if choices.requires_grad or not torch.equal(choices,F.one_hot(q,4).to(choices)):
             raise ValueError('successive experiment requires hard tiers')
-        y=self.semantic_encoder(features,xyz,q>0)
+        # Sender-only reuse within a single allocator update. This tensor never
+        # enters the receiver; received symbols still cross the real channel.
+        y=self.semantic_encoder(features,xyz,q>0) if _semantic_y is None else _semantic_y
         signal,scales=self.channel_encoder(y,q,self.resolve_condition_snr(snr,tx_condition_snr),self.channel_decoder)
         mask=prefix_mask(q.flatten(),self.cfg.rates).reshape_as(signal)
         if paired_noise:
@@ -53,6 +57,15 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
             scales=scales,delivered_xyz=side)
         return y,recovered,q
 
+    def forward_tier_batches(self,features,xyz,choices,snr,kind='awgn',paired_noise=False,*,
+                             tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None,
+                             _semantic_y=None):
+        _,y_hat,q=self.forward_channel_batches(features,xyz,choices,snr,kind,paired_noise,
+            tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr,
+            noise_reference_symbols=noise_reference_symbols,_semantic_y=_semantic_y)
+        result=self.decode_representation(y_hat,q,delivered_positions(features[...,:3],q,self.cfg))
+        return result,result[...,:3],(q>0).to(features)
+
     def scale_rate_record(self,scene,q,efficiency):
         offset=0;content=frames=0
         for ids in scene.group_ids:
@@ -68,7 +81,8 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
     def encode_full(self,*args,**kwargs):raise ValueError('successive codec needs encode_channel_packet with scale bytes')
     def encode(self,*args,**kwargs):raise ValueError('successive codec needs encode_channel_packet with scale bytes')
     def decode(self,*args,**kwargs):raise ValueError('successive codec needs decode_channel_packet with scale bytes')
-    def forward_st_prefix_batches(self,features,xyz,q,probabilities,snr,kind='awgn'):
+    def forward_st_prefix_batches(self,features,xyz,q,probabilities,snr,kind='awgn',*,
+                                  _semantic_y=None,_cached_actual=None,_timings=None):
         """Exact hard forward with detached, paired-noise local tier proxies.
 
         Conditional transmitters change symbols AND block scales with q. A
@@ -82,18 +96,26 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
             raise ValueError('invalid successive allocation shapes')
         if not torch.isfinite(probabilities).all():raise ValueError('nonfinite tier probabilities')
         from .optimization import preserved_rng
+        def timing(name):return _timings.measure(name) if _timings else nullcontext()
         candidates=[]
         if torch.is_grad_enabled() and probabilities.requires_grad:
             for tier in (1,2,3):
                 alternative=torch.where(q>0,tier,0)
                 # Every candidate starts at the real draw's RNG state; none
                 # consumes caller RNG or adds parameters to the codec graph.
-                with torch.no_grad(),preserved_rng(features.device):
+                with torch.no_grad(),preserved_rng(features.device),timing('candidate_decode_seconds'):
                     value=self.forward_tier_batches(features,xyz,F.one_hot(alternative,4).to(features),
-                                                   snr,kind,paired_noise=True)[0]
+                                                   snr,kind,paired_noise=True,_semantic_y=_semantic_y)[0]
                 candidates.append(value)
-        actual=self.forward_tier_batches(features,xyz,F.one_hot(q,4).to(features),
-                                         snr,kind,paired_noise=True)[0]
+        # Cached actual is permitted only for the frozen-codec replay. The
+        # caller has already consumed its real draw during scene construction;
+        # replay runs inside full_scene_step's RNG fork and never escapes it.
+        if _cached_actual is None:
+            with timing('actual_decode_seconds'):
+                actual=self.forward_tier_batches(features,xyz,F.one_hot(q,4).to(features),
+                    snr,kind,paired_noise=True,_semantic_y=_semantic_y)[0]
+        else:
+            actual=_cached_actual
         result=actual
         for tier,candidate in enumerate(candidates,1):
             gate=(probabilities[...,tier]-probabilities[...,tier].detach())*(q>0)
