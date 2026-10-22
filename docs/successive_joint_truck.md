@@ -5,6 +5,10 @@
 `successive_channel_v1` Truck 实验及其 `checkpoints/final/codec.pt`。
 原实验只读，输出必须是另一个独立目录。
 
+需要同时更新语义编码器的B对照版本，使用独立脚本
+`scripts/test_successive_joint_encoder_truck.sh`，见
+[联合微调B说明](successive_joint_encoder_truck.md)。本页A的默认范围和参数不变。
+
 ## 参数范围和目标
 
 保留完整训练权重、8/24/48 累计复符号预算、48 维实数 y、可靠 16bit XYZ、

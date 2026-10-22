@@ -21,7 +21,7 @@ def cameras(*args,**kwargs):
     return result
 
 
-def source_run(root):
+def source_run(root, *, context_variant='baseline'):
     from test_modular_experiment import source_fixture
     from gaussian_jscc.modular_config import ModularCodecConfig
     from gaussian_jscc.model_factory import build_codec
@@ -33,10 +33,12 @@ def source_run(root):
     original=source_fixture(root);parent=root/'parent'
     from argparse import Namespace
     metadata,manifest,spec,old=inputs(Namespace(run=str(original),manifest=None))
+    context=dict(context_variant=context_variant,context_centers=(4,2),context_neighbors=(2,4)) \
+        if context_variant!='baseline' else {}
     model=build_codec(ModularCodecConfig(channel_variant='successive',channel_prefix_mode='full_prefix',
         channel_power_mode='block',channel_neighbor_mode='plain',latent_dim=8,channel_hidden=16,
         hidden=16,sh_degree=1,block_size=8,depth=2,grid_dim=4,levels=(2,),attention_heads=4,
-        decoder_window=4,rates=(0,8,24,48)))
+        decoder_window=4,rates=(0,8,24,48),**context))
     raw,degree=read_ply(spec['ply']);mean,std=shared_statistics([raw])
     model.attr_mean.copy_(mean);model.attr_std.copy_(std)
     scene=make_scene(spec,raw,degree,model,metadata,old,parent)

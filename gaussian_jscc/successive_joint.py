@@ -1,7 +1,7 @@
 """Joint source-PLY rendering after the completed successive channel experiment.
 
-Full weights/config are retained. Only the semantic encoder remains frozen;
-the two channel modules and semantic decoder use a NEW Adam optimizer.
+Full weights/config are retained. A freezes the semantic encoder; opt-in B also
+adapts it. All selected modules use a NEW Adam optimizer; XYZ/statistics stay fixed.
 """
 import argparse
 import hashlib
@@ -36,21 +36,24 @@ def parser():
         p.add_argument('--'+key,type=int,default=value)
     p.add_argument('--lr',type=float,default=1e-5)
     p.add_argument('--latent-weight',type=float,default=1.)
+    p.add_argument('--train-semantic-encoder',action='store_true',
+                   help='Joint B: also adapt the semantic encoder; default is unchanged Joint A')
     p.add_argument('--lpips',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--device',default='cuda')
     p.add_argument('--resume',action='store_true');p.add_argument('--dry-run',action='store_true')
     return p
 
 
-def encoder_digest(state):
+def encoder_digest(state,*,include_encoder=True):
     digest=hashlib.sha256()
     for name,value in sorted(state.items()):
-        if name.startswith('semantic_encoder.') or name in ('attr_mean','attr_std'):
+        if (include_encoder and name.startswith('semantic_encoder.')) or name in ('attr_mean','attr_std'):
             digest.update(name.encode());digest.update(value.detach().cpu().contiguous().numpy().tobytes())
     return digest.hexdigest()
 
 
 def build_plan(args):
+    train_encoder=bool(getattr(args,'train_semantic_encoder',False))
     if (min(args.steps,args.validate_every,args.save_every,args.test_views,args.render_trials,args.cpu_threads)<1
             or any(not math.isfinite(v) or v<=0 for v in (args.lr,args.latent_weight))):
         raise ValueError('positive step/evaluation budgets and finite positive weights/LR required')
@@ -75,26 +78,36 @@ def build_plan(args):
     config_from_dict(config)
     validate_scene(state['scene_record'],metadata['scene'])
     with checkpoint.open('rb') as stream:identity=hashlib.file_digest(stream,'sha256').hexdigest()
-    return dict(version='successive_joint_v1',source_run=str(run),checkpoint=str(checkpoint),
+    plan=dict(version='successive_joint_encoder_v1' if train_encoder else 'successive_joint_v1',
+        source_run=str(run),checkpoint=str(checkpoint),
         source_sha256=identity,source_step=saved['step'],encoder_sha256=encoder_digest(saved['state_dict']),
         codec_config=json.loads(json.dumps(config)),
         manifest_override=str(Path(args.manifest).resolve()) if args.manifest else None,
-        settings={k:v for k,v in vars(args).items() if k not in ('run','out','manifest','resume','dry_run')},
-        trainable_modules=['channel_encoder','channel_decoder','semantic_decoder'],
-        frozen_modules=['semantic_encoder','attribute statistics','delivered XYZ'],
+        # Keep existing A plans byte-for-byte semantically comparable for exact resume.
+        settings={k:v for k,v in vars(args).items() if k not in
+                  ('run','out','manifest','resume','dry_run','train_semantic_encoder')},
+        trainable_modules=list(MODULES) if train_encoder else ['channel_encoder','channel_decoder','semantic_decoder'],
+        frozen_modules=['attribute statistics','delivered XYZ'] if train_encoder else
+                       ['semantic_encoder','attribute statistics','delivered XYZ'],
         optimizer_initialization='new Adam; source moments not loaded',
         objective='source PLY render RGB MSE + latent_weight * MSE(y_hat, stop_gradient(y))',
         channel='10 dB AWGN; actual reliable binary16 scale frames retained and counted',
         layout='q1/q2/q3/random-positive mixed cycle; no allocation learning')
+    if train_encoder:
+        plan['settings']['train_semantic_encoder']=True
+        plan['statistics_sha256']=encoder_digest(saved['state_dict'],include_encoder=False)
+        plan['latent_target']='current live semantic encoder y; target-side stop-gradient only; no cached teacher latent'
+    return plan
 
 
-def training_mode(model):
-    # Root train mode retains the quantized-scale STE; freeze encoder buffers too.
-    model.train();model.semantic_encoder.eval()
+def training_mode(model,*,train_semantic_encoder=False):
+    # Root train mode retains the scale STE; A also freezes encoder buffers.
+    model.train()
+    if not train_semantic_encoder:model.semantic_encoder.eval()
 
 
-def joint_step(model,batches,geometry,task,latent_weight,*,mode='replay'):
-    training_mode(model)
+def joint_step(model,batches,geometry,task,latent_weight,*,mode='replay',train_semantic_encoder=False):
+    training_mode(model,train_semantic_encoder=train_semantic_encoder)
     loss,stats=render_step(model,batches,geometry,10.,'awgn',task,'channel_render',
                            mode=mode,channel_latent_weight=latent_weight)
     stats.update(task.stats)
@@ -108,7 +121,8 @@ def summarize(out):
         for line in (out/'evaluation'/label/'metrics/validation.jsonl').read_text(encoding='utf8').splitlines():
             record=json.loads(line)
             keys=('path','layout','source_psnr','photo_psnr','source_ssim','photo_ssim','latent_mse',
-                  'latent_nmse','views','trials','source_lpips','photo_lpips','total_channel_uses','scale_stream_bytes')
+                  'latent_nmse','latent_target_power','views','trials','source_lpips','photo_lpips',
+                  'total_channel_uses','scale_stream_bytes')
             # Clean has no wire payload/scale cost; keep a common CSV schema.
             row={k:record.get(k) for k in keys};row['endpoint']=label
             previous=next((r for r in rows if r['endpoint']=='initial' and r['path']==row['path'] and r['layout']==row['layout']),None)
@@ -123,6 +137,7 @@ def summarize(out):
 
 def main(args,max_updates=None):
     plan=build_plan(args)
+    train_encoder=bool(getattr(args,'train_semantic_encoder',False))
     if args.dry_run:print(json.dumps(plan,indent=2));return plan
     out=Path(args.out).resolve()
     if out.exists():
@@ -138,21 +153,25 @@ def main(args,max_updates=None):
         source=torch.load(plan['checkpoint'],map_location='cpu',weights_only=True)
         model=build_codec(config_from_dict(source['config'])).to(device);model.load_state_dict(source['state_dict'])
         rates={name:args.lr for name in MODULES}
-        optimizer=configure_phase(model,'channel_render',rates)
+        optimizer=configure_phase(model,'channel_render',rates,train_semantic_encoder=train_encoder)
         progress=dict(step=0,phase='channel_render',phase_step=0,phase_complete=False,successive_joint=True,
             completed=dict(channel_render=0),phase_budgets=dict(channel_render=args.steps),module_lrs=rates,
             channel_trained=True,freeze_semantic=False,initial_done=False,final_done=False,
             source_step=plan['source_step'],train_snrs=[10.],
-            training_objective=dict(version='successive_joint_v1',channel_render_latent_weight=args.latent_weight))
+            training_objective=dict(version=plan['version'],channel_render_latent_weight=args.latent_weight))
+        if train_encoder:progress['train_semantic_encoder']=True
         record=source['training']['scene_record'];rng=capture_rng()
         json_write(out/'initialization.json',dict(all_source_weights_loaded=True,source_step=plan['source_step'],
             source_checkpoint_sha256=plan['source_sha256'],source_optimizer_loaded=False,
             optimizer_state_entries=len(optimizer.state)))
     else:
         model,optimizer,progress,rng,record=restore_training_checkpoint(latest,device)
-        if not progress.get('successive_joint'):raise ValueError('resume is not this joint experiment')
+        if (not progress.get('successive_joint') or bool(progress.get('train_semantic_encoder',False))!=train_encoder):
+            raise ValueError('resume is not this joint experiment/scope')
         repair_logs(out,progress['step'])
-    if encoder_digest(model.state_dict())!=plan['encoder_sha256']:raise RuntimeError('frozen encoder/statistics differ')
+    expected_frozen=plan['statistics_sha256'] if train_encoder else plan['encoder_sha256']
+    if encoder_digest(model.state_dict(),include_encoder=not train_encoder)!=expected_frozen:
+        raise RuntimeError('frozen encoder/statistics differ')
     metadata=json.loads((Path(plan['source_run'])/'training.json').read_text(encoding='utf8'))
     original,manifest,spec,old,_=control_inputs(metadata,args.manifest)
     raw,degree=read_ply(spec['ply']);scene=make_scene(spec,raw,degree,model,original,old,out);del raw
@@ -167,7 +186,8 @@ def main(args,max_updates=None):
     json_write(out/'training.json',training)
 
     def save(label='latest'):
-        if encoder_digest(model.state_dict())!=plan['encoder_sha256']:raise RuntimeError('frozen encoder/statistics changed')
+        if encoder_digest(model.state_dict(),include_encoder=not train_encoder)!=expected_frozen:
+            raise RuntimeError('frozen encoder/statistics changed')
         save_training_checkpoint(out/'checkpoints'/label/'codec.pt',model,optimizer,progress,capture_rng(),scene.record)
 
     def finish_evaluation():
@@ -181,7 +201,8 @@ def main(args,max_updates=None):
     if progress.get('pending_evaluation'):finish_evaluation()
     if not progress['initial_done']:
         evaluate('initial','test',True);progress['initial_done']=True;save()
-    print(f'Joint A: {args.steps} updates, all trainable LR={args.lr:g}; NEW Adam; semantic encoder FROZEN',flush=True)
+    print(f'Joint {"B" if train_encoder else "A"}: {args.steps} updates, all trainable LR={args.lr:g}; '
+          f'NEW Adam; semantic encoder {"TRAINABLE" if train_encoder else "FROZEN"}',flush=True)
     updates=0
     while progress['step']<args.steps:
         step=progress['step']+1;batches,indices,layout=joint_inputs(scene,step,step,args)
@@ -189,7 +210,8 @@ def main(args,max_updates=None):
         optimizer.zero_grad(set_to_none=True);before={n:p.detach().clone() for n,p in model.named_parameters()}
         if device.type=='cuda':torch.cuda.reset_peak_memory_stats(device);torch.cuda.synchronize(device)
         started=time.perf_counter()
-        loss,stats=joint_step(model,batches,scene.geometry,task,args.latent_weight)
+        loss,stats=joint_step(model,batches,scene.geometry,task,args.latent_weight,
+                              train_semantic_encoder=train_encoder)
         stats.update(finish_update(model,optimizer,before))
         if device.type=='cuda':
             torch.cuda.synchronize(device)
@@ -201,8 +223,11 @@ def main(args,max_updates=None):
             loss=float(loss),layout=layout,snr=10.,module_lrs={g['name']:g['lr'] for g in optimizer.param_groups},
             training_view_indices=indices,step_seconds=time.perf_counter()-started))
         if step<=4 or step%25==0 or step==args.steps:
+            encoder_info=(f', y_power={stats["latent_target_power"]:.6g}, NMSE={stats["latent_nmse"]:.5g}, '
+                          f'E_update={stats["updates"]["semantic_encoder"]["update_norm"]:.5g}') if train_encoder else ''
             print(f'joint {step}/{args.steps}: q={layout}, loss={float(loss):.6g}, render={stats["render_loss"]:.6g}, '
-                  f'y={stats["latent_mse"]:.6g}, grad={stats["grad_norm"]:.5g}, sec={time.perf_counter()-started:.2f}',flush=True)
+                  f'y={stats["latent_mse"]:.6g}, grad={stats["grad_norm"]:.5g}, sec={time.perf_counter()-started:.2f}'
+                  f'{encoder_info}',flush=True)
         if step%args.validate_every==0 and step<args.steps:evaluate(f'joint_{step:06d}')
         if step%args.save_every==0 or step==args.steps:save()
         updates+=1
@@ -213,8 +238,12 @@ def main(args,max_updates=None):
         evaluate('final','test',True);progress['final_done']=True
     summarize(out);save('final');save()
     result=dict(status='complete',step=progress['step'],source_step=plan['source_step'],
-        joint_updates=args.steps,frozen_encoder_state_unchanged=True,
+        joint_updates=args.steps,
         trainable_modules=plan['trainable_modules'],source_optimizer_loaded=False)
+    if train_encoder:
+        result.update(frozen_attribute_statistics_unchanged=True,
+                      semantic_encoder_updated=encoder_digest(model.state_dict())!=plan['encoder_sha256'])
+    else:result['frozen_encoder_state_unchanged']=True
     json_write(out/'complete.json',result)
     return result
 

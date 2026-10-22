@@ -27,9 +27,12 @@ PHASE_MODULES = {
 
 
 def configure_phase(model, phase, module_lrs, *, freeze_semantic=False,denoiser_only=False,neighbor_only=False,
-                    semantic_decoder_only=False):
+                    semantic_decoder_only=False,train_semantic_encoder=False):
     if phase not in PHASE_MODULES:
         raise ValueError('unknown modular training phase')
+    if train_semantic_encoder and (phase!='channel_render' or freeze_semantic or denoiser_only
+                                   or neighbor_only or semantic_decoder_only):
+        raise ValueError('semantic encoder adaptation requires full channel-render joint scope')
     if semantic_decoder_only:
         if phase != 'channel_render' or freeze_semantic or denoiser_only or neighbor_only:
             raise ValueError('semantic-decoder-only optimization requires exclusive channel render scope')
@@ -61,7 +64,8 @@ def configure_phase(model, phase, module_lrs, *, freeze_semantic=False,denoiser_
     groups=[]
     for name in MODULES:
         module=getattr(model,name)
-        trainable=name in PHASE_MODULES[phase] and not (freeze_semantic and name.startswith('semantic_'))
+        trainable=(name in PHASE_MODULES[phase] or (train_semantic_encoder and name=='semantic_encoder')) \
+            and not (freeze_semantic and name.startswith('semantic_'))
         module.requires_grad_(trainable)
         for p in module.parameters(): p.grad=None
         if trainable:
@@ -98,7 +102,8 @@ def latent_reconstruction_loss(y, y_hat, q, tier_count=4):
     count=max(errors.numel(),1)
     loss=errors.sum()/count
     metrics={'latent_mse':loss.detach(),
-             'latent_target_power':target.square().sum()/max(target.numel(),1)}
+             'latent_target_power':target.square().sum()/max(target.numel(),1),
+             'latent_target_mean':target.sum()/max(target.numel(),1)}
     for tier in range(1,tier_count):
         chosen=q[active]==tier
         metrics[f'latent_q{tier}_error']=errors.detach()[chosen].sum()/count
@@ -110,10 +115,14 @@ def latent_diagnostics(metrics):
     values={key:float(value) for key,value in metrics.items()}
     mse=values['latent_mse']; power=values['latent_target_power']
     tiers=sorted(int(k[len('latent_q'):-len('_fraction')]) for k in values if k.startswith('latent_q') and k.endswith('_fraction'))
-    return {'latent_mse':mse,'latent_target_power':power,
+    result={'latent_mse':mse,'latent_target_power':power,
             'latent_nmse':mse/max(power,1e-12),
             'latent_mse_by_tier':{str(t):values[f'latent_q{t}_error']/values[f'latent_q{t}_fraction']
                 if values[f'latent_q{t}_fraction']>0 else None for t in tiers}}
+    if 'latent_target_mean' in values:
+        mean=values['latent_target_mean']
+        result.update(latent_target_mean=mean,latent_target_std=math.sqrt(max(0.,power-mean*mean)))
+    return result
 
 
 def bootstrap_step(model, features, q, geometry, snr, kind, phase, directions=None):
