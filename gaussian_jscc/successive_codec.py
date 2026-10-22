@@ -68,4 +68,34 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
     def encode_full(self,*args,**kwargs):raise ValueError('successive codec needs encode_channel_packet with scale bytes')
     def encode(self,*args,**kwargs):raise ValueError('successive codec needs encode_channel_packet with scale bytes')
     def decode(self,*args,**kwargs):raise ValueError('successive codec needs decode_channel_packet with scale bytes')
-    def forward_st_prefix_batches(self,*args,**kwargs):raise ValueError('successive channel allocator is a separate experiment')
+    def forward_st_prefix_batches(self,features,xyz,q,probabilities,snr,kind='awgn'):
+        """Exact hard forward with detached, paired-noise local tier proxies.
+
+        Conditional transmitters change symbols AND block scales with q. A
+        private untransmitted suffix must not be exposed to the hard receiver.
+        Three uniform-positive candidate maps are evaluated only for backward
+        credit assignment, holding the actual retained set fixed. Their
+        differences are biased within-block/context proxies, not exact
+        one-point finite differences. Codec gradients use the real map only.
+        """
+        if q.shape!=features.shape[:2] or probabilities.shape!=(*q.shape,4):
+            raise ValueError('invalid successive allocation shapes')
+        if not torch.isfinite(probabilities).all():raise ValueError('nonfinite tier probabilities')
+        from .optimization import preserved_rng
+        candidates=[]
+        if torch.is_grad_enabled() and probabilities.requires_grad:
+            for tier in (1,2,3):
+                alternative=torch.where(q>0,tier,0)
+                # Every candidate starts at the real draw's RNG state; none
+                # consumes caller RNG or adds parameters to the codec graph.
+                with torch.no_grad(),preserved_rng(features.device):
+                    value=self.forward_tier_batches(features,xyz,F.one_hot(alternative,4).to(features),
+                                                   snr,kind,paired_noise=True)[0]
+                candidates.append(value)
+        actual=self.forward_tier_batches(features,xyz,F.one_hot(q,4).to(features),
+                                         snr,kind,paired_noise=True)[0]
+        result=actual
+        for tier,candidate in enumerate(candidates,1):
+            gate=(probabilities[...,tier]-probabilities[...,tier].detach())*(q>0)
+            result=result+gate[...,None]*(candidate-actual.detach())
+        return result

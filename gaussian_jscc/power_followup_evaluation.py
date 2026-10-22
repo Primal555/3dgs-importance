@@ -36,7 +36,7 @@ def bind_test_cameras(scene, spec, requested):
     names = [str(c.image_name) for c in cameras]
     if len(set(names)) != len(names) or set(names) & set(scene.record['train_view_names']):
         raise ValueError('test cameras duplicated or overlap training cameras')
-    scene.test_cameras = [cameras[i] for i in spaced_indices(len(cameras), requested)]
+    scene.test_cameras = [cameras[i] for i in spaced_indices(len(cameras), requested or len(cameras))]
     return [str(c.image_name) for c in scene.test_cameras]
 
 

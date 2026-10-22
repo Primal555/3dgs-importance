@@ -100,6 +100,13 @@ class SuccessiveChannelEncoder(nn.Module):
         proxy=torch.zeros_like(original);segments=[];scales=[]
         for tier,stage in enumerate(self.stages,1):
             donors=q>=tier
+            if not donors.any():
+                # Keep unused parameters out of autograd: zero gradients would
+                # still advance stale Adam moments after a higher-tier update.
+                width=2*(self.cfg.rates[tier]-self.cfg.rates[tier-1])
+                segments.append(original.new_zeros(*q.shape,width))
+                scales.append(original.new_ones(len(q)))
+                continue
             inputs=original if tier==1 else torch.cat((original,(original-proxy).detach()),-1)
             raw=stage(inputs,snr)
             signal,gain=normalize_segment(raw,donors,self.cfg.power_floor)
@@ -124,6 +131,7 @@ class SuccessiveChannelDecoder(nn.Module):
         end=self.cfg.rates[tier]
         if prefix.shape!=(*active.shape,2*end) or scales.shape!=(len(active),tier):
             raise ValueError('stage received prefix/scale shape mismatch')
+        if not active.any():return previous
         gains=torch.cat([scales[:,i:i+1].expand(-1,2*(b-a))
                          for i,(a,b) in enumerate(zip(self.cfg.rates[:tier],self.cfg.rates[1:tier+1]))],-1)
         # Shared scale restores amplitude; log-gain also tells the MLP noise level.

@@ -85,12 +85,17 @@ def measured_cost(model,scene,q,snr,identity):
     payload=int(torch.tensor(model.cfg.rates)[q].sum())
     bits=scene.net_bits_per_use
     xyz_uses=math.ceil(8*len(xyz)/bits);meta_uses=math.ceil(8*len(meta)/bits)
-    return dict(payload_complex_symbols=payload,symbols_per_source_gaussian=payload/len(q),
+    record=dict(payload_complex_symbols=payload,symbols_per_source_gaussian=payload/len(q),
         xyz_bytes=len(xyz),metadata_bytes=len(meta),coordinate_channel_uses=xyz_uses,
         metadata_channel_uses=meta_uses,total_channel_uses=payload+xyz_uses+meta_uses,
         net_bits_per_use_assumption=bits,
         rate_scope='analogue payload + measured retained XYZ + complete metadata; shared weights excluded',
         reliability='XYZ/metadata assumed reliable; no FEC/packet loss simulated')
+    if hasattr(model,'scale_rate_record'):
+        record.update(model.scale_rate_record(scene,q,bits))
+        record['total_channel_uses']+=record['scale_channel_uses']
+        record['rate_scope']='analogue payload + measured retained XYZ + complete metadata + binary16 scale frames; shared weights excluded'
+    return record
 
 
 @torch.no_grad()
@@ -110,7 +115,7 @@ def evaluate(model,scene,mask,out,step,phase,args,save_images=False,*,fixed_tier
                 info=dict(step=step,snr=args.snr,rates=list(model.cfg.rates),source_gaussians=len(q_original),
                     hard_tier_counts=torch.bincount(q_original,minlength=4).tolist(),
                     decision='unchanged saved final deployment map; no resampling')
-            if phase in ('initial','final'):
+            if phase in ('initial','end_allocation','final'):
                 folder=deployment/phase;folder.mkdir(exist_ok=True)
                 np.save(folder/'tiers.npy',q_original.numpy().astype(np.uint8),allow_pickle=False)
                 json_write(folder/'allocation.json',info)

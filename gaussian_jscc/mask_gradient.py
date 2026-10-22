@@ -7,6 +7,7 @@ gradients use straight-through nested prefix gates. These are biased local
 surrogates, not derivatives of zlib bytes or exact finite differences.
 """
 import time
+import math
 
 import torch
 
@@ -17,7 +18,10 @@ from .allocation import deployment_probabilities
 
 def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kind,
                     distortion_fn, beta, rate_meter, train_codec=True, mode='replay',
-                    sampling='single', rate_chunk_size=1024):
+                    sampling='single', rate_chunk_size=1024, channel_latent_weight=0.):
+    if not math.isfinite(channel_latent_weight) or channel_latent_weight<0:
+        raise ValueError('channel latent weight must be finite and nonnegative')
+    latent_weight=channel_latent_weight if train_codec else 0.
     if model.cfg.prefix_mode != 'progressive':
         raise ValueError('local mask gradient requires progressive prefixes')
     if rate_meter is None:
@@ -69,8 +73,21 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         # context. Its forward must see the actual delivered map.
         probabilities = torch.cat(((q == 0).to(conditional)[..., None],
                                    conditional * (q > 0)[..., None]), -1)
-        pred = model.forward_st_prefix_batches(features, features[..., :3], q,
-                                               probabilities, snr, kind)
+        values={};hooks=[]
+        if latent_weight:
+            hooks=[model.semantic_encoder.register_forward_hook(lambda m,a,o:values.update(y=o)),
+                   model.channel_decoder.register_forward_hook(lambda m,a,o:values.update(y_hat=o))]
+        try:
+            pred = model.forward_st_prefix_batches(features, features[..., :3], q,
+                                                   probabilities, snr, kind)
+        finally:
+            for hook in hooks:hook.remove()
+        auxiliary=pred.sum()*0
+        if latent_weight:
+            # q is detached and proxy candidates have no graph. The anchor
+            # trains the actual channel only, with q0 contributing zero.
+            auxiliary=(values['y_hat'][keep]-values['y'].detach()[keep]).square().sum()
+            auxiliary=auxiliary/(valid.sum().clamp_min(1)*values['y'].shape[-1])
         hard_presence = (q > 0).to(presence)
         st_presence = hard_presence + (presence - presence.detach())
         rows, gates = [to_raw(pred[keep], geometry, model)], [st_presence[keep]]
@@ -83,7 +100,7 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
             rows.append(to_raw(shadow[absent], geometry, model))
             gates.append(st_presence[absent])
         scene = torch.cat((torch.cat(rows), torch.cat(gates)[:, None]), -1)
-        return scene, scene.sum() * 0, {}
+        return scene, auxiliary, {}
 
     original_flags = [p.requires_grad for p in model.parameters()]
     if not train_codec:
@@ -92,7 +109,7 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         # Every sampled q0 source row has a hard-zero counterfactual splat.
         scene_loss, stats = full_scene_step(
             model, list(zip(feature_batches, batches)), geometry, snr, kind,
-            distortion_fn, attr_weight=0., mode=mode, batch_forward=forward)
+            distortion_fn, attr_weight=latent_weight, mode=mode, batch_forward=forward)
     finally:
         if not train_codec:
             for parameter, flag in zip(model.parameters(), original_flags):
@@ -148,7 +165,8 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
         mean_keep += (1-p[:, 0]).detach().sum()/len(mask.logits)
         deployment_keep += (1-deployed[:, 0]).detach().sum()/len(mask.logits)
         conditional_mean += (p[:, 1:]/(1-p[:, :1]).clamp_min(1e-12)).detach().sum(0)/len(mask.logits)
-    rate_loss = beta*(expected_payload+expected_xyz+tier_uses)/rate_meter.normalizer
+    scale_uses=measured.get('scale_channel_uses',0)/rate_meter.count
+    rate_loss = beta*(expected_payload+expected_xyz+tier_uses+scale_uses)/rate_meter.normalizer
     rate_gradient = gradients() - image_gradient
     stats.update(mask_estimator='hierarchical hard Gumbel keep/tier + local masked-render gradient + progressive prefixes',
                  mask_gradient_caveat='biased local surrogate; compressed XYZ/tier costs measured but not differentiated exactly',
@@ -181,4 +199,12 @@ def local_mask_step(model, mask, feature_batches, id_batches, geometry, snr, kin
                  tier_map_compression_seconds=measured.get('tier_map_compression_seconds', 0.),
                  sampled_retained_gaussians=retained, codec_updated=train_codec)
     stats['sampled_q0_shadow_candidates'] = shadow_count
+    if channel_latent_weight:
+        stats.update(channel_latent_weight=latent_weight,weighted_latent_loss=latent_weight*stats['aux_loss'],
+                     latent_normalization='sum over retained rows / all valid source rows and dimensions')
+    if 'scale_channel_uses' in measured:
+        stats.update(scale_stream_bytes=measured['scale_stream_bytes'],
+                     scale_channel_uses=measured['scale_channel_uses'],
+                     scale_rate_gradient='measured detached block presence; payload/keep proxy carries rate gradients')
+        stats['allocation_rate_normalizer_definition']+=' + reliable block-scale frames'
     return scene_loss + rate_loss.detach(), stats
