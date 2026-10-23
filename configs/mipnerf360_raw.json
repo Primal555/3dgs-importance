@@ -1,0 +1,14 @@
+{
+  "root": "..",
+  "scenes": [
+    {"name": "bicycle", "role": "train", "source": "data/mipnerf360/bicycle", "ply": "data/pretrained_3dgs/bicycle/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "garden", "role": "train", "source": "data/mipnerf360/garden", "ply": "data/pretrained_3dgs/garden/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "stump", "role": "train", "source": "data/mipnerf360/stump", "ply": "data/pretrained_3dgs/stump/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "bonsai", "role": "train", "source": "data/mipnerf360/bonsai", "ply": "data/pretrained_3dgs/bonsai/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "counter", "role": "train", "source": "data/mipnerf360/counter", "ply": "data/pretrained_3dgs/counter/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "kitchen", "role": "train", "source": "data/mipnerf360/kitchen", "ply": "data/pretrained_3dgs/kitchen/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "flowers", "role": "train", "source": "data/mipnerf360/flowers", "ply": "data/pretrained_3dgs/flowers/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "treehill", "role": "train", "source": "data/mipnerf360/treehill", "ply": "data/pretrained_3dgs/treehill/point_cloud/iteration_30000/point_cloud.ply"},
+    {"name": "room", "role": "train", "source": "data/mipnerf360/room", "ply": "data/pretrained_3dgs/room/point_cloud/iteration_30000/point_cloud.ply"}
+  ]
+}

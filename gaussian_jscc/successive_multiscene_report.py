@@ -8,11 +8,12 @@ from .modular_experiment import json_write
 
 def summarize(out,specs,heldout):
     out=Path(out);rows=[]
+    heldouts=heldout if isinstance(heldout,list) else [heldout]
     keys=('step','path','layout','source_psnr','source_ssim','source_lpips','photo_psnr','photo_ssim',
           'photo_lpips','latent_mse','latent_nmse','latent_target_power','total_channel_uses',
           'payload_complex_symbols','xyz_bytes','metadata_bytes','scale_stream_bytes','views','trials',
           'source_color_r_bias','source_color_g_bias','source_color_b_bias')
-    for spec in specs+[heldout]:
+    for spec in specs+heldouts:
         for label in ('initial','final'):
             path=out/'scenes'/spec['name']/'evaluation'/label/'metrics/validation.jsonl'
             for line in path.read_text(encoding='utf-8').splitlines():
@@ -33,7 +34,7 @@ def summarize(out,specs,heldout):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     folder=out/'charts';folder.mkdir(exist_ok=True)
-    for selected,name in (([heldout],'heldout_quality'),(specs,'training_scene_quality')):
+    for selected,name in ((heldouts,'heldout_quality'),(specs,'training_scene_quality')):
         fig,axes=plt.subplots(1,3,figsize=(12,3.5),layout='constrained')
         for ax,metric in zip(axes,('source_psnr','source_ssim','source_lpips')):
             for spec in selected:

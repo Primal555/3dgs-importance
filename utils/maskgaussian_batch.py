@@ -1,5 +1,6 @@
 """Sequential, explicit-GPU MaskGaussian post-training from pretrained PLYs."""
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -155,6 +156,9 @@ def run_plan(plan, gpu):
                       'metrics_reference':'held-out photos', 'metrics':metrics, 'baseline_metrics':baseline}
             record['psnr_change_db'] = metrics['PSNR']-baseline['PSNR']
             record['ssim_change'] = metrics['SSIM']-baseline['SSIM']
+            if 'input_sha256' in scene:
+                with Path(scene['output_ply']).open('rb') as stream:
+                    record['output_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
             result['scenes'].append(record)
             write_json(out/'summary.json', result)
             print(f'{scene["name"]} DONE: {record["input_points"]:,} -> {record["output_points"]:,}; PSNR={metrics["PSNR"]:.3f}', flush=True)

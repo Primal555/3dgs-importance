@@ -44,14 +44,15 @@ def parser():
     return p
 
 
-def main(args,max_updates=None):
-    saved,metadata,cfg,specs,heldout,source=inputs(args)
+def main(args,max_updates=None,*,input_loader=None,family=FAMILY):
+    saved,metadata,cfg,specs,heldout,source=(input_loader or inputs)(args)
+    heldouts=heldout if isinstance(heldout,list) else [heldout]
     if (min(args.steps_per_scene,args.validate_every,args.save_every,args.validation_views,args.render_trials,
             args.cpu_threads,args.blocks_per_batch,args.views_per_step)<1 or args.test_views<0
             or any(not math.isfinite(x) or x<=0 for x in (args.lr,args.latent_weight,args.net_bits_per_use))):
         raise ValueError('positive update/evaluation budgets, rates and weights required')
     settings={k:v for k,v in vars(args).items() if k not in ('out','run','device','resume','dry_run')}
-    plan=json.loads(json.dumps(dict(version=FAMILY,**source,settings=settings,selected_scenes=specs,
+    plan=json.loads(json.dumps(dict(version=family,**source,settings=settings,selected_scenes=specs,
         heldout_scene=heldout,codec_config=cfg.to_dict(),total_updates=len(specs)*args.steps_per_scene,
         statistics='retain source Joint B attribute mean/std; no refit on new scenes')))
     if args.dry_run:print(json.dumps(plan,indent=2));return plan
@@ -64,16 +65,16 @@ def main(args,max_updates=None):
     lrs={name:args.lr for name in MODULES}
     if args.resume:
         model,optimizer,progress,rng,old_records=restore_training_checkpoint(latest,device)
-        if progress.get('training_family')!=FAMILY or model.cfg!=cfg:raise ValueError('resume is not this multi-scene experiment')
+        if progress.get('training_family')!=family or model.cfg!=cfg:raise ValueError('resume is not this multi-scene experiment')
     else:
         model=build_codec(cfg).to(device);model.load_state_dict(saved['state_dict'])
         optimizer=configure_phase(model,'channel_render',lrs,train_semantic_encoder=True)
-        progress=dict(training_family=FAMILY,step=0,phase='channel_render',phase_step=0,
+        progress=dict(training_family=family,step=0,phase='channel_render',phase_step=0,
             successive_joint=True,train_semantic_encoder=True,channel_trained=True,phase_complete=False,
             module_lrs=lrs,train_snrs=[10.],source_step=source['source_step'],
             completed=dict(channel_render=0),phase_budgets=dict(channel_render=plan['total_updates']),
             scene_completed={s['name']:0 for s in specs},next_scene=0,initial_done=False,final_done=False,
-            training_objective=dict(version=FAMILY,channel_render_latent_weight=args.latent_weight))
+            training_objective=dict(version=family,channel_render_latent_weight=args.latent_weight))
         rng=capture_rng();old_records=None
     del saved
     if encoder_digest(model.state_dict(),include_encoder=False)!=source['statistics_sha256']:
@@ -81,7 +82,9 @@ def main(args,max_updates=None):
     model.set_training_snrs([10.]);scenes=[]
     for spec in specs:
         raw,degree=read_ply(spec['ply'])
-        scene=make_scene(spec,raw,degree,model,args,out,old=metadata['scene'] if spec['name']=='truck' else None)
+        old_record=metadata.get('scene_records',{}).get(spec['name'])
+        if old_record is None and spec['name']=='truck':old_record=metadata.get('scene')
+        scene=make_scene(spec,raw,degree,model,args,out,old=old_record)
         del raw;scenes.append(scene)
     # make_scene follows Scene's standard OUT/scenes/name layout.
     records={s.name:s.record for s in scenes}
@@ -110,10 +113,12 @@ def main(args,max_updates=None):
         with preserved_rng(device):
             for s in scenes:
                 evaluate_saved(model,s,s.out,args,progress['step'],label=label,scope=pending['scope'],images=pending['images'])
-            if pending['scope']=='test':
-                raw,degree=read_ply(heldout['ply'])
-                s=make_scene(heldout,raw,degree,model,args,out);del raw
-                if s.fingerprint in {x.fingerprint for x in scenes}:raise ValueError('heldout content aliases a training PLY')
+            seen={x.fingerprint for x in scenes}
+            for heldout_spec in heldouts if pending['scope']=='test' else ():
+                raw,degree=read_ply(heldout_spec['ply'])
+                s=make_scene(heldout_spec,raw,degree,model,args,out);del raw
+                if s.fingerprint in seen:raise ValueError('heldout content aliases training/another heldout PLY')
+                seen.add(s.fingerprint)
                 path=s.out/'scene.json'
                 record=dict(s.record,**s.spec)
                 if path.exists():validate_scene(json.loads(path.read_text(encoding='utf-8')),record)
@@ -132,7 +137,7 @@ def main(args,max_updates=None):
     if progress.get('pending_evaluation'):finish_evaluation()
     if not progress['initial_done']:evaluate('initial','test',True)
     print(f'Joint B multi-scene: {args.steps_per_scene} updates PER SCENE; {plan["total_updates"]} total; '
-          f'four modules LR={args.lr:g}; heldout {heldout["name"]} evaluation ONLY',flush=True)
+          f'four modules LR={args.lr:g}; heldout {",".join(s["name"] for s in heldouts)} evaluation ONLY',flush=True)
     updated=0
     while progress['step']<plan['total_updates']:
         s=scenes[progress['next_scene']];visit=progress['scene_completed'][s.name]+1;step=progress['step']+1
@@ -167,8 +172,10 @@ def main(args,max_updates=None):
     from .successive_multiscene_report import summarize
     summarize(out,specs,heldout)
     result=dict(status='complete',step=progress['step'],scene_completed=progress['scene_completed'],
-        heldout_scene=heldout['name'],heldout_optimizer_updates=0,attribute_statistics_frozen=True,
+        heldout_optimizer_updates=0,attribute_statistics_frozen=True,
         initial_source_step=source['source_step'],final_codec_id=model_id(model))
+    if isinstance(heldout,list):result['heldout_scenes']=[s['name'] for s in heldouts]
+    else:result['heldout_scene']=heldout['name']
     json_write(out/'complete.json',result);json_write(out/'progress.json',dict(progress,status='complete'))
     return result
 

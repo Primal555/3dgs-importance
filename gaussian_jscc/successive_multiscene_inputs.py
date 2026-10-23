@@ -90,7 +90,12 @@ def make_scene(spec,raw,degree,model,args,out,*,old=None):
     names=[str(c.image_name) for c in cameras]
     if len(names)!=len(set(names)) or set(names)&{str(c.image_name) for c in s.cameras+s.val_cameras}:
         raise ValueError('test cameras overlap or contain duplicate names')
-    s.test_cameras=[cameras[i] for i in spaced_indices(len(cameras),args.test_views or len(cameras))]
+    if old is not None and 'test_view_names' in old:
+        lookup=dict(zip(names,cameras));test_names=old['test_view_names']
+        if len(test_names)!=len(set(test_names)) or not set(test_names)<=set(lookup):
+            raise ValueError('source scene test-camera split changed')
+        s.test_cameras=[lookup[name] for name in test_names]
+    else:s.test_cameras=[cameras[i] for i in spaced_indices(len(cameras),args.test_views or len(cameras))]
     s.reference=RenderReference(s.raw,degree,args.white_background,'source')
     s.record=dict(fingerprint=s.fingerprint,source_gaussians=len(raw),sh_degree=degree,
         geometry=s.geometry.to_dict(),train_view_names=[str(c.image_name) for c in s.cameras],
