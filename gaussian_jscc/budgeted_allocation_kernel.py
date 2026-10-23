@@ -1,0 +1,193 @@
+"""Frozen-codec allocation credit in the actual mixed-tier neighborhood.
+
+Only scene-sized actual/shadow attributes and actual semantic latents live for
+one update. Two candidate rounds change ONE point per block, not all neighbors.
+No compression or differentiable codec graph is needed for this VJP estimator.
+"""
+from contextlib import nullcontext
+import torch
+from torch.nn import functional as F
+from .data import to_raw
+from .optimization import preserved_rng
+from .successive_channel import present_scales
+
+
+def timing(timings, name):
+    return timings.measure(name) if timings is not None else nullcontext()
+
+
+def rng_state(device):
+    return torch.cuda.get_rng_state(device) if device.type == 'cuda' else torch.get_rng_state()
+
+
+def set_rng(state, device):
+    if device.type == 'cuda': torch.cuda.set_rng_state(state, device)
+    else: torch.set_rng_state(state)
+
+
+def raw_batches(pred, geometry, model):
+    return to_raw(pred.reshape(-1, pred.shape[-1]), geometry, model).reshape(*pred.shape[:2], -1)
+
+
+@torch.no_grad()
+def mixed_point_candidates(model, features, q, target_columns, snr, kind, geometry, *,
+                           semantic_y, actual, actual_rng, timings):
+    columns = target_columns.to(q.device)
+    active = columns >= 0; rows = torch.arange(len(q), device=q.device)
+    current = q[rows, columns.clamp_min(0)]
+    baseline = raw_batches(actual, geometry, model)
+    # Heterogeneous alternatives batch into exactly TWO calls. Each target's
+    # current action reuses baseline; other block members keep their real tier.
+    for shift in (1, 2):
+        tiers = (current-1+shift) % 3+1
+        alternative = q.clone()
+        alternative[rows[active], columns[active]] = tiers[active]
+        with preserved_rng(features.device), timing(timings, 'candidate_decode_seconds'):
+            set_rng(actual_rng, features.device)
+            pred = model.forward_tier_batches(features, features[..., :3], F.one_hot(alternative, 4).to(features),
+                snr, kind, paired_noise=True, _semantic_y=semantic_y)[0]
+        delta = (raw_batches(pred, geometry, model)-baseline)*(q > 0)[..., None]*active[:, None, None]
+        yield tiers.masked_fill(~active, -1), delta
+
+
+def scene_gradient(task, scene, timings):
+    """Match the direct arithmetic mean; free each rasterizer graph immediately."""
+    if not hasattr(task, '_terms'):
+        loss = task(scene)
+        gradient, = torch.autograd.grad(loss, scene)
+        return float(loss.detach()), gradient
+    gradient = torch.zeros_like(scene); values = []; terms = iter(task._terms(scene))
+    for index in range(len(task.cameras)):
+        with timing(timings, f'view_{index}_render_seconds'):
+            term = next(terms)
+        if not torch.isfinite(term): raise RuntimeError('nonfinite render distortion')
+        with timing(timings, f'view_{index}_backward_seconds'):
+            part, = torch.autograd.grad(term + scene.sum()*0, scene)
+            gradient.add_(part, alpha=1/len(task.cameras))
+        values.append(float(term.detach()))
+    task.stats = dict(view_mse=values, views_per_step=len(values))
+    return sum(values)/len(values), gradient
+
+
+@torch.no_grad()
+def audit_interventions(model, features, q, positive, ids, columns, geometry, scene, upstream,
+                        offset, actual_rng, task, snr, kind, base_loss, limit):
+    """Independent finite rerenders; keep-set changes NEVER reuse actual y."""
+    records = []
+    valid = ids >= 0
+    # Additional audit is intentionally small. It does not limit the full q0 gate path.
+    targets = [tuple(v) for v in (valid & (q == 0)).nonzero().tolist()[:1]]
+    targets += [(row, int(col)) for row, col in enumerate(columns.tolist()) if col >= 0]
+    for row, column in targets[:limit]:
+        old = int(q[row, column]); new = 0 if old else int(positive[row, column])
+        for tier in ((new, (old % 3)+1) if old else (new,)):
+            if len(records) >= limit: break
+            alternative = q.clone(); alternative[row, column] = tier
+            with preserved_rng(features.device):
+                set_rng(actual_rng, features.device)
+                pred = model.forward_tier_batches(features, features[..., :3], F.one_hot(alternative, 4).to(features),
+                                                  snr, kind, paired_noise=True)[0]
+            changed = scene.detach().clone()
+            raw = raw_batches(pred, geometry, model)
+            block_scene = torch.cat((raw[valid], (alternative[valid] > 0).to(raw)[:, None]), -1)
+            changed[offset:offset+int(valid.sum())] = block_scene
+            loss = float(task(changed))
+            linear = float(((changed-scene.detach())*upstream).sum())
+            records.append(dict(source_row=int(ids[row, column]), old_tier=old, new_tier=tier,
+                measured_delta_mse=loss-base_loss, first_order_delta_mse=linear,
+                sign_agreement=(loss-base_loss)*linear >= 0,
+                absolute_error=abs(loss-base_loss-linear)))
+    return records
+
+
+def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task, scheduler,
+                       snr, kind, *, d_ref, price, budget, side_proxy, timings, audit_limit=0):
+    if model.training or any(p.requires_grad for p in model.parameters()):
+        raise ValueError('budgeted allocation requires an eval-mode, fully frozen codec')
+    if d_ref <= 0 or budget <= 0: raise ValueError('invalid objective normalization')
+    device = next(model.parameters()).device
+    count = len(table.logits); q_source = torch.empty(count, dtype=torch.long)
+    cache, parts, cache_bytes, q0_rows = [], [], 0, 0
+    with torch.no_grad():
+        for features, source_ids in zip(feature_batches, id_batches):
+            f, ids = features.to(device), source_ids.to(device)
+            valid = ids >= 0
+            with timing(timings, 'sampling_seconds'):
+                q, _, _, positive = table.sample(ids.clamp_min(0), snr)
+                q = q.masked_fill(~valid, 0)
+            q_source[ids[valid].cpu()] = q[valid].cpu()
+            with timing(timings, 'semantic_encode_seconds'):
+                y = model.semantic_encoder(f, f[..., :3], q > 0)
+            state = rng_state(device)
+            with timing(timings, 'actual_decode_seconds'):
+                actual = model.forward_tier_batches(f, f[..., :3], F.one_hot(q, 4).to(f), snr, kind,
+                                                    paired_noise=True, _semantic_y=y)[0]
+                raw = raw_batches(actual, geometry, model)
+            absent = valid & (q == 0)
+            if absent.any():
+                # Hypothetical q0 attributes never enter live attention context.
+                shadow_q = torch.where(absent, positive, q)
+                with preserved_rng(device), timing(timings, 'q0_shadow_seconds'):
+                    set_rng(state, device)
+                    shadow = model.forward_tier_batches(f, f[..., :3], F.one_hot(shadow_q, 4).to(f),
+                                                        snr, kind, paired_noise=True)[0]
+                    raw[absent] = raw_batches(shadow, geometry, model)[absent]
+                q0_rows += int(absent.sum())
+            parts.append(torch.cat((raw[valid], (q[valid] > 0).to(raw)[:, None]), -1))
+            cache.append((q, positive, y, actual, state))
+            cache_bytes += sum(x.numel()*x.element_size() for x in (q, positive, y, actual))
+    scene = torch.cat(parts).detach().requires_grad_(True); del parts
+    loss, upstream = scene_gradient(task, scene, timings)
+    actual_stats = dict(getattr(task, 'stats', {}))
+    if not torch.isfinite(upstream).all(): raise RuntimeError('nonfinite allocation scene gradient')
+    keep_image = torch.zeros(count, 2, dtype=torch.float64, device=device)
+    costs, selected, all_audits = [], [], []
+    with timing(timings, 'candidate_schedule_seconds'):
+        columns, visited = scheduler.select(q_source)
+    offset = 0
+    bits = side_proxy.get('bits_per_use', 2.)
+    rates = torch.tensor(model.cfg.rates, device=device, dtype=torch.float64)
+    with torch.no_grad():
+        for features, source_ids, entry, cols in zip(feature_batches, id_batches, cache, columns):
+            f, ids = features.to(device), source_ids.to(device)
+            q, positive, y, actual, state = entry
+            valid = ids >= 0; n = int(valid.sum())
+            g = torch.zeros((*q.shape, scene.shape[-1]), device=device, dtype=upstream.dtype)
+            g[valid] = upstream[offset:offset+n]
+            keep_image[ids[valid], 1] = g[..., -1][valid].double()/d_ref
+            active = cols >= 0
+            if active.any():
+                rows = torch.arange(len(q), device=device)[active.to(device)]
+                col = cols[active].to(device)
+                action_costs = torch.zeros(len(rows), 3, dtype=torch.float64, device=device)
+                block_scale_base = present_scales(q).sum(-1)
+                for tiers, delta in mixed_point_candidates(model, f, q, cols, snr, kind, geometry,
+                        semantic_y=y, actual=actual, actual_rng=state, timings=timings):
+                    image = (g[..., :-1]*delta).sum((1, 2)).double()/d_ref
+                    alt = q.clone(); alt[rows, col] = tiers[rows]
+                    scale_delta = (present_scales(alt).sum(-1)-block_scale_base)*16/bits
+                    rate_delta = rates[tiers[rows]]-rates[q[rows, col]]+scale_delta[rows]
+                    action_costs[torch.arange(len(rows), device=device), tiers[rows]-1] = image[rows]+price*rate_delta/budget
+                costs.append(action_costs); selected.append(ids[rows, col].cpu())
+            if len(all_audits) < audit_limit:
+                with timing(timings, 'audit_seconds'):
+                    all_audits.extend(audit_interventions(model, f, q, positive, ids, cols, geometry,
+                        scene, upstream, offset, state, task, snr, kind, loss, audit_limit-len(all_audits)))
+            offset += n
+    p = table.probabilities(torch.arange(count, device=table.logits.device), snr).detach()
+    conditional = table.logits.softmax(-1).detach()
+    expected_keep_payload = (conditional*rates[1:]).sum(-1)
+    unit_side = side_proxy['xyz_per_retained'] + side_proxy.get('scale_per_retained', 0.)
+    keep_costs = keep_image.clone()
+    keep_costs[:, 1] += price*(expected_keep_payload+unit_side)/budget
+    expected = float((p*rates).sum() + (1-p[:, 0]).sum()*unit_side + side_proxy['fixed_uses'])
+    sampled = float(rates[q_source.to(device)].sum()) + int((q_source>0).sum())*unit_side + side_proxy['fixed_uses']
+    tier_ids = torch.cat(selected) if selected else torch.empty(0, dtype=torch.long)
+    scheduler.record(tier_ids, side_proxy.get('step', 1))
+    return dict(render_loss=loss, keep_image_costs=keep_image, keep_costs=keep_costs,
+        tier_ids=tier_ids, tier_costs=torch.cat(costs) if costs else torch.empty(0, 3, device=device),
+        q=q_source, sampled_tier_counts=torch.bincount(q_source, minlength=4).tolist(),
+        q0_feedback_rows=q0_rows, expected_cost_proxy=expected, sampled_cost_proxy=sampled,
+        candidate_codec_calls=2*sum(bool((c>=0).any()) for c in columns), actual_codec_calls=len(cache),
+        q0_codec_calls=sum(bool(((ids>=0)&(e[0].cpu()==0)).any()) for ids,e in zip(id_batches,cache)),
+        cache_peak_mib=cache_bytes/2**20, audit=all_audits, **actual_stats)
