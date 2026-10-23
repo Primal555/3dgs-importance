@@ -124,8 +124,12 @@ def main(args, max_updates=None):
 
     def save(label='latest', map_q=None):
         if model_id(model) != identity: raise RuntimeError('frozen codec or attribute statistics changed')
-        return save_state(out,label,model,table,controller,blocks,views,progress,plan,scene_record,reference,
-                          q if map_q is None else map_q)
+        result = save_state(out,label,model,table,controller,blocks,views,progress,plan,scene_record,reference,
+                            q if map_q is None else map_q)
+        json_write(out/'progress.json',dict(status='running',step=progress['step'],phase='allocation',
+            budget=reference['budget'],price=controller.price,residual_ema=controller.ema,
+            pending=progress['pending'],best_feasible=progress['best']))
+        return result
 
     def proxy(cost, deployed):
         kept = int((deployed>0).sum())
@@ -217,11 +221,18 @@ def main(args, max_updates=None):
         updates += 1
         if max_updates is not None and updates >= max_updates:
             q=deploy(table,args); save(); return dict(status='interrupted',step=step)
-    q=deploy(table,args); latest_row=measure('latest',scene.test_cameras,True)
+    q=deploy(table,args)
     chosen_label = 'best_feasible' if progress['best'] is not None else 'lowest_violation'
     selected = torch.load(out/'checkpoints'/chosen_label/'state.pt',map_location='cpu',weights_only=True)
     chosen_q = selected['latest_q']
     selected_row = measure('selected',scene.test_cameras,True,map_q=chosen_q)
+    if torch.equal(chosen_q,q):
+        latest_row = dict(selected_row,event='latest',evaluation_seconds=0.,reused_from='selected')
+        upsert_jsonl(out/'metrics/validation.jsonl',latest_row)
+        json_write(out/'evaluation/latest/alias.json',dict(metrics_and_images_from='../selected',
+            codec_id=identity,tier_sha256=tier_hash(q),reason='identical fixed map, codec, cameras and paired noise'))
+    else:
+        latest_row=measure('latest',scene.test_cameras,True)
     export = out/'deployment'; export.mkdir(exist_ok=True)
     np.save(export/'latest_tiers.npy',q.numpy().astype(np.uint8),allow_pickle=False)
     np.save(export/'selected_tiers.npy',chosen_q.numpy().astype(np.uint8),allow_pickle=False)
@@ -234,7 +245,11 @@ def main(args, max_updates=None):
         selected_source_psnr=selected_row['source_psnr'],latest_total_channel_uses=latest_row['total_channel_uses'],
         codec_id=identity,tier_sha256=tier_hash(chosen_q),frozen_codec_verified=progress['frozen_codec_verified'])
     json_write(export/'selection.json',result); save('final'); save()
+    from .budgeted_allocation_report import summarize
+    summarize(out,result=result)
     json_write(out/'complete.json',result)
+    json_write(out/'progress.json',result)
+    print(json.dumps(result),flush=True)
     return result
 
 

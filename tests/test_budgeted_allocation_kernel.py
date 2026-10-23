@@ -107,6 +107,34 @@ class KernelTests(unittest.TestCase):
         self.assertTrue(any(r['old_tier'] == 0 for r in outputs[1]['audit']))
         self.assertEqual(outputs[0]['view_mse'], outputs[1]['view_mse'])
         torch.testing.assert_close(outputs[0]['keep_costs'], outputs[1]['keep_costs'], rtol=0, atol=0)
+        for row in outputs[1]['audit']:
+            if row['old_tier']==0 or row['new_tier']==0:
+                trained = float(outputs[1]['keep_image_costs'][row['source_row'],1])*.1
+                expected = trained if row['old_tier']==0 else -trained
+                self.assertAlmostEqual(row['first_order_delta_mse'],expected,places=12,
+                    msg='q0 audit must check the gate estimator actually used by training')
+
+    def test_full_step_candidates_do_not_consume_actual_channel_rng(self):
+        entry = self.entry()
+        from gaussian_jscc.allocation_mirror import MirrorTierTable, BlockVisitScheduler
+        _, geometry, f, model = small_successive(); model.eval().requires_grad_(False)
+        table=MirrorTierTable(16); table.keep_logits[:,0]=-100.;table.keep_logits[:,1]=100.
+        ids=[torch.arange(16).reshape(2,8)]; observed={}; real=model.forward_tier_batches
+        def record(*a,**kw):
+            if not observed:
+                observed['before']=torch.get_rng_state();observed['q']=a[2].argmax(-1).clone()
+                observed['pred']=real(*a,**kw)[0].clone();observed['after']=torch.get_rng_state()
+                return observed['pred'],observed['pred'][...,:3],(observed['q']>0).to(f)
+            return real(*a,**kw)
+        with patch.object(model,'forward_tier_batches',side_effect=record), \
+             patch('gaussian_jscc.rendering.render',side_effect=toy_mask_render):
+            task=MaskedMultiViewRenderTask([SimpleNamespace(factor=1.,source_count=16)],Reference(),1)
+            entry.budgeted_mask_step(model,table,[f],ids,geometry,task,BlockVisitScheduler(ids),10.,'awgn',
+                d_ref=.1,price=0.,budget=1000,side_proxy=dict(xyz_per_retained=1.,fixed_uses=8.),timings=None)
+        self.assertTrue(torch.equal(torch.get_rng_state(),observed['after']))
+        torch.set_rng_state(observed['before'])
+        expected=real(f,f[...,:3],F.one_hot(observed['q'],4).to(f),10.,'awgn',paired_noise=True)[0]
+        torch.testing.assert_close(expected,observed['pred'],rtol=0,atol=0)
 
 
 if __name__ == '__main__': unittest.main()

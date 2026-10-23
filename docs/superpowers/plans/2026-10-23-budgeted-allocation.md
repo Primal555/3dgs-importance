@@ -140,4 +140,4 @@
 - Spec sections 1–4 map to Tasks 1 and 3; section 5 maps to Task 2; section 6 maps to Tasks 1–3; sections 7–8 map to Tasks 3–4; all ten acceptance items have directed tests above.
 - Original experiments and existing dirty files are outside implementation scope. Any shared helper change must preserve default behavior and receive a targeted regression test.
 - The five Review Focus cases have explicit tests in their owning tasks. This plan adds no forced tier proportions, q0 cap, implicit budget, final-test-based selection or joint finetuning.
-- No production code has been written for this plan. Implementation begins after plan confirmation, in the current working repository, preserving the user's prior in-place workflow preference.
+- Implemented in the current working repository after user confirmation, preserving the user's in-place workflow preference. All four tasks have production code and directed tests; final review fixes cover the actual q0 gate audit, interrupted-log recovery and identical-endpoint deduplication. Full-scene CUDA performance/convergence remain server experiments.

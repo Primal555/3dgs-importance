@@ -193,5 +193,72 @@ class BudgetedEntryTests(unittest.TestCase):
         validations=[json.loads(s) for s in (out/'metrics/validation.jsonl').read_text().splitlines()]
         self.assertEqual(len({(r['step'],r['event']) for r in validations}),len(validations))
 
+    def test_probability_expected_under_budget_does_not_make_hard_deployment_feasible(self):
+        entry=self.entry(); original=entry.MirrorTierTable
+        def controlled(count):
+            table=original(count,.5); table.logits[:,1:]=-100.; return table
+        with patch.object(entry,'MirrorTierTable',side_effect=controlled), \
+             patch('gaussian_jscc.rendering.load_cameras',side_effect=cameras), \
+             patch('gaussian_jscc.rendering.render',side_effect=render), contextlib.redirect_stdout(io.StringIO()):
+            probe=self.root/'expected_probe'; args=self.options(probe)
+            args.keep_lr=args.tier_lr=1e-30
+            entry.main(args,max_updates=1)
+            rows=[json.loads(s) for s in (probe/'metrics/validation.jsonl').read_text().splitlines()]
+            actual=next(r['total_channel_uses'] for r in rows if r['event']=='initial')
+            dest=self.root/'expected_not_feasible'; args=self.options(dest,actual-1)
+            args.allocation_steps=1; args.keep_lr=args.tier_lr=1e-30
+            result=entry.main(args)
+        row=json.loads((dest/'metrics/loss.jsonl').read_text().splitlines()[0])
+        self.assertLess(row['expected_cost_proxy'],actual-1)
+        self.assertEqual(result['status'],'budget_unmet')
+        self.assertFalse(result['budget_feasible'])
+
+    def test_identical_latest_and_selected_maps_share_one_render_and_image_set(self):
+        entry=self.entry(); out=self.root/'endpoint_reuse'; args=self.options(out)
+        args.allocation_steps=1; args.keep_lr=args.tier_lr=1e-30
+        real=entry.evaluate_map; endpoints=[]
+        def observed(*a,**kw):
+            if kw.get('label') in ('latest','selected'): endpoints.append(kw['label'])
+            return real(*a,**kw)
+        with patch('gaussian_jscc.rendering.load_cameras',side_effect=cameras), \
+             patch('gaussian_jscc.rendering.render',side_effect=render), \
+             patch.object(entry,'evaluate_map',side_effect=observed), contextlib.redirect_stdout(io.StringIO()):
+            entry.main(args)
+        self.assertEqual(len(endpoints),1)
+        self.assertEqual(len(list((out/'evaluation/latest').rglob('*.png')))+
+                         len(list((out/'evaluation/selected').rglob('*.png'))),3)
+        self.assertTrue((out/'evaluation/latest/alias.json').exists())
+
+
+class ResumeLogTests(unittest.TestCase):
+    def test_partial_tail_is_archived_and_newline_restored_without_losing_saved_rows(self):
+        from gaussian_jscc.budgeted_allocation_state import repair
+        with tempfile.TemporaryDirectory() as folder:
+            out=Path(folder); (out/'metrics').mkdir(); log=out/'metrics/loss.jsonl'
+            log.write_text('{"step":1,"loss":0.1}\n{"step":2,"loss":')
+            try: repair(out,1)
+            except ValueError as exc: self.fail('interrupted append blocked exact resume: '+str(exc))
+            self.assertEqual([json.loads(s)['step'] for s in log.read_text().splitlines()],[1])
+            self.assertTrue(list((out/'metrics').glob('*.uncheckpointed*')))
+            log.write_text('{"step":1,"loss":0.1}')
+            repair(out,1)
+            self.assertTrue(log.read_text().endswith('\n'))
+
+    def test_event_upsert_recovers_partial_tail_without_reprocessing_archives(self):
+        from gaussian_jscc.budgeted_allocation_state import repair,upsert_jsonl
+        with tempfile.TemporaryDirectory() as folder:
+            out=Path(folder); (out/'metrics').mkdir(); log=out/'metrics/control.jsonl'
+            archive=out/'metrics/control.uncheckpointed.jsonl'; archive.write_text('old archive bytes')
+            log.write_text('{"step":1,"event":"control"}\n{"step":2')
+            try: upsert_jsonl(log,dict(step=2,event='control',price=.1))
+            except ValueError as exc: self.fail('event recovery failed: '+str(exc))
+            repair(out,2)
+            self.assertEqual([json.loads(s)['step'] for s in log.read_text().splitlines()],[1,2])
+            self.assertEqual(archive.read_text(),'old archive bytes')
+            log.write_text('broken committed line\n{"step":2,"event":"control"}\n')
+            with self.assertRaises(ValueError): repair(out,2)
+            log.write_text('{"step":1,"event":\n')
+            with self.assertRaises(ValueError): repair(out,2)
+
 
 if __name__ == '__main__': unittest.main()

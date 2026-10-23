@@ -80,7 +80,7 @@ def audit_interventions(model, features, q, positive, ids, columns, geometry, sc
     targets += [(row, int(col)) for row, col in enumerate(columns.tolist()) if col >= 0]
     for row, column in targets[:limit]:
         old = int(q[row, column]); new = 0 if old else int(positive[row, column])
-        for tier in ((new, (old % 3)+1) if old else (new,)):
+        for tier in ((new, (old % 3)+1, ((old+1) % 3)+1) if old else (new,)):
             if len(records) >= limit: break
             alternative = q.clone(); alternative[row, column] = tier
             with preserved_rng(features.device):
@@ -92,9 +92,18 @@ def audit_interventions(model, features, q, positive, ids, columns, geometry, sc
             block_scene = torch.cat((raw[valid], (alternative[valid] > 0).to(raw)[:, None]), -1)
             changed[offset:offset+int(valid.sum())] = block_scene
             loss = float(task(changed))
-            linear = float(((changed-scene.detach())*upstream).sum())
+            tangent = float(((changed-scene.detach())*upstream).sum())
+            if old==0 or tier==0:
+                # The training keep estimator varies the gate, not raw
+                # attributes AND the gate simultaneously. Fresh context is
+                # still used above for the true finite intervention.
+                flat_index = int(valid.flatten()[:row*q.shape[1]+column].sum())
+                linear = float(upstream[offset+flat_index,-1])*(1 if old==0 else -1)
+            else:
+                linear = tangent
             records.append(dict(source_row=int(ids[row, column]), old_tier=old, new_tier=tier,
                 measured_delta_mse=loss-base_loss, first_order_delta_mse=linear,
+                full_scene_tangent_delta_mse=tangent,
                 sign_agreement=(loss-base_loss)*linear >= 0,
                 absolute_error=abs(loss-base_loss-linear)))
     return records
