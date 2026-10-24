@@ -1,4 +1,4 @@
-"""Single-scene, frozen-codec allocation under an explicit total-use budget."""
+"""Frozen-codec allocation with an explicit budget OR a fixed RD coefficient."""
 import argparse
 import json
 import math
@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from .allocation import deployment_tiers
 from .allocation_budget import BudgetController
+from .allocation_objective import FixedRateDistortion
 from .allocation_mirror import MirrorTierTable, BlockVisitScheduler, ViewWindowScheduler
 from .allocation_reuse import AllocationTimings
 from .budgeted_allocation_inputs import load_inputs
@@ -26,6 +27,7 @@ from .successive_multiscene_inputs import make_scene
 from .transport import model_id
 
 FAMILY = 'budgeted_allocation_v1'
+RD_FAMILY = 'fixed_beta_allocation_v1'
 
 
 def parser():
@@ -35,6 +37,7 @@ def parser():
     budget = p.add_mutually_exclusive_group(required=True)
     budget.add_argument('--budget-total-uses', type=int)
     budget.add_argument('--budget-ratio-to-q3', type=float)
+    budget.add_argument('--beta', type=float, help='Fixed RD coefficient; no budget or adaptive price')
     for name, default in (('allocation-steps',2000),('window-views',4),('calibration-views',4),
                          ('control-every',25),('validate-every',250),('save-every',100),('profile-every',10),
                          ('audit-every',250),('audit-samples',4),('test-views',32),('trials',4),
@@ -54,11 +57,17 @@ def validate(args):
     if min(getattr(args,k) for k in required) < 1 or min(args.audit_every,args.audit_samples,args.profile_every,args.test_views) < 0:
         raise ValueError('invalid update/window/evaluation budgets')
     if args.snr != 10.: raise ValueError('this controlled experiment retains fixed 10dB')
-    if (args.budget_total_uses is None) == (args.budget_ratio_to_q3 is None):
-        raise ValueError('supply exactly one explicit budget')
+    beta = getattr(args, 'beta', None)
+    if sum(v is not None for v in (args.budget_total_uses, args.budget_ratio_to_q3, beta)) != 1:
+        raise ValueError('supply exactly one explicit budget or beta')
     for value in (args.budget_total_uses, args.budget_ratio_to_q3):
         if value is not None and (not math.isfinite(value) or value <= 0): raise ValueError('invalid explicit budget')
-    BudgetController(1, args.initial_price, args.dual_lr, args.ema_decay)
+    if beta is not None:
+        FixedRateDistortion(beta, 1., 1.)
+        if (args.initial_price, args.dual_lr, args.ema_decay) != (.01, .05, .9):
+            raise ValueError('adaptive price options do not apply to fixed beta')
+    else:
+        BudgetController(1, args.initial_price, args.dual_lr, args.ema_decay)
     if any(not math.isfinite(v) or v <= 0 for v in (args.keep_lr,args.tier_lr)):
         raise ValueError('invalid mirror learning rates')
 
@@ -70,9 +79,16 @@ def deploy(table, args):
 
 def main(args, max_updates=None):
     validate(args)
+    fixed_rd = getattr(args, 'beta', None) is not None
+    family = RD_FAMILY if fixed_rd else FAMILY
     saved, cfg, spec, old, options, source = load_inputs(args)
     settings = {k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device')}
-    plan = json.loads(json.dumps(dict(version=FAMILY, source=source, spec=spec, settings=settings,
+    # Keep old budget checkpoint plan identity byte-for-byte compatible.
+    if not fixed_rd: settings.pop('beta', None)
+    else:
+        for key in ('budget_total_uses','budget_ratio_to_q3','initial_price','dual_lr','ema_decay'):
+            settings.pop(key, None)
+    plan = json.loads(json.dumps(dict(version=family, source=source, spec=spec, settings=settings,
                                      codec_config=cfg.to_dict(), writes_output=False)))
     if args.dry_run:
         print(json.dumps(plan, indent=2)); return plan
@@ -98,37 +114,61 @@ def main(args, max_updates=None):
         state = restore_state(latest, plan, scene_record)
         model.load_state_dict(state['state_dict']); table.load_state_dict(state['table'])
         blocks.load_state_dict(state['blocks']); views.load_state_dict(state['views'])
-        controller = BudgetController(state['controller']['budget']); controller.load_state_dict(state['controller'])
-        progress, reference, q = state['progress'], state['budget_reference'], state['latest_q']
+        if fixed_rd:
+            controller = None
+        else:
+            controller = BudgetController(state['controller']['budget']); controller.load_state_dict(state['controller'])
+        reference = state['objective_reference' if fixed_rd else 'budget_reference']
+        progress, q = state['progress'], state['latest_q']
         repair(out, progress['step']); restore_rng(state['rng'])
     else:
         full = torch.full((len(scene.raw),), 3, dtype=torch.long)
         full_cost = meter.details(full)
-        budget = args.budget_total_uses if args.budget_total_uses is not None else math.floor(args.budget_ratio_to_q3*full_cost['total_channel_uses'])
-        if budget < 1: raise ValueError('resolved budget is less than one channel use')
+        if not fixed_rd:
+            budget = args.budget_total_uses if args.budget_total_uses is not None else math.floor(args.budget_ratio_to_q3*full_cost['total_channel_uses'])
+            if budget < 1: raise ValueError('resolved budget is less than one channel use')
         base_args = argparse.Namespace(**vars(args)); base_args.lpips = False
         baseline = evaluate_map(model,scene,full,calibration,base_args,folder=out/'evaluation/q3_reference',label='q3_reference')
-        reference = dict(q3_cost=full_cost, budget=int(budget), d_ref_raw=baseline['source_mse'],
+        reference = dict(q3_cost=full_cost, d_ref_raw=baseline['source_mse'],
                          d_ref=max(baseline['source_mse'],1e-12), d_ref_floor=1e-12)
-        controller = BudgetController(budget,args.initial_price,args.dual_lr,args.ema_decay)
+        if fixed_rd:
+            reference.update(beta=args.beta, c_ref=full_cost['total_channel_uses'])
+            controller = None
+        else:
+            reference['budget'] = int(budget)
+            controller = BudgetController(budget,args.initial_price,args.dual_lr,args.ema_decay)
         q = deploy(table,args)
         progress = dict(step=0, pending=['initial'], best=None, lowest=None, initial_q=q.clone(),
                         initial_codec_id=identity, frozen_codec_verified=False)
         json_write(out/'plan.json',plan)
         json_write(out/'training.json',dict(plan, **scene_record, source_run=str(Path(args.run).resolve()),
-            budget_reference=reference, trainable_modules=[], attribute_statistics_frozen=True,
+            **{'objective_reference' if fixed_rd else 'budget_reference': reference},
+            trainable_modules=[], attribute_statistics_frozen=True,
             optimizer='log-domain mirror descent; fixed N_source global gain for image and rate action costs',
             probability_global_gain=len(scene.raw), distortion='source PLY RGB MSE',
             allocation_training_sampling='single',deployment_draws=10,deployment_seed=args.seed,
             allocation_steps_scope='one update per multi-view window',allocation_joint_steps=0))
+
+    objective = FixedRateDistortion(args.beta,reference['d_ref'],reference['c_ref']) if fixed_rd else None
+    rate_normalizer = reference['c_ref'] if fixed_rd else reference['budget']
+
+    def objective_fields(distortion=None, cost=None):
+        if fixed_rd:
+            fields = dict(objective_mode='fixed_beta', beta=objective.beta,
+                          d_ref=objective.d_ref, c_ref=objective.c_ref)
+            if distortion is not None and cost is not None:
+                fields.update(normalized_distortion=distortion/objective.d_ref,
+                              normalized_cost=cost/objective.c_ref, rd_score=objective.score(distortion,cost))
+            return fields
+        return dict(budget=reference['budget'],price=controller.price,residual_ema=controller.ema)
 
     def save(label='latest', map_q=None):
         if model_id(model) != identity: raise RuntimeError('frozen codec or attribute statistics changed')
         result = save_state(out,label,model,table,controller,blocks,views,progress,plan,scene_record,reference,
                             q if map_q is None else map_q)
         json_write(out/'progress.json',dict(status='running',step=progress['step'],phase='allocation',
-            budget=reference['budget'],price=controller.price,residual_ema=controller.ema,
-            pending=progress['pending'],best_feasible=progress['best']))
+            **objective_fields(), pending=progress['pending'],
+            **{'best_rd' if fixed_rd else 'best_feasible': progress['best']}))
         return result
 
     def proxy(cost, deployed):
@@ -146,15 +186,20 @@ def main(args, max_updates=None):
                               folder=out/'evaluation'/label,label=label)
         cost = meter.details(chosen_q)
         row = dict(result, **cost, step=progress['step'],event=label,
-                   budget=reference['budget'],budget_feasible=cost['total_channel_uses']<=reference['budget'],
+                   **objective_fields(result['source_mse'],cost['total_channel_uses']),
                    evaluation_seconds=time.perf_counter()-started)
+        if not fixed_rd: row['budget_feasible'] = cost['total_channel_uses']<=reference['budget']
         upsert_jsonl(out/'metrics/validation.jsonl',row)
         return row
 
     def consider(row):
         candidate = dict(step=progress['step'], source_mse=row['source_mse'],
             total_channel_uses=row['total_channel_uses'], tier_sha256=row['tier_sha256'], codec_id=identity)
-        if row['budget_feasible']:
+        if fixed_rd:
+            candidate['rd_score'] = objective.score(row['source_mse'],row['total_channel_uses'])
+            if progress['best'] is None or objective.candidate_key(candidate) < objective.candidate_key(progress['best']):
+                progress['best'] = candidate; save('best_rd')
+        elif row['budget_feasible']:
             if progress['best'] is None or row['source_mse'] < progress['best']['source_mse']:
                 progress['best'] = candidate; save('best_feasible')
         else:
@@ -174,8 +219,9 @@ def main(args, max_updates=None):
             elif event == 'control':
                 started = time.perf_counter(); cost = meter.details(q)
                 reference['side_proxy'] = proxy(cost,q)
-                control = controller.observe(cost['total_channel_uses'])
-                upsert_jsonl(out/'metrics/control.jsonl',dict(control,**cost,step=progress['step'],event='control',
+                control = objective_fields() if fixed_rd else controller.observe(cost['total_channel_uses'])
+                upsert_jsonl(out/'metrics/control.jsonl',dict(control,**cost,step=progress['step'],
+                    event='cost_refresh' if fixed_rd else 'control',
                     tier_counts=torch.bincount(q,minlength=4).tolist(),cost_seconds=time.perf_counter()-started))
             elif event == 'calibration':
                 row = measure(f'calibration_{progress["step"]:06d}',calibration); consider(row)
@@ -194,7 +240,8 @@ def main(args, max_updates=None):
         task = MaskedMultiViewRenderTask([training[i] for i in indices],scene.reference,scene.degree,scene.white_background)
         audit_count = args.audit_samples if args.audit_every and step%args.audit_every==0 else 0
         result = budgeted_mask_step(model,table,scene.groups,scene.group_ids,scene.geometry,task,blocks,
-            args.snr,'awgn',d_ref=reference['d_ref'],price=controller.price,budget=reference['budget'],
+            args.snr,'awgn',d_ref=reference['d_ref'],price=args.beta if fixed_rd else controller.price,
+            rate_normalizer=rate_normalizer,
             side_proxy=dict(reference['side_proxy'],step=step),timings=timings,audit_limit=audit_count)
         with timings.measure('mirror_update_seconds'):
             table.update(result.pop('keep_costs'),result.pop('tier_ids'),result.pop('tier_costs'),
@@ -202,11 +249,17 @@ def main(args, max_updates=None):
         result.pop('keep_image_costs'); sampled_q = result.pop('q'); audits = result.pop('audit')
         timing_row = timings.summary()
         if device.type == 'cuda': torch.cuda.synchronize(device)
-        row = dict(result, **timing_row, step=step,event='update',price=controller.price,budget=reference['budget'],
-            d_ref=reference['d_ref'],loss=result['render_loss']/reference['d_ref']+controller.price*(result['expected_cost_proxy']/reference['budget']-1),
+        score = (objective.score(result['render_loss'],result['expected_cost_proxy']) if fixed_rd else
+                 result['render_loss']/reference['d_ref']+controller.price*(result['expected_cost_proxy']/reference['budget']-1))
+        row = dict(result, **timing_row, step=step,event='update',
+            **objective_fields(result['render_loss'],result['expected_cost_proxy']),
+            loss=score,
             training_view_names=[str(training[i].image_name) for i in indices],codec_updated=False,
             step_seconds=time.perf_counter()-started,**blocks.coverage(sampled_q),
             peak_allocated_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type=='cuda' else None)
+        row['d_ref'] = reference['d_ref']
+        if fixed_rd:
+            row['rd_score_scope'] = 'single-draw training distortion + expected side-cost proxy; not deployment score'
         append_json(out/'metrics/loss.jsonl',row)
         for audit in audits: upsert_jsonl(out/'metrics/audit.jsonl',dict(audit,step=step,event=f'{audit["source_row"]}_{audit["new_tier"]}'))
         progress['step'] = step; progress['pending'] = []
@@ -215,14 +268,15 @@ def main(args, max_updates=None):
         if progress['pending'] or step%args.save_every==0: q=deploy(table,args); save()
         pending()
         if step==1 or step%10==0 or step==args.allocation_steps:
-            print(f'allocation {step}/{args.allocation_steps}: MSE={row["render_loss"]:.6g}, price={controller.price:.5g}, '
+            coefficient = f'beta={args.beta:.5g}' if fixed_rd else f'price={controller.price:.5g}'
+            print(f'allocation {step}/{args.allocation_steps}: MSE={row["render_loss"]:.6g}, {coefficient}, '
                   f'sampled={row["sampled_tier_counts"]}, covered={row["evaluated_rows"]}/{len(scene.raw)}, '
                   f'sec={row["step_seconds"]:.2f}',flush=True)
         updates += 1
         if max_updates is not None and updates >= max_updates:
             q=deploy(table,args); save(); return dict(status='interrupted',step=step)
     q=deploy(table,args)
-    chosen_label = 'best_feasible' if progress['best'] is not None else 'lowest_violation'
+    chosen_label = 'best_rd' if fixed_rd else ('best_feasible' if progress['best'] is not None else 'lowest_violation')
     selected = torch.load(out/'checkpoints'/chosen_label/'state.pt',map_location='cpu',weights_only=True)
     chosen_q = selected['latest_q']
     selected_row = measure('selected',scene.test_cameras,True,map_q=chosen_q)
@@ -239,11 +293,16 @@ def main(args, max_updates=None):
     selected_table = MirrorTierTable(len(scene.raw)); selected_table.load_state_dict(selected['table'])
     np.save(export/'selected_probabilities.npy',selected_table.probabilities(torch.arange(len(scene.raw)),args.snr).numpy(),allow_pickle=False)
     progress['frozen_codec_verified'] = model_id(model)==identity
-    status = 'complete' if progress['best'] is not None else 'budget_unmet'
-    result = dict(status=status,step=progress['step'],budget=reference['budget'],budget_feasible=progress['best'] is not None,
+    status = 'complete' if fixed_rd or progress['best'] is not None else 'budget_unmet'
+    result = dict(status=status,step=progress['step'],
+        **objective_fields(selected_row['source_mse'],selected_row['total_channel_uses']),
         selection=chosen_label,selected_step=selected['progress']['step'],selected_total_channel_uses=selected_row['total_channel_uses'],
         selected_source_psnr=selected_row['source_psnr'],latest_total_channel_uses=latest_row['total_channel_uses'],
         codec_id=identity,tier_sha256=tier_hash(chosen_q),frozen_codec_verified=progress['frozen_codec_verified'])
+    if not fixed_rd: result['budget_feasible'] = progress['best'] is not None
+    else:
+        result['selection_rd_score'] = selected['progress']['best']['rd_score']
+        result['selection_rd_scope'] = 'calibration views only; final rd_score uses test views'
     json_write(export/'selection.json',result); save('final'); save()
     from .budgeted_allocation_report import summarize
     summarize(out,result=result)

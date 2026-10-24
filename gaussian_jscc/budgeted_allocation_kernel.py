@@ -5,6 +5,7 @@ one update. Two candidate rounds change ONE point per block, not all neighbors.
 No compression or differentiable codec graph is needed for this VJP estimator.
 """
 from contextlib import nullcontext
+import math
 import torch
 from torch.nn import functional as F
 from .data import to_raw
@@ -110,10 +111,16 @@ def audit_interventions(model, features, q, positive, ids, columns, geometry, sc
 
 
 def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task, scheduler,
-                       snr, kind, *, d_ref, price, budget, side_proxy, timings, audit_limit=0):
+                       snr, kind, *, d_ref, price, side_proxy, timings, audit_limit=0,
+                       rate_normalizer=None, budget=None):
     if model.training or any(p.requires_grad for p in model.parameters()):
         raise ValueError('budgeted allocation requires an eval-mode, fully frozen codec')
-    if d_ref <= 0 or budget <= 0: raise ValueError('invalid objective normalization')
+    if rate_normalizer is not None and budget is not None:
+        raise ValueError('supply one rate normalization, not both rate_normalizer and legacy budget')
+    rate_normalizer = budget if rate_normalizer is None else rate_normalizer
+    if (rate_normalizer is None or not math.isfinite(rate_normalizer) or rate_normalizer <= 0
+            or not math.isfinite(d_ref) or d_ref <= 0 or not math.isfinite(price) or price < 0):
+        raise ValueError('invalid objective normalization or rate coefficient')
     device = next(model.parameters()).device
     count = len(table.logits); q_source = torch.empty(count, dtype=torch.long)
     cache, parts, cache_bytes, q0_rows = [], [], 0, 0
@@ -176,7 +183,7 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                     alt = q.clone(); alt[rows, col] = tiers[rows]
                     scale_delta = (present_scales(alt).sum(-1)-block_scale_base)*16/bits
                     rate_delta = rates[tiers[rows]]-rates[q[rows, col]]+scale_delta[rows]
-                    action_costs[torch.arange(len(rows), device=device), tiers[rows]-1] = image[rows]+price*rate_delta/budget
+                    action_costs[torch.arange(len(rows), device=device), tiers[rows]-1] = image[rows]+price*rate_delta/rate_normalizer
                 costs.append(action_costs); selected.append(ids[rows, col].cpu())
             if len(all_audits) < audit_limit:
                 with timing(timings, 'audit_seconds'):
@@ -188,7 +195,7 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     expected_keep_payload = (conditional*rates[1:]).sum(-1)
     unit_side = side_proxy['xyz_per_retained'] + side_proxy.get('scale_per_retained', 0.)
     keep_costs = keep_image.clone()
-    keep_costs[:, 1] += price*(expected_keep_payload+unit_side)/budget
+    keep_costs[:, 1] += price*(expected_keep_payload+unit_side)/rate_normalizer
     expected = float((p*rates).sum() + (1-p[:, 0]).sum()*unit_side + side_proxy['fixed_uses'])
     sampled = float(rates[q_source.to(device)].sum()) + int((q_source>0).sum())*unit_side + side_proxy['fixed_uses']
     tier_ids = torch.cat(selected) if selected else torch.empty(0, dtype=torch.long)
