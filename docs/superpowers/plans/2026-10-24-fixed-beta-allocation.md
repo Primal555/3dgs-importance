@@ -49,7 +49,7 @@
 - [x] Run `python -m unittest discover -s tests -p test_fixed_beta_allocation_report.py -v`; expect failures for missing RD report/launcher behavior.
 - [x] Implement mode-aware score/cost/quality plots and CSV, report integrity checks, explicit-beta launcher, documented server commands and engineering-vs-paper references.
 - [x] Run all fixed-beta and budgeted tests, mirror/budget/reuse compatibility tests, Python compilation, `bash -n` and `git diff --check`; expect pass.
-- [ ] Perform independent whole-change review using requesting-code-review, address Important/Critical findings with failing regression tests, then commit and push to origin main under user's standing instruction.
+- [x] Perform independent whole-change review using requesting-code-review; no Important/Critical findings; two nonblocking test improvements recorded in the spec. Commit and push to origin main under user's standing instruction.
 
 ## Execution choice
 
