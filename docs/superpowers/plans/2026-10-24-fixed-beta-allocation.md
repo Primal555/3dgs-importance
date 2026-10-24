@@ -33,11 +33,11 @@
 
 **Interfaces:** `FixedRateDistortion(beta,d_ref,c_ref).score(distortion,cost)` returns normalized RD; `candidate_key(row)` ranks measured candidates by `(score,source_mse,total_channel_uses)`. Kernel accepts `rate_normalizer` while retaining legacy `budget` keyword. State identity follows the mode-specific plan version.
 
-- [ ] Write objective/CLI/end-to-end tests: hand-computed RD values, invalid beta, beta0 without budget, frozen weights, best_rd, exact resume, reference preservation and changed-beta rejection.
-- [ ] Run `python -m unittest discover -s tests -p test_fixed_beta_allocation.py -v`; expect failures for absent fixed-beta support before implementation.
-- [ ] Implement fixed objective, explicit mode parsing, no adaptive controller in RD, actual-cost calibration selection, saved best_rd/reference/beta and resume validation. Keep budget branch intact.
-- [ ] Run new tests plus `test_budgeted_allocation.py`, `test_budgeted_allocation_kernel.py`, `test_allocation_mirror.py`, `test_allocation_budget.py`; expect all pass.
-- [ ] Commit Task 1 implementation and tests.
+- [x] Write objective/CLI/end-to-end tests: hand-computed RD values, invalid beta, beta0 without budget, frozen weights, best_rd, exact resume, reference preservation and changed-beta rejection.
+- [x] Run `python -m unittest discover -s tests -p test_fixed_beta_allocation.py -v`; expect failures for absent fixed-beta support before implementation.
+- [x] Implement fixed objective, explicit mode parsing, no adaptive controller in RD, actual-cost calibration selection, saved best_rd/reference/beta and resume validation. Keep budget branch intact.
+- [x] Run new tests plus `test_budgeted_allocation.py`, `test_budgeted_allocation_kernel.py`, `test_allocation_mirror.py`, `test_allocation_budget.py`; expect all pass.
+- [x] Commit Task 1 implementation and tests.
 
 ### Task 2: Reports, launcher and usage
 
@@ -45,10 +45,10 @@
 
 **Interfaces:** RD final result/validation rows expose `objective_mode,beta,d_ref,c_ref,rd_score`; measured-cost event records continue in `metrics/control.jsonl` with a cost-refresh event and no adaptive-price update.
 
-- [ ] Write report tests with literal measured RD scores, tamper rejection and optional LPIPS missing; real Bash launcher tests for mandatory beta, budget conflict, dry run, resume flag and exit status.
-- [ ] Run `python -m unittest discover -s tests -p test_fixed_beta_allocation_report.py -v`; expect failures for missing RD report/launcher behavior.
-- [ ] Implement mode-aware score/cost/quality plots and CSV, report integrity checks, explicit-beta launcher, documented server commands and engineering-vs-paper references.
-- [ ] Run all fixed-beta and budgeted tests, mirror/budget/reuse compatibility tests, Python compilation, `bash -n` and `git diff --check`; expect pass.
+- [x] Write report tests with literal measured RD scores, tamper rejection and optional LPIPS missing; real Bash launcher tests for mandatory beta, budget conflict, dry run, resume flag and exit status.
+- [x] Run `python -m unittest discover -s tests -p test_fixed_beta_allocation_report.py -v`; expect failures for missing RD report/launcher behavior.
+- [x] Implement mode-aware score/cost/quality plots and CSV, report integrity checks, explicit-beta launcher, documented server commands and engineering-vs-paper references.
+- [x] Run all fixed-beta and budgeted tests, mirror/budget/reuse compatibility tests, Python compilation, `bash -n` and `git diff --check`; expect pass.
 - [ ] Perform independent whole-change review using requesting-code-review, address Important/Critical findings with failing regression tests, then commit and push to origin main under user's standing instruction.
 
 ## Execution choice

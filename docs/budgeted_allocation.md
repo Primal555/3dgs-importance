@@ -1,4 +1,64 @@
-# 总预算约束的逐点档位分配实验
+# 逐点档位分配：固定 beta 率失真与预算约束
+
+## 固定 beta 率失真模式（当前主线）
+
+启动脚本为 `scripts/test_rate_distortion_allocation.sh`，复用本页描述的冻结编解码器、完整 q0 反馈、真实混合邻域候选、镜像更新与同一步缓存。默认单场景 2000 次更新、每次四视角累计，不重训编解码器，不接联合微调。
+
+必须显式提供 `--beta BETA`，允许 0，拒绝负值/NaN/Inf；与两个预算参数互斥。beta 全程固定，没有总成本上限或档位数量要求，也不运行自适应价格控制器。
+
+训练目标：
+
+`L_proxy = D_train / D_ref + beta * C_proxy / C_ref`
+
+- `D_train`：源 PLY 渲染 RGB MSE；`D_ref`：初始化全 q3 在校准视角和 10 dB 下的平均 MSE，固定保存。
+- `C_ref`：同一场景全 q3 的实测总复信道使用次数，固定保存，仅为参考尺度。
+- `C_proxy`：符号精确计数与最近实测压缩侧流构成的局部代理；不会将代理值标为真实部署成本。
+- 每 25 步刷新十次规则部署的实际成本和侧流代理，不改变 beta；每 250 步在校准视角计算 `RD_deploy = D_calibration / D_ref + beta * C_actual / C_ref`，以最低评分选 `best_rd`。同分时依次比较更低失真、更低成本。
+- 测试相机只用于初始与最终报告，不参与 `best_rd` 选择。`complete.json` 的 `selection_rd_score` 是校准选取分数，`rd_score` 是选中部署在最终测试视角的分数，二者明确区分。
+
+本模式保存 `checkpoints/best_rd/state.pt`、`objective_reference`、固定 beta、覆盖/相机游标与 RNG，支持同参数 `RESUME=1` 精确续训。改变 beta 或在预算模式与固定 beta 之间切换必须使用新 OUT，旧预算 checkpoint 不会被静默转换。
+
+输出仍在一个 OUT 内；`metrics/control.jsonl` 记录 `cost_refresh` 事件，没有预算残差或动态价格。校准及测试的实际成本、q0–q3 占比、源 PLY/真实照片 PSNR、SSIM、LPIPS 继续保存。`comparison/endpoints.csv` 增加 `beta,d_ref,c_ref,normalized_distortion,normalized_cost,rd_score`；`charts/rate_distortion_training.png` 展示成本与固定 beta，`charts/deployment_rd_score.png` 将训练代理与实际部署校准分数分开画出。其余覆盖和实际档位占比图保留。初始与最终代表图及档位着色图保留，同图去重。
+
+以下 `0.1` **仅为显式参数的示例**，尚未证明是最佳惩罚强度。新双参考归一化下不能将历史 `0.005` 解释为相同惩罚；例如 beta=0.1 时，节省 `0.1*C_ref` 对目标的改善为 0.01，与增加 `0.01*D_ref` 的失真相抵。多个 beta 实验要固定源模型、场景、参考尺度和评估条件，以实际总成本—PSNR/SSIM/LPIPS 曲线比较，不能比较不同 beta 的总 loss 大小。
+
+```bash
+cd /data/home/zhangyueheng/projects/3dgs-importance
+conda activate maskgs
+git -c submodule.recurse=false pull --ff-only --no-recurse-submodules origin main
+
+RUN="$PWD/output/successive_multiscene_gpu3_20261022_230109"
+SCENE=truck
+GPU=2
+BETA=0.1
+OUT="$PWD/output/${SCENE}_rd_beta${BETA}_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
+
+CUDA_VISIBLE_DEVICES="$GPU" bash scripts/test_rate_distortion_allocation.sh \
+  "$RUN" "$SCENE" "$OUT" --beta "$BETA" --dry-run
+
+CUDA_VISIBLE_DEVICES="$GPU" nohup bash scripts/test_rate_distortion_allocation.sh \
+  "$RUN" "$SCENE" "$OUT" --beta "$BETA" >"${OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}.pid"
+tail -n 40 -F "${OUT}.log"
+```
+
+原进程确认退出后，保留原 RUN/SCENE/OUT/BETA 和所有设置，添加 `RESUME=1`：
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU" RESUME=1 nohup bash scripts/test_rate_distortion_allocation.sh \
+  "$RUN" "$SCENE" "$OUT" --beta "$BETA" >>"${OUT}.log" 2>&1 &
+```
+
+文献对应：
+
+- [NTSCC，式（17）](https://arxiv.org/html/2112.10961)：失真与主要内容/数字侧信息信道资源的固定权重权衡。
+- [FCGS，第 3.4 节式（8）](https://arxiv.org/html/2410.08017)、[HAC，第 3.4 节式（9）](https://arxiv.org/html/2403.14530)：渲染质量与归一化编码成本。
+- [RDO-Gaussian，第 3.2 节](https://arxiv.org/html/2406.01597)：逐 Gaussian 表示复杂度的率失真优化。
+- [MaskGaussian，第 3.3–3.5 节](https://arxiv.org/html/2412.20522)：概率保留与 masked-render 反馈。
+
+这里的全 q3 双参考归一化、镜像更新、四视角窗口与实际成本代理是项目工程设计；2000 步和 beta 数值没有作为原文最优参数使用。固定参考下目标等价于 `D + beta*D_ref/C_ref*C`。定向 CPU 测试验证执行、核算、选择与续训；服务器 CUDA 收敛和耗时仍需实测。
+
+## 原预算约束模式（兼容保留）
 
 入口为 `gaussian_jscc.budgeted_allocation`，启动脚本为 `scripts/test_budgeted_allocation.sh`。保留旧 `successive_allocation` 实验行为；本轮不重训编解码器，也不加入联合微调。
 
