@@ -158,38 +158,72 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     if not torch.isfinite(upstream).all(): raise RuntimeError('nonfinite allocation scene gradient')
     keep_image = torch.zeros(count, 2, dtype=torch.float64, device=device)
     costs, selected, all_audits = [], [], []
+    image_costs, rate_costs, locations = [], [], []
+    evidence = hasattr(scheduler, 'select_rounds')
     with timing(timings, 'candidate_schedule_seconds'):
-        columns, visited = scheduler.select(q_source)
+        if evidence:
+            influence = torch.zeros(count, dtype=torch.float64)
+            offset = 0
+            for ids in id_batches:
+                valid = ids >= 0; n = int(valid.sum())
+                value = (upstream[offset:offset+n, :-1]*scene[offset:offset+n, :-1]).abs().sum(-1)
+                value = value+upstream[offset:offset+n, -1].abs()
+                influence[ids[valid]] = value.detach().double().cpu(); offset += n
+            probabilities = table.probabilities(torch.arange(count, device=table.logits.device), snr).detach()
+            rounds = scheduler.select_rounds(q_source, influence, probabilities, side_proxy['step'])
+        else:
+            columns, _ = scheduler.select(q_source)
+            rounds = [columns]
     offset = 0
     bits = side_proxy.get('bits_per_use', 2.)
     rates = torch.tensor(model.cfg.rates, device=device, dtype=torch.float64)
     with torch.no_grad():
-        for features, source_ids, entry, cols in zip(feature_batches, id_batches, cache, columns):
+        for batch_index, (features, source_ids, entry) in enumerate(zip(feature_batches, id_batches, cache)):
             f, ids = features.to(device), source_ids.to(device)
             q, positive, y, actual, state = entry
             valid = ids >= 0; n = int(valid.sum())
             g = torch.zeros((*q.shape, scene.shape[-1]), device=device, dtype=upstream.dtype)
             g[valid] = upstream[offset:offset+n]
             keep_image[ids[valid], 1] = g[..., -1][valid].double()/d_ref
-            active = cols >= 0
-            if active.any():
-                rows = torch.arange(len(q), device=device)[active.to(device)]
-                col = cols[active].to(device)
-                action_costs = torch.zeros(len(rows), 3, dtype=torch.float64, device=device)
-                block_scale_base = present_scales(q).sum(-1)
-                for tiers, delta in mixed_point_candidates(model, f, q, cols, snr, kind, geometry,
-                        semantic_y=y, actual=actual, actual_rng=state, timings=timings):
-                    image = (g[..., :-1]*delta).sum((1, 2)).double()/d_ref
-                    alt = q.clone(); alt[rows, col] = tiers[rows]
-                    scale_delta = (present_scales(alt).sum(-1)-block_scale_base)*16/bits
-                    rate_delta = rates[tiers[rows]]-rates[q[rows, col]]+scale_delta[rows]
-                    action_costs[torch.arange(len(rows), device=device), tiers[rows]-1] = image[rows]+price*rate_delta/rate_normalizer
-                costs.append(action_costs); selected.append(ids[rows, col].cpu())
+            for columns in rounds:
+                cols = columns[batch_index]
+                active = cols >= 0
+                if active.any():
+                    rows = torch.arange(len(q), device=device)[active.to(device)]
+                    col = cols[active].to(device)
+                    action_image = torch.zeros(len(rows), 3, dtype=torch.float64, device=device)
+                    action_rate = torch.zeros_like(action_image)
+                    block_scale_base = present_scales(q).sum(-1)
+                    for tiers, delta in mixed_point_candidates(model, f, q, cols, snr, kind, geometry,
+                            semantic_y=y, actual=actual, actual_rng=state, timings=timings):
+                        image = (g[..., :-1]*delta).sum((1, 2)).double()/d_ref
+                        alt = q.clone(); alt[rows, col] = tiers[rows]
+                        scale_delta = (present_scales(alt).sum(-1)-block_scale_base)*16/bits
+                        rate_delta = rates[tiers[rows]]-rates[q[rows, col]]+scale_delta[rows]
+                        action_image[torch.arange(len(rows), device=device), tiers[rows]-1] = image[rows]
+                        action_rate[torch.arange(len(rows), device=device), tiers[rows]-1] = price*rate_delta/rate_normalizer
+                    costs.append(action_image+action_rate); selected.append(ids[rows, col].cpu())
+                    if evidence:
+                        image_costs.append(action_image); rate_costs.append(action_rate)
+                        locations.extend((batch_index, int(r), int(c)) for r,c in zip(rows.tolist(), col.tolist()))
+            cols = rounds[0][batch_index]
             if len(all_audits) < audit_limit:
                 with timing(timings, 'audit_seconds'):
                     all_audits.extend(audit_interventions(model, f, q, positive, ids, cols, geometry,
                         scene, upstream, offset, state, task, snr, kind, loss, audit_limit-len(all_audits)))
             offset += n
+    tier_ids = torch.cat(selected) if selected else torch.empty(0, dtype=torch.long)
+    feedback_stats = {}
+    if evidence:
+        from .allocation_finite import correct_actions
+        images = torch.cat(image_costs) if image_costs else torch.empty(0, 3, device=device, dtype=torch.float64)
+        rate_values = torch.cat(rate_costs) if rate_costs else torch.empty_like(images)
+        with timing(timings, 'finite_feedback_seconds'):
+            records, feedback_stats = correct_actions(model, feature_batches, id_batches, cache, geometry,
+                task, scene, upstream, scheduler, tier_ids, locations, images, rate_values, keep_image,
+                d_ref, snr, kind)
+        all_audits.extend(records)
+        costs = [scheduler.accumulate(tier_ids, images, rate_values, side_proxy['step'])]
     p = table.probabilities(torch.arange(count, device=table.logits.device), snr).detach()
     conditional = table.logits.softmax(-1).detach()
     expected_keep_payload = (conditional*rates[1:]).sum(-1)
@@ -198,12 +232,12 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     keep_costs[:, 1] += price*(expected_keep_payload+unit_side)/rate_normalizer
     expected = float((p*rates).sum() + (1-p[:, 0]).sum()*unit_side + side_proxy['fixed_uses'])
     sampled = float(rates[q_source.to(device)].sum()) + int((q_source>0).sum())*unit_side + side_proxy['fixed_uses']
-    tier_ids = torch.cat(selected) if selected else torch.empty(0, dtype=torch.long)
     scheduler.record(tier_ids, side_proxy.get('step', 1))
+    if evidence: feedback_stats.update(scheduler.diagnostics(q_source, step=side_proxy['step']))
     return dict(render_loss=loss, keep_image_costs=keep_image, keep_costs=keep_costs,
         tier_ids=tier_ids, tier_costs=torch.cat(costs) if costs else torch.empty(0, 3, device=device),
         q=q_source, sampled_tier_counts=torch.bincount(q_source, minlength=4).tolist(),
         q0_feedback_rows=q0_rows, expected_cost_proxy=expected, sampled_cost_proxy=sampled,
-        candidate_codec_calls=2*sum(bool((c>=0).any()) for c in columns), actual_codec_calls=len(cache),
+        candidate_codec_calls=2*sum(bool((c>=0).any()) for columns in rounds for c in columns), actual_codec_calls=len(cache),
         q0_codec_calls=sum(bool(((ids>=0)&(e[0].cpu()==0)).any()) for ids,e in zip(id_batches,cache)),
-        cache_peak_mib=cache_bytes/2**20, audit=all_audits, **actual_stats)
+        cache_peak_mib=cache_bytes/2**20, audit=all_audits, **feedback_stats, **actual_stats)

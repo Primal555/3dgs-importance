@@ -80,7 +80,11 @@ def deploy(table, args):
 def main(args, max_updates=None):
     validate(args)
     fixed_rd = getattr(args, 'beta', None) is not None
-    family = RD_FAMILY if fixed_rd else FAMILY
+    evidence = getattr(args, 'evidence_experiment', False)
+    if evidence:
+        from .evidence_allocation import validate as validate_evidence
+        validate_evidence(args)
+    family = 'evidence_allocation_v1' if evidence else (RD_FAMILY if fixed_rd else FAMILY)
     saved, cfg, spec, old, options, source = load_inputs(args)
     settings = {k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device')}
     # Keep old budget checkpoint plan identity byte-for-byte compatible.
@@ -107,7 +111,13 @@ def main(args, max_updates=None):
     scene_record = dict(scene.record, allocation_train_view_names=[str(c.image_name) for c in training],
                          calibration_view_names=[str(c.image_name) for c in calibration])
     table = MirrorTierTable(len(scene.raw)).to(device)
-    blocks = BlockVisitScheduler(scene.group_ids)
+    if evidence:
+        from .allocation_evidence import EvidenceScheduler
+        blocks = EvidenceScheduler(scene.group_ids,rounds=args.candidate_rounds,policy=args.candidate_policy,
+            memory=args.evidence_memory,half_life=args.evidence_half_life,context_tv=args.context_tv,
+            finite_samples=args.finite_samples if args.finite_feedback else 0)
+    else:
+        blocks = BlockVisitScheduler(scene.group_ids)
     views = ViewWindowScheduler(scene_record['allocation_train_view_names'], args.seed+9001)
     meter = ExactDeploymentCost(model,scene,identity,args.snr,options.net_bits_per_use)
     if args.resume:
@@ -237,7 +247,11 @@ def main(args, max_updates=None):
         timings = AllocationTimings(device, bool(args.profile_every and (step==1 or step%args.profile_every==0)))
         if device.type == 'cuda': torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
-        task = MaskedMultiViewRenderTask([training[i] for i in indices],scene.reference,scene.degree,scene.white_background)
+        task_type = MaskedMultiViewRenderTask
+        if evidence:
+            from .allocation_finite import PairedMaskedRenderTask
+            task_type = PairedMaskedRenderTask
+        task = task_type([training[i] for i in indices],scene.reference,scene.degree,scene.white_background)
         audit_count = args.audit_samples if args.audit_every and step%args.audit_every==0 else 0
         result = budgeted_mask_step(model,table,scene.groups,scene.group_ids,scene.geometry,task,blocks,
             args.snr,'awgn',d_ref=reference['d_ref'],price=args.beta if fixed_rd else controller.price,
@@ -258,10 +272,20 @@ def main(args, max_updates=None):
             step_seconds=time.perf_counter()-started,**blocks.coverage(sampled_q),
             peak_allocated_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type=='cuda' else None)
         row['d_ref'] = reference['d_ref']
+        if evidence:
+            row['candidate_evaluations_this_step'] = int(blocks.last.eq(step).sum())
+            row['candidate_evaluations_per_second'] = row['candidate_evaluations_this_step']/row['step_seconds']
+            with torch.no_grad():
+                confidence = table.logits.softmax(-1).amax(-1)
+                retained = sampled_q.to(confidence.device)>0
+                row['retained_confidence_below_04'] = float((confidence[retained]<.4).double().mean()) if retained.any() else None
         if fixed_rd:
             row['rd_score_scope'] = 'single-draw training distortion + expected side-cost proxy; not deployment score'
         append_json(out/'metrics/loss.jsonl',row)
-        for audit in audits: upsert_jsonl(out/'metrics/audit.jsonl',dict(audit,step=step,event=f'{audit["source_row"]}_{audit["new_tier"]}'))
+        for audit in audits:
+            audit_row = dict(audit,step=step,event=f'{audit["source_row"]}_{audit["new_tier"]}')
+            if evidence: append_json(out/'metrics/audit.jsonl',audit_row)
+            else: upsert_jsonl(out/'metrics/audit.jsonl',audit_row)
         progress['step'] = step; progress['pending'] = []
         if step%args.control_every==0: progress['pending'].append('control')
         if step%args.validate_every==0 or step==args.allocation_steps: progress['pending'].append('calibration')
@@ -272,6 +296,12 @@ def main(args, max_updates=None):
             print(f'allocation {step}/{args.allocation_steps}: MSE={row["render_loss"]:.6g}, {coefficient}, '
                   f'sampled={row["sampled_tier_counts"]}, covered={row["evaluated_rows"]}/{len(scene.raw)}, '
                   f'sec={row["step_seconds"]:.2f}',flush=True)
+            if evidence:
+                print(f'  evidence: candidates={row["candidate_evaluations_this_step"]}, '
+                      f'per_sec={row["candidate_evaluations_per_second"]:.1f}, '
+                      f'retained_visits={row["retained_candidate_evaluations_mean"]:.2f}, '
+                      f'finite={row["finite_corrections"]}, '
+                      f'sign_errors={row["finite_sign_disagreements"]}/{row["finite_nonzero_pairs"]}',flush=True)
         updates += 1
         if max_updates is not None and updates >= max_updates:
             q=deploy(table,args); save(); return dict(status='interrupted',step=step)
@@ -287,6 +317,9 @@ def main(args, max_updates=None):
             codec_id=identity,tier_sha256=tier_hash(q),reason='identical fixed map, codec, cameras and paired noise'))
     else:
         latest_row=measure('latest',scene.test_cameras,True)
+    if evidence and args.uniform_controls:
+        for tier in (2,3):
+            measure(f'uniform_q{tier}',scene.test_cameras,map_q=torch.full_like(q,tier))
     export = out/'deployment'; export.mkdir(exist_ok=True)
     np.save(export/'latest_tiers.npy',q.numpy().astype(np.uint8),allow_pickle=False)
     np.save(export/'selected_tiers.npy',chosen_q.numpy().astype(np.uint8),allow_pickle=False)
@@ -306,6 +339,9 @@ def main(args, max_updates=None):
     json_write(export/'selection.json',result); save('final'); save()
     from .budgeted_allocation_report import summarize
     summarize(out,result=result)
+    if evidence:
+        from .allocation_evidence import summarize_evidence
+        summarize_evidence(out,selected,args.seed)
     json_write(out/'complete.json',result)
     json_write(out/'progress.json',result)
     print(json.dumps(result),flush=True)

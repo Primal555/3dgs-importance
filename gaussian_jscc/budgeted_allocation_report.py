@@ -52,13 +52,17 @@ def summarize(out, result=None):
                 evaluation_seconds=sum(r.get('evaluation_seconds',0.) for r in rows),
                 control_cost_seconds=sum(r.get('cost_seconds',0.) for r in controls))
     comparisons=[]
-    for a,b in itertools.combinations(audit,2):
-        if a['step']==b['step'] and a['source_row']==b['source_row']:
+    groups={}
+    for r in audit: groups.setdefault((r['step'],r['source_row']),[]).append(r)
+    for group in groups.values():
+        for a,b in itertools.combinations(group,2):
             comparisons.append((a['measured_delta_mse']-b['measured_delta_mse'])*
                                (a['first_order_delta_mse']-b['first_order_delta_mse'])>=0)
+    signs=[r['sign_agreement'] for r in audit if r['sign_agreement'] is not None]
     summary=dict(result=result,units='total complex channel uses',endpoints=endpoints,timing=timing,
         objective_mode='fixed_beta' if fixed_rd else 'budget',
-        audit=dict(samples=len(audit),sign_agreement=float(np.mean([r['sign_agreement'] for r in audit])) if audit else None,
+        audit=dict(samples=len(audit),sign_agreement=float(np.mean(signs)) if signs else None,
+                   informative_sign_pairs=len(signs),
                    within_point_rank_agreement=float(np.mean(comparisons)) if comparisons else None),
         scope='fixed frozen codec; calibration-selected map; source/photo metrics kept separate',
         proxies=('per-update expected/sample side cost is approximate; best_rd uses calibrated distortion and measured ten-draw deployment cost'
