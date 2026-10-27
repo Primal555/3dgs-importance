@@ -83,3 +83,34 @@ def test_incomplete_history_checkpoint_cannot_silently_resume_with_empty_slots()
     del state['structured']['tensors']['keep_mean']
     with pytest.raises(ValueError, match='history'):
         scheduler().load_state_dict(state)
+
+
+def test_repeated_coverage_checks_visit_both_alternatives_without_parity_lock():
+    s = StructuredEvidence([torch.arange(3).reshape(1, 3)])
+    ids = torch.arange(3); q = torch.ones(3, dtype=torch.long)
+    scores = torch.tensor([[0., .9, .01]]).expand(3, -1)
+    seen = [set() for _ in range(3)]
+    for step in range(1, 13):
+        for i, tier, group in risk_choices(ids, scores, q, s, 3, step):
+            seen[i].add(tier)
+            s.finite_counts[i] += 1
+            s.positive_exact_count[i, tier-1] += 1
+    assert seen == [{2, 3}, {2, 3}, {2, 3}]
+
+
+def test_risk_group_remainder_rotates_across_steps():
+    from collections import Counter
+    s = StructuredEvidence([torch.arange(9).reshape(1, 9)])
+    groups = Counter()
+    for step in (1, 2, 3):
+        choices = risk_choices(torch.arange(9), torch.tensor([[0., .9, .01]]).expand(9, -1),
+            torch.ones(9, dtype=torch.long), s, 8, step)
+        groups.update(group for i, tier, group in choices)
+    assert groups == {'boundary':8, 'uncertainty':8, 'coverage':8}
+
+
+def test_history_restore_does_not_clone_a_scene_sized_snapshot(monkeypatch):
+    s = scheduler(); state = s.state_dict()
+    def forbidden(): raise AssertionError('full history cloned only to inspect metadata')
+    monkeypatch.setattr(s, 'state_dict', forbidden)
+    s.load_state_dict(state)

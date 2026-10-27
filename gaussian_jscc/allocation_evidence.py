@@ -120,7 +120,7 @@ class EvidenceScheduler(BlockVisitScheduler):
 
     def load_state_dict(self, state):
         data = state['evidence']
-        if data['settings'] != self.state_dict()['evidence']['settings']:
+        if data['settings'] != [self.rounds, self.policy, self.memory, self.half_life, self.context_tv, self.finite_samples]:
             raise ValueError('evidence resume settings mismatch')
         super().load_state_dict(state)
         for name in ('mean', 'second', 'weight', 'observations', 'evidence_step', 'finite_counts', 'context'):

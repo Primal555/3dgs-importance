@@ -43,13 +43,14 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
     variance = (scheduler.keep_second-scheduler.keep_mean.square()).clamp_min(0).sum((1, 2)).sqrt()
     risk = variance+scheduler.error+scheduler.refresh.double()
     rotation = torch.roll(torch.arange(n), -(step % n))
+    keep_action_checks = scheduler.keep_exact_count[torch.arange(n), keep_tiers-1]
     orders = [rotation[torch.argsort(keep_delta[rotation].abs(), stable=True)],
               rotation[torch.argsort(risk[rotation], descending=True, stable=True)],
-              rotation[torch.argsort(scheduler.finite_counts[rotation], stable=True)]]
+              rotation[torch.argsort(keep_action_checks[rotation], stable=True)]]
     chosen = set()
     cursors = [0, 0, 0]
     for slot in range(keep_limit):
-        group = slot % 3
+        group = (slot+step-1) % 3
         while int(orders[group][cursors[group]]) in chosen: cursors[group] += 1
         source = int(orders[group][cursors[group]]); chosen.add(source)
         for batch, ids in enumerate(id_batches):

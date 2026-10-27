@@ -151,18 +151,22 @@ class StructuredEvidence(EvidenceScheduler):
             keep_all_tiers_ready_fraction=float(self.keep_ready(step).double().mean()),
             finite_evaluated_rows=int((self.finite_counts > 0).sum()))
 
-    def state_dict(self):
-        state = super().state_dict()
+    @staticmethod
+    def _tensor_names():
         names = ('keep_mean', 'keep_second', 'keep_weight', 'keep_observations', 'keep_step',
                  'refresh', 'error', 'keep_trust', 'tier_trust')
         names += tuple(f'{b}_{k}_{s}' for b in ('positive', 'keep') for k in ('approx', 'exact') for s in ('mean', 'count'))
+        return names
+
+    def state_dict(self):
+        state = super().state_dict()
         state['structured'] = dict(version=1, refresh_events=self.refresh_events,
-            tensors={name:getattr(self, name).clone() for name in names})
+            tensors={name:getattr(self, name).clone() for name in self._tensor_names()})
         return state
 
     def load_state_dict(self, state):
         if state.get('structured', {}).get('version') != 1: raise ValueError('structured history family mismatch')
-        expected = self.state_dict()['structured']['tensors']
+        expected = self._tensor_names()
         if set(state['structured']['tensors']) != set(expected):
             raise ValueError('incomplete structured history checkpoint')
         super().load_state_dict(state)
@@ -187,17 +191,22 @@ def risk_choices(ids, action_scores, q, scheduler, limit, step):
     boundary = boundary/(1+move)
     variance = (scheduler.second[ids]-scheduler.mean[ids].square()).clamp_min(0).sum((1, 2)).sqrt()
     risk = variance+scheduler.error[ids]+scheduler.refresh[ids].double()
+    action_counts = scheduler.positive_exact_count[ids].clone()
+    action_counts[torch.arange(len(ids)), q[ids]-1] = torch.iinfo(torch.long).max
+    least_action_checks = action_counts.amin(-1)
     rotation = torch.roll(torch.arange(len(ids)), shifts=-(step % len(ids)))
     orders = [rotation[torch.argsort(boundary[rotation], stable=True)].tolist(),
               rotation[torch.argsort(risk[rotation], descending=True, stable=True)].tolist(),
-              rotation[torch.argsort(scheduler.finite_counts[ids[rotation]], stable=True)].tolist()]
+              rotation[torch.argsort(least_action_checks[rotation], stable=True)].tolist()]
     used, result = set(), []
     for slot in range(min(limit, len(ids))):
-        group = slot % 3
+        group = (slot+step-1) % 3
         index = next(i for i in orders[group] if i not in used); used.add(index)
         if group == 2:
             alternatives = [t for t in (1, 2, 3) if t != int(q[ids[index]])]
-            tier = alternatives[(step+int(scheduler.finite_counts[ids[index]])) % 2]
+            minimum = min(int(action_counts[index, t-1]) for t in alternatives)
+            tied = [t for t in alternatives if int(action_counts[index, t-1]) == minimum]
+            tier = tied[(step+int(ids[index])) % len(tied)]
         else: tier = int(scores[index].abs().argmin())+1
         result.append((index, tier, ('boundary', 'uncertainty', 'coverage')[group]))
     return result

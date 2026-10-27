@@ -91,6 +91,10 @@ def test_full_entry_resume_calibration_selection_and_legacy_rejection(source):
         ref = full['objective_reference']; assert ref['structure_reference_fraction'] == pytest.approx(.2)
         assert full['family'] == entry.FAMILY
         assert full['progress']['frozen_codec_verified']
+        history = json.loads((out/'comparison/structured_evidence.json').read_text())
+        assert history['selected_step'] == full['progress']['best']['step']
+        assert history['primary_observation_rule'] == 'one resolved observation per action per step'
+        assert (out/'charts/structured_evidence.png').exists()
         rows = [json.loads(s) for s in (out/'metrics/validation.jsonl').read_text().splitlines()]
         for row in rows:
             assert row['source_distortion'] == pytest.approx(row['source_mse']+ref['lambda_s']*row['source_structure_error'], abs=1e-8)
@@ -114,3 +118,25 @@ def test_mse_only_kernel_uses_zero_structure_without_ssim_gradients():
     assert got['source_structure_error'] == 0
     assert got['source_distortion'] == got['source_mse']
     assert torch.count_nonzero(scheduler.mean[..., 1]) == 0
+
+
+def test_real_launcher_validates_beta_and_preflights_without_output(source):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    parent, root = source
+    bash = Path('C:/softwares/Git/bin/bash.exe')
+    if not bash.exists(): pytest.skip('Git Bash unavailable')
+    out = root/'launcher_dry'
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES='2', PYTHON_BIN=Path(sys.executable).as_posix(), PYTHONUTF8='1')
+    command = [str(bash), 'scripts/test_structured_evidence_allocation.sh', parent.as_posix(), 'truck', out.as_posix()]
+    run = subprocess.run(command+['--beta', '.1', '--calibration-views', '1', '--dry-run'],
+        env=env, capture_output=True, text=True, encoding='utf-8')
+    assert run.returncode == 0, run.stderr
+    plan = json.loads(run.stdout[run.stdout.index('{'):])
+    assert plan['version'] == entry.FAMILY and not out.exists()
+    assert plan['settings']['finite_samples'] == 32
+    assert plan['settings']['distortion'] == 'mse_ssim'
+    bad = subprocess.run(command+['--dry-run'], env=env, capture_output=True, text=True, encoding='utf-8')
+    assert bad.returncode != 0 and 'beta' in bad.stderr

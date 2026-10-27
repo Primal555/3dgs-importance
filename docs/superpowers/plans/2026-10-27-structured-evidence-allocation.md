@@ -18,28 +18,32 @@ Objective/calibration/selection consistency; stable differences; one observation
 ### Task 1: Mixed objective and paired rendering
 
 Files: allocation_distortion.py; tests/test_structured_allocation_distortion.py.
-- [ ] RED: SSIM definition, paired perturbations, calibrated/manual/MSE objectives and component gradients.
-- [ ] GREEN: fixed calibrated objective and per-camera component render task.
-- [ ] Verify focused tests; commit task files.
+- [x] RED: SSIM definition, paired perturbations, calibrated/manual/MSE objectives and component gradients.
+- [x] GREEN: fixed calibrated objective and per-camera component render task.
+- [x] Verify focused tests; commit task files.
 
 ### Task 2: Continuous histories and bounded updates
 
 Files: structured_evidence.py; tests/test_structured_allocation_history.py.
-- [ ] RED: drift preservation, decay/replay, per-tier keep readiness, exact diagnostics and log-odds bounds.
-- [ ] GREEN: component histories, refresh selection, risk scheduling, bounded mirror step.
-- [ ] Verify focused tests; commit task files.
+- [x] RED: drift preservation, decay/replay, per-tier keep readiness, exact diagnostics and log-odds bounds.
+- [x] GREEN: component histories, refresh selection, risk scheduling, bounded mirror step.
+- [x] Verify focused tests; commit task files.
 
 ### Task 3: Experiment integration and exact correction
 
 Files: structured_allocation_finite.py, structured_evidence_allocation.py; opt-in budgeted_allocation*.py hooks; tests/test_structured_allocation_integration.py.
-- [ ] RED: real small codec/toy render, replacement, uncapped q0, consistent selection, exact-resume validation.
-- [ ] GREEN: wire objective, history, correction and bounded updates into frozen-codec lifecycle.
-- [ ] Verify new and affected legacy tests; commit task files.
+- [x] RED: real small codec/toy render, replacement, uncapped q0, consistent selection, exact-resume validation.
+- [x] GREEN: wire objective, history, correction and bounded updates into frozen-codec lifecycle.
+- [x] Verify new and affected legacy tests; commit task files.
 
 ### Task 4: Launcher, reporting and final review
 
 Files: scripts/test_structured_evidence_allocation.sh; docs/structured_evidence_allocation.md; launcher/report tests.
-- [ ] RED/GREEN: launcher arguments, dry-run, numerical reports.
-- [ ] Verify CLI, shell syntax, directed affected tests and diff hygiene.
-- [ ] Fresh final reviewer; fix substantial issues with reproducing tests.
-- [ ] Commit and report implementation plus local/server verification limits.
+- [x] RED/GREEN: launcher arguments, dry-run, numerical reports.
+- [x] Verify CLI, shell syntax, directed affected tests and diff hygiene.
+- [x] Fresh final reviewer; fix substantial issues with reproducing tests.
+- [x] Commit and report implementation plus local/server verification limits (60 directed tests and 10 subtests passed; no full-scene training or remote push).
+
+## Review resolution
+
+Fresh reviewer identified one important action-coverage parity lock and two minor issues (nonrotating remainders and scene-sized snapshot cloning during restore). Each was reproduced by a failing test, fixed, and accepted by the same reviewer. Coverage now uses branch/action-specific exact counts; remainder groups rotate by step; restore validates metadata without snapshot cloning. No unresolved review findings. Full-scene CUDA speed/memory and quality remain server measurements.

@@ -377,6 +377,9 @@ def main(args, max_updates=None):
     if evidence:
         from .allocation_evidence import summarize_evidence
         summarize_evidence(out,selected,args.seed)
+    if structured:
+        from .structured_allocation_report import summarize_structured
+        summarize_structured(out,selected)
     json_write(out/'complete.json',result)
     json_write(out/'progress.json',result)
     print(json.dumps(result),flush=True)
