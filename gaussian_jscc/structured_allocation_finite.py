@@ -24,13 +24,17 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
         valid = ids >= 0; q_source[ids[valid]] = entry[0][valid.to(device)].cpu()
         offsets.append(offset); offset += int(valid.sum())
     weight = task.distortion.lambda_s
-    image = scheduler._combine(components, weight)
+    calibrated = (scheduler.preview_positive(tier_ids,components,step)
+                  if hasattr(scheduler,'preview_positive') else components.cpu())
+    calibrated_keep = (scheduler.preview_keep(keep_tiers,keep_parts,step)
+                       if hasattr(scheduler,'preview_keep') else keep_parts.cpu())
+    image = scheduler._combine(calibrated, weight)
     # Reserve one quarter for keep/drop. Unused positive capacity goes to keep,
     # unused keep capacity to positive, respecting the total render budget.
     positive_limit = min(len(tier_ids), limit-limit//4)
     keep_limit = min(n, limit-positive_limit)
     positive_limit = min(len(tier_ids), limit-keep_limit)
-    positive = risk_choices(tier_ids, image+rates, q_source, scheduler, positive_limit, step)
+    positive = risk_choices(tier_ids, image+rates.detach().cpu(), q_source, scheduler, positive_limit, step)
     interventions = [(locations[i], tier, i, 'positive', group) for i,tier,group in positive]
     # A keep comparison has one alternative, so use the same three-way compute
     # priorities directly on toggle costs. Every q0 already has gradient credit.
@@ -38,7 +42,7 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
     bits = side_proxy.get('bits_per_use', 2.)
     proxy_cost = price*(raw_rates[keep_tiers]+side_proxy['xyz_per_retained']+
                         side_proxy.get('scale_per_retained', 0.))/c_ref
-    keep_delta = scheduler._combine(keep_parts.cpu(), weight)+proxy_cost
+    keep_delta = scheduler._combine(calibrated_keep, weight)+proxy_cost
     keep_delta *= torch.where(q_source > 0, -1., 1.)
     variance = (scheduler.keep_second-scheduler.keep_mean.square()).clamp_min(0).sum((1, 2)).sqrt()
     risk = variance+scheduler.error+scheduler.refresh.double()
@@ -74,11 +78,13 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
         measured = task.delta_components(changed)
         if branch == 'positive':
             predicted = components[position, new-1].clone()*d_ref
+            calibrated_prediction = calibrated[position,new-1]*d_ref
             rate_delta = float(rates[position, new-1])
             components[position, new-1] = measured/d_ref; exact[position, new-1] = True
         else:
             sign = 1 if old == 0 else -1
             predicted = keep_parts[source].clone()*d_ref*sign
+            calibrated_prediction = calibrated_keep[source]*d_ref*sign
             # Analytic marginal side cost; actual complete packet is measured at
             # control/selection time. No compression inside these counterfactuals.
             scales = float((present_scales(alt).sum()-present_scales(q).sum())*16/bits)
@@ -88,6 +94,9 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
         measured_d = float(scheduler._combine(measured, weight))
         predicted_d = float(scheduler._combine(predicted, weight))
         real_rd, proxy_rd = measured_d/d_ref+rate_delta, predicted_d/d_ref+rate_delta
+        calibrated_rd = float(scheduler._combine(calibrated_prediction,weight))/d_ref+rate_delta
+        calibrated_agrees = (real_rd*calibrated_rd > 0
+            if abs(real_rd)>1e-14 and abs(calibrated_rd)>1e-14 else None)
         informative = abs(real_rd) > 1e-14 and abs(proxy_rd) > 1e-14
         agrees = real_rd*proxy_rd > 0 if informative else None
         scheduler.finite_counts[source] += 1
@@ -98,6 +107,9 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
             first_order_delta_distortion=predicted_d, rate_delta_cost=rate_delta,
             measured_delta_rd=real_rd, first_order_delta_rd=proxy_rd,
             sign_agreement=agrees, absolute_error=abs(real_rd-proxy_rd),
+            calibrated_delta_rd=calibrated_rd,calibrated_sign_agreement=calibrated_agrees,
+            calibrated_absolute_error=abs(real_rd-calibrated_rd),
+            calibrated_decision_regret=abs(real_rd) if calibrated_agrees is False else 0.,
             decision_regret=abs(real_rd) if agrees is False else 0., applied_to_training=True))
     stats.update(finite_corrections=len(records),
         finite_positive_corrections=sum(r['feedback_kind']=='positive' for r in records),
@@ -107,6 +119,9 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
         finite_zero_predictions=sum(abs(r['first_order_delta_rd']) <= 1e-14 for r in records),
         finite_absolute_error_mean=sum(r['absolute_error'] for r in records)/max(1,len(records)),
         finite_decision_regret_mean=sum(r['decision_regret'] for r in records)/max(1,len(records)))
+    stats.update(calibrated_sign_disagreements=sum(r['calibrated_sign_agreement'] is False for r in records),
+        calibrated_nonzero_pairs=sum(r['calibrated_sign_agreement'] is not None for r in records),
+        calibrated_decision_regret_mean=sum(r['calibrated_decision_regret'] for r in records)/max(1,len(records)))
     for branch in ('positive', 'keep'):
         subset = [r for r in records if r['feedback_kind'] == branch]
         stats[branch+'_finite_rd_sign_errors'] = sum(r['sign_agreement'] is False for r in subset)

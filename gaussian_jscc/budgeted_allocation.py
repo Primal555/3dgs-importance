@@ -122,10 +122,11 @@ def main(args, max_updates=None):
     if evidence:
         from .allocation_evidence import EvidenceScheduler
         if structured:
-            from .structured_evidence import StructuredEvidence as EvidenceScheduler
+            from .calibrated_evidence import CalibratedEvidence as EvidenceScheduler
         blocks = EvidenceScheduler(scene.group_ids,rounds=args.candidate_rounds,policy=args.candidate_policy,
             memory=args.evidence_memory,half_life=args.evidence_half_life,context_tv=args.context_tv,
             finite_samples=args.finite_samples if args.finite_feedback else 0)
+        if structured: blocks.configure_views(len(training),args.window_views)
     else:
         blocks = BlockVisitScheduler(scene.group_ids)
     views = ViewWindowScheduler(scene_record['allocation_train_view_names'], args.seed+9001)
@@ -270,6 +271,7 @@ def main(args, max_updates=None):
     while progress['step'] < args.allocation_steps:
         step = progress['step']+1
         indices = views.next(args.window_views)
+        if structured: blocks.set_view_window(indices)
         timings = AllocationTimings(device, bool(args.profile_every and (step==1 or step%args.profile_every==0)))
         if device.type == 'cuda': torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
@@ -337,6 +339,11 @@ def main(args, max_updates=None):
             if structured:
                 print(f'  mixed: D={row["source_distortion"]:.6g}, S={row["source_structure_error"]:.6g}, '
                       f'lambda_s={reference["lambda_s"]:.6g}, history_weight={row["retained_effective_evidence_mean"]:.3f}',flush=True)
+                print(f'  calibrated: ESS={row["positive_mean_effective_samples"]:.2f}, '
+                      f'trust={row["positive_mean_trust"]:.3f}, '
+                      f'reused={row["positive_correction_reused_actions"]}/{row["keep_correction_reused_actions"]}, '
+                      f'sign_errors={row.get("calibrated_sign_disagreements",0)}/{row.get("calibrated_nonzero_pairs",0)}, '
+                      f'regret={row.get("finite_decision_regret_mean",0):.3g}->{row.get("calibrated_decision_regret_mean",0):.3g}',flush=True)
         updates += 1
         if max_updates is not None and updates >= max_updates:
             q=deploy(table,args); save(); return dict(status='interrupted',step=step)

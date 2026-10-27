@@ -23,7 +23,7 @@ INIT=()
 if [[ "${RESUME:-0}" == 1 ]]; then INIT=(--resume); fi
 echo "GPU: $CUDA_VISIBLE_DEVICES; frozen codec: $RUN; scene: $SCENE; output: $OUT"
 echo 'Defaults: 2000 updates; MSE + calibrated SSIM; structural reference share 20%.'
-echo 'Continuous histories; 32 independent finite checks/update; max log-odds step 0.25.'
+echo 'V2: independent action residuals; view-limited mean uncertainty; 32 finite checks/update; log-odds cap 0.25.'
 echo 'Single-draw learning / ten-draw deployment; frozen codecs; no joint phase.'
 exec "$PYTHON" -u -m gaussian_jscc.structured_evidence_allocation \
   --run "$RUN" --scene "$SCENE" --out "$OUT" "${INIT[@]}" "$@"

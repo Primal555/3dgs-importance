@@ -9,7 +9,8 @@ from .modular_checkpoint import capture_rng
 def save_state(out, label, model, table, controller, blocks, views, progress, plan, scene_record, reference, q):
     path = Path(out)/'checkpoints'/label/'state.pt'; path.parent.mkdir(parents=True, exist_ok=True)
     family = plan['version']
-    if family not in ('budgeted_allocation_v1', 'fixed_beta_allocation_v1', 'evidence_allocation_v1', 'structured_evidence_allocation_v1'):
+    if family not in ('budgeted_allocation_v1', 'fixed_beta_allocation_v1', 'evidence_allocation_v1',
+                      'structured_evidence_allocation_v1', 'calibrated_structured_allocation_v2'):
         raise ValueError('unknown allocation checkpoint family')
     state = dict(version=1, family=family, state_dict=model.state_dict(),
         config=model.cfg.to_dict(), table=table.state_dict(),
@@ -26,7 +27,8 @@ def restore_state(path, plan, scene_record):
     if (state.get('family') != plan['version'] or state['plan'] != plan
             or state['scene_record'] != scene_record):
         raise ValueError('exact resume source/settings/scene mismatch')
-    if state['family'] in ('fixed_beta_allocation_v1','evidence_allocation_v1','structured_evidence_allocation_v1'):
+    if state['family'] in ('fixed_beta_allocation_v1','evidence_allocation_v1','structured_evidence_allocation_v1',
+                           'calibrated_structured_allocation_v2'):
         from .allocation_objective import FixedRateDistortion
         ref = state['objective_reference']
         objective = FixedRateDistortion(ref['beta'], ref['d_ref'], ref['c_ref'])
@@ -34,7 +36,7 @@ def restore_state(path, plan, scene_record):
                 or ref['c_ref'] != ref['q3_cost']['total_channel_uses']
                 or ref['d_ref'] != max(ref['d_ref_raw'], ref['d_ref_floor'])):
             raise ValueError('fixed RD checkpoint objective/reference mismatch')
-        if state['family'] == 'structured_evidence_allocation_v1':
+        if state['family'] in ('structured_evidence_allocation_v1','calibrated_structured_allocation_v2'):
             from .allocation_distortion import calibrate
             settings = plan['settings']
             expected = calibrate(ref['mse_ref'], ref['structure_ref'], mode=settings['distortion'],

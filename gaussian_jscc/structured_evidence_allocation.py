@@ -3,7 +3,7 @@ import math
 from . import evidence_allocation as previous
 from . import budgeted_allocation as engine
 
-FAMILY = 'structured_evidence_allocation_v1'
+FAMILY = 'calibrated_structured_allocation_v2'
 
 
 def parser():

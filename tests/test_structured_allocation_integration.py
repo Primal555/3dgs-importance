@@ -8,19 +8,23 @@ import torch
 from gaussian_jscc import structured_evidence_allocation as entry
 from gaussian_jscc.allocation_distortion import ComponentRenderTask, ImageDistortion
 from gaussian_jscc.structured_evidence import StructuredEvidence, BoundedMirrorTable
+from gaussian_jscc.calibrated_evidence import CalibratedEvidence
 from gaussian_jscc.budgeted_allocation_kernel import budgeted_mask_step
 from test_successive_allocation import small_successive
 from test_mask_gradient import toy_mask_render, Reference
 import test_budgeted_allocation as fixture
 
 
-def run_kernel(finite, closed=False, mode='mse_ssim'):
+def run_kernel(finite, closed=False, mode='mse_ssim', calibrated=False, device='cpu'):
     torch.set_num_threads(1); torch.manual_seed(213)
     _, geometry, features, model = small_successive(); model.eval().requires_grad_(False)
+    features = features.to(device); model = model.to(device)
     ids = [torch.arange(16).reshape(2, 8)]
-    table = BoundedMirrorTable(16, .6)
+    table = BoundedMirrorTable(16, .6).to(device)
     if closed: table.keep_logits[:, 0] = 100.; table.keep_logits[:, 1] = -100.
-    scheduler = StructuredEvidence(ids, rounds=2, finite_samples=finite, memory=False)
+    scheduler = (CalibratedEvidence if calibrated else StructuredEvidence)(ids, rounds=2, finite_samples=finite, memory=False)
+    if calibrated:
+        scheduler.configure_views(1,1); scheduler.set_view_window([0])
     obj = ImageDistortion(mode, .0125 if mode != 'mse' else 0.)
     task = ComponentRenderTask([SimpleNamespace(factor=1., source_count=16)], Reference(), 1, distortion=obj)
     before = {k:v.clone() for k,v in model.state_dict().items()}
@@ -87,13 +91,19 @@ def test_full_entry_resume_calibration_selection_and_legacy_rejection(source):
         for k,v in full['table'].items(): torch.testing.assert_close(v, resumed['table'][k], rtol=0, atol=0)
         for k,v in full['blocks']['structured']['tensors'].items():
             torch.testing.assert_close(v, resumed['blocks']['structured']['tensors'][k], rtol=0, atol=0)
+        for k,v in full['blocks']['calibrated']['tensors'].items():
+            torch.testing.assert_close(v,resumed['blocks']['calibrated']['tensors'][k],rtol=0,atol=0)
+        for branch in ('positive','keep'):
+            for k,v in full['blocks']['calibrated'][branch].items():
+                torch.testing.assert_close(v,resumed['blocks']['calibrated'][branch][k],rtol=0,atol=0)
         assert full['objective_reference'] == resumed['objective_reference']
         ref = full['objective_reference']; assert ref['structure_reference_fraction'] == pytest.approx(.2)
         assert full['family'] == entry.FAMILY
         assert full['progress']['frozen_codec_verified']
         history = json.loads((out/'comparison/structured_evidence.json').read_text())
         assert history['selected_step'] == full['progress']['best']['step']
-        assert history['primary_observation_rule'] == 'one resolved observation per action per step'
+        assert history['correction_actions']['keep'] >= 0
+        assert int(full['blocks']['calibrated']['keep']['count'].sum()) > 0
         assert (out/'charts/structured_evidence.png').exists()
         rows = [json.loads(s) for s in (out/'metrics/validation.jsonl').read_text().splitlines()]
         for row in rows:
@@ -118,6 +128,38 @@ def test_mse_only_kernel_uses_zero_structure_without_ssim_gradients():
     assert got['source_structure_error'] == 0
     assert got['source_distortion'] == got['source_mse']
     assert torch.count_nonzero(scheduler.mean[..., 1]) == 0
+
+
+def test_calibrated_kernel_keeps_exact_costs_and_rng_with_fixed_codec():
+    base, _, rng = run_kernel(0, calibrated=True)
+    got, scheduler, rng1 = run_kernel(8, calibrated=True)
+    assert torch.equal(rng,rng1)
+    assert got['view_mse'] == base['view_mse']
+    for row in got['audit']:
+        assert 'calibrated_delta_rd' in row
+        if row['feedback_kind'] == 'positive':
+            j = (got['tier_ids'] == row['source_row']).nonzero().item()
+            old,new = row['old_tier']-1,row['new_tier']-1
+            assert float(got['tier_costs'][j,new]-got['tier_costs'][j,old]) == pytest.approx(row['measured_delta_rd'],abs=1e-10)
+    assert scheduler.positive_corrections.count.sum() == got['finite_positive_corrections']
+    assert scheduler.keep_corrections.count.sum() == got['finite_keep_corrections']
+
+
+@pytest.mark.parametrize('closed,mode',[(True,'mse_ssim'),(False,'mse')])
+def test_calibrated_kernel_closed_and_mse_cases(closed,mode):
+    got,scheduler,_ = run_kernel(8,closed=closed,mode=mode,calibrated=True)
+    assert torch.isfinite(got['keep_costs']).all()
+    assert got['keep_mean_effective_samples'] > 0
+    if closed:
+        assert got['tier_ids'].numel() == 0
+        assert got['finite_keep_corrections'] == 8
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
+def test_calibrated_finite_selection_accepts_cuda_costs():
+    got,_,_ = run_kernel(8,calibrated=True,device='cuda')
+    assert got['finite_corrections'] > 0
+    assert torch.isfinite(got['tier_costs']).all()
 
 
 def test_real_launcher_validates_beta_and_preflights_without_output(source):

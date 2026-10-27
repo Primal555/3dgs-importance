@@ -269,6 +269,9 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     unit_side = side_proxy['xyz_per_retained'] + side_proxy.get('scale_per_retained', 0.)
     keep_costs = keep_image.clone()
     keep_costs[:, 1] += price*(expected_keep_payload+unit_side)/rate_normalizer
+    if hasattr(scheduler, 'calibrate_keep_update'):
+        scheduler.calibrate_keep_update(keep_costs)
+        table.keep_trust = scheduler.keep_trust
     expected = float((p*rates).sum() + (1-p[:, 0]).sum()*unit_side + side_proxy['fixed_uses'])
     sampled = float(rates[q_source.to(device)].sum()) + int((q_source>0).sum())*unit_side + side_proxy['fixed_uses']
     scheduler.record(tier_ids, side_proxy.get('step', 1))

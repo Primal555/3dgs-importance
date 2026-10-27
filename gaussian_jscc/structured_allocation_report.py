@@ -25,6 +25,15 @@ def summarize_structured(out, selected):
         keep_observations_by_positive_tier=[int(data['keep_observations'][:, i].sum()) for i in range(3)],
         exact_checks_by_branch={b:int(data[f'{b}_exact_count'].sum()) for b in ('positive', 'keep')},
         diagnostic_note='exact checks replace same-step proxy before primary accumulation; no extra primary weight')
+    if 'calibrated' in selected['blocks']:
+        calibrated = selected['blocks']['calibrated']; tensors = calibrated['tensors']
+        summary.update(primary_observation_rule='one proxy observation per action per step; exact residuals independent',
+            diagnostic_note='current exact differences override predictions; sparse action residuals persist separately',
+            positive_mean_effective_samples=stats(tensors['positive_effective_samples'][kept]),
+            keep_mean_effective_samples=stats(tensors['keep_effective_samples']),
+            positive_trust=stats(data['tier_trust'][kept]),keep_trust=stats(data['keep_trust']),
+            correction_actions={b:len(calibrated[b]['keys']) for b in ('positive','keep')},
+            correction_observations={b:int(calibrated[b]['count'].sum()) for b in ('positive','keep')})
     json_write(out/'comparison/structured_evidence.json', summary)
     rows = read_rows(out/'metrics/validation.jsonl')
     keys = ('event','step','total_channel_uses','source_mse','source_structure_error','source_distortion',
@@ -46,6 +55,10 @@ def summarize_structured(out, selected):
         axes[1].plot(steps, [r['keep_history']['mean'] for r in losses], label='Keep history effective weight / slot')
         axes[2].plot(steps, [r['finite_sign_disagreements']/max(1,r['finite_nonzero_pairs']) for r in losses],
             label='Checked mixed-RD sign mismatch fraction')
+        if 'calibrated' in selected['blocks']:
+            axes[1].plot(steps,[r['positive_mean_effective_samples'] for r in losses],label='View-limited positive ESS')
+            axes[2].plot(steps,[r.get('calibrated_sign_disagreements',0)/max(1,r.get('calibrated_nonzero_pairs',0)) for r in losses],
+                label='After persistent residual correction')
     for ax in axes: ax.legend(fontsize=8)
     axes[0].set_ylabel('Raw distortion contribution'); axes[1].set_ylabel('Decayed observations')
     axes[2].set(xlabel='Actual allocation updates', ylabel='Selected checks only')
