@@ -21,13 +21,15 @@ def summarize(out, result=None):
     rows=read_rows(out/'metrics/validation.jsonl'); losses=read_rows(out/'metrics/loss.jsonl')
     controls=read_rows(out/'metrics/control.jsonl'); audit=read_rows(out/'metrics/audit.jsonl')
     fixed_rd=result.get('objective_mode')=='fixed_beta'
-    objective=FixedRateDistortion(result['beta'],result['d_ref'],result['c_ref']) if fixed_rd else None
+    distortion_key=result.get('distortion_field','source_mse')
+    structured=distortion_key=='source_distortion'
+    objective=FixedRateDistortion(result['beta'],result['d_ref'],result['c_ref'],distortion_key) if fixed_rd else None
     for row in rows:
         if fixed_rd:
             if (row.get('objective_mode')!='fixed_beta' or row.get('beta')!=objective.beta
                     or row.get('d_ref')!=objective.d_ref or row.get('c_ref')!=objective.c_ref
                     or 'budget' in row or 'budget_feasible' in row
-                    or not math.isclose(row['rd_score'],objective.score(row['source_mse'],row['total_channel_uses']),
+                    or not math.isclose(row['rd_score'],objective.score(row[distortion_key],row['total_channel_uses']),
                                         rel_tol=1e-10,abs_tol=1e-12)):
                 raise ValueError('reported RD score/objective disagrees with measured deployment')
         elif row['budget_feasible'] != (row['total_channel_uses'] <= row['budget']):
@@ -56,8 +58,13 @@ def summarize(out, result=None):
     for r in audit: groups.setdefault((r['step'],r['source_row']),[]).append(r)
     for group in groups.values():
         for a,b in itertools.combinations(group,2):
-            comparisons.append((a['measured_delta_mse']-b['measured_delta_mse'])*
-                               (a['first_order_delta_mse']-b['first_order_delta_mse'])>=0)
+            if structured:
+                if a['feedback_kind']!=b['feedback_kind'] or a['old_tier']!=b['old_tier']: continue
+                comparisons.append((a['measured_delta_rd']-b['measured_delta_rd'])*
+                                   (a['first_order_delta_rd']-b['first_order_delta_rd'])>=0)
+            else:
+                comparisons.append((a['measured_delta_mse']-b['measured_delta_mse'])*
+                                   (a['first_order_delta_mse']-b['first_order_delta_mse'])>=0)
     signs=[r['sign_agreement'] for r in audit if r['sign_agreement'] is not None]
     summary=dict(result=result,units='total complex channel uses',endpoints=endpoints,timing=timing,
         objective_mode='fixed_beta' if fixed_rd else 'budget',
@@ -73,6 +80,13 @@ def summarize(out, result=None):
           'codec_id','tier_sha256')
     keys += (('objective_mode','beta','d_ref','c_ref','normalized_distortion','normalized_cost','rd_score')
              if fixed_rd else ('budget','budget_feasible'))
+    if structured:
+        keys += ('source_mse','source_objective_mse','source_structure_error','source_distortion','lambda_s')
+        summary['audit']['scope']='decision-risk selected independent interventions; not population error rate'
+        summary['audit']['score']='mixed distortion + marginal communication proxy'
+        summary['audit']['decision_regret_mean']=float(np.mean([r['decision_regret'] for r in audit])) if audit else None
+        summary['distortion_field']=distortion_key
+        json_write(out/'comparison/summary.json',summary)
     with (out/'comparison/endpoints.csv').open('w',encoding='utf-8-sig',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=keys);writer.writeheader()
         writer.writerows({k:r.get(k) for k in keys} for r in endpoints)

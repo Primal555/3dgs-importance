@@ -18,12 +18,21 @@ def _window(channels, device):
     return create_window(11, channels).to(device=device, dtype=torch.float64)
 
 
-def ssim_map(image, target):
+def _target_stats(target):
+    y = target.detach().clamp(0, 1).double()
+    w = _window(y.shape[-3], str(y.device))
+    my = F.conv2d(y[None], w, padding=5, groups=y.shape[-3])[0]
+    vy = F.conv2d((y*y)[None], w, padding=5, groups=y.shape[-3])[0]-my*my
+    return my, vy
+
+
+def ssim_map(image, target, target_stats=None):
     x, y = image.clamp(0, 1).double(), target.detach().clamp(0, 1).double()
     w = _window(x.shape[-3], str(x.device))
     def blur(t): return F.conv2d(t.unsqueeze(0), w, padding=5, groups=x.shape[-3])[0]
-    mx, my = blur(x), blur(y)
-    vx, vy, cov = blur(x*x)-mx*mx, blur(y*y)-my*my, blur(x*y)-mx*my
+    mx = blur(x)
+    my, vy = _target_stats(target) if target_stats is None else target_stats
+    vx, cov = blur(x*x)-mx*mx, blur(x*y)-mx*my
     return ((2*mx*my+.01**2)*(2*cov+.03**2)/
             ((mx.square()+my.square()+.01**2)*(vx+vy+.03**2)))
 
@@ -67,14 +76,17 @@ class ImageDistortion:
     def combine(self, components): return components[..., 0]+self.lambda_s*components[..., 1]
 
     def prepare(self, base, target):
-        return ssim_map(base, target).detach() if self.mode != 'mse' else None
+        if self.mode == 'mse': return None
+        stats = _target_stats(target)
+        return dict(target_stats=stats, base_map=ssim_map(base, target, stats).detach())
 
     def delta(self, image, base, target, prepared=None):
         delta = image.double()-base.double()
         mse = (2*(base.double()-target.double())*delta+delta.square()).mean()
         if self.mode == 'mse': return torch.stack((mse, mse*0))
-        old = self.prepare(base, target) if prepared is None else prepared
-        new = ssim_map(image, target)
+        cached = self.prepare(base, target) if prepared is None else prepared
+        old = cached['base_map']
+        new = ssim_map(image, target, cached['target_stats'])
         # SSIM <= 1 theoretically. Match the clamp in components also at equality.
         ds = (old-new).mean()
         if old.mean() > 1 or new.mean() > 1:

@@ -8,6 +8,7 @@ class FixedRateDistortion:
     beta: float
     d_ref: float
     c_ref: float
+    distortion_key: str = 'source_mse'
 
     def __post_init__(self):
         if not math.isfinite(self.beta) or self.beta < 0:
@@ -21,5 +22,5 @@ class FixedRateDistortion:
         return distortion/self.d_ref + self.beta*(cost/self.c_ref)
 
     def candidate_key(self, row):
-        distortion, cost = row['source_mse'], row['total_channel_uses']
+        distortion, cost = row[self.distortion_key], row['total_channel_uses']
         return self.score(distortion, cost), distortion, cost

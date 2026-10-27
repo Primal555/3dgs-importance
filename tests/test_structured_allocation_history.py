@@ -76,3 +76,10 @@ def test_exact_replaces_one_action_without_double_counting_or_marking_others():
     assert s.positive_exact_count[0].tolist() == [0, 1, 0]
     assert s.positive_approx_count[0].tolist() == [1, 1, 1]
     assert s.mean[0, 1].tolist() == [2., 4.]
+
+
+def test_incomplete_history_checkpoint_cannot_silently_resume_with_empty_slots():
+    s = scheduler(); state = s.state_dict()
+    del state['structured']['tensors']['keep_mean']
+    with pytest.raises(ValueError, match='history'):
+        scheduler().load_state_dict(state)

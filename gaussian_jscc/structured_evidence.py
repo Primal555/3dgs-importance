@@ -162,6 +162,9 @@ class StructuredEvidence(EvidenceScheduler):
 
     def load_state_dict(self, state):
         if state.get('structured', {}).get('version') != 1: raise ValueError('structured history family mismatch')
+        expected = self.state_dict()['structured']['tensors']
+        if set(state['structured']['tensors']) != set(expected):
+            raise ValueError('incomplete structured history checkpoint')
         super().load_state_dict(state)
         for name, value in state['structured']['tensors'].items():
             current = getattr(self, name)

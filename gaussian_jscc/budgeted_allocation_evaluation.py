@@ -60,6 +60,8 @@ def evaluate_map(model, scene, q, cameras, args, *, save_images=False, folder=No
     identity = dict(codec_id=model_id(model), tier_sha256=tier_hash(q), label=label,
         views=[str(c.image_name) for c in cameras], trials=args.trials, seed=args.seed,
         snr=args.snr, lpips=args.lpips, images=save_images)
+    objective = getattr(args, 'allocation_image_objective', None)
+    if objective is not None: identity['image_objective'] = objective.identity()
     folder = Path(folder) if folder is not None else None
     if folder is not None and (folder/'metrics.json').exists():
         cached = json.loads((folder/'metrics.json').read_text(encoding='utf-8'))
@@ -79,6 +81,10 @@ def evaluate_map(model, scene, q, cameras, args, *, save_images=False, folder=No
                 image = render(received, camera, scene.degree, scene.white_background)
                 source = scene.reference.get(camera, device); photo = camera.original_image[:3].to(device)
                 row = dict(trial=trial, view=str(camera.image_name))
+                if objective is not None:
+                    components = objective.components(image, source)
+                    row.update(source_objective_mse=float(components[0]), source_structure_error=float(components[1]),
+                               source_distortion=float(objective.combine(components)))
                 for prefix, target in (('source', source), ('photo', photo)):
                     row.update({prefix+'_'+k: v for k,v in image_metrics(image, target).items()})
                     row[prefix+'_lpips'] = perceptual(image, target) if perceptual is not None else None
@@ -99,5 +105,9 @@ def evaluate_map(model, scene, q, cameras, args, *, save_images=False, folder=No
     for key in ('source_mse','source_psnr','source_ssim','source_lpips','photo_mse','photo_psnr','photo_ssim','photo_lpips'):
         values = [r[key] for r in observations]
         result[key] = float(np.mean(values)) if values[0] is not None else None
+    if objective is not None:
+        for key in ('source_objective_mse', 'source_structure_error', 'source_distortion'):
+            result[key] = float(np.mean([r[key] for r in observations]))
+        result['lambda_s'] = objective.lambda_s
     if folder is not None: json_write(folder/'metrics.json', dict(identity=identity, metrics=result))
     return result

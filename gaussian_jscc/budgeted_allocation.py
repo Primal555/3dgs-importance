@@ -81,12 +81,16 @@ def main(args, max_updates=None):
     validate(args)
     fixed_rd = getattr(args, 'beta', None) is not None
     evidence = getattr(args, 'evidence_experiment', False)
+    structured = getattr(args, 'structured_evidence', False)
     if evidence:
         from .evidence_allocation import validate as validate_evidence
         validate_evidence(args)
     family = 'evidence_allocation_v1' if evidence else (RD_FAMILY if fixed_rd else FAMILY)
+    if structured:
+        from .structured_evidence_allocation import validate as validate_structured, FAMILY as structured_family
+        validate_structured(args); family = structured_family
     saved, cfg, spec, old, options, source = load_inputs(args)
-    settings = {k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device')}
+    settings = {k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device','allocation_image_objective')}
     # Keep old budget checkpoint plan identity byte-for-byte compatible.
     if not fixed_rd: settings.pop('beta', None)
     else:
@@ -110,9 +114,15 @@ def main(args, max_updates=None):
     training = [c for i,c in enumerate(scene.cameras) if i not in chosen]
     scene_record = dict(scene.record, allocation_train_view_names=[str(c.image_name) for c in training],
                          calibration_view_names=[str(c.image_name) for c in calibration])
-    table = MirrorTierTable(len(scene.raw)).to(device)
+    if structured:
+        from .structured_evidence import BoundedMirrorTable
+        table = BoundedMirrorTable(len(scene.raw), max_log_odds=args.max_log_odds).to(device)
+    else:
+        table = MirrorTierTable(len(scene.raw)).to(device)
     if evidence:
         from .allocation_evidence import EvidenceScheduler
+        if structured:
+            from .structured_evidence import StructuredEvidence as EvidenceScheduler
         blocks = EvidenceScheduler(scene.group_ids,rounds=args.candidate_rounds,policy=args.candidate_policy,
             memory=args.evidence_memory,half_life=args.evidence_half_life,context_tv=args.context_tv,
             finite_samples=args.finite_samples if args.finite_feedback else 0)
@@ -138,9 +148,18 @@ def main(args, max_updates=None):
             budget = args.budget_total_uses if args.budget_total_uses is not None else math.floor(args.budget_ratio_to_q3*full_cost['total_channel_uses'])
             if budget < 1: raise ValueError('resolved budget is less than one channel use')
         base_args = argparse.Namespace(**vars(args)); base_args.lpips = False
+        if structured:
+            from .allocation_distortion import ImageDistortion
+            base_args.allocation_image_objective = ImageDistortion(args.distortion, 0.)
         baseline = evaluate_map(model,scene,full,calibration,base_args,folder=out/'evaluation/q3_reference',label='q3_reference')
         reference = dict(q3_cost=full_cost, d_ref_raw=baseline['source_mse'],
                          d_ref=max(baseline['source_mse'],1e-12), d_ref_floor=1e-12)
+        if structured:
+            from .allocation_distortion import calibrate
+            reference.update(calibrate(baseline['source_objective_mse'], baseline['source_structure_error'],
+                mode=args.distortion, share=args.structure_share, lambda_s=args.lambda_s))
+            reference['calibration_views'] = scene_record['calibration_view_names']
+            reference['calibration_trials'] = args.trials
         if fixed_rd:
             reference.update(beta=args.beta, c_ref=full_cost['total_channel_uses'])
             controller = None
@@ -155,17 +174,23 @@ def main(args, max_updates=None):
             **{'objective_reference' if fixed_rd else 'budget_reference': reference},
             trainable_modules=[], attribute_statistics_frozen=True,
             optimizer='log-domain mirror descent; fixed N_source global gain for image and rate action costs',
-            probability_global_gain=len(scene.raw), distortion='source PLY RGB MSE',
+            probability_global_gain=len(scene.raw), distortion=args.distortion if structured else 'source PLY RGB MSE',
             allocation_training_sampling='single',deployment_draws=10,deployment_seed=args.seed,
             allocation_steps_scope='one update per multi-view window',allocation_joint_steps=0))
 
-    objective = FixedRateDistortion(args.beta,reference['d_ref'],reference['c_ref']) if fixed_rd else None
+    distortion_key = 'source_distortion' if structured else 'source_mse'
+    if structured:
+        from .allocation_distortion import ImageDistortion
+        args.allocation_image_objective = ImageDistortion(args.distortion, reference['lambda_s'])
+    objective = FixedRateDistortion(args.beta,reference['d_ref'],reference['c_ref'],distortion_key) if fixed_rd else None
     rate_normalizer = reference['c_ref'] if fixed_rd else reference['budget']
 
     def objective_fields(distortion=None, cost=None):
         if fixed_rd:
             fields = dict(objective_mode='fixed_beta', beta=objective.beta,
                           d_ref=objective.d_ref, c_ref=objective.c_ref)
+            if structured:
+                fields.update(distortion_field=distortion_key, distortion_mode=args.distortion, lambda_s=reference['lambda_s'])
             if distortion is not None and cost is not None:
                 fields.update(normalized_distortion=distortion/objective.d_ref,
                               normalized_cost=cost/objective.c_ref, rd_score=objective.score(distortion,cost))
@@ -196,7 +221,7 @@ def main(args, max_updates=None):
                               folder=out/'evaluation'/label,label=label)
         cost = meter.details(chosen_q)
         row = dict(result, **cost, step=progress['step'],event=label,
-                   **objective_fields(result['source_mse'],cost['total_channel_uses']),
+                   **objective_fields(result[distortion_key],cost['total_channel_uses']),
                    evaluation_seconds=time.perf_counter()-started)
         if not fixed_rd: row['budget_feasible'] = cost['total_channel_uses']<=reference['budget']
         upsert_jsonl(out/'metrics/validation.jsonl',row)
@@ -206,7 +231,8 @@ def main(args, max_updates=None):
         candidate = dict(step=progress['step'], source_mse=row['source_mse'],
             total_channel_uses=row['total_channel_uses'], tier_sha256=row['tier_sha256'], codec_id=identity)
         if fixed_rd:
-            candidate['rd_score'] = objective.score(row['source_mse'],row['total_channel_uses'])
+            if structured: candidate['source_distortion'] = row['source_distortion']
+            candidate['rd_score'] = objective.score(row[distortion_key],row['total_channel_uses'])
             if progress['best'] is None or objective.candidate_key(candidate) < objective.candidate_key(progress['best']):
                 progress['best'] = candidate; save('best_rd')
         elif row['budget_feasible']:
@@ -251,7 +277,11 @@ def main(args, max_updates=None):
         if evidence:
             from .allocation_finite import PairedMaskedRenderTask
             task_type = PairedMaskedRenderTask
-        task = task_type([training[i] for i in indices],scene.reference,scene.degree,scene.white_background)
+        if structured:
+            from .allocation_distortion import ComponentRenderTask
+            task_type = ComponentRenderTask
+        task = task_type([training[i] for i in indices],scene.reference,scene.degree,scene.white_background,
+                         **({'distortion':args.allocation_image_objective} if structured else {}))
         audit_count = args.audit_samples if args.audit_every and step%args.audit_every==0 else 0
         result = budgeted_mask_step(model,table,scene.groups,scene.group_ids,scene.geometry,task,blocks,
             args.snr,'awgn',d_ref=reference['d_ref'],price=args.beta if fixed_rd else controller.price,
@@ -262,6 +292,7 @@ def main(args, max_updates=None):
                          args.keep_lr,args.tier_lr,len(scene.raw))
         result.pop('keep_image_costs'); sampled_q = result.pop('q'); audits = result.pop('audit')
         timing_row = timings.summary()
+        if structured: result.update(table.update_stats)
         if device.type == 'cuda': torch.cuda.synchronize(device)
         score = (objective.score(result['render_loss'],result['expected_cost_proxy']) if fixed_rd else
                  result['render_loss']/reference['d_ref']+controller.price*(result['expected_cost_proxy']/reference['budget']-1))
@@ -293,7 +324,8 @@ def main(args, max_updates=None):
         pending()
         if step==1 or step%10==0 or step==args.allocation_steps:
             coefficient = f'beta={args.beta:.5g}' if fixed_rd else f'price={controller.price:.5g}'
-            print(f'allocation {step}/{args.allocation_steps}: MSE={row["render_loss"]:.6g}, {coefficient}, '
+            mse = row['source_mse'] if structured else row['render_loss']
+            print(f'allocation {step}/{args.allocation_steps}: MSE={mse:.6g}, {coefficient}, '
                   f'sampled={row["sampled_tier_counts"]}, covered={row["evaluated_rows"]}/{len(scene.raw)}, '
                   f'sec={row["step_seconds"]:.2f}',flush=True)
             if evidence:
@@ -302,6 +334,9 @@ def main(args, max_updates=None):
                       f'retained_visits={row["retained_candidate_evaluations_mean"]:.2f}, '
                       f'finite={row["finite_corrections"]}, '
                       f'sign_errors={row["finite_sign_disagreements"]}/{row["finite_nonzero_pairs"]}',flush=True)
+            if structured:
+                print(f'  mixed: D={row["source_distortion"]:.6g}, S={row["source_structure_error"]:.6g}, '
+                      f'lambda_s={reference["lambda_s"]:.6g}, history_weight={row["retained_effective_evidence_mean"]:.3f}',flush=True)
         updates += 1
         if max_updates is not None and updates >= max_updates:
             q=deploy(table,args); save(); return dict(status='interrupted',step=step)
@@ -328,7 +363,7 @@ def main(args, max_updates=None):
     progress['frozen_codec_verified'] = model_id(model)==identity
     status = 'complete' if fixed_rd or progress['best'] is not None else 'budget_unmet'
     result = dict(status=status,step=progress['step'],
-        **objective_fields(selected_row['source_mse'],selected_row['total_channel_uses']),
+        **objective_fields(selected_row[distortion_key],selected_row['total_channel_uses']),
         selection=chosen_label,selected_step=selected['progress']['step'],selected_total_channel_uses=selected_row['total_channel_uses'],
         selected_source_psnr=selected_row['source_psnr'],latest_total_channel_uses=latest_row['total_channel_uses'],
         codec_id=identity,tier_sha256=tier_hash(chosen_q),frozen_codec_verified=progress['frozen_codec_verified'])
