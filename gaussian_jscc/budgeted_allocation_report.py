@@ -20,6 +20,9 @@ def summarize(out, result=None):
     if result is None: result=json.loads((out/'complete.json').read_text(encoding='utf-8'))
     rows=read_rows(out/'metrics/validation.jsonl'); losses=read_rows(out/'metrics/loss.jsonl')
     controls=read_rows(out/'metrics/control.jsonl'); audit=read_rows(out/'metrics/audit.jsonl')
+    learned=result.get('family')=='learned_benefit_allocation_v1'
+    if learned: losses=[r for r in losses if r.get('phase')=='allocation']
+    def plot_step(row):return row.get('allocation_step',row['step']) if learned else row['step']
     fixed_rd=result.get('objective_mode')=='fixed_beta'
     distortion_key=result.get('distortion_field','source_mse')
     structured=distortion_key=='source_distortion'
@@ -80,6 +83,7 @@ def summarize(out, result=None):
           'codec_id','tier_sha256')
     keys += (('objective_mode','beta','d_ref','c_ref','normalized_distortion','normalized_cost','rd_score')
              if fixed_rd else ('budget','budget_feasible'))
+    if learned: keys += ('allocation_step',)
     if structured:
         keys += ('source_mse','source_objective_mse','source_structure_error','source_distortion','lambda_s')
         summary['audit']['scope']='decision-risk selected independent interventions; not population error rate'
@@ -97,10 +101,10 @@ def summarize(out, result=None):
     fig,ax=plt.subplots(figsize=(9,4));price=ax.twinx()
     if losses:
         for key,label in (('expected_cost_proxy','Single-draw expected proxy'),('sampled_cost_proxy','Sampled proxy')):
-            ax.plot([r['step'] for r in losses],[r[key] for r in losses],label=label,alpha=.7)
-        price.plot([r['step'] for r in losses],[r['beta'] if fixed_rd else r['price'] for r in losses],
+            ax.plot([plot_step(r) for r in losses],[r[key] for r in losses],label=label,alpha=.7)
+        price.plot([plot_step(r) for r in losses],[r['beta'] if fixed_rd else r['price'] for r in losses],
                    color='purple',label='Fixed beta' if fixed_rd else 'Budget price',alpha=.7)
-    if controls: ax.plot([r['step'] for r in controls],[r['total_channel_uses'] for r in controls],'k.-',label='Measured ten-draw deployment')
+    if controls: ax.plot([plot_step(r) for r in controls],[r['total_channel_uses'] for r in controls],'k.-',label='Measured ten-draw deployment')
     ax.axhline(result['c_ref'] if fixed_rd else result['budget'],color='red',linestyle='--',
                label='Full q3 reference (not a budget)' if fixed_rd else 'Explicit budget')
     ax.set(xlabel='Actual allocation updates',ylabel='Total complex channel uses')
@@ -110,11 +114,11 @@ def summarize(out, result=None):
     if fixed_rd:
         fig,ax=plt.subplots(figsize=(9,4))
         if losses:
-            ax.plot([r['step'] for r in losses],[r['loss'] for r in losses],alpha=.5,
+            ax.plot([plot_step(r) for r in losses],[r['loss'] for r in losses],alpha=.5,
                     label='Training RD proxy (single draw / training views)')
         calibration=[r for r in rows if r['event'].startswith('calibration_')]
         if calibration:
-            ax.plot([r['step'] for r in calibration],[r['rd_score'] for r in calibration],'k.-',
+            ax.plot([plot_step(r) for r in calibration],[r['rd_score'] for r in calibration],'k.-',
                     label='Measured ten-draw deployment RD (calibration views)')
         ax.set(xlabel='Actual allocation updates',ylabel='Normalized RD objective');ax.legend(fontsize=8)
         fig.tight_layout();fig.savefig(folder/'deployment_rd_score.png',dpi=160);plt.close(fig)
@@ -126,8 +130,8 @@ def summarize(out, result=None):
     fig.savefig(folder/'tier_shares.png',dpi=160);plt.close(fig)
     fig,ax=plt.subplots(figsize=(8,4))
     if losses:
-        ax.plot([r['step'] for r in losses],[r['evaluated_rows'] for r in losses],label='Original rows evaluated at least once')
-        other=ax.twinx();other.plot([r['step'] for r in losses],[r['complete_coverages'] for r in losses],color='orange')
+        ax.plot([plot_step(r) for r in losses],[r['evaluated_rows'] for r in losses],label='Original rows evaluated at least once')
+        other=ax.twinx();other.plot([plot_step(r) for r in losses],[r['complete_coverages'] for r in losses],color='orange')
         other.set_ylabel('Complete coverages over ALL source rows')
     ax.set(xlabel='Actual allocation updates',ylabel='Positive-tier candidate coverage');ax.legend();fig.tight_layout()
     fig.savefig(folder/'candidate_coverage.png',dpi=160);plt.close(fig)

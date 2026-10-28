@@ -114,7 +114,7 @@ def audit_interventions(model, features, q, positive, ids, columns, geometry, sc
 
 def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task, scheduler,
                        snr, kind, *, d_ref, price, side_proxy, timings, audit_limit=0,
-                       rate_normalizer=None, budget=None, inspector=None):
+                       rate_normalizer=None, budget=None, inspector=None, benefit=None):
     if model.training or any(p.requires_grad for p in model.parameters()):
         raise ValueError('budgeted allocation requires an eval-mode, fully frozen codec')
     if rate_normalizer is not None and budget is not None:
@@ -125,7 +125,7 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
         raise ValueError('invalid objective normalization or rate coefficient')
     device = next(model.parameters()).device
     count = len(table.logits); q_source = torch.empty(count, dtype=torch.long)
-    structured = hasattr(scheduler, 'accumulate_components')
+    structured = hasattr(scheduler, 'accumulate_components') or benefit is not None
     if structured:
         keep_tiers = torch.empty(count, dtype=torch.long)
     cache, parts, cache_bytes, q0_rows = [], [], 0, 0
@@ -163,6 +163,9 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     loss, upstream = scene_gradient(task, scene, timings)
     actual_stats = dict(getattr(task, 'stats', {}))
     if not torch.isfinite(upstream).all(): raise RuntimeError('nonfinite allocation scene gradient')
+    if benefit is not None:
+        benefit.begin(model, table, feature_batches, id_batches, cache, geometry, task, scene, q_source,
+                      d_ref, price, rate_normalizer, side_proxy, snr, kind, timings)
     keep_image = torch.zeros(count, 2, dtype=torch.float64, device=device)
     if structured:
         keep_parts = torch.zeros(count, 2, dtype=torch.float64, device=device)
@@ -201,6 +204,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                     part = torch.zeros_like(g); part[valid] = gradient[offset:offset+n]
                     keep_parts[ids[valid], j] = part[..., -1][valid].double()/d_ref
                     component_g.append(part)
+            if benefit is not None:
+                basis = benefit.batch(f, ids, entry, scene[offset:offset+n], component_g)
             for columns in rounds:
                 cols = columns[batch_index]
                 active = cols >= 0
@@ -211,6 +216,7 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                     action_rate = torch.zeros_like(action_image)
                     if structured:
                         action_parts = torch.zeros(len(rows), 3, 2, dtype=torch.float64, device=device)
+                    position_start = sum(x.numel() for x in selected)
                     block_scale_base = present_scales(q).sum(-1)
                     for tiers, delta in mixed_point_candidates(model, f, q, cols, snr, kind, geometry,
                             semantic_y=y, actual=actual, actual_rng=state, timings=timings):
@@ -224,6 +230,9 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                                 value = (part[..., :-1]*delta).sum((1, 2)).double()/d_ref
                                 action_parts[torch.arange(len(rows), device=device), tiers[rows]-1, j] = value[rows]
                         action_rate[torch.arange(len(rows), device=device), tiers[rows]-1] = price*rate_delta/rate_normalizer
+                        if benefit is not None:
+                            parts = action_parts[torch.arange(len(rows),device=device),tiers[rows]-1]
+                            benefit.positive(basis, rows, col, tiers[rows], delta, parts, position_start)
                     costs.append(action_image+action_rate); selected.append(ids[rows, col].cpu())
                     if evidence:
                         image_costs.append(action_image); rate_costs.append(action_rate)
@@ -240,7 +249,14 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     if evidence:
         images = torch.cat(image_costs) if image_costs else torch.empty(0, 3, device=device, dtype=torch.float64)
         rate_values = torch.cat(rate_costs) if rate_costs else torch.empty_like(images)
-        if structured:
+        if benefit is not None:
+            with timing(timings, 'finite_feedback_seconds'):
+                learned_costs, feedback_stats = benefit.finish(tier_ids, torch.cat(rate_costs) if rate_costs else
+                    torch.empty(0,3,device=device,dtype=torch.float64))
+            records = []
+            costs = [learned_costs]
+            keep_image[:,1] = benefit.keep_image
+        elif structured:
             from .structured_allocation_finite import correct_components
             components = torch.cat(component_costs) if component_costs else torch.empty(0, 3, 2, device=device, dtype=torch.float64)
             approximate, approximate_keep = components.clone(), keep_parts.clone()
@@ -269,6 +285,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     unit_side = side_proxy['xyz_per_retained'] + side_proxy.get('scale_per_retained', 0.)
     keep_costs = keep_image.clone()
     keep_costs[:, 1] += price*(expected_keep_payload+unit_side)/rate_normalizer
+    if benefit is not None:
+        keep_costs = benefit.keep_costs
     if hasattr(scheduler, 'calibrate_keep_update'):
         scheduler.calibrate_keep_update(keep_costs)
         table.keep_trust = scheduler.keep_trust
