@@ -7,7 +7,7 @@ import time
 
 import torch
 
-from .allocation_benefit import BenefitNetwork, group_losses
+from .allocation_benefit import BenefitNetwork
 from .allocation_benefit_learning import BenefitLearner, pack_groups
 from .allocation_benefit_report import summarize_records
 from .benefit_bias_audit import cost_audit, fit_offsets, correct_offsets, fit_thresholds
@@ -22,6 +22,7 @@ def parser():
     p.add_argument('--device',default='cpu')
     p.add_argument('--cpu-threads',type=int,default=4)
     p.add_argument('--ply',help='relocate the identical source PLY; no camera/image data required')
+    p.add_argument('--fresh-factored',action='store_true',help='train a random factored evaluator on the same replay, with fresh Adam')
     return p
 
 
@@ -45,15 +46,19 @@ def static_features(state, ply=None):
 
 def restore_learner(state, device, ply=None):
     progress=state.get('progress',{})
-    if (state.get('family')!='learned_benefit_allocation_v1' or progress.get('phase')!='pretrain'
+    if (state.get('family') not in ('learned_benefit_allocation_v1','learned_benefit_factored_v2') or progress.get('phase')!='pretrain'
             or not progress.get('pretrain_complete') or not bool(state['learner']['network']['ready'])):
         raise ValueError('diagnostics require completed learned-benefit pretraining')
     saved=state['learner'];weights=saved['network']
-    net=BenefitNetwork(*(weights[key+'_mean'].numel() for key in ('point','action','views','aux')),
+    Network,Learner=BenefitNetwork,BenefitLearner
+    if state['family']=='learned_benefit_factored_v2':
+        from .factored_benefit import FactoredBenefitNetwork,DecisionBenefitLearner
+        Network,Learner=FactoredBenefitNetwork,DecisionBenefitLearner
+    net=Network(*(weights[key+'_mean'].numel() for key in ('point','action','views','aux')),
         continuous={key:weights[key+'_continuous'] for key in ('point','action','views','aux')},
         mse_only=state['plan']['settings']['distortion']=='mse').to(device)
     lr,fit_windows,steps,batch,mask,mask_weight=saved['settings']
-    learner=BenefitLearner(net,static_source=static_features(state,ply),capacity=saved['replay']['capacity'],
+    learner=Learner(net,static_source=static_features(state,ply),capacity=saved['replay']['capacity'],
         lr=lr,fit_windows=fit_windows,updates_per_window=steps,batch_size=batch,
         mask_fraction=mask,mask_weight=mask_weight)
     learner.load_state_dict(saved)
@@ -84,7 +89,7 @@ def predict_records(learner,replay):
         rows=records[start:start+128]
         features,target,rates,conditional,groups,branches=pack_groups(rows,learner.device)
         full=learner.predict(features,branches[groups]);masked=learner.predict(features,branches[groups],masked=True)
-        losses=group_losses(full.to(target),target,rates,conditional,groups,learner.network.scales[branches])
+        losses=learner.losses(full.to(target),target,rates,conditional,groups,learner.network.scales[branches],branches)
         for branch in (0,1):
             chosen=branches==branch;sums[branch]+=float(losses[chosen].sum());counts[branch]+=int(chosen.sum())
         offset=0
@@ -117,18 +122,28 @@ def main(args):
     path=run/'checkpoints/latest/state.pt';source_digest=_file_digest(path)
     state=torch.load(path,map_location='cpu',weights_only=True)
     learner=restore_learner(state,device,args.ply);window=state['progress']['step']
-    source_updates=learner.updates;fixed_digest=_record_digest(learner)
+    source_updates=learner.updates;source_baseline=None
+    if args.fresh_factored:
+        from .factored_benefit import fresh_factored
+        train,_=predict_records(learner,learner.replay);validation,_=predict_records(learner,learner.validation)
+        source_baseline=dict(training=summarize_records(train),validation=summarize_records(validation))
+        del train,validation
+        learner=fresh_factored(learner,state['plan']['settings'].get('seed',42))
+    variant='factored' if hasattr(learner.network,'common_scale') else 'legacy'
+    initial_updates=learner.updates;fixed_digest=_record_digest(learner)
     normalization={key:value.detach().cpu().clone() for key,value in learner.network.state_dict().items()
-                   if key.endswith(('_mean','_std','_continuous')) or key in ('scales','ready')}
+                   if key.endswith(('_mean','_std','_continuous','_scale')) or key in ('scales','ready')}
     del state
     thresholds=fit_thresholds(learner.replay.records())
     out.mkdir(parents=True)
     _write(out/'settings.json',dict(source_checkpoint=str(path),source_checkpoint_sha256=source_digest,
         fixed_records_sha256=fixed_digest,source_network_updates=source_updates,frozen_source_window=window,
         additional_updates=args.updates,evaluate_every=args.evaluate_every,device=str(device),
-        loss_and_optimizer='source loss, Adam state and learning rate retained',
+        model_variant=variant,optimizer_initialization='fresh Adam' if args.fresh_factored else 'source Adam retained',
+        loss_and_optimizer='factored decision objective; source learning rate' if args.fresh_factored else 'source loss, Adam state and learning rate retained',
         new_labels=0,renderer_calls=0,probability_table_updated=False,normalization_refitted=False,
         thresholds_fitted_on='training labels only',magnitude_thresholds=thresholds))
+    if source_baseline is not None:_write(out/'source_baseline.json',source_baseline)
     started=time.perf_counter();history=[]
 
     def evaluate(update):
@@ -168,10 +183,11 @@ def main(args):
     if not unchanged:raise RuntimeError('source checkpoint changed during diagnostics')
     torch.save(dict(network={k:v.detach().cpu() for k,v in learner.network.state_dict().items()},
         source_checkpoint_sha256=source_digest,additional_updates=args.updates,
-        diagnostic_only=True,probability_table_updated=False),out/'offline_final.pt')
+        model_variant=variant,diagnostic_only=True,probability_table_updated=False),out/'offline_final.pt')
     result=dict(status='complete',additional_updates=args.updates,source_checkpoint_unchanged=unchanged,
         fixed_records_sha256=fixed_digest,training_records=len(learner.replay.groups),
         validation_records=len(learner.validation.groups),source_network_updates=source_updates,
+        initial_network_updates=initial_updates,model_variant=variant,source_baseline=source_baseline,
         before=history[0],after=history[-1],elapsed_seconds=time.perf_counter()-started,
         scope='fixed cached action distribution; does not establish deployment quality or identify a unique cause')
     _write(out/'summary.json',result);print(json.dumps({k:result[k] for k in

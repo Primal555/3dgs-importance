@@ -43,6 +43,7 @@ FAMILY = 'learned_benefit_allocation_v1'
 def parser():
     p=base_parser();p.description=__doc__;p.set_defaults(audit_every=0,audit_samples=0)
     p.add_argument('--phase',choices=('pretrain','allocation'),default='pretrain')
+    p.add_argument('--benefit-variant',choices=('legacy','factored'),default='legacy')
     for name,default in (('pretrain-windows',200),('fit-windows',50),('benefit-steps',4),
                          ('benefit-batch-size',128),('benefit-validate-every',50),
                          ('replay-capacity',65536),('chunk-size',8192),('finite-samples',32)):
@@ -80,8 +81,13 @@ def main(args,max_updates=None):
     settings={k:v for k,v in vars(args).items() if k not in
               ('out','resume','dry_run','device','phase','allocation_image_objective')}
     for key in ('budget_total_uses','budget_ratio_to_q3','initial_price','dual_lr','ema_decay'):settings.pop(key,None)
+    family=FAMILY;Network,Learner=BenefitNetwork,BenefitLearner
+    if args.benefit_variant=='factored':
+        from .factored_benefit import FAMILY as family,FactoredBenefitNetwork,DecisionBenefitLearner
+        Network,Learner=FactoredBenefitNetwork,DecisionBenefitLearner
+    else:settings.pop('benefit_variant',None)
     protocol=FeatureProtocol(len(saved['state_dict']['attr_mean']),cfg.latent_dim)
-    plan=json.loads(json.dumps(dict(version=FAMILY,source=source,spec=spec,settings=settings,
+    plan=json.loads(json.dumps(dict(version=family,source=source,spec=spec,settings=settings,
         codec_config=cfg.to_dict(),feature_protocol=protocol.identity(),writes_output=False)))
     if args.dry_run:
         print(json.dumps(plan,indent=2));return plan
@@ -103,9 +109,9 @@ def main(args,max_updates=None):
     views=ViewWindowScheduler(scene_record['allocation_train_view_names'],args.seed+9001)
     static=torch.empty(len(scene.raw),3+protocol.attr_dim)
     for f,ids in zip(scene.groups,scene.group_ids):static[ids[ids>=0]]=f[ids>=0]
-    network=BenefitNetwork(protocol.point_dim,protocol.action_dim,continuous=protocol.continuous,
+    network=Network(protocol.point_dim,protocol.action_dim,continuous=protocol.continuous,
                            mse_only=args.distortion=='mse').to(device)
-    learner=BenefitLearner(network,static_source=static,capacity=args.replay_capacity,seed=args.seed,
+    learner=Learner(network,static_source=static,capacity=args.replay_capacity,seed=args.seed,
         lr=args.benefit_lr,fit_windows=args.fit_windows,updates_per_window=args.benefit_steps,
         batch_size=args.benefit_batch_size,mask_fraction=args.mask_fraction,mask_weight=args.mask_weight)
     meter=ExactDeploymentCost(model,scene,identity,args.snr,options.net_bits_per_use)
@@ -304,7 +310,7 @@ def main(args,max_updates=None):
     chosen_table=MirrorTierTable(len(scene.raw));chosen_table.load_state_dict(selected['table'])
     np.save(export/'selected_probabilities.npy',chosen_table.probabilities(torch.arange(len(q)),args.snr).numpy(),allow_pickle=False)
     progress['frozen_codec_verified']=model_id(model)==identity
-    result=dict(status='complete',family=FAMILY,phase='allocation',step=progress['step'],allocation_step=progress['allocation_step'],
+    result=dict(status='complete',family=family,phase='allocation',step=progress['step'],allocation_step=progress['allocation_step'],
         selection='best_rd',selected_step=selected['progress']['step'],codec_id=identity,tier_sha256=tier_hash(chosen_q),
         selected_total_channel_uses=selected_row['total_channel_uses'],latest_total_channel_uses=latest_row['total_channel_uses'],
         selected_source_psnr=selected_row['source_psnr'],selection_rd_score=selected['progress']['best']['rd_score'],

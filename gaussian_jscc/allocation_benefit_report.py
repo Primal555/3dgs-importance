@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from .allocation_benefit_learning import pack_groups
+from .factored_benefit_report import keep_policy_metrics
 from .modular_experiment import json_write
 
 
@@ -99,6 +100,7 @@ def summarize_records(records,*,seed=42):
                     values.append(float(actual[choice]-actual.min()))
                 selection[name]=float(np.mean(values))
             part['three_tier_selection_regret']=selection
+            part.update(keep_policy_metrics(rows,STAGES))
         result[branch]=part
     result['scope']='selected paired actions; positive pairwise RD and conditional keep RD reported separately'
     return result

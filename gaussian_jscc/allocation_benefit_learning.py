@@ -64,19 +64,22 @@ class BenefitLearner:
         return dict(stats, network_ready=bool(self.network.ready), network_updates=self.updates,
                     replay_groups=len(self.replay.groups), validation_groups=len(self.validation.groups))
 
+    def losses(self, prediction, target, rates, conditional, groups, scales, branches):
+        return group_losses(prediction, target, rates, conditional, groups, scales)
+
     def train_step(self, step):
         records = self.replay.sample(self.batch_size, step)
         x, target, rates, conditional, groups, branches = pack_groups(records, self.device)
         scales = self.network.scales[branches]
         self.network.train()
         predicted = self.network(x, branches[groups])
-        losses = group_losses(predicted, target, rates, conditional, groups, scales)
+        losses = self.losses(predicted, target, rates, conditional, groups, scales, branches)
         mask = torch.rand(len(records), generator=self.generator)<self.mask_fraction
         if mask.any() and self.mask_weight:
             mask = mask.to(self.device);selected = mask.nonzero(as_tuple=True)[0]
             rows = mask[groups];local_groups = mask.long().cumsum(0)[groups[rows]]-1
             masked = self.network({k:v[rows] for k,v in x.items()}, branches[groups[rows]], masked=True)
-            masked_losses = group_losses(masked,target[rows],rates[rows],conditional[rows],local_groups,scales[selected])
+            masked_losses = self.losses(masked,target[rows],rates[rows],conditional[rows],local_groups,scales[selected],branches[selected])
             losses = losses+self.mask_weight*torch.zeros_like(losses).scatter(0,selected,masked_losses)
         parts = [losses[branches==index].mean() for index in (0,1) if (branches==index).any()]
         loss = torch.stack(parts).mean()

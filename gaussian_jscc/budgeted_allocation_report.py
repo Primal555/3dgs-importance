@@ -20,7 +20,7 @@ def summarize(out, result=None):
     if result is None: result=json.loads((out/'complete.json').read_text(encoding='utf-8'))
     rows=read_rows(out/'metrics/validation.jsonl'); losses=read_rows(out/'metrics/loss.jsonl')
     controls=read_rows(out/'metrics/control.jsonl'); audit=read_rows(out/'metrics/audit.jsonl')
-    learned=result.get('family')=='learned_benefit_allocation_v1'
+    learned=result.get('family') in ('learned_benefit_allocation_v1','learned_benefit_factored_v2')
     if learned: losses=[r for r in losses if r.get('phase')=='allocation']
     def plot_step(row):return row.get('allocation_step',row['step']) if learned else row['step']
     fixed_rd=result.get('objective_mode')=='fixed_beta'
