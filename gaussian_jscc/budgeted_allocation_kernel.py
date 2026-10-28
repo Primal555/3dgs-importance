@@ -114,7 +114,7 @@ def audit_interventions(model, features, q, positive, ids, columns, geometry, sc
 
 def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task, scheduler,
                        snr, kind, *, d_ref, price, side_proxy, timings, audit_limit=0,
-                       rate_normalizer=None, budget=None):
+                       rate_normalizer=None, budget=None, inspector=None):
     if model.training or any(p.requires_grad for p in model.parameters()):
         raise ValueError('budgeted allocation requires an eval-mode, fully frozen codec')
     if rate_normalizer is not None and budget is not None:
@@ -272,6 +272,14 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     if hasattr(scheduler, 'calibrate_keep_update'):
         scheduler.calibrate_keep_update(keep_costs)
         table.keep_trust = scheduler.keep_trust
+    if inspector is not None:
+        if not structured or scheduler.finite_samples:
+            raise ValueError('update inspector requires calibrated history and zero training finite replacements')
+        inspector(model=model,features=feature_batches,id_batches=id_batches,cache=cache,
+            geometry=geometry,task=task,scene=scene,scheduler=scheduler,tier_ids=tier_ids,
+            locations=locations,components=approximate,rates=rate_values,keep_parts=approximate_keep,
+            keep_tiers=keep_tiers,table=table,tier_costs=costs[0],keep_costs=keep_costs,
+            d_ref=d_ref,price=price,c_ref=rate_normalizer,side_proxy=side_proxy,snr=snr,kind=kind)
     expected = float((p*rates).sum() + (1-p[:, 0]).sum()*unit_side + side_proxy['fixed_uses'])
     sampled = float(rates[q_source.to(device)].sum()) + int((q_source>0).sum())*unit_side + side_proxy['fixed_uses']
     scheduler.record(tier_ids, side_proxy.get('step', 1))
