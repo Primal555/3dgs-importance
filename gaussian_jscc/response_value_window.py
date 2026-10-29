@@ -8,6 +8,7 @@ from .allocation_benefit_schedule import BenefitScheduler
 from .budgeted_allocation_kernel import rng_state,set_rng,raw_batches,timing
 from .optimization import preserved_rng
 from .response_value_features import depth_context,patch_views
+from .successive_codec import SuccessiveGaussianCodec
 
 
 class ResponseScheduler(BenefitScheduler):
@@ -25,15 +26,57 @@ class ResponseScheduler(BenefitScheduler):
 
 
 @torch.no_grad()
-def decode_candidates(model,f,q,columns,actual,state,geometry,snr,kind):
+def decode_candidates(model,f,q,columns,actual,state,geometry,snr,kind,*,semantic_y=None,stats=None):
+    """Four absolute states from three full-batch, paired-noise tier shifts.
+
+    Each row reuses its actual state and evaluates its other three tiers. Keep
+    full original batch shapes: selecting rows before the channel would move
+    their noise slots. Semantic caches are local to this selected-point round.
+    """
     rows=torch.arange(len(q),device=q.device);active=columns>=0
+    counts=stats if stats is not None else {}
+    counts.setdefault('candidate_codec_calls',0);counts.setdefault('candidate_semantic_calls',0)
+    if isinstance(model,SuccessiveGaussianCodec) and not model.training:
+        current=q[rows,columns.clamp_min(0)]
+        predictions=[actual]
+        if active.any():
+            with preserved_rng(f.device):
+                if semantic_y is None:
+                    semantic_y=model.semantic_encoder(f,f[...,:3],q>0)
+                    counts['candidate_semantic_calls']+=1
+                present=absent=semantic_y
+                if (active&(current==0)).any():
+                    keep=q>0;keep[rows[active],columns[active]]=True
+                    present=model.semantic_encoder(f,f[...,:3],keep)
+                    counts['candidate_semantic_calls']+=1
+                if (active&(current>0)).any():
+                    keep=q>0;keep[rows[active],columns[active]]=False
+                    absent=model.semantic_encoder(f,f[...,:3],keep)
+                    counts['candidate_semantic_calls']+=1
+            for shift in (1,2,3):
+                target=(current+shift)%4
+                alternative=q.clone();alternative[rows[active],columns[active]]=target[active]
+                y=torch.where((active&(target==0))[:,None,None],absent,present)
+                with preserved_rng(f.device):
+                    set_rng(state,f.device)
+                    predictions.append(model.forward_tier_batches(f,f[...,:3],
+                        F.one_hot(alternative,4).to(f),snr,kind,paired_noise=True,_semantic_y=y)[0])
+                counts['candidate_codec_calls']+=1
+        for tier in range(4):
+            alternative=q.clone();alternative[rows[active],columns[active]]=tier
+            relative=(tier-current)%4
+            pred=actual
+            for shift,value in enumerate(predictions[1:],1):
+                pred=torch.where((active&(relative==shift))[:,None,None],value,pred)
+            yield alternative,raw_batches(pred,geometry,model)
+        return
     for tier in range(4):
         alternative=q.clone();alternative[rows[active],columns[active]]=tier
         with preserved_rng(f.device):
             set_rng(state,f.device)
-            # The keep set can change. Recompute semantics for EVERY candidate.
             pred=model.forward_tier_batches(f,f[...,:3],F.one_hot(alternative,4).to(f),snr,kind,
                 paired_noise=True)[0]
+        counts['candidate_codec_calls']+=1
         unchanged=(q==alternative).all(-1)
         pred=torch.where(unchanged[:,None,None],actual,pred)
         yield alternative,raw_batches(pred,geometry,model)
@@ -72,11 +115,16 @@ class ResponseValueWindow:
             q=table.sample(ids.clamp_min(0),snr)[0].masked_fill(~valid,0)
             state=rng_state(device)
             with timing(timings,'actual_decode_seconds'):
-                actual=model.forward_tier_batches(f,f[...,:3],F.one_hot(q,4).to(f),snr,kind,paired_noise=True)[0]
+                semantic_y=None;semantic_args={}
+                if isinstance(model,SuccessiveGaussianCodec) and not model.training:
+                    semantic_y=model.semantic_encoder(f,f[...,:3],q>0)
+                    semantic_args['_semantic_y']=semantic_y
+                actual=model.forward_tier_batches(f,f[...,:3],F.one_hot(q,4).to(f),snr,kind,
+                    paired_noise=True,**semantic_args)[0]
                 raw=raw_batches(actual,geometry,model)
             q_source[ids[valid].cpu()]=q[valid].cpu()
             parts.append(torch.cat((raw[valid],(q[valid]>0).to(raw)[:,None]),-1))
-            cache.append((q,actual,state));offsets.append(offset);offset+=int(valid.sum())
+            cache.append((q,actual,state,semantic_y));offsets.append(offset);offset+=int(valid.sum())
         scene=torch.cat(parts);del parts
         task.baseline=[];components=[];depth_maps=[];depth_scale=max(float(geometry.span.max()),1e-6)
         for camera in task.cameras:
@@ -95,18 +143,19 @@ class ResponseValueWindow:
         order=order[torch.argsort(scheduler.keep_checks[candidates[order]],stable=True)]
         exact=set(candidates[order[:self.finite_samples//3]].tolist())
         pending=[];tier_ids=[];tier_costs=[];keep_costs=scene.new_zeros(n,2,dtype=torch.float64)
-        conditional=table.logits.softmax(-1).detach();calls=0
+        conditional=table.logits.softmax(-1).detach();decode_stats={}
         scale=scene.new_tensor([1.,task.distortion.lambda_s],dtype=torch.float64)/d_ref
         for columns in rounds:
             for batch,(features_cpu,ids_cpu,cols_cpu,entry) in enumerate(zip(features,id_batches,columns,cache)):
                 if not (cols_cpu>=0).any():continue
                 f,ids,cols=features_cpu.to(device),ids_cpu.to(device),cols_cpu.to(device)
-                q,actual,state=entry;valid=ids>=0;rows=(cols>=0).nonzero(as_tuple=True)[0];col=cols[rows]
+                q,actual,state,semantic_y=entry;valid=ids>=0;rows=(cols>=0).nonzero(as_tuple=True)[0];col=cols[rows]
                 selected=ids[rows,col];base=raw_batches(actual,geometry,model)
                 all_raw=[];neighbors=[];block_candidates=[]
                 with timing(timings,'candidate_decode_seconds'):
-                    for alternative,raw in decode_candidates(model,f,q,cols,actual,state,geometry,snr,kind):
-                        calls+=1;all_raw.append(raw[rows,col])
+                    for alternative,raw in decode_candidates(model,f,q,cols,actual,state,geometry,snr,kind,
+                            semantic_y=semantic_y,stats=decode_stats):
+                        all_raw.append(raw[rows,col])
                         neighbors.append(_neighbor_response(raw,base,valid&(q>0),cols,model.attr_std)[rows])
                         # Retain full changed blocks only for the finite-label subset.
                         snapshots={int(source):(raw[row,valid[row]].clone(),alternative[row,valid[row]].clone())
@@ -184,7 +233,7 @@ class ResponseValueWindow:
             sampled_tier_counts=torch.bincount(q_source,minlength=4).tolist(),
             benefit_exact_render_calls=renders,benefit_exact_keep_groups=len(pending),
             benefit_exact_positive_groups=2*len(pending),benefit_validation_groups=sum(r['validation'] for r in self.records),
-            benefit_network_ready=bool(self.learner.network.ready),candidate_codec_calls=calls,
+            benefit_network_ready=bool(self.learner.network.ready),**decode_stats,
             actual_codec_calls=len(cache),first_order_input=False,render_backward_calls=0,
             response_candidate_rows=len(selected),response_q0_candidate_rows=int((q_source[selected]==0).sum()),
             **scheduler.diagnostics(q_source,step))

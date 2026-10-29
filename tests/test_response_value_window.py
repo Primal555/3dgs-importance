@@ -147,7 +147,7 @@ def test_closed_points_receive_complete_paired_labels_and_only_visited_points_up
 
 def test_uniform_positive_candidates_have_exact_zero_current_state_difference():
     result,window,_=run_response_kernel()
-    assert result['candidate_codec_calls']==8
+    assert result['candidate_codec_calls']==6
     for record in window.records:
         if record['branch']=='keep' and record['old']>0:
             # Absolute values are relative to q0. Returning to the current tier

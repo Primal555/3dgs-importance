@@ -56,6 +56,28 @@ def test_response_cli_has_separate_protocol_and_rejects_first_order_masking(sour
     assert not (root/'response_dry').exists()
 
 
+def test_reference_pretraining_checkpoint_resumes_optimized_allocation_exactly(source):
+    from test_response_value_reuse import reference_candidates
+    parent,root=source;module=entry()
+    args=options(parent,root/'response_reference_resume');args.benefit_variant='response'
+    reference=options(parent,root/'response_reference');reference.benefit_variant='response'
+    with patch('gaussian_jscc.rendering.load_cameras',side_effect=response_cameras), \
+         patch('gaussian_jscc.rendering.render',side_effect=fixture.render), \
+         contextlib.redirect_stdout(io.StringIO()):
+        with patch('gaussian_jscc.response_value_window.decode_candidates',side_effect=reference_candidates):
+            module.main(args)
+            module.main(reference)
+            old=read(root/'response_reference_resume/checkpoints/latest/state.pt')
+            reference.resume=True;reference.phase='allocation';module.main(reference)
+        args.resume=True;args.phase='allocation';module.main(args)
+    expected=read(root/'response_reference/checkpoints/latest/state.pt')
+    actual=read(root/'response_reference_resume/checkpoints/latest/state.pt')
+    assert old['family']==actual['family']=='render_response_value_v1'
+    for key in ('learner','table','blocks','latest_q','state_dict'):
+        assert_nested_equal(expected[key],actual[key])
+    assert_nested_equal(old['state_dict'],actual['state_dict'])
+
+
 def test_response_launcher_forces_new_family_and_is_readonly_on_dry_run(source):
     import os
     from pathlib import Path
