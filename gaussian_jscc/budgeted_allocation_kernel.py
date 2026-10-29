@@ -123,6 +123,9 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     if (rate_normalizer is None or not math.isfinite(rate_normalizer) or rate_normalizer <= 0
             or not math.isfinite(d_ref) or d_ref <= 0 or not math.isfinite(price) or price < 0):
         raise ValueError('invalid objective normalization or rate coefficient')
+    if benefit is not None and getattr(benefit,'gradient_free',False):
+        return benefit.step(model,table,feature_batches,id_batches,geometry,task,scheduler,snr,kind,
+            d_ref=d_ref,price=price,side_proxy=side_proxy,timings=timings,rate_normalizer=rate_normalizer)
     device = next(model.parameters()).device
     count = len(table.logits); q_source = torch.empty(count, dtype=torch.long)
     structured = hasattr(scheduler, 'accumulate_components') or benefit is not None

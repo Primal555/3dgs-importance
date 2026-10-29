@@ -43,7 +43,7 @@ FAMILY = 'learned_benefit_allocation_v1'
 def parser():
     p=base_parser();p.description=__doc__;p.set_defaults(audit_every=0,audit_samples=0)
     p.add_argument('--phase',choices=('pretrain','allocation'),default='pretrain')
-    p.add_argument('--benefit-variant',choices=('legacy','factored'),default='legacy')
+    p.add_argument('--benefit-variant',choices=('legacy','factored','response'),default='legacy')
     for name,default in (('pretrain-windows',200),('fit-windows',50),('benefit-steps',4),
                          ('benefit-batch-size',128),('benefit-validate-every',50),
                          ('replay-capacity',65536),('chunk-size',8192),('finite-samples',32)):
@@ -75,6 +75,9 @@ def validate(args):
 
 
 def main(args,max_updates=None):
+    response=args.benefit_variant=='response'
+    if response:
+        args.mask_fraction=0.;args.mask_weight=0.
     validate(args)
     saved,cfg,spec,old,options,source=load_inputs(args)
     if tuple(cfg.rates)!=(0,8,24,48):raise ValueError('this experiment retains 0/8/24/48 source rates')
@@ -82,11 +85,21 @@ def main(args,max_updates=None):
               ('out','resume','dry_run','device','phase','allocation_image_objective')}
     for key in ('budget_total_uses','budget_ratio_to_q3','initial_price','dual_lr','ema_decay'):settings.pop(key,None)
     family=FAMILY;Network,Learner=BenefitNetwork,BenefitLearner
+    Protocol,Scheduler,Window,Table=FeatureProtocol,BenefitScheduler,BenefitWindow,BoundedMirrorTable
+    assess,summarize_actions,write_report=validate_network,summarize_records,write_benefit_report
     if args.benefit_variant=='factored':
         from .factored_benefit import FAMILY as family,FactoredBenefitNetwork,DecisionBenefitLearner
         Network,Learner=FactoredBenefitNetwork,DecisionBenefitLearner
+    elif response:
+        from .response_value import FAMILY as family,ResponseValueNetwork,ResponseValueLearner,ResponseProtocol,ResponseMirrorTable
+        from .response_value_window import ResponseScheduler,ResponseValueWindow
+        from .response_value_report import validate_response,summarize_response,write_response_report
+        Network,Learner,Protocol=ResponseValueNetwork,ResponseValueLearner,ResponseProtocol
+        Scheduler,Window=ResponseScheduler,ResponseValueWindow
+        Table=ResponseMirrorTable
+        assess,summarize_actions,write_report=validate_response,summarize_response,write_response_report
     else:settings.pop('benefit_variant',None)
-    protocol=FeatureProtocol(len(saved['state_dict']['attr_mean']),cfg.latent_dim)
+    protocol=Protocol(len(saved['state_dict']['attr_mean']),cfg.latent_dim)
     plan=json.loads(json.dumps(dict(version=family,source=source,spec=spec,settings=settings,
         codec_config=cfg.to_dict(),feature_protocol=protocol.identity(),writes_output=False)))
     if args.dry_run:
@@ -104,12 +117,12 @@ def main(args,max_updates=None):
     training=[c for i,c in enumerate(scene.cameras) if i not in chosen]
     scene_record=dict(scene.record,allocation_train_view_names=[str(c.image_name) for c in training],
                       calibration_view_names=[str(c.image_name) for c in calibration])
-    table=BoundedMirrorTable(len(scene.raw),max_log_odds=args.max_log_odds).to(device)
-    blocks=BenefitScheduler(scene.group_ids,seed=args.seed)
+    table=Table(len(scene.raw),max_log_odds=args.max_log_odds).to(device)
+    blocks=Scheduler(scene.group_ids,seed=args.seed)
     views=ViewWindowScheduler(scene_record['allocation_train_view_names'],args.seed+9001)
     static=torch.empty(len(scene.raw),3+protocol.attr_dim)
     for f,ids in zip(scene.groups,scene.group_ids):static[ids[ids>=0]]=f[ids>=0]
-    network=Network(protocol.point_dim,protocol.action_dim,continuous=protocol.continuous,
+    network=Network(protocol.point_dim,protocol.action_dim,view_dim=getattr(protocol,'view_dim',12),continuous=protocol.continuous,
                            mse_only=args.distortion=='mse').to(device)
     learner=Learner(network,static_source=static,capacity=args.replay_capacity,seed=args.seed,
         lr=args.benefit_lr,fit_windows=args.fit_windows,updates_per_window=args.benefit_steps,
@@ -185,15 +198,19 @@ def main(args,max_updates=None):
 
     def validate_benefit():
         if not bool(network.ready):return
-        report=validate_network(learner,progress['step'])
-        upsert_jsonl(out/'metrics/benefit_validation.jsonl',report);write_benefit_report(out,report)
+        report=assess(learner,progress['step'])
+        upsert_jsonl(out/'metrics/benefit_validation.jsonl',report);write_report(out,report)
         score=report['selection_score'];best=progress['evaluator_best']
         if progress['phase']=='pretrain' and score is not None and (best is None or score<best['score']):
             progress['evaluator_best']=dict(step=progress['step'],score=score,
                 network=cpu_copy(network.state_dict()),optimizer=cpu_copy(learner.optimizer.state_dict()))
         stages=report['positive']['stages']
-        print(f'  benefit validation: positive regret={stages["first_order"]["regret_mean"]}'
-              f'->{stages["network"]["regret_mean"]}; both_improved={report["both_branches_lower_regret"]}',flush=True)
+        if response:
+            print(f'  value validation: positive regret={stages["network"]["regret_mean"]}; '
+                  f'keep regret={report["keep"]["stages"]["network"]["regret_mean"]}; score={score}',flush=True)
+        else:
+            print(f'  benefit validation: positive regret={stages["first_order"]["regret_mean"]}'
+                  f'->{stages["network"]["regret_mean"]}; both_improved={report["both_branches_lower_regret"]}',flush=True)
 
     def pending():
         nonlocal q
@@ -233,7 +250,7 @@ def main(args,max_updates=None):
         started=time.perf_counter()
         task=ComponentRenderTask([training[i] for i in indices],scene.reference,scene.degree,scene.white_background,
                                  distortion=args.allocation_image_objective)
-        window=BenefitWindow(learner,blocks,finite_samples=args.finite_samples,chunk_size=args.chunk_size)
+        window=Window(learner,blocks,finite_samples=args.finite_samples,chunk_size=args.chunk_size)
         result=budgeted_mask_step(model,table,scene.groups,scene.group_ids,scene.geometry,task,blocks,args.snr,'awgn',
             d_ref=reference['d_ref'],price=args.beta,rate_normalizer=reference['c_ref'],
             side_proxy=dict(reference['side_proxy'],step=step,window_seed=window_seed),timings=timings,benefit=window)
@@ -262,7 +279,7 @@ def main(args,max_updates=None):
             append_json(out/'metrics/benefit_actions.jsonl',dict(action_log(record),event=str(i)))
             if record['network_ready']:ready_records.append(record)
         if ready_records:
-            upsert_jsonl(out/'metrics/benefit_prequential.jsonl',dict(summarize_records(ready_records),step=step,event='pre_label_prediction'))
+            upsert_jsonl(out/'metrics/benefit_prequential.jsonl',dict(summarize_actions(ready_records),step=step,event='pre_label_prediction'))
         progress['step']=step;progress[counter]+=1;progress['pending']=[]
         if step%args.benefit_validate_every==0 or progress[counter]==target:progress['pending'].append('benefit_validation')
         if args.phase=='allocation':
@@ -285,11 +302,12 @@ def main(args,max_updates=None):
             network.load_state_dict(best['network']);learner.optimizer.load_state_dict(best['optimizer'])
             progress['evaluator_selected']=True;progress['selected_evaluator_window']=best['step']
         progress['pretrain_complete']=True;progress['frozen_codec_verified']=model_id(model)==identity
-        report=validate_network(learner,progress['step']);write_benefit_report(out,report)
+        report=assess(learner,progress['step']);write_report(out,report)
         result=dict(status='pretrain_complete',phase='pretrain',step=progress['step'],
             network_updates=learner.updates,selected_evaluator_window=progress['selected_evaluator_window'],
-            both_branches_lower_regret=report['both_branches_lower_regret'],
             allocation_started=False,frozen_codec_verified=progress['frozen_codec_verified'])
+        if response:result['value_validation_score']=report['selection_score']
+        else:result['both_branches_lower_regret']=report['both_branches_lower_regret']
         json_write(out/'comparison/benefit_pretrain.json',dict(result,validation=report));save()
         json_write(out/'pretrain_complete.json',result);json_write(out/'progress.json',result)
         from .budgeted_allocation_report import read_rows
