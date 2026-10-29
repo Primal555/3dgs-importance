@@ -46,6 +46,59 @@ def stitch_tiles(image, tiles, rendered):
 
 
 @torch.no_grad()
+def verify_expansion_probe(device, white_background, full_renderer):
+    """Exercise new tile entries with a deterministic, visible footprint change.
+
+    The probe has its own camera and raw tensors. Real decoded blocks can
+    already cover every image tile, so their union cannot test this boundary.
+    The caller supplies the original renderer for the two independent checks.
+    """
+    from types import SimpleNamespace
+    from utils.graphics_utils import getProjectionMatrix
+    from utils.sh_utils import RGB2SH
+    device = torch.device(device)
+    camera = SimpleNamespace(image_height=64, image_width=64, FoVx=math.pi/2,
+        FoVy=math.pi/2, world_view_transform=torch.eye(4, device=device),
+        full_proj_transform=getProjectionMatrix(.01, 100., math.pi/2, math.pi/2).T.to(device).contiguous(),
+        camera_center=torch.zeros(3, device=device))
+    raw = torch.zeros(3, 14, device=device)
+    raw[:, :3] = raw.new_tensor([[-.5, -.5, 2.], [0., 0., 3.], [.8, -.7, 4.]])
+    raw[:, 3] = 2.
+    raw[:, 4:7] = raw.new_tensor([.02, .4, .2]).log()[:, None]
+    raw[:, 7] = 1.
+    raw[:, 11:14] = RGB2SH(raw.new_tensor([[.9, .15, .05], [.05, .2, .9], [.1, .8, .15]]))
+    masks = raw.new_ones(3)
+    cached = capture(raw, camera, 0, masks, white_background, backend=device.type)
+    baseline = assert_close('expansion probe baseline versus full renderer', cached.image,
+        full_renderer(raw, camera, 0, white_background, masks), atol=3e-5, rtol=3e-5)
+    changed = torch.tensor([0], device=device)
+    candidate = raw[:1].clone()
+    multiplier = 16.
+    candidate[:, 4:7] += math.log(multiplier)
+    projected = cached.project(candidate, masks[:1])
+    original_tiles = _members(cached.projected[changed], 64, 64)[0].unique()
+    enlarged_tiles = _members(projected, 64, 64)[0].unique()
+    new_tiles = enlarged_tiles[~torch.isin(enlarged_tiles, original_tiles)]
+    if not len(new_tiles):
+        raise RuntimeError('expansion probe failed to construct new tile entries')
+    affected = cached.affected_tiles(changed, projected[None].expand(4, -1, -1))
+    output = stitch_tiles(cached.image, affected, cached.render_tiles(changed, projected, affected))
+    branch = raw.clone()
+    branch[changed] = candidate
+    full_image = full_renderer(branch, camera, 0, white_background, masks)
+    image_check = assert_close('expanded footprint local image versus full renderer', output,
+                              full_image, atol=3e-5, rtol=3e-5)
+    x, y = pixel_coordinates(new_tiles, 64, halo=0)
+    new_tile_change = float((full_image[:, y, x]-cached.image[:, y, x]).abs().max())
+    if new_tile_change <= .001:
+        raise RuntimeError('expansion probe must produce a visible change in newly entered tiles')
+    return dict(scope='deterministic_expansion_probe', height=64, width=64, points=3,
+        scale_multiplier=multiplier, original_tiles=len(original_tiles), new_tiles=len(new_tiles),
+        affected_tiles=len(affected), new_tile_max_change=new_tile_change,
+        baseline=baseline, image=image_check, full_render_count=2)
+
+
+@torch.no_grad()
 def verify_group(tile_scene, ids, projected, target, full_renderer, *, lambda_s, d_ref):
     """Compare four local states and dense integrals with sequential full renders.
 
@@ -170,7 +223,7 @@ def verify_renderer(model, scene, args, reference, camera=None):
         selected = [i for i in order if float(scores_cpu[i]) > 0][:2]
         if len(selected) < 2:
             raise RuntimeError('preflight camera must see at least two populated codec blocks')
-        reports, expansion_report = [], None
+        reports = []
         for index in selected:
             batch, row, begin, end = blocks[index]
             f, ids, q, semantic, actual, noise = _decode_batch(model, scene, batch, seed, snr, device)
@@ -208,30 +261,8 @@ def verify_renderer(model, scene, args, reference, camera=None):
             report.update(batch=batch, block=row, source_id=int(ids[row, column]),
                           original_tier=int(q[row, column]), codec_checks=codec_checks)
             reports.append(report)
-            if expansion_report is None:
-                original_tiles = _members(projected[3, masks[3] > 0], cached.height, cached.width)[0].unique()
-                for multiplier in (2., 4., 8., 16.):
-                    expanded = raw[3].clone()
-                    expanded[:, 4:7] += math.log(multiplier)
-                    ep = cached.project(expanded, masks[3])
-                    enlarged_tiles = _members(ep[masks[3] > 0], cached.height, cached.width)[0].unique()
-                    new_tiles = enlarged_tiles[~torch.isin(enlarged_tiles, original_tiles)]
-                    if not len(new_tiles):
-                        continue
-                    affected = cached.affected_tiles(changed, ep[None].expand(4, -1, -1))
-                    output = stitch_tiles(cached.image, affected, cached.render_tiles(changed, ep, affected))
-                    branch = mixed.clone()
-                    branch[changed, :-1], branch[changed, -1] = expanded, masks[3]
-                    full_image = render(branch[:, :-1], camera, scene.degree, scene.white_background, branch[:, -1])
-                    expansion_report = dict(batch=batch, block=row, scale_multiplier=multiplier,
-                        new_tiles=len(new_tiles), affected_tiles=len(affected),
-                        image=assert_close('expanded footprint local image versus full renderer',
-                                           output, full_image, atol=3e-5, rtol=3e-5))
-                    del branch, output, full_image
-                    break
             del raw, masks, projected, ids, q, tiers
-        if expansion_report is None:
-            raise RuntimeError('preflight could not exercise a candidate entering a new tile on this camera')
+        expansion_report = verify_expansion_probe(device, scene.white_background, render)
         torch.cuda.synchronize(device)
         return dict(version=1, status='passed', backend='cuda', extension='maskgaussian_pixel_local_v1',
             camera=str(getattr(camera, 'image_name', 'unnamed')), height=cached.height, width=cached.width,
@@ -239,7 +270,7 @@ def verify_renderer(model, scene, args, reference, camera=None):
             seed=seed, snr=snr, original_lambda_s=lambda_s, diagnostic_lambda_s=diagnostic_weight, d_ref=d_ref,
             actual_decode_seconds=decode_seconds, capture_seconds=capture_seconds,
             total_seconds=time.perf_counter()-started, baseline=baseline_check, groups=reports,
-            expansion=expansion_report, full_render_count=2+4*len(reports),
+            expansion=expansion_report, full_render_count=1+4*len(reports)+expansion_report['full_render_count'],
             cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(device))
 
 

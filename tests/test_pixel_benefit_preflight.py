@@ -102,6 +102,43 @@ def test_real_frozen_codec_reconstruction_has_deterministic_original_noise_slots
         torch.set_num_threads(threads)
 
 
+@pytest.mark.parametrize('white', [False, True])
+def test_expansion_probe_covers_new_tiles_and_matches_full_compositing(white):
+    from gaussian_jscc.pixel_local_renderer import capture
+    module = preflight()
+    def full(raw, camera, degree, white_background, existence):
+        return capture(raw, camera, degree, existence, white_background, backend='cpu').image
+    before = torch.get_rng_state()
+    report = module.verify_expansion_probe(torch.device('cpu'), white, full)
+    assert report['original_tiles'] == 1
+    assert report['new_tiles'] > 0
+    assert report['new_tile_max_change'] > .001
+    assert report['image']['max_absolute_error'] < 1e-6
+    assert report['baseline']['max_absolute_error'] < 1e-6
+    assert torch.equal(before, torch.get_rng_state())
+
+
+def test_expansion_probe_rejects_renderer_that_omits_new_footprint():
+    from gaussian_jscc.pixel_local_renderer import capture
+    module = preflight()
+    initial = None
+    def stuck(raw, camera, degree, white_background, existence):
+        nonlocal initial
+        if initial is None:
+            initial = capture(raw, camera, degree, existence, white_background, backend='cpu').image
+        return initial
+    with pytest.raises(RuntimeError, match='expanded footprint'):
+        module.verify_expansion_probe(torch.device('cpu'), False, stuck)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA expansion probe requires GPU')
+def test_cuda_expansion_probe_matches_original_renderer():
+    from gaussian_jscc.rendering import render
+    report = preflight().verify_expansion_probe(torch.device('cuda'), False, render)
+    assert report['new_tiles'] > 0
+    assert report['new_tile_max_change'] > .001
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA mask requires GPU')
 def test_cpu_teacher_density_accepts_cuda_valid_mask():
     from gaussian_jscc.pixel_benefit import integrate_density

@@ -32,6 +32,8 @@
 
 首次运行会单独编译 CUDA 扩展，需要现有 mask rasterizer 源码、CUDA 编译环境和 Ninja。随后使用真实场景检查局部渲染与原渲染器、候选配对解码、密集标签积分的一致性。结果保存为 `preflight.json`；任何检查失败都会停止训练。
 
+新增图块覆盖使用独立的 64×64 三高斯样例检查，并验证新增区域确实产生像素变化。真实场景的两个编解码块仍执行四档全图对照。该样例避免真实块已经覆盖全部图块时无法构造扩展测试，图像与失真误差阈值保持不变。
+
 ```bash
 cd /data/home/zhangyueheng/projects/3dgs-importance
 conda activate maskgs
