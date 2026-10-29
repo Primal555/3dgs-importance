@@ -73,6 +73,9 @@ def validate_response(learner,step):
     result.update(step=step,event='benefit_validation',network_updates=learner.updates,
         network_ready=bool(learner.network.ready),selection_score=score,
         split='heldout Morton blocks; labels excluded from training')
+    if hasattr(learner.network,'pair_scale'):
+        result['supervision_scales']={key:getattr(learner.network,key+'_scale').detach().cpu().tolist()
+                                      for key in ('common','centered','pair')}
     return result
 
 

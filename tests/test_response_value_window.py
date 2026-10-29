@@ -85,13 +85,18 @@ def test_high_resolution_random_thin_rotations_have_finite_response_patches():
     assert torch.isfinite(values).all()
 
 
-def run_response_kernel(closed=False,label_scale=1):
+def run_response_kernel(closed=False,label_scale=1,visible=False):
     from unittest.mock import patch
     from test_successive_allocation import small_successive
     from test_mask_gradient import Reference,toy_mask_render
     from gaussian_jscc.allocation_distortion import ComponentRenderTask,ImageDistortion
     from gaussian_jscc.response_value import ResponseProtocol,ResponseValueNetwork,ResponseValueLearner,ResponseMirrorTable
     from gaussian_jscc.response_value_window import ResponseScheduler,ResponseValueWindow
+    if visible:
+        from gaussian_jscc.visible_response import VisibleResponseProtocol as ResponseProtocol
+        from gaussian_jscc.visible_response import VisibleResponseNetwork as ResponseValueNetwork
+        from gaussian_jscc.visible_response import VisibleResponseLearner as ResponseValueLearner
+        from gaussian_jscc.response_value_window import VisibleResponseWindow as ResponseValueWindow
     from gaussian_jscc.budgeted_allocation_kernel import budgeted_mask_step
     torch.set_num_threads(1);torch.manual_seed(18)
     _,geometry,f,model=small_successive();model.eval().requires_grad_(False)

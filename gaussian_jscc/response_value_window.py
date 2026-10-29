@@ -98,6 +98,8 @@ def _neighbor_response(raw,baseline,valid,columns,attr_std):
 
 class ResponseValueWindow:
     gradient_free=True
+    visible_response=False
+    feature_protocol='response_patch_values_v1'
 
     def __init__(self,learner,scheduler,*,finite_samples=32,chunk_size=8192):
         self.learner,self.scheduler=learner,scheduler
@@ -133,6 +135,11 @@ class ResponseValueWindow:
                 target=task.reference.get(camera,device);components.append(task.distortion.components(image,target))
                 task.baseline.append((image.detach(),target.detach(),task.distortion.prepare(image,target)))
                 depth_maps.append(depth_context(scene,camera,task.degree,render,depth_scale))
+        visibility_context=[]
+        if self.visible_response:
+            from .visible_response_features import layer_context
+            with timing(timings,'visibility_context_seconds'):
+                visibility_context=[layer_context(scene,c,task.degree,render) for c in task.cameras]
         mean=torch.stack(components).mean(0)
         loss=float(task.distortion.combine(mean))
         rounds=scheduler.response_rounds(step)
@@ -151,17 +158,21 @@ class ResponseValueWindow:
                 f,ids,cols=features_cpu.to(device),ids_cpu.to(device),cols_cpu.to(device)
                 q,actual,state,semantic_y=entry;valid=ids>=0;rows=(cols>=0).nonzero(as_tuple=True)[0];col=cols[rows]
                 selected=ids[rows,col];base=raw_batches(actual,geometry,model)
-                all_raw=[];neighbors=[];block_candidates=[]
+                all_raw=[];neighbors=[];block_candidates=[];visible_raw=[];visible_q=[]
                 with timing(timings,'candidate_decode_seconds'):
                     for alternative,raw in decode_candidates(model,f,q,cols,actual,state,geometry,snr,kind,
                             semantic_y=semantic_y,stats=decode_stats):
                         all_raw.append(raw[rows,col])
+                        if self.visible_response:
+                            visible_raw.append(raw[rows]);visible_q.append(alternative[rows])
                         neighbors.append(_neighbor_response(raw,base,valid&(q>0),cols,model.attr_std)[rows])
                         # Retain full changed blocks only for the finite-label subset.
                         snapshots={int(source):(raw[row,valid[row]].clone(),alternative[row,valid[row]].clone())
                             for source,row in zip(selected.cpu().tolist(),rows.cpu().tolist()) if source in exact}
                         block_candidates.append(snapshots)
                 raw_candidates=torch.stack(all_raw,1)
+                if self.visible_response:
+                    visible_raw=torch.stack(visible_raw,1);visible_q=torch.stack(visible_q,1)
                 action_tail=torch.cat((((raw_candidates[...,3:]-model.attr_mean)/model.attr_std).flatten(1),
                     torch.stack(neighbors,1).flatten(1)),1)
                 rates=keep_rates(q,valid,model.cfg.rates,xyz=side_proxy['xyz_per_retained'],
@@ -177,6 +188,12 @@ class ResponseValueWindow:
                         x=dict(point=point,action=torch.cat((selectors,action_tail[start:stop]),1),
                             views=patch_views(raw_candidates[start:stop],task.cameras,task.baseline,depth_maps,task.degree,depth_scale),
                             aux=f.new_zeros(len(r),15),available=f.new_zeros(len(r),1))
+                    if self.visible_response:
+                        from .visible_response_features import visible_block_views
+                        with timing(timings,'visibility_features_seconds'):
+                            extra=visible_block_views(visible_raw[start:stop],visible_q[start:stop],c,
+                                task.cameras,task.baseline,visibility_context,task.degree)
+                            x['views']=torch.cat((x['views'],extra),-1)
                     with timing(timings,'benefit_inference_seconds'):
                         values=self.learner.network.values(x).double()
                     costs=values[:,1:].sum(-1)+rates[start:stop]
@@ -202,7 +219,7 @@ class ResponseValueWindow:
             validation=bool(scheduler.validation[source]);x=item['features']
             common=dict(source=source,step=step,validation=validation,group='complete_four_state',
                 views=[str(c.image_name) for c in task.cameras],noise_seed=side_proxy.get('window_seed'),
-                feature_protocol='response_patch_values_v1',applied_to_training=not validation)
+                feature_protocol=self.feature_protocol,applied_to_training=not validation)
             def record(branch,origin,new):
                 count=len(new);inputs={k:v.expand(count,*v.shape[1:]).clone() for k,v in x.items()}
                 inputs['action'][:,:12]=0
@@ -235,5 +252,12 @@ class ResponseValueWindow:
             benefit_exact_positive_groups=2*len(pending),benefit_validation_groups=sum(r['validation'] for r in self.records),
             benefit_network_ready=bool(self.learner.network.ready),**decode_stats,
             actual_codec_calls=len(cache),first_order_input=False,render_backward_calls=0,
+            **(dict(visibility_context_render_calls=sum(c['render_calls'] for c in visibility_context))
+               if self.visible_response else {}),
             response_candidate_rows=len(selected),response_q0_candidate_rows=int((q_source[selected]==0).sum()),
             **scheduler.diagnostics(q_source,step))
+
+
+class VisibleResponseWindow(ResponseValueWindow):
+    visible_response=True
+    feature_protocol='visible_response_patch_values_v1'

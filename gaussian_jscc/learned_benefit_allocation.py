@@ -43,7 +43,7 @@ FAMILY = 'learned_benefit_allocation_v1'
 def parser():
     p=base_parser();p.description=__doc__;p.set_defaults(audit_every=0,audit_samples=0)
     p.add_argument('--phase',choices=('pretrain','allocation'),default='pretrain')
-    p.add_argument('--benefit-variant',choices=('legacy','factored','response'),default='legacy')
+    p.add_argument('--benefit-variant',choices=('legacy','factored','response','response_visible'),default='legacy')
     for name,default in (('pretrain-windows',200),('fit-windows',50),('benefit-steps',4),
                          ('benefit-batch-size',128),('benefit-validate-every',50),
                          ('replay-capacity',65536),('chunk-size',8192),('finite-samples',32)):
@@ -75,7 +75,7 @@ def validate(args):
 
 
 def main(args,max_updates=None):
-    response=args.benefit_variant=='response'
+    response=args.benefit_variant in ('response','response_visible')
     if response:
         args.mask_fraction=0.;args.mask_weight=0.
     validate(args)
@@ -98,6 +98,11 @@ def main(args,max_updates=None):
         Scheduler,Window=ResponseScheduler,ResponseValueWindow
         Table=ResponseMirrorTable
         assess,summarize_actions,write_report=validate_response,summarize_response,write_response_report
+        if args.benefit_variant=='response_visible':
+            from .visible_response import FAMILY as family,VisibleResponseNetwork,VisibleResponseLearner,VisibleResponseProtocol
+            from .response_value_window import VisibleResponseWindow
+            Network,Learner=VisibleResponseNetwork,VisibleResponseLearner
+            Protocol,Window=VisibleResponseProtocol,VisibleResponseWindow
     else:settings.pop('benefit_variant',None)
     protocol=Protocol(len(saved['state_dict']['attr_mean']),cfg.latent_dim)
     plan=json.loads(json.dumps(dict(version=family,source=source,spec=spec,settings=settings,
