@@ -30,7 +30,7 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
 
     def forward_channel_batches(self,features,xyz,choices,snr,kind='awgn',paired_noise=False,*,
                                 tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None,
-                                _semantic_y=None):
+                                _semantic_y=None,_channel_noise=None):
         if features.ndim!=3 or choices.shape!=(*features.shape[:2],4):raise ValueError('invalid original batched choices')
         q=choices.argmax(-1)
         if choices.requires_grad or not torch.equal(choices,F.one_hot(q,4).to(choices)):
@@ -40,11 +40,19 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
         y=self.semantic_encoder(features,xyz,q>0) if _semantic_y is None else _semantic_y
         signal,scales=self.channel_encoder(y,q,self.resolve_condition_snr(snr,tx_condition_snr),self.channel_decoder)
         mask=prefix_mask(q.flatten(),self.cfg.rates).reshape_as(signal)
+        if _channel_noise is not None and (not paired_noise or kind!='awgn'):
+            raise ValueError('explicit additive noise requires paired AWGN')
         if paired_noise:
             width=self.cfg.rates[-1] if noise_reference_symbols is None else noise_reference_symbols
             if type(width) is not int or width<self.cfg.rates[-1]:raise ValueError('noise reference shorter than payload')
             padded=F.pad(signal,(0,2*width-signal.shape[-1]))
-            noisy=channel(padded.reshape(-1,2),snr,kind).reshape_as(padded)
+            if _channel_noise is None:
+                noisy=channel(padded.reshape(-1,2),snr,kind).reshape_as(padded)
+            else:
+                if (_channel_noise.shape!=padded.shape or _channel_noise.device!=padded.device or
+                    _channel_noise.dtype!=padded.dtype or not torch.isfinite(_channel_noise).all()):
+                    raise ValueError('explicit noise must match the finite full paired payload')
+                noisy=padded+_channel_noise
             received=noisy[...,:signal.shape[-1]]*mask
         else:
             noisy=channel(signal[mask].reshape(-1,2),snr,kind)
@@ -59,10 +67,10 @@ class SuccessiveGaussianCodec(ModularGaussianCodec):
 
     def forward_tier_batches(self,features,xyz,choices,snr,kind='awgn',paired_noise=False,*,
                              tx_condition_snr=None,rx_condition_snr=None,noise_reference_symbols=None,
-                             _semantic_y=None):
+                             _semantic_y=None,_channel_noise=None):
         _,y_hat,q=self.forward_channel_batches(features,xyz,choices,snr,kind,paired_noise,
             tx_condition_snr=tx_condition_snr,rx_condition_snr=rx_condition_snr,
-            noise_reference_symbols=noise_reference_symbols,_semantic_y=_semantic_y)
+            noise_reference_symbols=noise_reference_symbols,_semantic_y=_semantic_y,_channel_noise=_channel_noise)
         result=self.decode_representation(y_hat,q,delivered_positions(features[...,:3],q,self.cfg))
         return result,result[...,:3],(q>0).to(features)
 
