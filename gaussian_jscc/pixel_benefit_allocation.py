@@ -127,7 +127,10 @@ def preflight(model, scene, camera, args, reference):
     return verify_renderer(model, scene, args, reference, camera=camera)
 
 
-def main(args, max_updates=None):
+def main(args, max_updates=None, *, family=None, learner_factory=None, window_factory=None, preflight_fn=None):
+    family = family or FAMILY
+    window_factory = window_factory or PixelWindow
+    preflight_fn = preflight_fn or preflight
     validate(args)
     saved, cfg, spec, old, options, source = load_inputs(args)
     if tuple(cfg.rates) != (0, 8, 24, 48):
@@ -136,7 +139,7 @@ def main(args, max_updates=None):
                 ('out', 'resume', 'dry_run', 'device', 'phase', 'allocation_image_objective')}
     for key in ('budget_total_uses', 'budget_ratio_to_q3', 'initial_price', 'dual_lr', 'ema_decay'):
         settings.pop(key, None)
-    plan = json.loads(json.dumps(dict(version=FAMILY, source=source, spec=spec, settings=settings,
+    plan = json.loads(json.dumps(dict(version=family, source=source, spec=spec, settings=settings,
                                      codec_config=cfg.to_dict(), writes_output=False)))
     if args.dry_run:
         print(json.dumps(plan, indent=2))
@@ -170,17 +173,18 @@ def main(args, max_updates=None):
     views = ViewWindowScheduler(scene_record['allocation_train_view_names'], args.seed+9001)
     replay = PixelReplay(out/'replay', seed=args.seed+123, max_groups=args.replay_capacity,
                          validation_groups=args.validation_capacity)
-    learner = PixelLearner(replay, device, hidden=args.hidden, lr=args.benefit_lr, tile_batch=args.tile_batch)
+    learner = (learner_factory(replay, device, args) if learner_factory else
+               PixelLearner(replay, device, hidden=args.hidden, lr=args.benefit_lr, tile_batch=args.tile_batch))
     meter = ExactDeploymentCost(model, scene, identity, args.snr, options.net_bits_per_use)
     if args.resume:
         state = torch.load(latest, map_location='cpu', weights_only=True)
-        if state['plan'] != plan or state['scene_record'] != scene_record or state['family'] != FAMILY:
+        if state['plan'] != plan or state['scene_record'] != scene_record or state['family'] != family:
             raise ValueError('exact resume source/settings/scene mismatch')
         model.load_state_dict(state['state_dict']); table.load_state_dict(state['table'])
         blocks.load_state_dict(state['blocks']); views.load_state_dict(state['views'])
         replay.load_state_dict(state['replay']); learner.load_state_dict(state['learner'])
         reference, progress, q = state['objective_reference'], state['progress'], state['latest_q']
-        window = PixelWindow(model, scene, table, blocks, reference, args)
+        window = window_factory(model, scene, table, blocks, reference, args)
         window.load_state_dict(state['window'])
         repair(out, progress['step']); restore_rng(state['rng'])
     else:
@@ -197,12 +201,12 @@ def main(args, max_updates=None):
         q = deploy(table, args)
         progress = dict(step=0, phase='pretrain', pretrain_windows_done=0, allocation_step=0,
                         pretrain_complete=False, pending=['initial'])
-        window = PixelWindow(model, scene, table, blocks, reference, args)
+        window = window_factory(model, scene, table, blocks, reference, args)
         json_write(out/'plan.json', plan)
         json_write(out/'training.json', dict(plan, **scene_record, objective_reference=reference,
                                             deployment_draws=10, deployment_seed=args.seed))
     with preserved_rng(device):
-        preflight_result = preflight(model, scene, training[0], args, reference)
+        preflight_result = preflight_fn(model, scene, training[0], args, reference)
     json_write(out/'preflight.json', preflight_result)
     args.allocation_image_objective = ImageDistortion(args.distortion, reference['lambda_s'])
 
@@ -210,7 +214,7 @@ def main(args, max_updates=None):
     def save(label='latest'):
         if model_id(model) != identity:
             raise RuntimeError('frozen codec changed')
-        state = dict(version=1, family=FAMILY, state_dict=model.state_dict(), table=table.state_dict(),
+        state = dict(version=1, family=family, state_dict=model.state_dict(), table=table.state_dict(),
             blocks=blocks.state_dict(), views=views.state_dict(), learner=learner.state_dict(),
             replay=replay.state_dict(), window=window.state_dict(), progress=dict(progress), plan=plan,
             scene_record=scene_record, objective_reference=reference, latest_q=q.detach().cpu(), rng=capture_rng())
@@ -337,7 +341,7 @@ def main(args, max_updates=None):
     np.save(export/'latest_tiers.npy', q.cpu().numpy().astype(np.uint8), allow_pickle=False)
     probabilities = table.probabilities(torch.arange(len(q), device=device), args.snr).detach().cpu().numpy()
     np.save(export/'latest_probabilities.npy', probabilities, allow_pickle=False)
-    result = dict(status='complete', family=FAMILY, phase='allocation', step=progress['step'],
+    result = dict(status='complete', family=family, phase='allocation', step=progress['step'],
                   allocation_step=progress['allocation_step'], network_updates=learner.updates,
                   tier_sha256=tier_hash(q), frozen_codec_verified=model_id(model) == identity)
     save('final'); save(); json_write(out/'complete.json', result)

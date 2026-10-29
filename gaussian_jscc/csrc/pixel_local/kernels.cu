@@ -70,6 +70,70 @@ __global__ void composite_tiles(const float* base, const float* candidate,
     for (int ch = 0; ch < 3; ++ch)
         output[(slot*3+ch)*256+lane] = valid ? color[ch]+trans*background : 0.f;
 }
+
+__global__ void visibility_tiles(const float* points, const int64_t* ranges,
+    const int64_t* entries, const float* image, const float* target,
+    int height, int width, float* output) {
+    const int tile=blockIdx.x, lane=threadIdx.x, gx=(width+15)/16;
+    const int x=(tile%gx)*16+lane%16, y=(tile/gx)*16+lane/16;
+    const bool valid=x<width && y<height;
+    bool done=!valid;
+    float trans=1.f, ref[3]={0.f,0.f,0.f}, residual[3]={0.f,0.f,0.f};
+    if (valid) for (int c=0;c<3;++c) {
+        ref[c]=target[(c*height+y)*width+x];
+        residual[c]=image[(c*height+y)*width+x]-ref[c];
+    }
+    __shared__ float shared[256][12];
+    __shared__ int64_t ids[256];
+    const int64_t begin=ranges[2*tile], end=ranges[2*tile+1];
+    for (int64_t first=begin;first<end;first+=256) {
+        // Hidden contributors still need unoccluded footprint mass.
+        if (first+lane<end) {
+            ids[lane]=entries[first+lane];
+            for (int c=0;c<12;++c) shared[lane][c]=points[12*ids[lane]+c];
+        }
+        __syncthreads();
+        const int count=static_cast<int>((end-first)<256 ? end-first : 256);
+        // Every lane participates in each reduction, including terminated pixels.
+        for (int j=0;j<count;++j) {
+            const float* p=shared[j];
+            float w=0.f, alpha_mass=0.f, accepted=0.f;
+            if (valid) {
+                const float dx=p[0]-float(x), dy=p[1]-float(y);
+                const float power=-.5f*(p[3]*dx*dx+p[5]*dy*dy)-p[4]*dx*dy;
+                if (power<=0.f) {
+                    const float alpha=min(.99f,p[6]*exp(power));
+                    if (alpha>=1.f/255.f) {
+                        alpha_mass=alpha;
+                        if (!done) {
+                            const float next=trans*(1.f-p[7]*alpha);
+                            if (next<.0001f) done=true;
+                            else { w=alpha*trans; accepted=1.f; trans=next; }
+                        }
+                    }
+                }
+            }
+            float values[12]={w,w*p[7],w*w,w,alpha_mass,
+                w*ref[0],w*ref[1],w*ref[2],w*residual[0],w*residual[1],w*residual[2],accepted};
+            if (!__any_sync(0xffffffff,alpha_mass>0.f)) continue;
+            #pragma unroll
+            for (int c=0;c<12;++c) {
+                float v=values[c];
+                for (int offset=16;offset;offset/=2) {
+                    const float other=__shfl_down_sync(0xffffffff,v,offset);
+                    v=c==3 ? fmaxf(v,other) : v+other;
+                }
+                if ((lane&31)==0 && v!=0.f) {
+                    float* dest=output+12*ids[j]+c;
+                    // All peak weights are nonnegative; IEEE float order matches int order.
+                    if (c==3) atomicMax(reinterpret_cast<int*>(dest),__float_as_int(v));
+                    else atomicAdd(dest,v);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
 }
 
 torch::Tensor pixel_project_cuda(torch::Tensor xyz, torch::Tensor opacity,
@@ -137,6 +201,29 @@ torch::Tensor pixel_render_cuda(torch::Tensor base, torch::Tensor candidate,
         base.data_ptr<float>(), candidate.data_ptr<float>(), ranges.data_ptr<int64_t>(),
         entries.data_ptr<int64_t>(), tiles.data_ptr<int64_t>(), height, width,
         white ? 1.f : 0.f, output.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor pixel_visibility_cuda(torch::Tensor points, torch::Tensor ranges,
+    torch::Tensor entries, torch::Tensor image, torch::Tensor target,
+    int64_t height, int64_t width) {
+    check_float(points); check_float(image); check_float(target);
+    const c10::cuda::CUDAGuard guard(points.device());
+    TORCH_CHECK(height>0 && width>0 && points.dim()==2 && points.size(1)==12,
+                "invalid visibility dimensions");
+    for (const auto& tensor : {ranges,entries})
+        TORCH_CHECK(tensor.device()==points.device() && tensor.is_contiguous() &&
+                    tensor.scalar_type()==torch::kInt64,"visibility requires same-device int64 indices");
+    TORCH_CHECK(image.device()==points.device() && target.device()==points.device() &&
+                image.numel()==3*height*width && target.sizes()==image.sizes(),"invalid visibility images");
+    const int64_t tiles=((height+15)/16)*((width+15)/16);
+    TORCH_CHECK(ranges.dim()==2 && ranges.size(0)==tiles && ranges.size(1)==2,"invalid visibility ranges");
+    auto output=torch::zeros({points.size(0),12},points.options());
+    if (!entries.numel()) return output;
+    visibility_tiles<<<tiles,256,0,c10::cuda::getCurrentCUDAStream()>>>(
+        points.data_ptr<float>(),ranges.data_ptr<int64_t>(),entries.data_ptr<int64_t>(),
+        image.data_ptr<float>(),target.data_ptr<float>(),height,width,output.data_ptr<float>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

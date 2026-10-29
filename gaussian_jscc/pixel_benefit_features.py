@@ -4,7 +4,7 @@ from collections import OrderedDict
 
 import torch
 
-from .pixel_benefit import pixel_density_labels
+from .pixel_benefit import pixel_density_labels, integrate_density
 from .pixel_local_renderer import _range_entries, _rectangles
 
 
@@ -45,6 +45,61 @@ def _intersects(p, tile, height, width):
     good=((low[:,0]<x+2)&(high[:,0]>x-1)&(low[:,1]<y+2)&(high[:,1]>y-1)
           &(high>low).all(-1))
     return good.reshape(p.shape[:-1])
+
+
+@torch.no_grad()
+def _label_chunks(scene, ids, projected, target, lambda_s, tiles, affected):
+    """Exact teacher shared by dense and integrated supervision."""
+    device = scene.projected.device
+    h, w = scene.height, scene.width
+    if not len(tiles):
+        return
+    lookup = torch.full((len(scene.tile_ranges),), -1, device=device, dtype=torch.long)
+    lookup[affected] = torch.arange(len(affected), device=device)
+    states = []
+    original=scene.projected[ids][None]
+    equal=(projected==original).all(-1) | ((projected[...,7]==0)&(original[...,7]==0))
+    unchanged=equal.all(-1).cpu().tolist()
+    for q in range(4):
+        if unchanged[q]:
+            states.append(None)
+            continue
+        rendered = scene.image.new_empty(len(affected), 3, 16, 16)
+        for first in range(0, len(affected), 128):
+            last = min(first+128, len(affected))
+            rendered[first:last] = scene.render_tiles(ids, projected[q], affected[first:last])
+        states.append(rendered)
+    for first in range(0, len(tiles), 16):
+        chosen = tiles[first:first+16]
+        image, reference = crops(scene.image, chosen), crops(target, chosen)
+        x, y = pixel_coordinates(chosen, w)
+        inside = (x>=0)&(y>=0)&(x<w)&(y<h)
+        sx, sy = x.clamp(0,w-1), y.clamp(0,h-1)
+        slots = lookup[sy.div(16,rounding_mode='floor')*((w+15)//16)+sx.div(16,rounding_mode='floor')]
+        changed = inside & (slots>=0)
+        candidates = []
+        for rendered in states:
+            if rendered is None:
+                candidates.append(image)
+                continue
+            replacement = rendered[slots.clamp_min(0), :, sy.remainder(16), sx.remainder(16)].permute(0,3,1,2)
+            candidates.append(torch.where(changed[:,None], replacement, image))
+        density = pixel_density_labels(torch.stack(candidates,1), reference, lambda_s)
+        yield chosen, density
+
+
+@torch.no_grad()
+def exact_values(scene, changed_ids, projected, target, lambda_s, d_ref):
+    """Integrate paired labels immediately; no network features or dense replay."""
+    ids = torch.as_tensor(changed_ids, device=scene.projected.device, dtype=torch.long)
+    affected = scene.affected_tiles(ids, projected)
+    tiles = scene.affected_tiles(ids, projected, halo_tiles=1)
+    value = torch.zeros(3,2,dtype=torch.float64,device=scene.projected.device)
+    for chosen, density in _label_chunks(scene, ids, projected, target, lambda_s, tiles, affected):
+        x,y = pixel_coordinates(chosen, scene.width, halo=0)
+        valid = ((x>=0)&(y>=0)&(x<scene.width)&(y<scene.height))[:,None]
+        value += integrate_density(density, valid, scene.height, scene.width, d_ref)
+    return value
 
 
 @torch.no_grad()
@@ -98,29 +153,8 @@ def build_group(scene, changed_ids, projected, target, lambda_s, d_ref, *, with_
     if with_labels:
         start=time.perf_counter()
         if nt:
-            # Construct just the requested halo pixels by looking up changed
-            # tile slots. No full-image clone is made for any intervention.
-            lookup=torch.full((len(scene.tile_ranges),),-1,device=device,dtype=torch.long)
-            lookup[affected]=torch.arange(len(affected),device=device)
-            states=[]
-            for q in range(4):
-                rendered=scene.image.new_empty(len(affected),3,16,16)
-                for first in range(0,len(affected),128):
-                    last=min(first+128,len(affected))
-                    rendered[first:last]=scene.render_tiles(ids,projected[q],affected[first:last])
-                states.append(rendered)
-            labels=[]
-            for first in range(0,nt,16):
-                last=min(first+16,nt); x,y=pixel_coordinates(tiles[first:last],w)
-                inside=(x>=0)&(y>=0)&(x<w)&(y<h)
-                safe_x=x.clamp(0,w-1); safe_y=y.clamp(0,h-1)
-                slots=lookup[safe_y.div(16,rounding_mode='floor')*((w+15)//16)+safe_x.div(16,rounding_mode='floor')]
-                changed=inside&(slots>=0); candidates=[]
-                for rendered in states:
-                    replacement=rendered[slots.clamp_min(0),:,safe_y.remainder(16),safe_x.remainder(16)].permute(0,3,1,2)
-                    candidates.append(torch.where(changed[:,None],replacement,image[first:last]))
-                labels.append(pixel_density_labels(torch.stack(candidates,1),reference[first:last],lambda_s).cpu())
-            result['density']=torch.cat(labels)
+            result['density']=torch.cat([density.cpu() for _,density in
+                _label_chunks(scene,ids,projected,target,lambda_s,tiles,affected)])
         else:
             result['density']=scene.image.new_zeros((0,3,2,16,16),dtype=torch.float64)
         result['teacher_seconds']=time.perf_counter()-start

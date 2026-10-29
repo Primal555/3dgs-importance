@@ -84,6 +84,23 @@ class PixelWindow:
             raise ValueError('invalid pixel difficulty state')
         self.difficulty = difficulty.clone()
 
+    def prepare_camera(self, tile, target):
+        pass
+
+    def capture_inputs(self, mixed):
+        return mixed
+
+    def build_view(self, tile, changed, projected, target, *, source, block_ids, raw, with_labels):
+        return build_group(tile, changed, projected, target, self.reference['lambda_s'],
+                           self.reference['d_ref'], with_labels=with_labels)
+
+    @staticmethod
+    def truth(view):
+        if 'values' in view:
+            return view['values']
+        return integrate_density(view['density'], view['inputs']['valid'],
+                                 view['height'], view['width'], view['d_ref'])
+
     @torch.no_grad()
     def collect(self, step, cameras, learner, replay, pretrain):
         model, scene, table, scheduler = self.model, self.scene, self.table, self.scheduler
@@ -113,7 +130,7 @@ class PixelWindow:
             timings['actual_decode_seconds'] += time.perf_counter() - started
             parts.append(torch.cat((raw[valid], (q[valid] > 0).to(raw)[:, None]), -1))
             entries.append((f, ids, q, y, actual, noise))
-        mixed = torch.cat(parts)
+        mixed = self.capture_inputs(torch.cat(parts))
         del parts
         captures, targets, components = [], [], []
         distortion = ImageDistortion('mse_ssim' if self.reference['lambda_s'] else 'mse', self.reference['lambda_s'])
@@ -123,6 +140,9 @@ class PixelWindow:
                            backend='cuda' if device.type == 'cuda' else 'cpu')
             timings['projection_seconds'] += time.perf_counter() - started
             target = scene.reference.get(camera, device)
+            started = time.perf_counter()
+            self.prepare_camera(tile, target)
+            timings['feature_seconds'] += time.perf_counter() - started
             captures.append(tile); targets.append(target)
             components.append(distortion.components(tile.image, target))
         if not cameras:
@@ -198,15 +218,15 @@ class PixelWindow:
                                          for tier in range(4)])
                 timings['projection_seconds'] += time.perf_counter() - started
                 started = time.perf_counter()
-                view = build_group(tile, changed, projected, target, self.reference['lambda_s'],
-                                   self.reference['d_ref'], with_labels=source in labels)
+                view = self.build_view(tile, changed, projected, target, source=source,
+                                       block_ids=block_ids, raw=raw[:,valid], with_labels=source in labels)
                 timings['feature_seconds'] += view.get('feature_seconds', time.perf_counter() - started)
                 timings['teacher_seconds'] += view.get('teacher_seconds', 0.)
-                evaluated_tiles+=len(view['inputs']['valid'])
+                evaluated_tiles+=view['tile_count'] if 'tile_count' in view else len(view['inputs']['valid'])
                 cache_hits+=view.get('cache_hits',0)
                 if getattr(learner, 'scales', None) is not None:
                     started = time.perf_counter()
-                    kwargs={'cache_keys':view['prediction_cache_keys']} if hasattr(learner,'begin_window') else {}
+                    kwargs={'cache_keys':view['prediction_cache_keys']} if 'prediction_cache_keys' in view and hasattr(learner,'begin_window') else {}
                     predictions.append(learner.predict(view['inputs'], view['height'], view['width'], view['d_ref'],**kwargs))
                     timings['network_seconds'] += time.perf_counter() - started
                 view.pop('prediction_cache_keys',None)
@@ -217,8 +237,7 @@ class PixelWindow:
                 built[source] = dict(source=source, step=step, validation=bool(scheduler.validation[source]),
                                      views=views, rates=rates.detach().cpu())
                 if predictions and not bool(scheduler.validation[source]):
-                    truth = torch.stack([integrate_density(view['density'], view['inputs']['valid'],
-                        view['height'], view['width'], view['d_ref']) for view in views]).mean(0)
+                    truth = torch.stack([self.truth(view) for view in views]).mean(0)
                     scale=learner.scales['value'] if isinstance(learner.scales,dict) else torch.ones(2)
                     error = float(((torch.stack(predictions).mean(0).cpu()-truth)/scale).square().mean())
                     self.difficulty[source] = 0.9 * self.difficulty[source] + 0.1 * error
