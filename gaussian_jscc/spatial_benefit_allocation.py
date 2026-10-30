@@ -61,7 +61,7 @@ def preflight(model, scene, camera, args, reference):
     return result
 
 
-def main(args, max_updates=None):
+def validate_options(args):
     for name in ('decision_weight', 'tie_fraction', 'weight_decay', 'dropout',
                  'common_weight', 'pair_weight', 'replay_cache_mib'):
         value = getattr(args, name)
@@ -69,6 +69,10 @@ def main(args, max_updates=None):
             raise ValueError(f'invalid {name}')
     if args.dropout >= 1 or args.hidden < 2 or args.neighbors < 1 or args.training_probe_groups < 1:
         raise ValueError('invalid network or probe settings')
+
+
+def main(args, max_updates=None):
+    validate_options(args)
     return base.main(args, max_updates, family=FAMILY, learner_factory=learner_factory,
         window_factory=SpatialWindow, preflight_fn=preflight,
         replay_factory=partial(SpatialReplay, cache_mib=args.replay_cache_mib))

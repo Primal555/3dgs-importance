@@ -71,7 +71,7 @@ class SpatialBenefitNetwork(nn.Module):
         return result.masked_fill(identical[..., None], 0.)
 
 
-def value_losses(prediction, truth, rates, scale, tie_fraction=.02):
+def value_losses(prediction, truth, rates, scale, tie_fraction=.02, *, direction_fn=decision_loss):
     """Both components retain their calibrated RD units, including all six pairs."""
     scale = torch.as_tensor(scale, device=prediction.device, dtype=prediction.dtype).clamp_min(1e-8)
     error = (prediction-truth)/scale
@@ -81,10 +81,12 @@ def value_losses(prediction, truth, rates, scale, tie_fraction=.02):
     pair_error = ((p[..., j, :]-p[..., i, :])-(t[..., j, :]-t[..., i, :]))/scale
     return dict(absolute=error.square().mean((-2, -1)),
                 common=error.mean(-2).square().mean(-1), pair=pair_error.square().mean((-2, -1)),
-                decision=decision_loss(prediction, truth, rates, scale, tie_fraction))
+                decision=direction_fn(prediction, truth, rates, scale, tie_fraction))
 
 
 class SpatialLearner(PhysicalLearner):
+    direction_loss = staticmethod(decision_loss)
+
     def __init__(self, replay, device, hidden=64, lr=1e-4, dropout=.05, weight_decay=1e-4,
                  decision_weight=.25, tie_fraction=.02, common_weight=1., pair_weight=1.,
                  training_probe_groups=256):
@@ -147,12 +149,13 @@ class SpatialLearner(PhysicalLearner):
         pred = self.network(*pack_inputs(inputs, self.device)).double()
         truth = torch.stack(targets).to(self.device, dtype=torch.float64)
         rates = torch.stack([torch.as_tensor(g['rates']) for g in groups]).to(self.device, dtype=torch.float64)
-        losses = value_losses(pred, truth, rates[owner], self.scales['rd'], self.tie_fraction)
+        losses = value_losses(pred, truth, rates[owner], self.scales['rd'], self.tie_fraction,
+                              direction_fn=self.direction_loss)
         # Geometry/color are supervised per camera; decisions use the actual
         # mean over the same camera window as the allocator and teacher.
         losses = {k: mean_groups(v) for k, v in losses.items() if k != 'decision'}
         p, t = mean_groups(pred), mean_groups(truth)
-        losses['decision'] = decision_loss(p, t, rates, self.scales['rd'], self.tie_fraction)
+        losses['decision'] = self.direction_loss(p, t, rates, self.scales['rd'], self.tie_fraction)
         losses['total'] = (losses['absolute']+self.common_weight*losses['common']+
                           self.pair_weight*losses['pair']+self.decision_weight*losses['decision'])
         pc = torch.cat((p.new_zeros(len(groups), 1), p.sum(-1)+rates), -1)
