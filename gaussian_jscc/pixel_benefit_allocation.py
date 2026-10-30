@@ -127,7 +127,8 @@ def preflight(model, scene, camera, args, reference):
     return verify_renderer(model, scene, args, reference, camera=camera)
 
 
-def main(args, max_updates=None, *, family=None, learner_factory=None, window_factory=None, preflight_fn=None):
+def main(args, max_updates=None, *, family=None, learner_factory=None, window_factory=None, preflight_fn=None,
+         replay_factory=None):
     family = family or FAMILY
     window_factory = window_factory or PixelWindow
     preflight_fn = preflight_fn or preflight
@@ -171,8 +172,8 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
     table = ResponseMirrorTable(len(scene.raw), max_log_odds=args.max_log_odds).to(device)
     blocks = ResponseScheduler(scene.group_ids, seed=args.seed)
     views = ViewWindowScheduler(scene_record['allocation_train_view_names'], args.seed+9001)
-    replay = PixelReplay(out/'replay', seed=args.seed+123, max_groups=args.replay_capacity,
-                         validation_groups=args.validation_capacity)
+    replay = (replay_factory or PixelReplay)(out/'replay', seed=args.seed+123, max_groups=args.replay_capacity,
+                                            validation_groups=args.validation_capacity)
     learner = (learner_factory(replay, device, args) if learner_factory else
                PixelLearner(replay, device, hidden=args.hidden, lr=args.benefit_lr, tile_batch=args.tile_batch))
     meter = ExactDeploymentCost(model, scene, identity, args.snr, options.net_bits_per_use)
@@ -323,6 +324,10 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
                   f"groups={row.get('labeled_groups', 0)}, tiles={row.get('evaluated_tiles', 0)}, "
                   f"teacher={row.get('teacher_seconds', 0):.2f}s, updates={learner.updates}, "
                   f"time={row['step_seconds']:.2f}s, peak_mib={row['peak_allocated_mib']}", flush=True)
+            if 'replay_mean_visits' in row:
+                print(f"  replay: min={row['replay_min_visits']}, mean={row['replay_mean_visits']:.2f}, "
+                      f"p10={row['replay_p10_visits']:.1f}, unused={row['replay_never_updated_fraction']:.2%}, "
+                      f"draws={row['replay_all_group_draws']}, pair_loss={row['pair_loss']:.6g}", flush=True)
         updates += 1
         if max_updates is not None and updates >= max_updates:
             save()

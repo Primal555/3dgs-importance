@@ -179,11 +179,38 @@ class PixelWindow:
                                        val_draws + [int(draw['source']) for draw in draws]))
         keep = torch.zeros(n, 2, dtype=torch.float64, device=device)
         selected, costs, built = [], [], {}
+        pending_predictions = []
         evaluated_tiles=cache_hits=0
         side = self.reference['side_proxy']
         rate_cache = [keep_rates(q, ids >= 0, model.cfg.rates, xyz=side['xyz_per_retained'],
                                  bits=side['bits_per_use']) * self.args.beta / self.reference['c_ref']
                       for _, ids, q, _, _, _ in entries]
+        def apply_prediction(source, predictions, labeled_views, rates):
+            if not predictions:
+                return
+            values = torch.stack(predictions).mean(0)
+            if labeled_views and not bool(scheduler.validation[source]):
+                truth = torch.stack([self.truth(view) for view in labeled_views]).mean(0)
+                scale = learner.scales['value'] if isinstance(learner.scales,dict) else torch.ones(2)
+                error = float(((values.cpu()-truth)/scale).square().mean())
+                self.difficulty[source] = 0.9*self.difficulty[source]+0.1*error
+            cost = values.sum(-1).double()+rates
+            conditional = table.logits[source].softmax(-1).to(device)
+            keep[source, 1] = (cost*conditional).sum()
+            selected.append(source); costs.append(cost)
+
+        def flush_predictions():
+            if not pending_predictions:
+                return
+            started = time.perf_counter()
+            predictions = learner.predict_group_views([item[1] for item in pending_predictions])
+            timings['network_seconds'] += time.perf_counter()-started
+            if len(predictions) != len(pending_predictions):
+                raise ValueError('candidate prediction batch size mismatch')
+            for (source, _, labeled_views, rates), values in zip(pending_predictions, predictions):
+                apply_prediction(source, values, labeled_views, rates)
+            pending_predictions.clear()
+
         def decoded_batches():
             pool = torch.tensor(evaluated, dtype=torch.long)
             batch_size = int(getattr(self.args, 'candidate_batch', 16))
@@ -211,7 +238,7 @@ class PixelWindow:
             block_ids = block_ids[block_ids >= 0].cpu().long()
             changed = self.positions[block_ids, 3].to(device)
             rates = rate_cache[batch][row, col]
-            views, predictions = [], []
+            views, predictions, prediction_inputs = [], [], []
             for tile, target in zip(captures, targets):
                 started = time.perf_counter()
                 projected = torch.stack([tile.project(raw[tier, valid], (tiers[tier, valid] > 0).to(raw))
@@ -225,10 +252,13 @@ class PixelWindow:
                 evaluated_tiles+=view['tile_count'] if 'tile_count' in view else len(view['inputs']['valid'])
                 cache_hits+=view.get('cache_hits',0)
                 if getattr(learner, 'scales', None) is not None:
-                    started = time.perf_counter()
-                    kwargs={'cache_keys':view['prediction_cache_keys']} if 'prediction_cache_keys' in view and hasattr(learner,'begin_window') else {}
-                    predictions.append(learner.predict(view['inputs'], view['height'], view['width'], view['d_ref'],**kwargs))
-                    timings['network_seconds'] += time.perf_counter() - started
+                    if hasattr(learner, 'predict_group_views'):
+                        prediction_inputs.append(view['inputs'])
+                    else:
+                        started = time.perf_counter()
+                        kwargs={'cache_keys':view['prediction_cache_keys']} if 'prediction_cache_keys' in view and hasattr(learner,'begin_window') else {}
+                        predictions.append(learner.predict(view['inputs'], view['height'], view['width'], view['d_ref'],**kwargs))
+                        timings['network_seconds'] += time.perf_counter() - started
                 view.pop('prediction_cache_keys',None)
                 if source in labels:
                     views.append(cpu_copy(view))
@@ -236,17 +266,13 @@ class PixelWindow:
             if source in labels:
                 built[source] = dict(source=source, step=step, validation=bool(scheduler.validation[source]),
                                      views=views, rates=rates.detach().cpu())
-                if predictions and not bool(scheduler.validation[source]):
-                    truth = torch.stack([self.truth(view) for view in views]).mean(0)
-                    scale=learner.scales['value'] if isinstance(learner.scales,dict) else torch.ones(2)
-                    error = float(((torch.stack(predictions).mean(0).cpu()-truth)/scale).square().mean())
-                    self.difficulty[source] = 0.9 * self.difficulty[source] + 0.1 * error
-            if predictions:
-                values = torch.stack(predictions).mean(0).sum(-1).double()
-                cost = values + rates
-                conditional = table.logits[source].softmax(-1).to(device)
-                keep[source, 1] = (cost * conditional).sum()
-                selected.append(source); costs.append(cost)
+            if prediction_inputs:
+                pending_predictions.append((source, prediction_inputs, views, rates))
+                if len(pending_predictions) >= int(getattr(self.args, 'candidate_batch', 16)):
+                    flush_predictions()
+            else:
+                apply_prediction(source, predictions, views, rates)
+        flush_predictions()
         for source in val_draws:
             replay.add(dict(built[source], importance_weight=1.), True)
         for draw in draws:
