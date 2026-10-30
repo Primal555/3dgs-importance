@@ -11,6 +11,8 @@ FAMILY = 'calibrated_spatial_benefit_allocation_v1'
 def parser():
     p = spatial.parser(); p.description = __doc__
     p.set_defaults(direction_objective=DIRECTION_OBJECTIVE)
+    p.add_argument('--pretrain-until', type=int,
+                   help='Resume pretraining to this absolute window count, preserving the original plan')
     return p
 
 
@@ -23,9 +25,13 @@ def learner_factory(replay, device, args):
 
 def main(args, max_updates=None):
     spatial.validate_options(args)
+    target = getattr(args, 'pretrain_until', None)
+    if target is not None and (not args.resume or args.phase != 'pretrain' or target < args.pretrain_windows):
+        raise ValueError('--pretrain-until requires --resume --phase pretrain and cannot shorten pretraining')
     return base.main(args, max_updates, family=FAMILY, learner_factory=learner_factory,
         window_factory=spatial.SpatialWindow, preflight_fn=spatial.preflight,
-        replay_factory=partial(spatial.SpatialReplay, cache_mib=args.replay_cache_mib))
+        replay_factory=partial(spatial.SpatialReplay, cache_mib=args.replay_cache_mib),
+        pretrain_target=target)
 
 
 if __name__ == '__main__':

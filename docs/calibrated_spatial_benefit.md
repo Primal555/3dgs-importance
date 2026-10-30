@@ -42,7 +42,30 @@ printf '%s\n' "$!" >"${OUT}.pid"
 tail -n 40 -F "${OUT}.log"
 ```
 
-仅当本轮意外中断时，才使用同一个输出目录和同一配置，设置 `RESUME=1` 恢复。旧收益网络的 checkpoint 不用于本轮。
+本轮意外中断时，使用同一个输出目录和同一配置，设置 `RESUME=1` 恢复。
+
+## 在现有 200 个窗口上续训 500 个窗口
+
+`--pretrain-until 700` 表示预训练累计目标为 700 个窗口。固定尺度、网络、Adam、replay、验证集及随机状态均从最新 checkpoint 恢复；编解码器和概率表继续冻结，原训练配置不变。
+
+当前第 200 个窗口已完成 9600 次网络更新，额外 500 个窗口增加 32000 次更新，最终累计 41600 次。继续每 50 个窗口验证一次，比较三档／四档 regret、保留 regret、共同误差和 MSE 分量误差的走势。
+
+```bash
+cd /data/home/zhangyueheng/projects/3dgs-importance
+git -c submodule.recurse=false pull --ff-only --no-recurse-submodules origin main
+conda activate maskgs
+CODEC="$PWD/output/successive_mip360_gpu1_20261023_142948/training"
+OUT="$PWD/output/truck_soft_direction_gpu2_20261030_152022"
+CUDA_VISIBLE_DEVICES=2 RESUME=1 nohup bash scripts/test_calibrated_spatial_benefit.sh \
+  "$CODEC" truck "$OUT" --beta 0.1 --phase pretrain --pretrain-until 700 \
+  >"${OUT}_continue700.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}_continue700.pid"
+tail -n 40 -F "${OUT}_continue700.log"
+```
+
+确认原进程已经结束后启动。续训仍写入原目录，现有 `metrics` 记录保留，并从第 201 个窗口追加。第 200 个窗口的完成标记归档为 `pretrain_complete_000200.json`，700 个窗口完成后写入新的 `pretrain_complete.json`。原 `plan.json` 保留初始 200 窗口配置，累计目标写入 checkpoint 的 `progress.pretrain_target` 和完成标记。
+
+中断后可重复上述启动命令；目标仍为 700。也可以省略 `--pretrain-until`，程序会恢复 checkpoint 中已保存的累计目标。其他参数必须与原实验一致。缩短目标或修改训练配置会报错。
 
 ## 查看结果
 

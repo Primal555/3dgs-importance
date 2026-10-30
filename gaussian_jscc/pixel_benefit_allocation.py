@@ -127,8 +127,30 @@ def preflight(model, scene, camera, args, reference):
     return verify_renderer(model, scene, args, reference, camera=camera)
 
 
+def _pretrain_target(args, progress, requested):
+    saved = progress.get('pretrain_target', args.pretrain_windows)
+    target = saved if requested is None else requested
+    if (target < max(saved, args.pretrain_windows, progress['pretrain_windows_done']) or
+            (requested is not None and progress['phase'] != 'pretrain')):
+        raise ValueError('pretrain target cannot shrink or extend an allocation checkpoint')
+    return target
+
+
+def _archive_pretrain_completion(out):
+    marker = out/'pretrain_complete.json'
+    if marker.is_file():
+        completed = json.loads(marker.read_text(encoding='utf-8'))
+        archive = out/f"pretrain_complete_{int(completed['step']):06d}.json"
+        if archive.exists():
+            if json.loads(archive.read_text(encoding='utf-8')) != completed:
+                raise ValueError('pretrain completion archive mismatch')
+            marker.unlink()
+        else:
+            marker.replace(archive)
+
+
 def main(args, max_updates=None, *, family=None, learner_factory=None, window_factory=None, preflight_fn=None,
-         replay_factory=None):
+         replay_factory=None, pretrain_target=None):
     family = family or FAMILY
     window_factory = window_factory or PixelWindow
     preflight_fn = preflight_fn or preflight
@@ -137,7 +159,7 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
     if tuple(cfg.rates) != (0, 8, 24, 48):
         raise ValueError('requires 0/8/24/48 source rates')
     settings = {k: v for k, v in vars(args).items() if k not in
-                ('out', 'resume', 'dry_run', 'device', 'phase', 'allocation_image_objective')}
+                ('out', 'resume', 'dry_run', 'device', 'phase', 'allocation_image_objective', 'pretrain_until')}
     for key in ('budget_total_uses', 'budget_ratio_to_q3', 'initial_price', 'dual_lr', 'ema_decay'):
         settings.pop(key, None)
     plan = json.loads(json.dumps(dict(version=family, source=source, spec=spec, settings=settings,
@@ -181,6 +203,7 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
         state = torch.load(latest, map_location='cpu', weights_only=True)
         if state['plan'] != plan or state['scene_record'] != scene_record or state['family'] != family:
             raise ValueError('exact resume source/settings/scene mismatch')
+        pretrain_target = _pretrain_target(args, state['progress'], pretrain_target)
         model.load_state_dict(state['state_dict']); table.load_state_dict(state['table'])
         blocks.load_state_dict(state['blocks']); views.load_state_dict(state['views'])
         replay.load_state_dict(state['replay']); learner.load_state_dict(state['learner'])
@@ -202,6 +225,7 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
         q = deploy(table, args)
         progress = dict(step=0, phase='pretrain', pretrain_windows_done=0, allocation_step=0,
                         pretrain_complete=False, pending=['initial'])
+        pretrain_target = args.pretrain_windows
         window = window_factory(model, scene, table, blocks, reference, args)
         json_write(out/'plan.json', plan)
         json_write(out/'training.json', dict(plan, **scene_record, objective_reference=reference,
@@ -267,11 +291,21 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
         raise ValueError('resume allocation with --phase allocation')
     if args.phase == 'allocation' and not progress['pretrain_complete']:
         raise ValueError('finish pretraining before allocation')
+    if args.phase == 'pretrain':
+        progress['pretrain_target'] = pretrain_target
+        if progress['pretrain_windows_done'] < pretrain_target:
+            progress['pretrain_complete'] = False
+            # Commit the extended target before retiring the previous completion marker.
+            save()
+            _archive_pretrain_completion(out)
     pending()
     if args.phase == 'allocation' and progress['phase'] == 'pretrain':
         progress['phase'] = 'allocation'; save()
-    target = args.pretrain_windows if args.phase == 'pretrain' else args.allocation_steps
+    target = pretrain_target if args.phase == 'pretrain' else args.allocation_steps
     counter = 'pretrain_windows_done' if args.phase == 'pretrain' else 'allocation_step'
+    if args.resume and args.phase == 'pretrain':
+        print(f"Resume pretrain: completed={progress[counter]}, target={target}, "
+              f"remaining={max(0, target-progress[counter])}, network_updates={learner.updates}", flush=True)
     updates = 0
     while progress[counter] < target:
         step = progress['step']+1
@@ -335,6 +369,7 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
     if args.phase == 'pretrain':
         progress['pretrain_complete'] = True; save()
         result = dict(status='pretrain_complete', step=progress['step'], network_updates=learner.updates,
+                      pretrain_target=target,
                       frozen_codec_verified=model_id(model) == identity)
         json_write(out/'pretrain_complete.json', result)
         print(json.dumps(result), flush=True)
