@@ -159,7 +159,8 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
     if tuple(cfg.rates) != (0, 8, 24, 48):
         raise ValueError('requires 0/8/24/48 source rates')
     settings = {k: v for k, v in vars(args).items() if k not in
-                ('out', 'resume', 'dry_run', 'device', 'phase', 'allocation_image_objective', 'pretrain_until')}
+                ('out', 'resume', 'dry_run', 'device', 'phase', 'allocation_image_objective', 'pretrain_until',
+                 'allocation_batch')}
     for key in ('budget_total_uses', 'budget_ratio_to_q3', 'initial_price', 'dual_lr', 'ema_decay'):
         settings.pop(key, None)
     plan = json.loads(json.dumps(dict(version=family, source=source, spec=spec, settings=settings,
@@ -242,6 +243,7 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
         state = dict(version=1, family=family, state_dict=model.state_dict(), table=table.state_dict(),
             blocks=blocks.state_dict(), views=views.state_dict(), learner=learner.state_dict(),
             replay=replay.state_dict(), window=window.state_dict(), progress=dict(progress), plan=plan,
+            execution=getattr(window, 'execution_settings', None),
             scene_record=scene_record, objective_reference=reference, latest_q=q.detach().cpu(), rng=capture_rng())
         path = out/'checkpoints'/label/'state.pt'
         gc_stats['removed'] += save_replay_checkpoint(path, state, replay)
@@ -334,6 +336,7 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
         if device.type == 'cuda':
             torch.cuda.synchronize(device)
         row = dict(result['metrics'], step=step, event='update', phase=args.phase,
+                   execution=getattr(window, 'execution_settings', None),
                    step_seconds=time.perf_counter()-started, beta=args.beta, d_ref=reference['d_ref'],
                    c_ref=reference['c_ref'], lambda_s=reference['lambda_s'],
                    sampled_tier_counts=torch.bincount(result['q'].cpu(), minlength=4).tolist(),
@@ -358,6 +361,10 @@ def main(args, max_updates=None, *, family=None, learner_factory=None, window_fa
                   f"groups={row.get('labeled_groups', 0)}, tiles={row.get('evaluated_tiles', 0)}, "
                   f"teacher={row.get('teacher_seconds', 0):.2f}s, updates={learner.updates}, "
                   f"time={row['step_seconds']:.2f}s, peak_mib={row['peak_allocated_mib']}", flush=True)
+            if row['execution'] is not None:
+                print(f"  execution: {row['execution']}, evaluated={row.get('evaluated_groups')}, "
+                      f"projection_calls={row.get('candidate_projection_calls')}, "
+                      f"feature_batches={row.get('spatial_feature_batches')}", flush=True)
             if 'replay_mean_visits' in row:
                 print(f"  replay: min={row['replay_min_visits']}, mean={row['replay_mean_visits']:.2f}, "
                       f"p10={row['replay_p10_visits']:.1f}, unused={row['replay_never_updated_fraction']:.2%}, "

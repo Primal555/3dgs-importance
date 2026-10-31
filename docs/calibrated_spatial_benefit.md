@@ -74,3 +74,5 @@ tail -n 40 -F "${OUT}_continue700.log"
 重点比较 100、150、200 窗口的共同误差 RMSE、MSE 分量 RMSE、保留／删除 regret 和四档 regret，同时检查三档 regret 能否保住已有优势。训练侧 `decision_loss` 现在是 KL，其数值不宜与旧硬方向损失直接比较。
 
 输入与标签缓存策略保持上一版：空间 replay 体积较大，精确恢复需要保留完整 replay 和 checkpoints；分析结果可先下载日志与 metrics。
+
+分配阶段可使用 `--allocation-batch 64` 恢复为批量投影与空间特征路径，详见 [批量执行与断点恢复](batched_spatial_allocation.md)。

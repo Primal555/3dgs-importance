@@ -21,5 +21,6 @@ fi
 echo 'Default: 200 windows, first 50 fit scales; 64 true label groups/window, then 64 updates x 8 groups/window.'
 echo 'Unchanged spatial inputs, replay, MSE+SSIM, 0/8/24/48, 10dB; direction weight 0.25.'
 echo 'Default phase is pretrain: allocation table remains frozen. Resume uses the SAME output directory.'
+echo 'Allocation acceleration: --phase allocation --allocation-batch 64; runtime batch does not change the saved training plan.'
 exec "$PYTHON" -u -m gaussian_jscc.calibrated_spatial_benefit_allocation \
   --run "$RUN" --scene "$SCENE" --out "$OUT" "${INIT[@]}" "$@"
