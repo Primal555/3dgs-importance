@@ -101,6 +101,51 @@ class PixelWindow:
         return integrate_density(view['density'], view['inputs']['valid'],
                                  view['height'], view['width'], view['d_ref'])
 
+    @property
+    def candidate_batch_size(self):
+        size = int(getattr(self.args, 'candidate_batch', 16))
+        if size <= 0:
+            raise ValueError('candidate batch must be positive')
+        return size
+
+    def candidate_batches(self, evaluated, entries, timings):
+        pool = torch.tensor(evaluated, dtype=torch.long)
+        for batch, (f, ids, q, y, actual, noise) in enumerate(entries):
+            sources = pool[self.positions[pool, 0] == batch]
+            sources = sources[torch.argsort(self.positions[sources, 1], stable=True)]
+            for start in range(0, len(sources), self.candidate_batch_size):
+                group = sources[start:start+self.candidate_batch_size]
+                loc = self.positions[group]
+                rows, cols = loc[:, 1].to(q.device), loc[:, 2].to(q.device)
+                started = time.perf_counter()
+                alternatives, tiers = decode_groups(self.model, f, q, rows, cols, actual, y, noise, self.args.snr)
+                shape = alternatives.shape
+                raw = raw_batches(alternatives.reshape(-1, *shape[2:]), self.scene.geometry, self.model)
+                raw = raw.reshape(*shape[:2], *raw.shape[1:])
+                timings['candidate_decode_seconds'] += time.perf_counter()-started
+                yield group, batch, loc, raw, tiers
+
+    def candidate_views(self, evaluated, entries, captures, targets, labels, timings):
+        for group, batch, loc, raw, tiers in self.candidate_batches(evaluated, entries, timings):
+            ids = self.scene.group_ids[batch]
+            for i, source in enumerate(group.tolist()):
+                row, col = int(loc[i, 1]), int(loc[i, 2])
+                valid = ids[row] >= 0
+                block_ids = ids[row, valid].cpu().long()
+                changed = self.positions[block_ids, 3].to(raw.device)
+                views = []
+                for tile, target in zip(captures, targets):
+                    started = time.perf_counter()
+                    projected = torch.stack([tile.project(raw[i, tier, valid], (tiers[i, tier, valid] > 0).to(raw))
+                                             for tier in range(4)])
+                    timings['projection_seconds'] += time.perf_counter()-started
+                    started = time.perf_counter()
+                    view = self.build_view(tile, changed, projected, target, source=source,
+                        block_ids=block_ids, raw=raw[i, :, valid], with_labels=source in labels)
+                    view.setdefault('feature_seconds', time.perf_counter()-started)
+                    views.append(view)
+                yield source, batch, row, col, views
+
     @torch.no_grad()
     def collect(self, step, cameras, learner, replay, pretrain):
         model, scene, table, scheduler = self.model, self.scene, self.table, self.scheduler
@@ -211,43 +256,12 @@ class PixelWindow:
                 apply_prediction(source, values, labeled_views, rates)
             pending_predictions.clear()
 
-        def decoded_batches():
-            pool = torch.tensor(evaluated, dtype=torch.long)
-            batch_size = int(getattr(self.args, 'candidate_batch', 16))
-            if batch_size <= 0:
-                raise ValueError('candidate_batch must be positive')
-            for batch, (f, ids, q, y, actual, noise) in enumerate(entries):
-                sources = pool[self.positions[pool, 0] == batch]
-                sources=sources[torch.argsort(self.positions[sources,1],stable=True)]
-                for start in range(0, len(sources), batch_size):
-                    group = sources[start:start + batch_size]
-                    loc = self.positions[group]
-                    rows, cols = loc[:, 1].to(device), loc[:, 2].to(device)
-                    started = time.perf_counter()
-                    alternatives, tier_maps = decode_groups(model, f, q, rows, cols, actual, y, noise, snr)
-                    shape = alternatives.shape
-                    raw = raw_batches(alternatives.reshape(-1, *shape[2:]), scene.geometry, model)
-                    raw = raw.reshape(*shape[:2], *raw.shape[1:])
-                    timings['candidate_decode_seconds'] += time.perf_counter() - started
-                    for i, source in enumerate(group.tolist()):
-                        yield source, batch, int(loc[i, 1]), int(loc[i, 2]), raw[i], tier_maps[i]
-        for source, batch, row, col, raw, tiers in decoded_batches():
-            f, ids, q, y, actual, noise = entries[batch]
-            valid = ids[row] >= 0
-            block_ids = scene.group_ids[batch][row]
-            block_ids = block_ids[block_ids >= 0].cpu().long()
-            changed = self.positions[block_ids, 3].to(device)
+        for source, batch, row, col, candidate_views in self.candidate_views(
+                evaluated, entries, captures, targets, labels, timings):
             rates = rate_cache[batch][row, col]
             views, predictions, prediction_inputs = [], [], []
-            for tile, target in zip(captures, targets):
-                started = time.perf_counter()
-                projected = torch.stack([tile.project(raw[tier, valid], (tiers[tier, valid] > 0).to(raw))
-                                         for tier in range(4)])
-                timings['projection_seconds'] += time.perf_counter() - started
-                started = time.perf_counter()
-                view = self.build_view(tile, changed, projected, target, source=source,
-                                       block_ids=block_ids, raw=raw[:,valid], with_labels=source in labels)
-                timings['feature_seconds'] += view.get('feature_seconds', time.perf_counter() - started)
+            for view in candidate_views:
+                timings['feature_seconds'] += view['feature_seconds']
                 timings['teacher_seconds'] += view.get('teacher_seconds', 0.)
                 evaluated_tiles+=view['tile_count'] if 'tile_count' in view else len(view['inputs']['valid'])
                 cache_hits+=view.get('cache_hits',0)
@@ -268,7 +282,7 @@ class PixelWindow:
                                      views=views, rates=rates.detach().cpu())
             if prediction_inputs:
                 pending_predictions.append((source, prediction_inputs, views, rates))
-                if len(pending_predictions) >= int(getattr(self.args, 'candidate_batch', 16)):
+                if len(pending_predictions) >= self.candidate_batch_size:
                     flush_predictions()
             else:
                 apply_prediction(source, predictions, views, rates)
