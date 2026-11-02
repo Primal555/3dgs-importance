@@ -8,6 +8,9 @@ from .spatial_benefit_features import SpatialWindow
 
 
 class BatchedSpatialWindow(SpatialWindow):
+    def observe_projection(self, source, tile, changed, projected):
+        pass
+
     @property
     def candidate_batch_size(self):
         size = int(self.args.allocation_batch)
@@ -55,6 +58,7 @@ class BatchedSpatialWindow(SpatialWindow):
                     timings['spatial_feature_batches'] += 1
                 feature_seconds = (time.perf_counter()-started)/len(sources)
                 for i, source in enumerate(sources):
+                    self.observe_projection(source, tile, metadata[i][3], projected[i])
                     view = dict(inputs=inputs[i], height=tile.height, width=tile.width,
                         d_ref=self.reference['d_ref'], tile_count=0, feature_seconds=feature_seconds)
                     if source in labels:

@@ -147,9 +147,8 @@ class PixelWindow:
                 yield source, batch, row, col, views
 
     @torch.no_grad()
-    def collect(self, step, cameras, learner, replay, pretrain):
+    def prepare_context(self, cameras):
         model, scene, table, scheduler = self.model, self.scene, self.table, self.scheduler
-        if hasattr(learner,'begin_window'): learner.begin_window()
         device = next(model.parameters()).device
         n = len(table.logits)
         snr = self.args.snr
@@ -192,6 +191,16 @@ class PixelWindow:
             components.append(distortion.components(tile.image, target))
         if not cameras:
             raise ValueError('at least one camera required')
+        return q_source, entries, captures, targets, components, timings
+
+    @torch.no_grad()
+    def collect(self, step, cameras, learner, replay, pretrain):
+        model, scene, table, scheduler = self.model, self.scene, self.table, self.scheduler
+        if hasattr(learner,'begin_window'): learner.begin_window()
+        device = next(model.parameters()).device
+        n, snr = len(table.logits), self.args.snr
+        q_source, entries, captures, targets, components, timings = self.prepare_context(cameras)
+        distortion = ImageDistortion('mse_ssim' if self.reference['lambda_s'] else 'mse', self.reference['lambda_s'])
         impact = torch.zeros(n, dtype=torch.float64)
         projected_impact = torch.stack([tile.projected[:, 11].clamp_min(0).square() *
                                         tile.projected[:, 6].clamp_min(0) for tile in captures]).sum(0)
