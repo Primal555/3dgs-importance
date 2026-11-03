@@ -114,7 +114,7 @@ def audit_interventions(model, features, q, positive, ids, columns, geometry, sc
 
 def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task, scheduler,
                        snr, kind, *, d_ref, price, side_proxy, timings, audit_limit=0,
-                       rate_normalizer=None, budget=None, inspector=None, benefit=None):
+                       rate_normalizer=None, budget=None, inspector=None, benefit=None, positive_provider=None):
     if model.training or any(p.requires_grad for p in model.parameters()):
         raise ValueError('budgeted allocation requires an eval-mode, fully frozen codec')
     if rate_normalizer is not None and budget is not None:
@@ -126,6 +126,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     if benefit is not None and getattr(benefit,'gradient_free',False):
         return benefit.step(model,table,feature_batches,id_batches,geometry,task,scheduler,snr,kind,
             d_ref=d_ref,price=price,side_proxy=side_proxy,timings=timings,rate_normalizer=rate_normalizer)
+    if positive_provider is not None and (benefit is not None or not hasattr(scheduler,'accumulate_components')):
+        raise ValueError('positive provider requires the calibrated dense-keep path')
     device = next(model.parameters()).device
     count = len(table.logits); q_source = torch.empty(count, dtype=torch.long)
     structured = hasattr(scheduler, 'accumulate_components') or benefit is not None
@@ -221,14 +223,20 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                         action_parts = torch.zeros(len(rows), 3, 2, dtype=torch.float64, device=device)
                     position_start = sum(x.numel() for x in selected)
                     block_scale_base = present_scales(q).sum(-1)
-                    for tiers, delta in mixed_point_candidates(model, f, q, cols, snr, kind, geometry,
-                            semantic_y=y, actual=actual, actual_rng=state, timings=timings):
-                        image = (g[..., :-1]*delta).sum((1, 2)).double()/d_ref
+                    if positive_provider is None:
+                        candidates = mixed_point_candidates(model, f, q, cols, snr, kind, geometry,
+                            semantic_y=y, actual=actual, actual_rng=state, timings=timings)
+                    else:
+                        current = q[torch.arange(len(q),device=device), cols.clamp_min(0).to(device)]
+                        candidates = (((current-1+shift)%3+1, None) for shift in (1,2))
+                    for tiers, delta in candidates:
                         alt = q.clone(); alt[rows, col] = tiers[rows]
                         scale_delta = (present_scales(alt).sum(-1)-block_scale_base)*16/bits
                         rate_delta = rates[tiers[rows]]-rates[q[rows, col]]+scale_delta[rows]
-                        action_image[torch.arange(len(rows), device=device), tiers[rows]-1] = image[rows]
-                        if structured:
+                        if delta is not None:
+                            image = (g[..., :-1]*delta).sum((1, 2)).double()/d_ref
+                            action_image[torch.arange(len(rows), device=device), tiers[rows]-1] = image[rows]
+                        if structured and delta is not None:
                             for j, part in enumerate(component_g):
                                 value = (part[..., :-1]*delta).sum((1, 2)).double()/d_ref
                                 action_parts[torch.arange(len(rows), device=device), tiers[rows]-1, j] = value[rows]
@@ -249,6 +257,14 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
             offset += n
     tier_ids = torch.cat(selected) if selected else torch.empty(0, dtype=torch.long)
     feedback_stats = {}
+    neural_stats = {}
+    if positive_provider is not None:
+        parts, neural_stats = positive_provider.predict(task,cache,scene.detach(),q_source,tier_ids,locations,
+            side_proxy=side_proxy,step=side_proxy['step'])
+        if (parts.shape != (len(tier_ids),3,2) or not torch.isfinite(parts).all()):
+            raise ValueError('invalid neural positive components')
+        component_costs = [parts.to(device=device,dtype=torch.float64)]
+        image_costs = [scheduler._combine(component_costs[0],task.distortion.lambda_s)]
     if evidence:
         images = torch.cat(image_costs) if image_costs else torch.empty(0, 3, device=device, dtype=torch.float64)
         rate_values = torch.cat(rate_costs) if rate_costs else torch.empty_like(images)
@@ -305,10 +321,18 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     sampled = float(rates[q_source.to(device)].sum()) + int((q_source>0).sum())*unit_side + side_proxy['fixed_uses']
     scheduler.record(tier_ids, side_proxy.get('step', 1))
     if evidence: feedback_stats.update(scheduler.diagnostics(q_source, step=side_proxy['step']))
+    if positive_provider is not None:
+        for record in all_audits:
+            record['proxy_estimator'] = 'spatial_network' if record.get('feedback_kind')=='positive' else 'first_order_keep'
+            for suffix in ('mse','structure','distortion','rd'):
+                if 'first_order_delta_'+suffix in record:
+                    record['proxy_delta_'+suffix] = record['first_order_delta_'+suffix]
+        feedback_stats.update(neural_stats,positive_estimator='spatial_network',keep_estimator='dense_first_order')
     return dict(render_loss=loss, keep_image_costs=keep_image, keep_costs=keep_costs,
         tier_ids=tier_ids, tier_costs=torch.cat(costs) if costs else torch.empty(0, 3, device=device),
         q=q_source, sampled_tier_counts=torch.bincount(q_source, minlength=4).tolist(),
         q0_feedback_rows=q0_rows, expected_cost_proxy=expected, sampled_cost_proxy=sampled,
-        candidate_codec_calls=2*sum(bool((c>=0).any()) for columns in rounds for c in columns), actual_codec_calls=len(cache),
+        candidate_codec_calls=neural_stats.get('neural_candidate_decode_calls',
+            2*sum(bool((c>=0).any()) for columns in rounds for c in columns)), actual_codec_calls=len(cache),
         q0_codec_calls=sum(bool(((ids>=0)&(e[0].cpu()==0)).any()) for ids,e in zip(id_batches,cache)),
         cache_peak_mib=cache_bytes/2**20, audit=all_audits, **feedback_stats, **actual_stats)

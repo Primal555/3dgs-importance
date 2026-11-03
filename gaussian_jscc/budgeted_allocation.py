@@ -77,7 +77,7 @@ def deploy(table, args):
     return deployment_tiers(table.probabilities(torch.arange(len(table.logits),device=table.logits.device),args.snr), args.seed)
 
 
-def main(args, max_updates=None):
+def main(args, max_updates=None, *, positive_factory=None, family_override=None):
     validate(args)
     fixed_rd = getattr(args, 'beta', None) is not None
     evidence = getattr(args, 'evidence_experiment', False)
@@ -89,6 +89,9 @@ def main(args, max_updates=None):
     if structured:
         from .structured_evidence_allocation import validate as validate_structured, FAMILY as structured_family
         validate_structured(args); family = structured_family
+    if family_override is not None:
+        if positive_factory is None or not structured: raise ValueError('hybrid family requires calibrated positive provider')
+        family = family_override
     saved, cfg, spec, old, options, source = load_inputs(args)
     settings = {k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device','allocation_image_objective')}
     # Keep old budget checkpoint plan identity byte-for-byte compatible.
@@ -185,6 +188,14 @@ def main(args, max_updates=None):
         args.allocation_image_objective = ImageDistortion(args.distortion, reference['lambda_s'])
     objective = FixedRateDistortion(args.beta,reference['d_ref'],reference['c_ref'],distortion_key) if fixed_rd else None
     rate_normalizer = reference['c_ref'] if fixed_rd else reference['budget']
+    positive_provider = None
+    if positive_factory is not None:
+        with preserved_rng(device):
+            positive_provider = positive_factory(model,scene,table,blocks,reference,args)
+        if args.resume:
+            if positive_provider.replay is not None: positive_provider.replay.load_state_dict(state['replay'])
+            positive_provider.load_state_dict(state['positive_provider'])
+        else: positive_provider.initialize_replay()
 
     def objective_fields(distortion=None, cost=None):
         if fixed_rd:
@@ -201,7 +212,7 @@ def main(args, max_updates=None):
     def save(label='latest', map_q=None):
         if model_id(model) != identity: raise RuntimeError('frozen codec or attribute statistics changed')
         result = save_state(out,label,model,table,controller,blocks,views,progress,plan,scene_record,reference,
-                            q if map_q is None else map_q)
+                            q if map_q is None else map_q,positive_provider=positive_provider)
         json_write(out/'progress.json',dict(status='running',step=progress['step'],phase='allocation',
             **objective_fields(), pending=progress['pending'],
             **{'best_rd' if fixed_rd else 'best_feasible': progress['best']}))
@@ -265,7 +276,9 @@ def main(args, max_updates=None):
             else: raise RuntimeError('unknown pending allocation event')
             progress['pending'].pop(0); save()
 
-    if not args.resume: save('initial'); save()
+    if not args.resume:
+        if positive_provider is None: save('initial')
+        save()
     pending()
     updates = 0
     while progress['step'] < args.allocation_steps:
@@ -288,7 +301,8 @@ def main(args, max_updates=None):
         result = budgeted_mask_step(model,table,scene.groups,scene.group_ids,scene.geometry,task,blocks,
             args.snr,'awgn',d_ref=reference['d_ref'],price=args.beta if fixed_rd else controller.price,
             rate_normalizer=rate_normalizer,
-            side_proxy=dict(reference['side_proxy'],step=step),timings=timings,audit_limit=audit_count)
+            side_proxy=dict(reference['side_proxy'],step=step),timings=timings,audit_limit=audit_count,
+            **({'positive_provider':positive_provider} if positive_provider is not None else {}))
         with timings.measure('mirror_update_seconds'):
             table.update(result.pop('keep_costs'),result.pop('tier_ids'),result.pop('tier_costs'),
                          args.keep_lr,args.tier_lr,len(scene.raw))
@@ -358,7 +372,7 @@ def main(args, max_updates=None):
         json_write(out/'evaluation/latest/alias.json',dict(metrics_and_images_from='../selected',
             codec_id=identity,tier_sha256=tier_hash(q),reason='identical fixed map, codec, cameras and paired noise'))
     else:
-        latest_row=measure('latest',scene.test_cameras,True)
+        latest_row=measure('latest',scene.test_cameras,positive_provider is None)
     if evidence and args.uniform_controls:
         for tier in (2,3):
             measure(f'uniform_q{tier}',scene.test_cameras,map_q=torch.full_like(q,tier))
@@ -378,7 +392,14 @@ def main(args, max_updates=None):
     else:
         result['selection_rd_score'] = selected['progress']['best']['rd_score']
         result['selection_rd_scope'] = 'calibration views only; final rd_score uses test views'
-    json_write(export/'selection.json',result); save('final'); save()
+    if positive_provider is not None:
+        verification = positive_provider.state_dict()
+        result.update(network_mode=args.network_mode,network_updates=positive_provider.learner.updates,
+            frozen_network_verified=verification['frozen_network_verified'],
+            positive_estimator='spatial_network',keep_estimator='dense_calibrated_first_order')
+    json_write(export/'selection.json',result)
+    if positive_provider is None: save('final')
+    save()
     from .budgeted_allocation_report import summarize
     summarize(out,result=result)
     if evidence:
