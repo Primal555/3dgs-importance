@@ -9,7 +9,7 @@ from .structured_evidence import risk_choices
 @torch.no_grad()
 def correct_components(model, features, id_batches, cache, geometry, task, scene, scheduler,
                        tier_ids, locations, components, rates, keep_parts, keep_tiers, table,
-                       d_ref, price, c_ref, side_proxy, snr, kind):
+                       d_ref, price, c_ref, side_proxy, snr, kind, *, external_keep=False):
     from .budgeted_allocation_kernel import raw_batches, set_rng
     n = len(scheduler.counts); device = scene.device; step = side_proxy['step']
     exact = torch.zeros(len(tier_ids), 3, dtype=torch.bool)
@@ -34,6 +34,7 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
     positive_limit = min(len(tier_ids), limit-limit//4)
     keep_limit = min(n, limit-positive_limit)
     positive_limit = min(len(tier_ids), limit-keep_limit)
+    if external_keep:keep_limit=0
     positive = risk_choices(tier_ids, image+rates.detach().cpu(), q_source, scheduler, positive_limit, step)
     interventions = [(locations[i], tier, i, 'positive', group) for i,tier,group in positive]
     # A keep comparison has one alternative, so use the same three-way compute

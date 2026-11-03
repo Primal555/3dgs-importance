@@ -12,7 +12,7 @@ def save_state(out, label, model, table, controller, blocks, views, progress, pl
     if family not in ('budgeted_allocation_v1', 'fixed_beta_allocation_v1', 'evidence_allocation_v1',
                       'structured_evidence_allocation_v1', 'calibrated_structured_allocation_v2',
                       'learned_benefit_allocation_v1','learned_benefit_factored_v2','render_response_value_v1','visible_response_value_v1',
-                      'dense_keep_neural_tiers_v1'):
+                      'dense_keep_neural_tiers_v1','neural_dense_keep_tiers_v1'):
         raise ValueError('unknown allocation checkpoint family')
     state = dict(version=1, family=family, state_dict=model.state_dict(),
         config=model.cfg.to_dict(), table=table.state_dict(),
@@ -20,7 +20,7 @@ def save_state(out, label, model, table, controller, blocks, views, progress, pl
         blocks=blocks.state_dict(), views=views.state_dict(), progress=dict(progress),
         plan=plan, scene_record=scene_record, latest_q=q.detach().cpu(), rng=capture_rng())
     state['objective_reference' if family != 'budgeted_allocation_v1' else 'budget_reference'] = reference
-    if family == 'dense_keep_neural_tiers_v1':
+    if family in ('dense_keep_neural_tiers_v1','neural_dense_keep_tiers_v1'):
         if positive_provider is None: raise ValueError('hybrid checkpoint requires positive provider')
         state['positive_provider'] = positive_provider.state_dict()
         if positive_provider.replay is not None:
@@ -42,7 +42,7 @@ def restore_state(path, plan, scene_record):
         raise ValueError('exact resume source/settings/scene mismatch')
     if state['family'] in ('fixed_beta_allocation_v1','evidence_allocation_v1','structured_evidence_allocation_v1',
                            'calibrated_structured_allocation_v2','learned_benefit_allocation_v1','learned_benefit_factored_v2',
-                           'render_response_value_v1','visible_response_value_v1','dense_keep_neural_tiers_v1'):
+                           'render_response_value_v1','visible_response_value_v1','dense_keep_neural_tiers_v1','neural_dense_keep_tiers_v1'):
         from .allocation_objective import FixedRateDistortion
         ref = state['objective_reference']
         objective = FixedRateDistortion(ref['beta'], ref['d_ref'], ref['c_ref'])
@@ -52,7 +52,7 @@ def restore_state(path, plan, scene_record):
             raise ValueError('fixed RD checkpoint objective/reference mismatch')
         if state['family'] in ('structured_evidence_allocation_v1','calibrated_structured_allocation_v2',
                               'learned_benefit_allocation_v1','learned_benefit_factored_v2','render_response_value_v1','visible_response_value_v1',
-                              'dense_keep_neural_tiers_v1'):
+                              'dense_keep_neural_tiers_v1','neural_dense_keep_tiers_v1'):
             from .allocation_distortion import calibrate
             settings = plan['settings']
             expected = calibrate(ref['mse_ref'], ref['structure_ref'], mode=settings['distortion'],

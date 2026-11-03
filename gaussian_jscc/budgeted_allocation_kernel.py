@@ -128,6 +128,10 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
             d_ref=d_ref,price=price,side_proxy=side_proxy,timings=timings,rate_normalizer=rate_normalizer)
     if positive_provider is not None and (benefit is not None or not hasattr(scheduler,'accumulate_components')):
         raise ValueError('positive provider requires the calibrated dense-keep path')
+    keep_policy=getattr(positive_provider,'keep_policy',None)
+    if keep_policy is not None:
+        if not getattr(table,'neural_keep',False):raise ValueError('learned keep requires its execution table')
+        keep_policy.prepare(side_proxy)
     device = next(model.parameters()).device
     count = len(table.logits); q_source = torch.empty(count, dtype=torch.long)
     structured = hasattr(scheduler, 'accumulate_components') or benefit is not None
@@ -139,7 +143,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
             f, ids = features.to(device), source_ids.to(device)
             valid = ids >= 0
             with timing(timings, 'sampling_seconds'):
-                q, _, _, positive = table.sample(ids.clamp_min(0), snr)
+                q, _, _, positive = (table.sample(ids.clamp_min(0), snr) if keep_policy is None
+                                     else keep_policy.sample(ids,snr))
                 q = q.masked_fill(~valid, 0)
             q_source[ids[valid].cpu()] = q[valid].cpu()
             if structured:
@@ -282,13 +287,15 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
             with timing(timings, 'finite_feedback_seconds'):
                 records, feedback_stats, exact, keep_exact = correct_components(model, feature_batches,
                     id_batches, cache, geometry, task, scene, scheduler, tier_ids, locations, components,
-                    rate_values, keep_parts, keep_tiers, table, d_ref, price, rate_normalizer, side_proxy, snr, kind)
+                    rate_values, keep_parts, keep_tiers, table, d_ref, price, rate_normalizer, side_proxy, snr, kind,
+                    **({'external_keep':True} if keep_policy is not None else {}))
             costs = [scheduler.accumulate_components(tier_ids, components, rate_values, side_proxy['step'],
                 task.distortion.lambda_s, approximate=approximate, exact=exact)]
-            keep_image[:, 1] = scheduler.accumulate_keep(keep_tiers, keep_parts,
-                table.logits.softmax(-1), side_proxy['step'], task.distortion.lambda_s,
-                approximate=approximate_keep, exact=keep_exact)
-            table.keep_trust = scheduler.keep_trust
+            if keep_policy is None:
+                keep_image[:, 1] = scheduler.accumulate_keep(keep_tiers, keep_parts,
+                    table.logits.softmax(-1), side_proxy['step'], task.distortion.lambda_s,
+                    approximate=approximate_keep, exact=keep_exact)
+                table.keep_trust = scheduler.keep_trust
             table.tier_trust = scheduler.tier_trust[tier_ids]
         else:
             from .allocation_finite import correct_actions
@@ -306,9 +313,16 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     keep_costs[:, 1] += price*(expected_keep_payload+unit_side)/rate_normalizer
     if benefit is not None:
         keep_costs = benefit.keep_costs
-    if hasattr(scheduler, 'calibrate_keep_update'):
+    if hasattr(scheduler, 'calibrate_keep_update') and keep_policy is None:
         scheduler.calibrate_keep_update(keep_costs)
         table.keep_trust = scheduler.keep_trust
+    if keep_policy is not None:
+        from .neural_keep_teacher import collect_keep_labels
+        labels,teacher_stats=collect_keep_labels(keep_policy,task,cache,scene.detach(),q_source,id_batches,side_proxy,
+            scheduler.finite_samples-feedback_stats.get('finite_corrections',0),d_ref,rate_normalizer)
+        render_sources=torch.cat([ids[ids>=0] for ids in id_batches]).cpu()
+        feedback_stats.update(keep_policy.train(upstream,side_proxy,labels,d_ref,rate_normalizer,render_sources),**teacher_stats)
+        keep_costs.zero_()
     if inspector is not None:
         if not structured or scheduler.finite_samples:
             raise ValueError('update inspector requires calibrated history and zero training finite replacements')
@@ -327,7 +341,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
             for suffix in ('mse','structure','distortion','rd'):
                 if 'first_order_delta_'+suffix in record:
                     record['proxy_delta_'+suffix] = record['first_order_delta_'+suffix]
-        feedback_stats.update(neural_stats,positive_estimator='spatial_network',keep_estimator='dense_first_order')
+        feedback_stats.update(neural_stats,positive_estimator='spatial_network',
+                             keep_estimator='dense_neural_gate' if keep_policy is not None else 'dense_first_order')
     return dict(render_loss=loss, keep_image_costs=keep_image, keep_costs=keep_costs,
         tier_ids=tier_ids, tier_costs=torch.cat(costs) if costs else torch.empty(0, 3, device=device),
         q=q_source, sampled_tier_counts=torch.bincount(q_source, minlength=4).tolist(),

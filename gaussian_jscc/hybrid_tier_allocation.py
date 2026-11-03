@@ -101,14 +101,16 @@ def review(root,result):
     return comparison
 
 
-def main(args,max_updates=None):
+def main(args,max_updates=None,*,provider_factory=HybridPositiveProvider,family=FAMILY,
+         table_factory=None,allocation_transform=None,pretrain_factory=None):
     if args.pretrain_until is not None: raise ValueError('fresh pipeline uses --pretrain-windows; no previous evaluator reuse')
     if args.allocation_batch<1:raise ValueError('positive allocation batch required')
     root=Path(args.out).resolve()
     pre=pretrain_options(args,root)
+    train_pre=pretrain_factory or pretraining.main
     if args.dry_run:
-        with contextlib.redirect_stdout(io.StringIO()):plan=pretraining.main(pre)
-        plan.update(version=FAMILY,automatic_transition=True,network_mode=args.network_mode,
+        with contextlib.redirect_stdout(io.StringIO()):plan=train_pre(pre)
+        plan.update(version=family,automatic_transition=True,network_mode=args.network_mode,
                     pretrain_windows=args.pretrain_windows,allocation_steps=args.allocation_steps)
         print(json.dumps(plan,ensure_ascii=False,indent=2));return plan
     identity={k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','phase','device')}
@@ -116,7 +118,7 @@ def main(args,max_updates=None):
     if (root/'plan.json').is_file():
         if json.loads((root/'plan.json').read_text(encoding='utf8'))['settings']!=identity:
             raise ValueError('pipeline settings mismatch')
-    else:json_write(root/'plan.json',dict(version=FAMILY,settings=identity))
+    else:json_write(root/'plan.json',dict(version=family,settings=identity))
     if (root/'complete.json').is_file() and (root/'review.tar.gz').is_file():
         return json.loads((root/'complete.json').read_text(encoding='utf8'))
     marker=root/'pretrain/pretrain_complete.json'
@@ -127,7 +129,7 @@ def main(args,max_updates=None):
         before=0
         if max_updates is not None and pre.resume:
             before=torch.load(root/'pretrain/checkpoints/latest/state.pt',map_location='cpu',weights_only=True)['progress']['pretrain_windows_done']
-        status=pretraining.main(pre,max_updates=max_updates)
+        status=train_pre(pre,max_updates=max_updates)
         if status['status']=='interrupted':return status
         consumed=args.pretrain_windows-before
     network=export_network(root,args.pretrain_windows)
@@ -135,10 +137,11 @@ def main(args,max_updates=None):
     if max_updates is not None and consumed>=max_updates:
         return dict(status='interrupted',phase='between_stages')
     options=allocation_options(args,root,network)
+    if allocation_transform is not None:allocation_transform(options,args)
     result=allocator.main(options,max_updates=None if max_updates is None else max_updates-consumed,
-                          positive_factory=HybridPositiveProvider,family_override=FAMILY)
+                          positive_factory=provider_factory,family_override=family,table_factory=table_factory)
     if result.get('status')=='interrupted':return result
-    result=dict(result,pipeline_family=FAMILY,pretrain_windows=args.pretrain_windows,
+    result=dict(result,pipeline_family=family,pretrain_windows=args.pretrain_windows,
                 allocation_steps=args.allocation_steps)
     json_write(root/'complete.json',result)
     comparison=review(root,result)

@@ -77,7 +77,7 @@ def deploy(table, args):
     return deployment_tiers(table.probabilities(torch.arange(len(table.logits),device=table.logits.device),args.snr), args.seed)
 
 
-def main(args, max_updates=None, *, positive_factory=None, family_override=None):
+def main(args, max_updates=None, *, positive_factory=None, family_override=None,table_factory=None):
     validate(args)
     fixed_rd = getattr(args, 'beta', None) is not None
     evidence = getattr(args, 'evidence_experiment', False)
@@ -119,7 +119,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None)
                          calibration_view_names=[str(c.image_name) for c in calibration])
     if structured:
         from .structured_evidence import BoundedMirrorTable
-        table = BoundedMirrorTable(len(scene.raw), max_log_odds=args.max_log_odds).to(device)
+        table = (table_factory or BoundedMirrorTable)(len(scene.raw), max_log_odds=args.max_log_odds).to(device)
     else:
         table = MirrorTierTable(len(scene.raw)).to(device)
     if evidence:
@@ -181,6 +181,17 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None)
             probability_global_gain=len(scene.raw), distortion=args.distortion if structured else 'source PLY RGB MSE',
             allocation_training_sampling='single',deployment_draws=10,deployment_seed=args.seed,
             allocation_steps_scope='one update per multi-view window',allocation_joint_steps=0))
+        if getattr(args,'keep_estimator',None) is not None:
+            document=json.loads((out/'training.json').read_text(encoding='utf8'))
+            learned_keep=args.keep_estimator=='neural'
+            modules=['dense_keep_policy.network'] if learned_keep else []
+            if args.network_mode=='online':modules.append('positive_provider.learner.network')
+            document.update(trainable_modules=modules,positive_network_mode=args.network_mode,
+                aligned_spatial_inputs=True,keep_estimator=args.keep_estimator)
+            if learned_keep:
+                document.update(optimizer='Adam for dense keep network; mirror descent for positive table',
+                    keep_execution='EMA probability proposals; ST render VJP; paired calibration')
+            json_write(out/'training.json',document)
 
     distortion_key = 'source_distortion' if structured else 'source_mse'
     if structured:
@@ -397,6 +408,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None)
         result.update(network_mode=args.network_mode,network_updates=positive_provider.learner.updates,
             frozen_network_verified=verification['frozen_network_verified'],
             positive_estimator='spatial_network',keep_estimator='dense_calibrated_first_order')
+        if hasattr(positive_provider,'result_fields'):result.update(positive_provider.result_fields())
     json_write(export/'selection.json',result)
     if positive_provider is None: save('final')
     save()

@@ -111,6 +111,9 @@ class HybridPositiveProvider:
         if not self.frozen: self.learner.load_state_dict(state['learner'])
         self.generator.set_state(state['generator'].cpu()); self.resumed=True
 
+    def observe_context(self,scene,q,entries,captures,targets,task):
+        pass
+
     @torch.no_grad()
     def predict(self,task,cache,scene,q,tier_ids,locations,*,side_proxy,step):
         started=time.perf_counter(); device=scene.device
@@ -135,6 +138,7 @@ class HybridPositiveProvider:
                          backend=device.type)
             target=self.scene.reference.get(camera,device)
             self.window.prepare_camera(tile,target); captures.append(tile); targets.append(target)
+        self.observe_context(scene,q,entries,captures,targets,task)
         labels=set()
         if not self.frozen:
             training=tier_ids[~self.window.scheduler.validation[tier_ids]]
