@@ -77,6 +77,15 @@ def deploy(table, args):
     return deployment_tiers(table.probabilities(torch.arange(len(table.logits),device=table.logits.device),args.snr), args.seed)
 
 
+def make_plan(args,family,source,spec,codec_config):
+    settings={k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device','allocation_image_objective')}
+    if getattr(args,'beta',None) is None:settings.pop('beta',None)
+    else:
+        for key in ('budget_total_uses','budget_ratio_to_q3','initial_price','dual_lr','ema_decay'):settings.pop(key,None)
+    return json.loads(json.dumps(dict(version=family,source=source,spec=spec,settings=settings,
+                                     codec_config=codec_config,writes_output=False)))
+
+
 def main(args, max_updates=None, *, positive_factory=None, family_override=None,table_factory=None):
     validate(args)
     fixed_rd = getattr(args, 'beta', None) is not None
@@ -93,14 +102,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         if positive_factory is None or not structured: raise ValueError('hybrid family requires calibrated positive provider')
         family = family_override
     saved, cfg, spec, old, options, source = load_inputs(args)
-    settings = {k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device','allocation_image_objective')}
-    # Keep old budget checkpoint plan identity byte-for-byte compatible.
-    if not fixed_rd: settings.pop('beta', None)
-    else:
-        for key in ('budget_total_uses','budget_ratio_to_q3','initial_price','dual_lr','ema_decay'):
-            settings.pop(key, None)
-    plan = json.loads(json.dumps(dict(version=family, source=source, spec=spec, settings=settings,
-                                     codec_config=cfg.to_dict(), writes_output=False)))
+    plan=make_plan(args,family,source,spec,cfg.to_dict())
     if args.dry_run:
         print(json.dumps(plan, indent=2)); return plan
     out = Path(args.out).resolve(); latest = out/'checkpoints/latest/state.pt'
@@ -271,9 +273,10 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         while progress['pending']:
             event = progress['pending'][0]
             q = deploy(table,args)
-            if event == 'initial':
-                row = measure('calibration_000000',calibration); consider(row)
-                reference['side_proxy'] = proxy(row,q)
+            if event in ('initial','fork_initial'):
+                label='calibration_000000' if event=='initial' else f'calibration_{progress["step"]:06d}'
+                row = measure(label,calibration); consider(row)
+                if event=='initial':reference['side_proxy'] = proxy(row,q)
                 measure('initial',scene.test_cameras,True)
             elif event == 'control':
                 started = time.perf_counter(); cost = meter.details(q)
@@ -369,6 +372,13 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
                       f'reused={row["positive_correction_reused_actions"]}/{row["keep_correction_reused_actions"]}, '
                       f'sign_errors={row.get("calibrated_sign_disagreements",0)}/{row.get("calibrated_nonzero_pairs",0)}, '
                       f'regret={row.get("finite_decision_regret_mean",0):.3g}->{row.get("calibrated_decision_regret_mean",0):.3g}',flush=True)
+            if 'tier_applied_log_odds_step_mean' in row:
+                print(f'  tier-step: mode={row["tier_update_mode"]}, cap={row["tier_max_log_odds"]}, '
+                      f'limited={row["tier_step_limited_fraction"]:.1%}, '
+                      f'raw={row["tier_raw_log_odds_step_mean"]:.4g}, '
+                      f'applied={row["tier_applied_log_odds_step_mean"]:.4g}, '
+                      f'retained={row["tier_actual_to_raw_step_ratio"]:.1%}, '
+                      f'candidate_trust={row["tier_candidate_trust_mean"]:.3f}',flush=True)
         updates += 1
         if max_updates is not None and updates >= max_updates:
             q=deploy(table,args); save(); return dict(status='interrupted',step=step)
