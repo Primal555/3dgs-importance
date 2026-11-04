@@ -34,6 +34,9 @@ def summarize_structured(out, selected):
             positive_trust=stats(data['tier_trust'][kept]),keep_trust=stats(data['keep_trust']),
             correction_actions={b:len(calibrated[b]['keys']) for b in ('positive','keep')},
             correction_observations={b:int(calibrated[b]['count'].sum()) for b in ('positive','keep')})
+    if 'neural_history' in selected['blocks']:
+        summary.update(primary_observation_rule='positive proxy history belongs to one network revision; keep history unchanged',
+            diagnostic_note='current exact gaps supervise the network; matched residual anchors are recomputed by current weights')
     json_write(out/'comparison/structured_evidence.json', summary)
     rows = read_rows(out/'metrics/validation.jsonl')
     keys = ('event','step','total_channel_uses','source_mse','source_structure_error','source_distortion',

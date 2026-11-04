@@ -289,6 +289,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                     id_batches, cache, geometry, task, scene, scheduler, tier_ids, locations, components,
                     rate_values, keep_parts, keep_tiers, table, d_ref, price, rate_normalizer, side_proxy, snr, kind,
                     **({'external_keep':True} if keep_policy is not None else {}))
+            if positive_provider is not None and hasattr(positive_provider,'observe_exact'):
+                feedback_stats.update(positive_provider.observe_exact(records,side_proxy['step']))
             costs = [scheduler.accumulate_components(tier_ids, components, rate_values, side_proxy['step'],
                 task.distortion.lambda_s, approximate=approximate, exact=exact)]
             if keep_policy is None:
@@ -343,11 +345,14 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                     record['proxy_delta_'+suffix] = record['first_order_delta_'+suffix]
         feedback_stats.update(neural_stats,positive_estimator='spatial_network',
                              keep_estimator='dense_neural_gate' if keep_policy is not None else 'dense_first_order')
+        if hasattr(positive_provider,'finish_step'):
+            feedback_stats.update(positive_provider.finish_step(side_proxy['step']))
     return dict(render_loss=loss, keep_image_costs=keep_image, keep_costs=keep_costs,
         tier_ids=tier_ids, tier_costs=torch.cat(costs) if costs else torch.empty(0, 3, device=device),
         q=q_source, sampled_tier_counts=torch.bincount(q_source, minlength=4).tolist(),
         q0_feedback_rows=q0_rows, expected_cost_proxy=expected, sampled_cost_proxy=sampled,
         candidate_codec_calls=neural_stats.get('neural_candidate_decode_calls',
-            2*sum(bool((c>=0).any()) for columns in rounds for c in columns)), actual_codec_calls=len(cache),
+            2*sum(bool((c>=0).any()) for columns in rounds for c in columns))+
+            feedback_stats.get('neural_exact_candidate_decode_calls',0), actual_codec_calls=len(cache),
         q0_codec_calls=sum(bool(((ids>=0)&(e[0].cpu()==0)).any()) for ids,e in zip(id_batches,cache)),
         cache_peak_mib=cache_bytes/2**20, audit=all_audits, **feedback_stats, **actual_stats)

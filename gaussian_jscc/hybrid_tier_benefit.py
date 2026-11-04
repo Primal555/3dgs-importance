@@ -57,6 +57,7 @@ class HybridSpatialWindow(BatchedSpatialWindow):
 
 
 class HybridPositiveProvider:
+    learner_class=CalibratedSpatialLearner
     def __init__(self, model, scene, table, scheduler, reference, args):
         self.model,self.scene,self.reference,self.args = model,scene,reference,args
         device = next(model.parameters()).device
@@ -77,7 +78,7 @@ class HybridPositiveProvider:
             self.replay = SpatialReplay(Path(args.out)/'neural_replay',max_groups=replay_state['max_groups'],
                 validation_groups=replay_state['validation_groups'],cache_mib=self.settings['replay_cache_mib'])
             self.initial_replay = replay_state
-        self.learner = CalibratedSpatialLearner(self.replay,device,hidden=self.settings['hidden'],
+        self.learner = self.learner_class(self.replay,device,hidden=self.settings['hidden'],
             lr=self.settings['benefit_lr'],dropout=self.settings['dropout'],
             weight_decay=self.settings['weight_decay'],decision_weight=self.settings['decision_weight'],
             tie_fraction=self.settings['tie_fraction'],common_weight=self.settings['common_weight'],
@@ -121,6 +122,14 @@ class HybridPositiveProvider:
     def observe_context(self,scene,q,entries,captures,targets,task):
         pass
 
+    def observe_predictions(self,pending,predictions):
+        pass
+
+    def train_groups(self,groups):
+        for group in groups:self.replay.add(group,False)
+        with preserved_rng(next(self.model.parameters()).device),torch.enable_grad():
+            return self.learner.train_updates(self.settings['net_updates'],self.settings['batch_groups'])
+
     @torch.no_grad()
     def predict(self,task,cache,scene,q,tier_ids,locations,*,side_proxy,step):
         started=time.perf_counter(); device=scene.device
@@ -157,6 +166,7 @@ class HybridPositiveProvider:
         def flush():
             if not pending:return
             predictions=self.learner.predict_group_views([[v['inputs'] for v in views] for _,views,_ in pending])
+            self.observe_predictions(pending,predictions)
             for (source,views,rate),predicted in zip(pending,predictions):
                 values=torch.stack(predicted).mean(0)
                 delta=values-values[int(q[source])-1][None]
@@ -179,9 +189,7 @@ class HybridPositiveProvider:
             if len(pending)>=self.args.allocation_batch: flush()
         flush()
         if not self.frozen:
-            for group in groups:self.replay.add(group,False)
-            with preserved_rng(device),torch.enable_grad():
-                learned=self.learner.train_updates(self.settings['net_updates'],self.settings['batch_groups'])
+            learned=self.train_groups(groups)
             stats.update({'neural_'+k:v for k,v in learned.items()})
         self.learner.network.eval()
         stats.update(neural_labels=len(groups),neural_teacher_seconds=timings['teacher_seconds'],

@@ -109,7 +109,7 @@ def review(root,result):
 
 
 def main(args,max_updates=None,*,provider_factory=HybridPositiveProvider,family=FAMILY,
-         table_factory=None,allocation_transform=None,pretrain_factory=None):
+         table_factory=None,allocation_transform=None,pretrain_factory=None,scheduler_factory=None):
     if args.pretrain_until is not None: raise ValueError('fresh pipeline uses --pretrain-windows; no previous evaluator reuse')
     if args.allocation_batch<1:raise ValueError('positive allocation batch required')
     root=Path(args.out).resolve()
@@ -149,7 +149,8 @@ def main(args,max_updates=None,*,provider_factory=HybridPositiveProvider,family=
     options=allocation_options(args,root,network)
     if allocation_transform is not None:allocation_transform(options,args)
     result=allocator.main(options,max_updates=None if max_updates is None else max_updates-consumed,
-                          positive_factory=provider_factory,family_override=family,table_factory=table_factory)
+                          positive_factory=provider_factory,family_override=family,table_factory=table_factory,
+                          scheduler_factory=scheduler_factory)
     if result.get('status')=='interrupted':return result
     result=dict(result,pipeline_family=family,pretrain_windows=args.pretrain_windows,
                 allocation_steps=args.allocation_steps)

@@ -86,7 +86,7 @@ def make_plan(args,family,source,spec,codec_config):
                                      codec_config=codec_config,writes_output=False)))
 
 
-def main(args, max_updates=None, *, positive_factory=None, family_override=None,table_factory=None):
+def main(args, max_updates=None, *, positive_factory=None, family_override=None,table_factory=None,scheduler_factory=None):
     validate(args)
     fixed_rd = getattr(args, 'beta', None) is not None
     evidence = getattr(args, 'evidence_experiment', False)
@@ -128,6 +128,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         from .allocation_evidence import EvidenceScheduler
         if structured:
             from .calibrated_evidence import CalibratedEvidence as EvidenceScheduler
+        if scheduler_factory is not None:EvidenceScheduler=scheduler_factory
         blocks = EvidenceScheduler(scene.group_ids,rounds=args.candidate_rounds,policy=args.candidate_policy,
             memory=args.evidence_memory,half_life=args.evidence_half_life,context_tv=args.context_tv,
             finite_samples=args.finite_samples if args.finite_feedback else 0)
