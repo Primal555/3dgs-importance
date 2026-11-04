@@ -40,11 +40,12 @@ def source_info(path):
     plan=json.loads((allocation/'plan.json').read_text(encoding='utf8'))
     if plan.get('version')!=FAMILY or plan['settings'].get('network_mode')!='frozen':
         raise ValueError('source must be an original frozen dense-keep hybrid run')
-    if plan['settings'].get('aligned_spatial_inputs'):
-        raise ValueError('source uses a different spatial-input variant; select the original hybrid run')
     if not plan['settings'].get('uniform_controls',False):raise ValueError('source must enable uniform q2/q3 controls')
     artifact=owner/'benefit_network.pt'
     if not artifact.is_file():raise FileNotFoundError(artifact)
+    network=torch.load(artifact,map_location='cpu',weights_only=True)
+    if bool(plan['settings'].get('aligned_spatial_inputs',False))!=bool(network['settings'].get('aligned_spatial_inputs',False)):
+        raise ValueError('spatial input layout mismatch between source plan and benefit network')
     return owner,plan,artifact
 
 

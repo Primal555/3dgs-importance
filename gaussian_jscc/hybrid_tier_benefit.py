@@ -68,6 +68,9 @@ class HybridPositiveProvider:
         self.frozen = args.network_mode == 'frozen'
         self.identity = artifact['network_sha256']
         self.settings = artifact['settings']
+        aligned=bool(self.settings.get('aligned_spatial_inputs',False))
+        if aligned!=bool(getattr(args,'aligned_spatial_inputs',False)):
+            raise ValueError('spatial input layout mismatch between allocation and benefit network')
         replay_state = artifact['replay']
         self.replay = None
         if not self.frozen:
@@ -87,7 +90,11 @@ class HybridPositiveProvider:
         window_args = SimpleNamespace(**self.settings)
         window_args.allocation_batch = args.allocation_batch
         window_args.out = args.out
-        self.window = HybridSpatialWindow(model,scene,table,ResponseScheduler(scene.group_ids,seed=args.seed),
+        window_class=HybridSpatialWindow
+        if aligned:
+            from .aligned_spatial_inputs import AlignedSpatialWindow
+            window_class=AlignedSpatialWindow
+        self.window = window_class(model,scene,table,ResponseScheduler(scene.group_ids,seed=args.seed),
                                            reference,window_args)
         self.resumed = False
 

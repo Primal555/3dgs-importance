@@ -40,6 +40,7 @@ def pretrain(args,max_updates=None):
     from . import calibrated_spatial_benefit_allocation as old
     from .pixel_benefit_allocation import main
     from .spatial_benefit_replay import SpatialReplay
+    old.spatial.validate_options(args)
     return main(args,max_updates,family='aligned_spatial_pretraining_v1',learner_factory=old.learner_factory,
         window_factory=AlignedSpatialWindow,preflight_fn=old.spatial.preflight,
         replay_factory=partial(SpatialReplay,cache_mib=args.replay_cache_mib))

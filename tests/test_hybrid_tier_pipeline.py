@@ -45,6 +45,7 @@ def environment():
     with patch('gaussian_jscc.rendering.load_cameras',side_effect=cameras), \
          patch('gaussian_jscc.rendering.render',side_effect=fixture.render), \
          patch.object(entry.pretraining.spatial,'SpatialWindow',Window), \
+         patch('gaussian_jscc.aligned_spatial_inputs.pretrain',side_effect=entry.pretraining.main), \
          patch.object(entry.pretraining.spatial,'preflight',return_value={}), \
          contextlib.redirect_stdout(io.StringIO()):yield
 
@@ -55,6 +56,7 @@ def test_default_fresh_700_automatic_and_frozen(source):
     assert args.beta==.1
     assert args.pretrain_windows==700 and args.phase=='auto' and args.network_mode=='frozen'
     assert args.allocation_steps==2000 and args.tier_lr==.4
+    assert args.aligned_spatial_inputs is True
     args.calibration_views=1;args.dry_run=True
     with environment():plan=entry.main(args)
     assert plan['automatic_transition'] and plan['pretrain_windows']==700
@@ -91,6 +93,8 @@ def test_real_spatial_provider_pipeline_and_resume(source,mode):
     assert_nested_equal(a['rng'],b['rng'])
     assert result['frozen_codec_verified'] and resumed['frozen_codec_verified']
     artifact=read(out/'benefit_network.pt')
+    assert artifact['settings']['aligned_spatial_inputs'] is True
+    assert a['plan']['settings']['aligned_spatial_inputs'] is True
     assert pretrained['learner']['updates']==3
     if mode=='frozen':
         assert result['frozen_network_verified'] is True
@@ -128,3 +132,34 @@ def test_pretraining_interruption_then_automatic_allocation(source):
         assert result['status']=='interrupted' and not (out/'allocation').exists()
         args.resume=True;entry.main(args)
     assert (out/'complete.json').is_file()
+
+
+def test_export_rejects_network_with_legacy_feature_layout(source):
+    parent,root=source;out=root/'legacy_artifact'
+    with environment():entry.main(options(parent,out))
+    artifact=read(out/'benefit_network.pt')
+    artifact['settings'].pop('aligned_spatial_inputs',None)
+    torch.save(artifact,out/'benefit_network.pt')
+    with pytest.raises(ValueError,match='spatial input layout'):
+        entry.export_network(out,4,aligned_spatial_inputs=True)
+
+
+def test_actual_aligned_windows_in_both_stages(source):
+    from gaussian_jscc.aligned_spatial_inputs import AlignedSpatialWindow
+    from gaussian_jscc.physical_benefit_features import static_features
+    parent,root=source;out=root/'actual_aligned';windows=[]
+    def construct(*args,**kwargs):
+        window=AlignedSpatialWindow(*args,**kwargs);windows.append(window);return window
+    with patch('gaussian_jscc.rendering.load_cameras',side_effect=cameras), \
+         patch('gaussian_jscc.rendering.render',side_effect=fixture.render), \
+         patch('gaussian_jscc.aligned_spatial_inputs.AlignedSpatialWindow',side_effect=construct), \
+         patch.object(entry.pretraining.spatial,'preflight',return_value={}), \
+         contextlib.redirect_stdout(io.StringIO()):
+        entry.main(options(parent,out))
+    assert len(windows)==2
+    for window in windows:
+        assert not torch.equal(window.scene.order,torch.arange(len(window.scene.raw)))
+        expected=static_features(window.scene.raw,window.args.neighbors,window.args.cpu_threads)
+        torch.testing.assert_close(window.static[window.scene.order],expected,rtol=0,atol=0)
+        mixed=torch.cat((window.scene.raw+100,torch.zeros(len(expected),1)),1)
+        torch.testing.assert_close(window.capture_inputs(mixed)[:,:-1],window.scene.raw,rtol=0,atol=0)

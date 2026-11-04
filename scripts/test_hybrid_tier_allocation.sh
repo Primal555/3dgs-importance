@@ -14,6 +14,7 @@ INIT=()
 if [[ "${RESUME:-0}" == 1 ]]; then INIT=(--resume); fi
 echo "GPU: $CUDA_VISIBLE_DEVICES; frozen codec: $CODEC; output: $OUT"
 echo 'Fresh spatial value network: 700 windows, then automatically 2000 allocation updates.'
+echo 'Aligned original PLY IDs and packet rows in both stages; use a new OUT and retrain the benefit network.'
 echo 'Dense calibrated first-order KEEP; sparse neural positive tiers; mirror updates; default network frozen.'
 echo '10dB; 0/8/24/48; normalized MSE+SSIM RD; beta0.1; batch128. Use --network-mode online explicitly.'
 echo 'Download OUT/review.tar.gz. Frozen allocation resume needs benefit_network.pt and allocation checkpoints; pretraining replay is separate.'

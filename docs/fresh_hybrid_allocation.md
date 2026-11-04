@@ -15,7 +15,7 @@
 
 场景、通信惩罚、MSE＋SSIM 目标、信道、候选规则、空间输入和评估条件沿用源配置。q0 使用原密集反馈算法和原上限。正档位独立上限默认 1.0，实际更新仍受候选 trust 调节；`--unbounded-tier-updates` 直接执行原始正档位镜像更新。数值溢出检查和 -700 支持下限保留。
 
-新运行只读取源 `allocation/plan.json` 和紧凑收益网络，不需要旧分配 checkpoint、分配快照或预训练 replay。支持原混合管线根目录及其 `allocation` 目录作为 source。其他空间输入变体需使用其对应入口。
+新运行只读取源 `allocation/plan.json` 和紧凑收益网络，不需要旧分配 checkpoint、分配快照或预训练 replay。支持混合管线根目录及其 `allocation` 目录作为 source。按源配置与网络共同记录的 `aligned_spatial_inputs` 选择布局，兼容旧实验复现及索引修复后的网络，两者不混用。修复布局需要先通过主混合入口重训收益网络。
 
 ## 启动
 

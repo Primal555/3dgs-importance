@@ -78,9 +78,9 @@ def test_defaults_directory_guard_and_shell(source):
     assert not nested.exists()
     source_plan=json.loads((base/'allocation/plan.json').read_text())
     metadata_path=base/'allocation/plan.json'
-    source_plan['settings']['aligned_spatial_inputs']=True
+    source_plan['settings']['aligned_spatial_inputs']=not source_plan['settings'].get('aligned_spatial_inputs',False)
     metadata_path.write_text(json.dumps(source_plan))
-    with pytest.raises(ValueError,match='spatial-input'):entry.source_info(base)
+    with pytest.raises(ValueError,match='spatial input layout'):entry.source_info(base)
     bash=Path('C:/softwares/Git/bin/bash.exe')
     if bash.exists():
         env=dict(os.environ,CUDA_VISIBLE_DEVICES='1',PYTHON_BIN=Path(sys.executable).as_posix(),PYTHONUTF8='1')
@@ -88,3 +88,13 @@ def test_defaults_directory_guard_and_shell(source):
             '--help'],env=env,capture_output=True,text=True,encoding='utf8',timeout=40)
         assert run.returncode==0,run.stdout+run.stderr
         assert '--unbounded-tier-updates' in run.stdout
+
+
+def test_legacy_fresh_run_keeps_recorded_layout(source):
+    parent,root=source;base=root/'legacy_source';out=root/'legacy_fresh'
+    settings=options(parent,base);settings.aligned_spatial_inputs=False
+    with environment():
+        original.main(settings)
+        entry.main(args(base,out,'--allocation-steps','1'))
+    saved=read(out/'allocation/checkpoints/latest/state.pt')
+    assert saved['plan']['settings']['aligned_spatial_inputs'] is False

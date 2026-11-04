@@ -22,7 +22,7 @@ def parser():
     p=pretraining.parser(); p.description=__doc__
     p._option_string_actions['--phase'].choices=('auto','pretrain','allocation')
     p.set_defaults(phase='auto',pretrain_windows=700,allocation_steps=2000,beta=.1,
-                   keep_lr=.1,tier_lr=.4,candidate_batch=64)
+                   keep_lr=.1,tier_lr=.4,candidate_batch=64,aligned_spatial_inputs=True)
     for group in p._mutually_exclusive_groups:
         if any('--beta' in action.option_strings for action in group._group_actions):group.required=False
     p.add_argument('--network-mode',choices=('frozen','online'),default='frozen')
@@ -39,15 +39,21 @@ def pretrain_options(args,root):
     return argparse.Namespace(**settings)
 
 
-def export_network(root,target):
+def export_network(root,target,*,aligned_spatial_inputs=None):
     path=root/'benefit_network.pt'
     if path.is_file():
         artifact=torch.load(path,map_location='cpu',weights_only=True)
         if artifact.get('version')!=FAMILY or artifact['pretrain_windows']!=target:
             raise ValueError('incompatible exported benefit network')
+        if (aligned_spatial_inputs is not None and
+                bool(artifact['settings'].get('aligned_spatial_inputs',False))!=aligned_spatial_inputs):
+            raise ValueError('spatial input layout mismatch; retrain benefit network and replay in a new output')
         return path
     source=root/'pretrain/checkpoints/latest/state.pt'
     saved=torch.load(source,map_location='cpu',weights_only=True)
+    if (aligned_spatial_inputs is not None and
+            bool(saved['plan']['settings'].get('aligned_spatial_inputs',False))!=aligned_spatial_inputs):
+        raise ValueError('spatial input layout mismatch; retrain benefit network and replay in a new output')
     if (not saved['progress']['pretrain_complete'] or saved['progress']['pretrain_windows_done']!=target
             or saved['progress']['allocation_step']!=0):
         raise ValueError('fresh complete pretraining before any allocation required')
@@ -73,6 +79,7 @@ def allocation_options(args,root,network):
     for key,value in vars(args).items():
         if key in vars(opts) and key not in protected:setattr(opts,key,value)
     opts.network_mode=args.network_mode;opts.benefit_checkpoint=str(network)
+    opts.aligned_spatial_inputs=args.aligned_spatial_inputs
     opts.allocation_batch=args.allocation_batch
     opts.resume=bool(args.resume and (root/'allocation/checkpoints/latest/state.pt').is_file())
     return opts
@@ -108,6 +115,9 @@ def main(args,max_updates=None,*,provider_factory=HybridPositiveProvider,family=
     root=Path(args.out).resolve()
     pre=pretrain_options(args,root)
     train_pre=pretrain_factory or pretraining.main
+    if pretrain_factory is None and args.aligned_spatial_inputs:
+        from .aligned_spatial_inputs import pretrain
+        train_pre=pretrain
     if args.dry_run:
         with contextlib.redirect_stdout(io.StringIO()):plan=train_pre(pre)
         plan.update(version=family,automatic_transition=True,network_mode=args.network_mode,
@@ -132,7 +142,7 @@ def main(args,max_updates=None,*,provider_factory=HybridPositiveProvider,family=
         status=train_pre(pre,max_updates=max_updates)
         if status['status']=='interrupted':return status
         consumed=args.pretrain_windows-before
-    network=export_network(root,args.pretrain_windows)
+    network=export_network(root,args.pretrain_windows,aligned_spatial_inputs=args.aligned_spatial_inputs)
     if args.phase=='pretrain':return dict(status='pretrain_complete',network_checkpoint=str(network))
     if max_updates is not None and consumed>=max_updates:
         return dict(status='interrupted',phase='between_stages')
