@@ -1,6 +1,6 @@
 # 3DGS 数字交付对照实验
 
-本目录保存 MesonGS 与 MaskGaussian 的官方源码，用于准备场景压缩和数字交付对照。两个源码目录均为 Git 子模块，版本由本项目的 Git 提交固定。
+本目录提供 MesonGS 与 MaskGaussian 的数字交付对照：官方源码、压缩适配、真实 LDPC/QAM 文件传输、独立接收恢复、统一图像评估及服务器启动脚本。两个官方源码目录均为 Git 子模块，版本由本项目的 Git 提交固定。
 
 ## 论文与固定版本
 
@@ -18,9 +18,82 @@
 
 - 已拉取两个官方仓库，保持上游源码不变。
 - 已拉取 MaskGaussian 的普通光栅器、掩码光栅器、simple-knn 及所需 GLM 子模块。
-- 已核对压缩、剪枝、保存和渲染入口。
-- 本机核查环境为 `torch 2.9.0+cpu`，`torch.cuda.is_available()` 为 `False`。CUDA 扩展尚未编译，完整训练、压缩和渲染结果尚未复现。
-- LDPC、QAM、分组与信道测试需要后续实现；本目录目前提供官方源码和复现准备说明。
+- `digital_link.py` 已实现 Sionna 2.2.0 的实际 5G NR LDPC 编解码、公开固定比特加扰、Gray QAM、AWGN 和软解调，按实际编码后长度计费。
+- `mesongs_adapter.py` 已实现官方 CUDA 编码组件调用、压缩包独立解码和标准 PLY 导出。
+- `evaluate.py` 复用主项目的相机、光栅器、PSNR、SSIM 和 LPIPS/VGG 0.1。
+- `run.py` 串联完整流程，支持断点继续，输出紧凑的 `review.tar.gz`。
+- 本机为 `torch 2.9.0+cpu`。真实 CPU LDPC/QAM 文件传输、官方序列化压缩包的解码及流程测试已验证；完整场景的 CUDA 编码、光栅化和 LPIPS 权重自检需要在服务器执行。
+
+## 服务器安装与启动
+
+在主项目根目录、现有 `maskgs` 环境中执行。安装脚本会获取两个子模块，并分别建立 `gs_digital` 和 `gs_mesongs` 环境。
+
+```bash
+git -c submodule.recurse=false pull --ff-only --no-recurse-submodules origin main
+conda activate maskgs
+bash scripts/setup_comparison_baselines.sh all
+```
+
+也可按阶段执行：`sources` 拉取源码，`digital` 安装数字链路，`mesongs` 安装 MesonGS。MesonGS 默认安装独立 CUDA 12.1 工具链；已有相容工具链时可设置 `MESONGS_CUDA_HOME=/path/to/cuda`。默认编译架构为 RTX 4090 的 `8.9`，其他 GPU 通过 `TORCH_CUDA_ARCH_LIST` 指定。
+
+默认先运行 Truck、10 dB、4 次信道试验，MesonGS 使用 `c1` 配置且不做渲染微调：
+
+```bash
+RUN="$PWD/output/successive_mip360_gpu1_20261023_142948/training"
+GPU=3
+OUT="$PWD/output/digital_baselines_truck_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
+
+CUDA_VISIBLE_DEVICES="$GPU" nohup bash scripts/test_digital_baselines.sh \
+  "$RUN" "$OUT" --scene truck >"${OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}.pid"
+tail -n 40 -F "${OUT}.log"
+```
+
+`RUN` 只用于读取该编解码器实际使用的源 PLY、照片路径、分辨率、图片子目录、背景和保存的测试相机名单；本实验不加载或更新该编解码器权重。保存有名单时严格沿用其名称和顺序；显式设置 `--views` 才在该名单内取子集。运行前可用相同命令追加 `--dry-run` 查看计划。
+
+可选参数：
+
+- `--methods maskgaussian`：只跑剪枝 PLY 的数字交付。
+- `--meson-configs c1 c3`：增加第二个官方压缩工作点。
+- `--meson-iterations 8000`：增加官方渲染微调步骤，默认 0。
+- `--snrs 6 8 10 12`：扫描多个 Es/N0；每个点分别执行真实传输。
+- `--trials 1`：先进行一次场景规模的流程检查。
+- `--batch-size 64`：增大数字链路的码字批次，默认 32。
+- `--no-lpips`：显式关闭 LPIPS；默认启用并先检查权重。
+- `--keep-intermediates`：额外保存成功接收的码流与 PLY，默认清理这些大中间文件。
+
+如果独立环境放在其他目录，设置 `DIGITAL_PYTHON`、`MESONGS_PYTHON` 和 `EVAL_PYTHON` 为对应 Python 的绝对路径。
+
+恢复中断实验时沿用原始 OUT 和全部参数：
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU" RESUME=1 nohup bash scripts/test_digital_baselines.sh \
+  "$RUN" "$OUT" --scene truck >>"${OUT}.log" 2>&1 &
+```
+
+也支持显式输入，便于使用其他已有剪枝结果：
+
+```bash
+python -m comparison_baselines.run \
+  --ply /path/to/pruned/point_cloud.ply --source /path/to/photos/truck \
+  --scene truck --out /path/to/new/output \
+  --digital-python /path/to/gs_digital/bin/python \
+  --mesongs-python /path/to/gs_mesongs/bin/python
+```
+
+## 结果、计费和运行开销
+
+- `summary.json`、`comparison.csv`：每种方法、SNR 下的交付成功率、真实总信道使用次数，以及成功交付条件下的画质均值。
+- `results/<method>/snr_<value>/trial_<index>/link.json`：逐次传输的 BER、块错误、CRC 错误、实际平均发送功率、开销、种子、版本和耗时。
+- `results/.../evaluation/metrics.json`：统一相机及协议下，相对照片、源 PLY 的逐视角和平均指标。每个方法最多保存两张对照图。
+- `artifacts/<method>/sender.json`、`encode.json`：输入哈希、压缩配置和版本。压缩文件保留在服务器供恢复使用。
+- `review.tar.gz`：收集指标、配置和代表图，下载此文件即可分析结果。
+
+默认数字链路为 `k=4096`、`n=6144`、16QAM、20 次 BP 迭代和复 AWGN 10 dB Es/N0。每个信息块内含 CRC32；文件长度、SHA256、分组填充均实际发送。总信道使用为 `codewords * 6144 / 4`，没有按每符号净 2 bit 估算。公开固定的计数器加扰独立于噪声种子，接收端按同一协议解扰，无需传输额外幅度。
+
+每次 trial 都实际编码、加噪、解调和解码。完整接收包通过校验后，其解压结果相同，因此后续成功 trial 复用该包已经验证的渲染指标；复用来源写入 `evaluation_report`。传输失败记录为 `failed`，不赋予伪造的画质值。`quality_conditioning` 明确标注为 `successful_file_delivery`，应同时查看成功率。
+
+实际通信成本覆盖完整数字文件。现有 JSCC 结果中的可靠支路可能使用指定净 bit/use 假设；与这些数字链路结果作正式成本对比时，应统一可靠支路的配置及计费。
 
 ## 两组实验的作用
 
@@ -89,7 +162,7 @@ git -C comparison_baselines/MaskGaussian submodule status --recursive
 3. 上游 `prune_mask()` 使用 `<=` 阈值，因此设置剪枝比例为 0 也可能移除最低分点。需要原样保留全部输入点时，应在后续适配中显式处理该边界，并记录变更。
 4. `configs/c1.json` 和 `configs/c3.json` 存在于仓库，但该固定版本的 `mesongs.py` 没有读取它们的入口。不能仅凭 JSON 文件名认定实验已经应用了对应配置。
 
-本轮保留上述上游行为，后续复现适配在主项目中单独记录。
+默认实验通过 `mesongs_adapter.py` 映射实际 JSON 配置、处理零剪枝边界和文件路径，并调用官方压缩组件，避免重复保存发送端评估图。适配不修改上游仓库。接收端支持本次编码实际生成的六文件 NPZ 压缩包，复用官方 RAHT 树和逆变换方程，保留官方坐标端点打包语义并导出标准四元数 PLY；具体变更和解码来源写入 `encode.json`。
 
 ## MaskGaussian 复现入口与输入要求
 
@@ -104,7 +177,7 @@ git -C comparison_baselines/MaskGaussian submodule status --recursive
 
 ## 数字交付的计费约定
 
-后续数字链路按实际编码后的分组长度统计信道使用次数。坐标、属性、码本、量化参数、必要元数据和纠错冗余均计入。
+数字链路按实际编码后的分组长度统计信道使用次数。坐标、属性、码本、量化参数、必要元数据和纠错冗余均计入。
 
 无损打包恢复后的 MaskGaussian PLY 应与发送前逐字节一致。MesonGS 应从接收的压缩包独立解压并渲染，评估使用统一的相机、分辨率和指标实现。
 

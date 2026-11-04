@@ -1,0 +1,11 @@
+numpy==1.26.4
+scipy>=1.10,<1.14
+plyfile>=0.8,<2
+tqdm
+einops
+open3d
+trimesh
+seaborn
+loguru
+pandas<2.3
+mediapy
