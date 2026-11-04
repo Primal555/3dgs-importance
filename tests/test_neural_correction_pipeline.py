@@ -39,6 +39,7 @@ def test_online_exact_teacher_and_resume(source):
     rows=[json.loads(x) for x in (full/'allocation/metrics/loss.jsonl').read_text().splitlines()]
     assert all(r['tier_max_log_odds']==1. and r['neural_exact_training_groups']>0 for r in rows)
     assert all(r['neural_exact_extra_teacher_renders']==0 for r in rows)
+    assert all('neural_full_state_regression_loss' in r and 'neural_observed_gap_regression_loss' in r for r in rows)
     assert all(r['neural_history_invalidated_rows']==r['neural_candidates'] for r in rows)
     for saved,out in ((a,full),(b,split)):
         active={record['id'] for record in saved['replay']['training']}
@@ -52,6 +53,11 @@ def test_online_exact_teacher_and_resume(source):
                 assert not validation[group['source']]
         assert gaps
     assert (full/'allocation/metrics/network_validation.jsonl').is_file()
+    report=json.loads((full/'allocation/comparison/structured_evidence.json').read_text())
+    if report['selected_step']:
+        assert report['checkpoint_network_updates']==report['positive_network_feedback_revision']+1
+    else:
+        assert report['positive_network_feedback_revision'] is None
     pretrained=read(full/'benefit_network.pt')['learner']['network']
     assert any(not torch.equal(v,a['positive_provider']['learner']['network'][k]) for k,v in pretrained.items())
 

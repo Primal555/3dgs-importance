@@ -61,3 +61,13 @@ def test_no_positive_candidates_still_updates_every_closed_keep_row():
     assert result['tier_ids'].numel()==0
     assert scheduler.keep_observations.sum(1).tolist()==[1]*16
     assert int((result['keep_costs'][:,1]!=0).sum())==16
+
+
+def test_provider_revision_is_prepared_before_candidate_selection():
+    provider=Provider();prepared=[]
+    provider.prepare_step=lambda step:prepared.append(step)
+    original=CalibratedEvidence.select_rounds
+    def select(scheduler,*args,**kwargs):
+        assert prepared==[1]
+        return original(scheduler,*args,**kwargs)
+    with patch.object(CalibratedEvidence,'select_rounds',select):run(provider)

@@ -183,6 +183,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
     costs, selected, all_audits = [], [], []
     image_costs, rate_costs, locations = [], [], []
     evidence = hasattr(scheduler, 'select_rounds')
+    if positive_provider is not None and hasattr(positive_provider,'prepare_step'):
+        positive_provider.prepare_step(side_proxy['step'])
     with timing(timings, 'candidate_schedule_seconds'):
         if evidence:
             influence = torch.zeros(count, dtype=torch.float64)

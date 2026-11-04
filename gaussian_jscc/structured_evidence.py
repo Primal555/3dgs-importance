@@ -45,7 +45,7 @@ class StructuredEvidence(EvidenceScheduler):
         else:
             self.context.copy_(probabilities); self.context_ready = True
         selected = []
-        variation = (self.second-self.mean.square()).clamp_min(0).sum((1, 2)).sqrt()
+        variation = self.positive_variation()
         for ids in self.ids:
             safe = ids.clamp_min(0); available = (ids >= 0) & (q[safe] > 0)
             batch = []
@@ -64,6 +64,18 @@ class StructuredEvidence(EvidenceScheduler):
 
     @staticmethod
     def _combine(parts, weight): return parts[..., 0]+weight*parts[..., 1]
+
+    def positive_variation(self,ids=None):
+        mean=self.mean if ids is None else self.mean[ids]
+        second=self.second if ids is None else self.second[ids]
+        return (second-mean.square()).clamp_min(0).sum((1,2)).sqrt()
+
+    def positive_risk(self,ids):
+        return self.positive_variation(ids)+self.error[ids]+self.refresh[ids].double()
+
+    def keep_risk(self):
+        variance=(self.keep_second-self.keep_mean.square()).clamp_min(0).sum((1,2)).sqrt()
+        return variance+self.error+self.refresh.double()
 
     def _trust(self, mean, second, weight, age, refresh, error, lambda_s):
         magnitude = self._combine(mean, lambda_s).abs().mean(-1).clamp_min(1e-12)
@@ -189,8 +201,7 @@ def risk_choices(ids, action_scores, q, scheduler, limit, step):
     boundary = scores.abs().amin(-1)
     move = torch.nan_to_num(scores, posinf=0.).amax(-1)-torch.nan_to_num(scores, posinf=0.).amin(-1)
     boundary = boundary/(1+move)
-    variance = (scheduler.second[ids]-scheduler.mean[ids].square()).clamp_min(0).sum((1, 2)).sqrt()
-    risk = variance+scheduler.error[ids]+scheduler.refresh[ids].double()
+    risk = scheduler.positive_risk(ids)
     action_counts = scheduler.positive_exact_count[ids].clone()
     action_counts[torch.arange(len(ids)), q[ids]-1] = torch.iinfo(torch.long).max
     least_action_checks = action_counts.amin(-1)

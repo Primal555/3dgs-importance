@@ -5,7 +5,7 @@ from .calibrated_spatial_benefit import CalibratedSpatialLearner
 from .spatial_benefit import pack_inputs
 
 
-def gap_losses(prediction,groups,scale,decision_weight):
+def gap_losses(prediction,groups,scale,decision_weight,tie_fraction=.02):
     rows=torch.arange(len(groups),device=prediction.device)
     old=torch.tensor([g['old_tier']-1 for g in groups],device=prediction.device)
     new=torch.tensor([g['new_tier']-1 for g in groups],device=prediction.device)
@@ -18,26 +18,32 @@ def gap_losses(prediction,groups,scale,decision_weight):
     target=torch.sigmoid(-t)
     kl=(F.binary_cross_entropy_with_logits(-p,target,reduction='none')-
         F.binary_cross_entropy_with_logits(-t,target,reduction='none')).clamp_min(0.)
-    decision=kl*t.abs()
+    decision=kl*torch.where(t.abs()>tie_fraction,t.abs(),0.)
     regret=torch.where(p*t<0,(truth.sum(-1)+rates).abs(),0.)
     zero=regression*0
     return dict(absolute=regression,common=zero,pair=zero,decision=decision,
-                total=regression+decision_weight*decision,regret=regret.detach())
+                total=regression+decision_weight*decision,regret=regret.detach(),
+                full_state_regression=zero,observed_gap_regression=regression)
 
 
 class CorrectionLearner(CalibratedSpatialLearner):
+    def full_losses(self,groups):
+        result=super()._batch_losses(groups)
+        result.update(full_state_regression=result['absolute'],observed_gap_regression=result['absolute']*0)
+        return result
+
     def _batch_losses(self,groups):
         full=[i for i,g in enumerate(groups) if g.get('supervision')!='action_gap']
         gaps=[i for i,g in enumerate(groups) if g.get('supervision')=='action_gap']
-        if not gaps:return super()._batch_losses(groups)
+        if not gaps:return self.full_losses(groups)
         batches=[]
-        if full:batches.append((full,super()._batch_losses([groups[i] for i in full])))
+        if full:batches.append((full,self.full_losses([groups[i] for i in full])))
         selected=[groups[i] for i in gaps]
         inputs=[v['inputs'] for g in selected for v in g['views']]
         sizes=[len(g['views']) for g in selected]
         prediction=self.network(*pack_inputs(inputs,self.device)).double()
         prediction=torch.stack([v.mean(0) for v in prediction.split(sizes)])
-        batches.append((gaps,gap_losses(prediction,selected,self.scales['rd'],self.decision_weight)))
+        batches.append((gaps,gap_losses(prediction,selected,self.scales['rd'],self.decision_weight,self.tie_fraction)))
         return {key:sum(value[key].new_zeros(len(groups)).index_copy(0,
                     torch.tensor(indices,device=self.device),value[key])
                     for indices,value in batches) for key in batches[0][1]}

@@ -10,7 +10,7 @@ from .optimization import preserved_rng
 from .pixel_benefit_learning import summarize_pixel_values
 from .render_validation import append_json
 
-POLICY='current_network_context_residual_v1'
+POLICY='current_network_context_residual_v2'
 
 
 class NetworkCorrectionProvider(HybridPositiveProvider):
@@ -34,9 +34,11 @@ class NetworkCorrectionProvider(HybridPositiveProvider):
         return dict(neural_correction_policy=POLICY,positive_history_policy='current_network_revision',
                     positive_residual_policy='matched_context_recomputed_teacher_gap')
 
+    def prepare_step(self,step):
+        self.scheduler.model_revision=self.learner.updates
+
     def observe_context(self,scene,q,entries,captures,targets,task):
         self.step_data=(entries,captures,targets)
-        self.scheduler.model_revision=self.learner.updates
         self.block_context={}
         for b,entry in enumerate(entries):
             tiers=entry[2].cpu().numpy().astype('uint8')
@@ -107,6 +109,7 @@ class NetworkCorrectionProvider(HybridPositiveProvider):
             rows,weighted=self.learner._report_groups(self.replay.validation_records())
             report=summarize_pixel_values(rows)
             report.update(step=step,network_updates=self.learner.updates,weighted_validation=weighted,
+                active_decision='q1/q2/q3 differences; q0 network metrics are auxiliary',
                 scope='fixed held-out pretraining contexts; no training or on-policy replacement')
             append_json(self.args.out+'/metrics/network_validation.jsonl',report)
         self.groups=[];self.step_data=None

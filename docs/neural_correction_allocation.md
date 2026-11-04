@@ -49,3 +49,13 @@ tail -n 40 -f "${OUT}.log"
 - `review.tar.gz`：供下载检查，排除 checkpoint 和 replay。
 
 固定验证集使用预训练时保留的上下文。部署 RD 用于判断整个分配系统是否改善。
+
+## 启动前口径审计（2026-11-04）
+
+策略版本为 `current_network_context_residual_v2`。每步在候选调度之前同步网络版本，过时正档位方差及误差不参与新版本的候选与纠偏优先级；q0 核验优先级使用自身误差，密集反馈、历史及更新公式保持原设计。旧预测均值仍在点被重新访问时惰性清理，避免每步清空全场景统计。
+
+完整四档监督和动作差值监督使用同一个 `tie_fraction` 近似平局区间：小于阈值的真实 RD 差值保留数值回归，不增加方向损失。日志中的 `neural_full_state_regression_loss`、`neural_observed_gap_regression_loss` 分别表示两类样本对 minibatch 回归损失的加权贡献；`neural_absolute_loss` 保留为两者之和。
+
+历史统计按本步分配实际使用的反馈版本筛选，`positive_feedback_revision` 记录该版本。`network_updates` 是本步在线训练后的版本，默认比反馈版本多 64 次优化。结果报告分别记录 `positive_network_feedback_revision` 和 `checkpoint_network_updates`，避免把最近一次分配反馈误读为训练后权重已经具备的历史。累计候选访问及 observation 统计仍覆盖整个实验。
+
+标签统一为 `[ΔMSE/D_ref, lambda_s·Δstructure/D_ref]`，网络只预测失真，通信差价在决策中单独加入一次。q0 锚定的完整监督作为辅助目标保留；网络验证中的 q0 指标明确标记为辅助项。实际删点仍由密集 q0 分支负责。训练 RD 为单次采样失真与期望成本代理，部署 RD 使用十次规则输出和完整计费，两者在日志中分别注明。

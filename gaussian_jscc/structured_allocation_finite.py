@@ -45,8 +45,7 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
                         side_proxy.get('scale_per_retained', 0.))/c_ref
     keep_delta = scheduler._combine(calibrated_keep, weight)+proxy_cost
     keep_delta *= torch.where(q_source > 0, -1., 1.)
-    variance = (scheduler.keep_second-scheduler.keep_mean.square()).clamp_min(0).sum((1, 2)).sqrt()
-    risk = variance+scheduler.error+scheduler.refresh.double()
+    risk = scheduler.keep_risk()
     rotation = torch.roll(torch.arange(n), -(step % n))
     keep_action_checks = scheduler.keep_exact_count[torch.arange(n), keep_tiers-1]
     orders = [rotation[torch.argsort(keep_delta[rotation].abs(), stable=True)],

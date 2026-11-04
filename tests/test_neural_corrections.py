@@ -16,6 +16,45 @@ def test_gap_supervision_only_constrains_observed_pair():
     assert changed.grad[:,2].abs().sum()==0
 
 
+def test_gap_direction_uses_same_tie_band_as_full_state_supervision():
+    prediction=torch.tensor([[[0.,0.],[5.,0.],[9.,0.]]],requires_grad=True)
+    group=dict(old_tier=1,new_tier=2,delta_values=torch.tensor([.01,0.]),rate_delta=0.)
+    result=gap_losses(prediction,[group],1.,.25,tie_fraction=.02)
+    assert result['decision'].item()==0
+    assert result['observed_gap_regression'].item()>0 and result['full_state_regression'].item()==0
+
+
+def test_obsolete_variance_cannot_drive_candidate_or_teacher_selection():
+    from gaussian_jscc.neural_correction_provider import NetworkCorrectionProvider
+    scheduler=NetworkAwareEvidence([torch.arange(4).reshape(1,4)],rounds=1,finite_samples=0)
+    scheduler.model_revision=1;scheduler.prediction_revision.fill_(1)
+    scheduler.second.fill_(100);scheduler.positive_error.fill_(200);scheduler.error.fill_(200)
+    scheduler.keep_error.fill_(.5)
+    assert scheduler.positive_variation().min()>0
+    provider=object.__new__(NetworkCorrectionProvider)
+    provider.scheduler=scheduler;provider.learner=SimpleNamespace(updates=2)
+    provider.prepare_step(1)
+    assert scheduler.model_revision==2
+    assert scheduler.positive_variation().max()==0
+    torch.testing.assert_close(scheduler.positive_risk(torch.arange(4)),torch.full((4,),.5,dtype=torch.float64))
+    torch.testing.assert_close(scheduler.keep_risk(),torch.full((4,),.5,dtype=torch.float64))
+    assert scheduler.second.min()==100
+
+
+def test_diagnostics_exclude_stale_evidence_without_losing_lifetime_counts():
+    scheduler=NetworkAwareEvidence([torch.arange(4).reshape(1,4)],rounds=1,finite_samples=0)
+    scheduler.configure_views(4,1);scheduler.model_revision=2
+    scheduler.prediction_revision[:]=torch.tensor([2,1,1,1])
+    scheduler.weight.fill_(10);scheduler.observations.fill_(20);scheduler.counts.fill_(30)
+    scheduler.evidence_step.fill_(1);scheduler.positive_effective_samples.fill_(10)
+    report=scheduler.diagnostics(torch.ones(4,dtype=torch.long),step=1)
+    assert report['positive_history']['zero_fraction']==.75
+    assert report['retained_effective_evidence_mean']==2.5
+    assert report['positive_feedback_revision_rows']==1 and report['positive_feedback_revision']==2
+    assert report['positive_observations']['mean']==20
+    assert report['retained_candidate_evaluations_mean']==30
+
+
 def test_network_revision_resets_positive_prediction_history_only():
     ids=[torch.arange(4).reshape(1,4)]
     scheduler=NetworkAwareEvidence(ids,rounds=1,finite_samples=0)

@@ -11,6 +11,11 @@ def summarize_structured(out, selected):
     evidence = selected['blocks']['evidence']; data = selected['blocks']['structured']['tensors']
     half_life = evidence['settings'][3]; kept = selected['latest_q'] > 0
     weight = evidence['weight']*torch.exp2(-(step-evidence['evidence_step']).double()/half_life)
+    neural=selected['blocks'].get('neural_history')
+    current=None
+    if neural is not None:
+        current=neural['revision']==neural['feedback_revision']
+        weight=weight*current
     keep_weight = data['keep_weight']*torch.exp2(-(step-data['keep_step']).double()/half_life)
     def stats(value):
         value = value.double().flatten()
@@ -35,8 +40,12 @@ def summarize_structured(out, selected):
             correction_actions={b:len(calibrated[b]['keys']) for b in ('positive','keep')},
             correction_observations={b:int(calibrated[b]['count'].sum()) for b in ('positive','keep')})
     if 'neural_history' in selected['blocks']:
-        summary.update(primary_observation_rule='positive proxy history belongs to one network revision; keep history unchanged',
-            diagnostic_note='current exact gaps supervise the network; matched residual anchors are recomputed by current weights')
+        summary.update(primary_observation_rule='positive history is scoped to the last allocation feedback revision; keep history unchanged',
+            diagnostic_note='current exact gaps supervise the network; matched residual anchors are recomputed by current weights',
+            positive_network_feedback_revision=neural['feedback_revision'] if (neural['revision']>=0).any() else None,
+            checkpoint_network_updates=selected['positive_provider']['network_updates'],
+            positive_mean_effective_samples=stats(tensors['positive_effective_samples'][kept&current]),
+            positive_trust=stats(data['tier_trust'][kept&current]))
     json_write(out/'comparison/structured_evidence.json', summary)
     rows = read_rows(out/'metrics/validation.jsonl')
     keys = ('event','step','total_channel_uses','source_mse','source_structure_error','source_distortion',

@@ -92,6 +92,19 @@ class NetworkAwareEvidence(CalibratedEvidence):
         self.prediction_revision=torch.full_like(self.counts,-1)
         self.model_revision=0;self.reset_rows=0
 
+    def positive_variation(self,ids=None):
+        revision=self.prediction_revision if ids is None else self.prediction_revision[ids]
+        return super().positive_variation(ids).masked_fill(revision!=self.model_revision,0.)
+
+    def positive_risk(self,ids):
+        current=self.prediction_revision[ids]==self.model_revision
+        error=torch.maximum(torch.where(current,self.positive_error[ids],0.),self.keep_error[ids])
+        return self.positive_variation(ids)+error+self.refresh[ids].double()
+
+    def keep_risk(self):
+        variance=(self.keep_second-self.keep_mean.square()).clamp_min(0).sum((1,2)).sqrt()
+        return variance+self.keep_error+self.refresh.double()
+
     def accumulate_components(self,ids,parts,rate,step,lambda_s,**kwargs):
         ids=ids.cpu();changed=ids[self.prediction_revision[ids]!=self.model_revision]
         for name in ('mean','second','weight','positive_weight2','positive_effective_samples',
@@ -101,12 +114,35 @@ class NetworkAwareEvidence(CalibratedEvidence):
         return super().accumulate_components(ids,parts,rate,step,lambda_s,**kwargs)
 
     def state_dict(self):
-        return dict(super().state_dict(),neural_history=dict(version=1,revision=self.prediction_revision.clone()))
+        return dict(super().state_dict(),neural_history=dict(version=2,revision=self.prediction_revision.clone(),
+                                                             feedback_revision=self.model_revision))
+
+    def diagnostics(self,q,step=None):
+        result=super().diagnostics(q,step)
+        step=int(self.last.max()) if step is None else step
+        kept=q.cpu()>0;current=self.prediction_revision==self.model_revision
+        active=kept&current
+        weights=self.weight*torch.exp2(-(step-self.evidence_step).double()/self.half_life)*current
+        values=weights[kept]
+        def mean(x):return float(x.double().mean()) if x.numel() else 0.
+        result.update(retained_effective_evidence_mean=mean(values),
+            positive_mean_effective_samples=mean(self.positive_effective_samples[active]),
+            positive_mean_trust=mean(self.tier_trust[active]),
+            positive_feedback_revision=self.model_revision,
+            positive_feedback_revision_rows=int(active.sum()),
+            positive_feedback_stale_retained_fraction=mean((~current)[kept]),
+            positive_history_scope='this allocation feedback revision; observation and candidate counts remain lifetime',
+            positive_trust_scope='retained points evaluated by this allocation feedback network')
+        result['positive_history']=dict(mean=mean(values),zero_fraction=mean(values==0),
+            quantiles=torch.quantile(values,torch.tensor([0.,.25,.5,.75,1.],dtype=torch.float64)).tolist()
+                      if values.numel() else [])
+        return result
 
     def load_state_dict(self,state):
         extra=state.get('neural_history',{})
         revision=extra.get('revision')
-        if (extra.get('version')!=1 or not isinstance(revision,torch.Tensor) or
+        if (extra.get('version')!=2 or not isinstance(revision,torch.Tensor) or
                 revision.shape!=self.counts.shape or revision.dtype!=torch.long or (revision < -1).any()):
             raise ValueError('network-aware history mismatch')
         super().load_state_dict(state);self.prediction_revision=revision.cpu().clone()
+        self.model_revision=int(extra['feedback_revision'])
