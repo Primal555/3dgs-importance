@@ -19,3 +19,9 @@
 [submodule "external/ROI-JSCC"]
 	path = external/ROI-JSCC
 	url = https://github.com/hansung-choi/ROI-JSCC.git
+[submodule "comparison_baselines/MesonGS"]
+	path = comparison_baselines/MesonGS
+	url = https://github.com/ShuzhaoXie/MesonGS.git
+[submodule "comparison_baselines/MaskGaussian"]
+	path = comparison_baselines/MaskGaussian
+	url = https://github.com/kaikai23/MaskGaussian.git
