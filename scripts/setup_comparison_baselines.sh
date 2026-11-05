@@ -47,9 +47,24 @@ if [[ "$MODE" == all || "$MODE" == mesongs ]]; then
     export CUDA_HOME="$MESONGS_ENV"
   fi
   test -x "$CUDA_HOME/bin/nvcc" || { echo "nvcc missing: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
+  # CUDA 12.1 and the PyTorch 2.1 bundled pybind11 headers need a compatible
+  # host toolchain (https://github.com/pybind/pybind11/issues/4606).
+  conda_command install -y -p "$MESONGS_ENV" -c conda-forge 'gcc_linux-64=11' 'gxx_linux-64=11'
+  conda_command activate "$MESONGS_ENV"
+  # Absolute Python paths alone do not isolate the compiler environment. In
+  # particular, a parent maskgs shell can inject its includes and nvcc -ccbin.
+  unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH
+  unset NVCC_PREPEND_FLAGS NVCC_APPEND_FLAGS CUDAHOSTCC GCC_EXEC_PREFIX COMPILER_PATH
+  export CC="$MESONGS_ENV/bin/x86_64-conda-linux-gnu-cc"
+  export CXX="$MESONGS_ENV/bin/x86_64-conda-linux-gnu-c++"
+  export CUDAHOSTCXX="$CXX"
+  test -x "$CC" && test -x "$CXX" || { echo 'MesonGS GCC 11 toolchain missing' >&2; exit 1; }
   export PATH="$CUDA_HOME/bin:$PATH"
   export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
   export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
+  export MAX_JOBS="${MAX_JOBS:-4}"
+  printf 'MesonGS build: CC=%s CXX=%s CUDA_HOME=%s MAX_JOBS=%s\n' "$CC" "$CXX" "$CUDA_HOME" "$MAX_JOBS"
+  "$CXX" --version
   for module in diff-gaussian-rasterization simple-knn weighted_distance; do
     "$MESONGS_ENV/bin/python" -m pip install --no-build-isolation \
       "$PROJECT/comparison_baselines/MesonGS/submodules/$module"

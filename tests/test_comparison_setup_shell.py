@@ -31,9 +31,14 @@ if [[ "$1" == info ]]; then printf '%s/conda\\n' "$PWD"; fi
 ''',
                 'conda/envs/gs_mesongs/bin/python': '''#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$PWD/python_calls"
+if [[ "$*" == *submodules/* ]]; then
+  printf '%s|%s|%s|%s|%s|%s|%s\\n' "$CC" "$CXX" "${CFLAGS:-}" "${CXXFLAGS:-}" "${CPATH:-}" "${NVCC_PREPEND_FLAGS:-}" "${NVCC_APPEND_FLAGS:-}" >> "$PWD/build_environment"
+fi
 if [[ "$*" == *submodules/diff-gaussian-rasterization* && "${TEST_FAILURE:-}" == extension ]]; then exit 41; fi
 ''',
                 'conda/envs/gs_mesongs/bin/nvcc': '#!/usr/bin/env bash\nexit 0\n',
+                'conda/envs/gs_mesongs/bin/x86_64-conda-linux-gnu-cc': '#!/usr/bin/env bash\necho gcc 11\n',
+                'conda/envs/gs_mesongs/bin/x86_64-conda-linux-gnu-c++': '#!/usr/bin/env bash\necho g++ 11\n',
             }
             for name, content in files.items():
                 path = root / name
@@ -44,11 +49,21 @@ if [[ "$*" == *submodules/diff-gaussian-rasterization* && "${TEST_FAILURE:-}" ==
             for name in ('DIGITAL_ENV', 'MESONGS_ENV', 'MESONGS_CUDA_HOME', 'CONDA_BACKUP_CXX'):
                 env.pop(name, None)
             env['TEST_FAILURE'] = failure
+            for name in ('CC', 'CXX', 'CFLAGS', 'CXXFLAGS', 'CPATH', 'NVCC_PREPEND_FLAGS', 'NVCC_APPEND_FLAGS'):
+                env[name] = '/old/maskgs/contamination'
             result = subprocess.run(
                 [BASH, '-c', 'export PATH="$PWD/bin:$PATH"; bash scripts/setup.sh mesongs'],
                 cwd=root, env=env, capture_output=True, text=True,
             )
             calls = (root / 'python_calls').read_text() if (root / 'python_calls').exists() else ''
+            if result.returncode == 0:
+                build_env = (root / 'build_environment').read_text()
+                self.assertNotIn('/old/maskgs/', build_env)
+                for line in build_env.splitlines():
+                    cc, cxx, *flags = line.split('|')
+                    self.assertTrue(cc.endswith('/gs_mesongs/bin/x86_64-conda-linux-gnu-cc'))
+                    self.assertTrue(cxx.endswith('/gs_mesongs/bin/x86_64-conda-linux-gnu-c++'))
+                    self.assertEqual(flags, ['', '', '', '', ''])
             return result, calls
 
     def test_conda_hook_with_unset_backup_does_not_abort_extension_install(self):
