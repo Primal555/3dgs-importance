@@ -8,12 +8,23 @@ if [[ "$MODE" == all || "$MODE" == sources ]]; then
 fi
 if [[ "$MODE" == sources ]]; then exit 0; fi
 command -v conda >/dev/null || { echo 'Activate conda before running setup.' >&2; exit 1; }
-CONDA_BASE="$(conda info --base)"
+# Conda compiler activation hooks may read unset CONDA_BACKUP_* variables.
+# Relax nounset only inside Conda operations and preserve their exit status.
+conda_command() {
+  local conda_status=0
+  set +u
+  conda "$@" || conda_status=$?
+  set -u
+  return "$conda_status"
+}
+CONDA_BASE="$(conda_command info --base)"
+set +u
 source "$CONDA_BASE/etc/profile.d/conda.sh"
+set -u
 DIGITAL_ENV="${DIGITAL_ENV:-$CONDA_BASE/envs/gs_digital}"
 MESONGS_ENV="${MESONGS_ENV:-$CONDA_BASE/envs/gs_mesongs}"
 if [[ "$MODE" == all || "$MODE" == digital ]]; then
-  if [[ ! -x "$DIGITAL_ENV/bin/python" ]]; then conda create -y -p "$DIGITAL_ENV" python=3.11 pip; fi
+  if [[ ! -x "$DIGITAL_ENV/bin/python" ]]; then conda_command create -y -p "$DIGITAL_ENV" python=3.11 pip; fi
   "$DIGITAL_ENV/bin/python" -m pip install 'torch==2.9.1' --index-url https://download.pytorch.org/whl/cu128
   "$DIGITAL_ENV/bin/python" -m pip install -r "$PROJECT/comparison_baselines/requirements-digital.txt"
   # The PHY path does not require the optional ray-tracing distribution.
@@ -22,7 +33,7 @@ if [[ "$MODE" == all || "$MODE" == digital ]]; then
 fi
 if [[ "$MODE" == all || "$MODE" == mesongs ]]; then
   test -f "$PROJECT/comparison_baselines/MesonGS/mesongs.py" || { echo 'Run the sources setup first.' >&2; exit 1; }
-  if [[ ! -x "$MESONGS_ENV/bin/python" ]]; then conda create -y -p "$MESONGS_ENV" python=3.10 pip; fi
+  if [[ ! -x "$MESONGS_ENV/bin/python" ]]; then conda_command create -y -p "$MESONGS_ENV" python=3.10 pip; fi
   "$MESONGS_ENV/bin/python" -m pip install 'numpy==1.26.4' 'setuptools<70' wheel ninja
   "$MESONGS_ENV/bin/python" -m pip install 'torch==2.1.0+cu121' 'torchvision==0.16.0+cu121' \
     'torchaudio==2.1.0+cu121' --index-url https://download.pytorch.org/whl/cu121
@@ -32,7 +43,7 @@ if [[ "$MODE" == all || "$MODE" == mesongs ]]; then
   if [[ -n "${MESONGS_CUDA_HOME:-}" ]]; then
     export CUDA_HOME="$MESONGS_CUDA_HOME"
   else
-    conda install -y -p "$MESONGS_ENV" -c nvidia/label/cuda-12.1.1 cuda-toolkit
+    conda_command install -y -p "$MESONGS_ENV" -c nvidia/label/cuda-12.1.1 cuda-toolkit
     export CUDA_HOME="$MESONGS_ENV"
   fi
   test -x "$CUDA_HOME/bin/nvcc" || { echo "nvcc missing: $CUDA_HOME/bin/nvcc" >&2; exit 1; }
