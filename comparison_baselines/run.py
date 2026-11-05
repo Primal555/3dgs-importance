@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -177,11 +178,23 @@ def snr_label(snr):
     return repr(float(snr))
 
 
+def _subprocess_environment(python):
+    env=dict(os.environ,PYTHONUNBUFFERED='1',PYTHONUTF8='1')
+    executable=shutil.which(str(python)) or str(python)
+    # Selecting another environment's Python does not select its C++ runtime.
+    # Set the loader path before the child starts importing native extensions.
+    library=Path(executable).absolute().parent.parent/'lib'
+    if library.is_dir():
+        paths=[str(library),*env.get('LD_LIBRARY_PATH','').split(os.pathsep)]
+        env['LD_LIBRARY_PATH']=os.pathsep.join(dict.fromkeys(p for p in paths if p))
+    return env
+
+
 def _execute(python,module,arguments,log):
     command=[python,'-u','-m',module,*map(str,arguments)]
     log=Path(log);log.parent.mkdir(parents=True,exist_ok=True)
     print(shlex.join(command),flush=True)
-    env=dict(os.environ,PYTHONUNBUFFERED='1',PYTHONUTF8='1')
+    env=_subprocess_environment(python)
     with log.open('a',encoding='utf-8') as handle:
         handle.write('\n'+shlex.join(command)+'\n');handle.flush()
         process=subprocess.Popen(command,cwd=ROOT,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
