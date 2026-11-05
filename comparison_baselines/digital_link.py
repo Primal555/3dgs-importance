@@ -128,6 +128,22 @@ def _receive_file(wire, destination: Path, *, payload_bytes: int, codewords: int
     return result
 
 
+def _resolve_device(torch, requested):
+    device = torch.device(requested)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"请求设备 {device}，当前 PyTorch 无可用 CUDA")
+        # Sionna validates exact device names; PyTorch's bare cuda alias is
+        # resolved using the current logical index after CUDA_VISIBLE_DEVICES.
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+    elif device.type == "cpu":
+        device = torch.device("cpu")
+    else:
+        raise ValueError("数字链路 device 仅支持 cpu 或 cuda")
+    return device
+
+
 def transmit_file(source, destination, *, config: LinkConfig, snr_db: float, seed: int,
                   noiseless: bool = False, progress: Callable[[dict], None] | None = None) -> dict:
     """传输一个文件；有效试验返回 success/failed，依赖或程序错误抛出异常。
@@ -166,11 +182,7 @@ def transmit_file(source, destination, *, config: LinkConfig, snr_db: float, see
     version = importlib.metadata.version("sionna")
     if version != "2.2.0":
         raise RuntimeError(f"数字链路要求 Sionna==2.2.0，当前为 {version}")
-    device = torch.device(config.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(f"请求设备 {device}，当前 PyTorch 无可用 CUDA")
-    if device.type not in ("cpu", "cuda"):
-        raise ValueError("数字链路 device 仅支持 cpu 或 cuda")
+    device = _resolve_device(torch, config.device)
     encoder = LDPC5GEncoder(config.k, config.n, num_bits_per_symbol=config.bits_per_symbol,
                             precision="single", device=str(device))
     decoder = LDPC5GDecoder(encoder, num_iter=config.decoder_iterations, hard_out=True,
