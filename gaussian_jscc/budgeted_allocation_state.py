@@ -1,9 +1,34 @@
 """Atomic exact resume; numeric logs use unique step/event keys."""
 import json
+import _codecs
 from pathlib import Path
+import threading
 import time
 import torch
 from .modular_checkpoint import capture_rng
+
+
+_checkpoint_read_lock = threading.RLock()
+
+
+def load_checkpoint(path):
+    """Restricted allocation-state reader, including binary context hashes on 2.3."""
+    with _checkpoint_read_lock:
+        safe_globals = getattr(torch.serialization, 'safe_globals', None)
+        if callable(safe_globals):
+            with safe_globals([_codecs.encode]):
+                return torch.load(path, map_location='cpu', weights_only=True)
+        # PyTorch 2.3 has no scoped safe_globals API. Extend only this read's
+        # restricted loader with the bytes reconstruction function supported by
+        # newer versions; preserve both the original cache and lookup afterward.
+        module = torch.serialization._weights_only_unpickler
+        original = module._get_allowed_globals
+        allowed = dict(original(), **{'_codecs.encode': _codecs.encode})
+        try:
+            module._get_allowed_globals = lambda: allowed
+            return torch.load(path, map_location='cpu', weights_only=True)
+        finally:
+            module._get_allowed_globals = original
 
 
 def save_state(out, label, model, table, controller, blocks, views, progress, plan, scene_record, reference, q, *, learner=None,positive_provider=None):
@@ -36,7 +61,7 @@ def save_state(out, label, model, table, controller, blocks, views, progress, pl
 
 
 def restore_state(path, plan, scene_record):
-    state = torch.load(path, map_location='cpu', weights_only=True)
+    state = load_checkpoint(path)
     if (state.get('family') != plan['version'] or state['plan'] != plan
             or state['scene_record'] != scene_record):
         raise ValueError('exact resume source/settings/scene mismatch')

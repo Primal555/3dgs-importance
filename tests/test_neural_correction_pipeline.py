@@ -71,3 +71,33 @@ def test_defaults_and_no_cross_policy_resume(source):
     assert plan['settings']['aligned_spatial_inputs'] and not out.exists()
     args.network_mode='frozen'
     with pytest.raises(ValueError,match='online'):entry.main(args)
+
+
+def test_completed_updates_resume_final_evaluation_without_training(source):
+    import pickle
+    from gaussian_jscc import budgeted_allocation as allocator
+
+    parent, root = source
+    out = root / 'correction_final_read_failure'
+    args = options(parent, out)
+    original = allocator.load_checkpoint
+
+    def fail_selected_read(path):
+        if Path(path).parent.name == 'best_rd':
+            raise pickle.UnpicklingError('Unsupported class _codecs.encode')
+        return original(path)
+
+    with environment(), patch.object(allocator, 'load_checkpoint', side_effect=fail_selected_read):
+        with pytest.raises(pickle.UnpicklingError, match='_codecs.encode'):
+            entry.main(args)
+    state = original(out / 'allocation/checkpoints/latest/state.pt')
+    assert state['progress']['step'] == args.allocation_steps
+    assert not (out / 'complete.json').exists()
+    updates = state['positive_provider']['network_updates']
+    args.resume = True
+    with environment(), patch.object(allocator, 'budgeted_mask_step',
+                                      side_effect=AssertionError('finished training repeated')):
+        result = entry.main(args)
+    assert result['status'] == 'complete' and result['network_updates'] == updates
+    assert (out / 'review_summary.json').is_file()
+    assert (out / 'review.tar.gz').is_file()

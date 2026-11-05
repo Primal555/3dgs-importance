@@ -14,7 +14,7 @@ from .allocation_reuse import AllocationTimings
 from .budgeted_allocation_inputs import load_inputs
 from .budgeted_allocation_kernel import budgeted_mask_step
 from .budgeted_allocation_evaluation import ExactDeploymentCost, evaluate_map, tier_hash
-from .budgeted_allocation_state import save_state, restore_state, repair, upsert_jsonl
+from .budgeted_allocation_state import save_state, restore_state, repair, upsert_jsonl, load_checkpoint
 from .cli import seed_all, device_for
 from .data import read_ply
 from .model_factory import build_codec
@@ -385,7 +385,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             q=deploy(table,args); save(); return dict(status='interrupted',step=step)
     q=deploy(table,args)
     chosen_label = 'best_rd' if fixed_rd else ('best_feasible' if progress['best'] is not None else 'lowest_violation')
-    selected = torch.load(out/'checkpoints'/chosen_label/'state.pt',map_location='cpu',weights_only=True)
+    selected = load_checkpoint(out/'checkpoints'/chosen_label/'state.pt')
     chosen_q = selected['latest_q']
     selected_row = measure('selected',scene.test_cameras,True,map_q=chosen_q)
     if torch.equal(chosen_q,q):
