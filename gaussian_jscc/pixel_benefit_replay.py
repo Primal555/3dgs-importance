@@ -34,6 +34,8 @@ def sample_sources(candidates, impact, difficulty, count, generator):
 class PixelReplay:
     """Store groups in immutable shards; retain evicted shards for older checkpoints."""
 
+    evict_on_capacity = True
+
     def __init__(self, root, seed=0, max_groups=1024, validation_groups=64):
         if max_groups <= 0 or validation_groups < 0:
             raise ValueError("invalid replay capacity")
@@ -78,7 +80,7 @@ class PixelReplay:
         else:
             self.training.append(entry)
             self.priorities[record_id] = 1.0
-            if len(self.training) > self.max_groups:
+            if self.evict_on_capacity and len(self.training) > self.max_groups:
                 old = self.training.pop(0)
                 del self.priorities[old["id"]]
         return record_id

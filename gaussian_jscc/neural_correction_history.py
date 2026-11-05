@@ -30,6 +30,7 @@ class ContextResidualBank:
             block=self.blocks[source],visibility=self.visibility[source].clone())
 
     def prune(self):
+        if getattr(self.replay,'retains_all_training',False):return
         active={e['id'] for e in self.replay.training}
         self.records={k:v for k,v in self.records.items() if v['record_id'] in active}
 
@@ -40,7 +41,8 @@ class ContextResidualBank:
 
     @torch.no_grad()
     def query(self,keys,context,step):
-        entries={e['id']:e for e in self.replay.training} if self.replay is not None else {}
+        entries=getattr(self.replay,'entries_by_id',None)
+        if entries is None:entries={e['id']:e for e in self.replay.training} if self.replay is not None else {}
         chosen=[]
         for pos,key in enumerate(keys.flatten().tolist()):
             source=key//9;record=self.records.get((key,self.views,self.blocks.get(source)))

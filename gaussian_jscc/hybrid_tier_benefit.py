@@ -58,6 +58,7 @@ class HybridSpatialWindow(BatchedSpatialWindow):
 
 class HybridPositiveProvider:
     learner_class=CalibratedSpatialLearner
+    replay_class=SpatialReplay
     def __init__(self, model, scene, table, scheduler, reference, args):
         self.model,self.scene,self.reference,self.args = model,scene,reference,args
         device = next(model.parameters()).device
@@ -75,7 +76,7 @@ class HybridPositiveProvider:
         replay_state = artifact['replay']
         self.replay = None
         if not self.frozen:
-            self.replay = SpatialReplay(Path(args.out)/'neural_replay',max_groups=replay_state['max_groups'],
+            self.replay = self.replay_class(Path(args.out)/'neural_replay',max_groups=replay_state['max_groups'],
                 validation_groups=replay_state['validation_groups'],cache_mib=self.settings['replay_cache_mib'])
             self.initial_replay = replay_state
         self.learner = self.learner_class(self.replay,device,hidden=self.settings['hidden'],
