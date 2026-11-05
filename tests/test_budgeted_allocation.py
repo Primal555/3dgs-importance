@@ -91,6 +91,8 @@ class BudgetedEntryTests(unittest.TestCase):
         q = torch.arange(16) % 4
         expected = measured_cost(model, scene, q[order], 10., model_id(model))
         result = meter.details(q)
+        from comparison_baselines.side_information_accounting import side_information_cost
+        self.assertEqual(result['comparison_accounting'], side_information_cost(result))
         for key in ('xyz_bytes', 'metadata_bytes', 'scale_stream_bytes', 'payload_complex_symbols', 'total_channel_uses'):
             self.assertEqual(result[key], expected[key], key)
         other = torch.where(q>0, torch.full_like(q, 3), q)

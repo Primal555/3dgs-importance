@@ -93,7 +93,34 @@ python -m comparison_baselines.run \
 
 每次 trial 都实际编码、加噪、解调和解码。完整接收包通过校验后，其解压结果相同，因此后续成功 trial 复用该包已经验证的渲染指标；复用来源写入 `evaluation_report`。传输失败记录为 `failed`，不赋予伪造的画质值。`quality_conditioning` 明确标注为 `successful_file_delivery`，应同时查看成功率。
 
-实际通信成本覆盖完整数字文件。现有 JSCC 结果中的可靠支路可能使用指定净 bit/use 假设；与这些数字链路结果作正式成本对比时，应统一可靠支路的配置及计费。
+实际通信成本覆盖完整数字文件。`file_channel_cost` 与真实传输共用文件头、CRC、补齐和调制编码的计费公式。
+
+### JSCC 侧信息统一账本
+
+JSCC 的属性按实际发送复符号计费，可靠 XYZ、档位元数据、binary16 块尺度各封装为一个数字文件，采用与基线相同的 LDPC／QAM 配置。默认每码块含 508 字节净载荷，发送 1536 个复符号。每路文件增加 48 字节头，分别补齐，因此侧信息成本为：
+
+```text
+K_side = sum_j ceil((B_j + 48) / 508) * 1536
+K_total = payload_complex_symbols + K_side
+```
+
+`scale_stream_bytes` 已包含尺度流内部帧头；外层数字文件封装在此基础上另计。共享权重预置，trial 不乘进单次交付开销。数字基线的压缩包已经包含其解码侧信息，整包按同一函数计费。
+
+新运行的预算／RD 分配评估在成本记录中增加 `comparison_accounting`，其中的 `total_channel_uses` 用于统一通信成本对比。原顶层 `total_channel_uses`、训练成本代理和选模 RD 继续沿用该实验的既定口径，保证历史续训一致。
+
+已有实验无需 GPU 或重训即可生成统一的 `summary.json`、`comparison.csv`：
+
+```bash
+python -m comparison_baselines.side_information_accounting \
+  --allocation output/truck_neural_corrections_gpu1_20261104_115640 \
+  --baseline output/digital_baselines_truck_gpu3_20261105_094813 maskgaussian \
+  --baseline output/mesongs_raw_truck_gpu1_20261105_123433 mesongs_c1 \
+  --out output/communication_accounting
+```
+
+`--allocation` 和每个 `--baseline` 也接受对应的 `review.tar.gz`。JSCC 目录需包含 `review_summary.json`、`allocation/training.json` 与最终评估指标。工具核对场景、相机名单及顺序、分辨率、背景、图片子目录、SNR 和数字链路成本；同时保留各组源 PLY 身份及数字组成功率。
+
+JSCC 侧信息当前按可靠交付假设计费，未执行三路文件的信道误码仿真，字段为 `side_link_simulated=false`。数字基线保留实际文件交付成功率及成功条件下的画质。统一账本只重算通信成本，原始画质、历史 RD 和选中的档位保持不变。
 
 ## 两组实验的作用
 

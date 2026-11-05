@@ -78,6 +78,21 @@ class LinkConfig:
             raise ValueError("device 必须是非空设备字符串")
 
 
+def file_channel_cost(source_bytes: int, config: LinkConfig = LinkConfig()) -> dict:
+    """按实际文件头、CRC、补齐、LDPC 和 QAM 计算一次文件交付开销。"""
+    if isinstance(source_bytes, bool) or not isinstance(source_bytes, int) or not 0 <= source_bytes < 2**64:
+        raise ValueError('source_bytes 必须是 uint64 范围的非负整数')
+    if not isinstance(config, LinkConfig):
+        raise TypeError('config 必须是 LinkConfig')
+    payload_bytes = config.k // 8 - _CRC.size
+    codewords = (_HEADER.size + source_bytes + payload_bytes - 1) // payload_bytes
+    return dict(source_bytes=source_bytes, codewords=codewords, header_bytes=_HEADER.size,
+                crc_bytes=codewords * _CRC.size, payload_bytes_per_codeword=payload_bytes,
+                padding_bytes=codewords * payload_bytes - _HEADER.size - source_bytes,
+                information_bits=codewords * config.k, coded_bits=codewords * config.n,
+                total_channel_uses=codewords * (config.n // config.bits_per_symbol))
+
+
 def _receive_file(wire, destination: Path, *, payload_bytes: int, codewords: int,
                   crc_error_blocks: int) -> dict:
     """独立接收端：只读取实际解码的数据和 CRC 结果。"""
@@ -209,7 +224,8 @@ def transmit_file(source, destination, *, config: LinkConfig, snr_db: float, see
             input_file.seek(0)
             source_hash = digest.hexdigest()
             pending = _HEADER.pack(_MAGIC, size, digest.digest())
-            codewords = (_HEADER.size + size + payload_bytes - 1) // payload_bytes
+            accounting = file_channel_cost(size, config)
+            codewords = accounting['codewords']
             with torch.inference_mode():
                 for offset in range(0, codewords, config.batch_size):
                     count = min(config.batch_size, codewords - offset)
@@ -262,12 +278,7 @@ def transmit_file(source, destination, *, config: LinkConfig, snr_db: float, see
         "constellation_average_energy": 1.0, "noise_variance": 0.0 if noiseless else n0,
         "mean_complex_power": transmitted_energy / (completed * (config.n // config.bits_per_symbol)),
         "scrambler": dict(_SCRAMBLER),
-        "noiseless": noiseless, "seed": seed, "codewords": completed,
-        "header_bytes": _HEADER.size, "crc_bytes": completed * _CRC.size,
-        "payload_bytes_per_codeword": payload_bytes,
-        "padding_bytes": completed * payload_bytes - _HEADER.size - size,
-        "information_bits": completed * config.k, "coded_bits": completed * config.n,
-        "total_channel_uses": completed * (config.n // config.bits_per_symbol),
+        "noiseless": noiseless, "seed": seed, **accounting,
         "bit_errors": bit_errors, "ber": bit_errors / (completed * config.k),
         "error_blocks": error_blocks, "block_error_rate": error_blocks / completed,
         "crc_error_blocks": crc_errors, "coded_bit_errors": coded_bit_errors,

@@ -54,6 +54,9 @@ def test_real_ldpc_recovers_bytes_and_charges_header_crc_padding(tmp_path, noise
     assert result["total_channel_uses"] == 576
     assert result["coded_bits"] == 2304
     assert result["information_bits"] == 1536
+    expected_cost = link.file_channel_cost(121, link.LinkConfig(k=512, n=768))
+    for key, value in expected_cost.items():
+        assert result[key] == value
     assert result["crc_error_blocks"] == result["bit_errors"] == 0
     assert result["ber"] == 0.0
     assert result["snr_definition"] == "Es/N0"

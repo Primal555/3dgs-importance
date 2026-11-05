@@ -43,12 +43,15 @@ class ExactDeploymentCost:
         payload = int(torch.tensor(self.model.cfg.rates)[q].sum())
         xyz_uses, meta_uses = math.ceil(8*size/self.bits), math.ceil(8*meta_bytes/self.bits)
         scale = self.model.scale_rate_record(self.scene, q, self.bits)
-        return dict(payload_complex_symbols=payload, xyz_bytes=size, metadata_bytes=meta_bytes,
+        result = dict(payload_complex_symbols=payload, xyz_bytes=size, metadata_bytes=meta_bytes,
             coordinate_channel_uses=xyz_uses, metadata_channel_uses=meta_uses, **scale,
             total_channel_uses=payload+xyz_uses+meta_uses+scale['scale_channel_uses'],
             net_bits_per_use_assumption=self.bits, xyz_cache_hit=self.positions.last_cache_hit,
             rate_scope='analogue payload + retained XYZ + complete metadata + binary16 scale frames; shared weights excluded',
             reliability='reliable-side assumption; no FEC/packet errors simulated')
+        from comparison_baselines.side_information_accounting import side_information_cost
+        result['comparison_accounting'] = side_information_cost(result)
+        return result
 
 
 @torch.no_grad()
