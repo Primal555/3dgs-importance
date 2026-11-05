@@ -56,7 +56,7 @@ def build_spatial_graph(xyz, k=16, workers=1):
     return torch.from_numpy(output)
 
 
-def build_projection_graph(projected, k=16, workers=1):
+def build_projection_graph(projected, k=16, workers=1, *, progress=None):
     """Coverage-overlap neighbors, balanced across front/back depth layers.
 
     Accept the renderer's [N,12] records or [u,v,depth,radius] [N,4]. Radius
@@ -66,37 +66,58 @@ def build_projection_graph(projected, k=16, workers=1):
     Query batches bound broad-phase temporaries independently of scene size.
     Widespread overlap can still produce O(N^2) broad-phase candidates; only
     retained graph storage is O(N*k).
+
+    An optional callback receives time-limited progress records. Completed roots
+    count only rows whose queries across every bucket and final selection have
+    finished. Bucket heartbeats report partial work without advancing that count.
     """
     from scipy.spatial import cKDTree
     _graph_options(k, workers)
     values = _array(projected, (4, 12))
     n = len(values)
     output = np.full((n, k), -1, dtype=np.int64)
-    if not k or n < 2:
-        return torch.from_numpy(output)
     center, depth = values[:, :2], values[:, 2]
     radius = values[:, -1]
     valid = (radius > 0) & (depth > 0)
     ids = np.flatnonzero(valid)
-    if len(ids) < 2:
+    started = time.perf_counter() if progress is not None else 0.
+    last_report = started
+    broadphase_hits = 0
+    def report(stage, completed, *, force=False, **details):
+        nonlocal last_report
+        if progress is None:return
+        now=time.perf_counter()
+        if not force and now-last_report<5.:return
+        elapsed=max(0.,now-started)
+        progress(dict(stage=stage,completed=int(completed),total=len(ids),
+            elapsed_seconds=elapsed,
+            eta_seconds=(elapsed*(len(ids)-completed)/completed if completed>0 else None),
+            broadphase_hits=int(broadphase_hits),**details))
+        last_report=now
+    report('building_trees',0,force=True)
+    if not k or n < 2 or len(ids) < 2:
+        report('complete',len(ids),force=True)
         return torch.from_numpy(output)
     # Powers of two limit each bucket's radius ratio while retaining all hits.
     exponent = np.floor(np.log2(radius[ids]))
     buckets = []
-    for scale in np.unique(exponent):
+    scales=np.unique(exponent)
+    for bucket_index,scale in enumerate(scales):
         members = ids[exponent == scale]
         buckets.append((members, cKDTree(center[members]), radius[members].max()))
+        report('building_trees',0,bucket_index=bucket_index+1,buckets_total=len(scales))
     front_budget = (k+1)//2
     for first in range(0, len(ids), 256):
         roots = ids[first:first+256]
         choices = [[] for _ in roots]
-        for members, tree, largest in buckets:
+        for bucket_index,(members, tree, largest) in enumerate(buckets):
             # Avoid a chunk*N Python-list allocation for heavily overlapping views.
             chunk = max(1, min(len(roots), 262144//max(len(members), 1)))
             for start in range(0, len(roots), chunk):
                 selected = roots[start:start+chunk]
                 matches = tree.query_ball_point(center[selected], radius[selected]+largest,
                                                 workers=workers, return_sorted=True)
+                if progress is not None:broadphase_hits+=sum(map(len,matches))
                 for offset, hits in enumerate(matches):
                     root = int(selected[offset])
                     other = members[np.asarray(hits, dtype=np.int64)]
@@ -113,6 +134,8 @@ def build_projection_graph(projected, k=16, workers=1):
                         rank = np.lexsort((candidates, distance[side], -overlap[side]))[:k]
                         choices[start+offset].extend(zip(candidates[rank].tolist(),
                             overlap[side][rank].tolist(), distance[side][rank].tolist()))
+                report('querying_bucket',first,bucket_index=bucket_index+1,buckets_total=len(buckets),
+                    probe_completed=start+len(selected),probe_total=len(roots))
         for slot, root in enumerate(roots):
             ranked = sorted(choices[slot], key=lambda row: (-row[1], row[2], row[0]))
             front = [row for row in ranked if depth[row[0]] <= depth[root]]
@@ -121,7 +144,26 @@ def build_projection_graph(projected, k=16, workers=1):
             used = {row[0] for row in chosen}
             chosen += [row for row in ranked if row[0] not in used][:k-len(chosen)]
             output[root, :len(chosen)] = [row[0] for row in chosen]
+        report('completed_roots',first+len(roots))
+    report('complete',len(ids),force=True)
     return torch.from_numpy(output)
+
+
+def _projection_progress_printer(view, views):
+    """Describe one view's work and explicitly scope its rough ETA."""
+    def display(event):
+        completed,total=event['completed'],event['total']
+        fraction=completed/max(total,1)
+        eta=event['eta_seconds']
+        estimate='pending' if eta is None else f'{eta/60:.1f}min (current-view rough estimate)'
+        probe=(f" bucket={event['bucket_index']}/{event['buckets_total']}"
+               if 'bucket_index' in event else '')
+        if 'probe_completed' in event:probe+=f" probe={event['probe_completed']}/{event['probe_total']}"
+        print(f"Projection graph view {view}/{views}: {event['stage']} "
+              f"roots={completed}/{total} ({fraction:.1%}){probe}, "
+              f"elapsed={event['elapsed_seconds']:.1f}s, ETA={estimate}, "
+              f"broadphase_hits={event['broadphase_hits']}",flush=True)
+    return display
 
 
 def _scatter(packet, order):
@@ -369,7 +411,8 @@ def prepare_bank(model, scene, cameras, args):
                             _image_profile(tile.image, context_capture.image, projected[first:last])), -1)
                     del context_capture, context_stats, context_projected
                 print(f'Building coverage graph for view {view+1}/{len(cameras)}...', flush=True)
-                view_index[view] = build_projection_graph(graph_projected, kv, workers)
+                view_index[view] = build_projection_graph(graph_projected, kv, workers,
+                    progress=_projection_progress_printer(view+1,len(cameras)))
                 coverage_profiles.append(dict(
                     source_max_radius=float(projected[:, 11].amax()),
                     union_max_radius=float(graph_projected[:, 11].amax()),
@@ -380,8 +423,10 @@ def prepare_bank(model, scene, cameras, args):
     finally:
         for module, mode in modes:
             module.training = mode
+    print('Building shared three-dimensional neighbor graph...',flush=True)
+    spatial_index=build_spatial_graph(xyz, ks, workers)
     bank = dict(node=node, candidate=candidate, xyz=xyz.float(),
-        spatial_index=build_spatial_graph(xyz, ks, workers), view_node=view_node,
+        spatial_index=spatial_index, view_node=view_node,
         view_geom=view_geom, view_index=view_index,
         view_weights=torch.full((len(cameras),), 1/len(cameras), dtype=torch.float32))
     for name, value in bank.items():

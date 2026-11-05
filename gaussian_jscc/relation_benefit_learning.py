@@ -13,19 +13,19 @@ from .physical_benefit_audit_metrics import decision_report
 
 
 class RelationReplay:
-    """An explicit 25/75 stable/recent training mixture, with no validation labels."""
-    def __init__(self, capacity=8192, anchor_capacity=2048, validation_ids=(), seed=42):
-        if capacity < 2 or not 0 < anchor_capacity < capacity:
-            raise ValueError('require 0 < anchor_capacity < capacity')
-        self.capacity, self.anchor_capacity = capacity, anchor_capacity
+    """Retain every fixed label, sample contexts then rows uniformly in O(batch)."""
+    policy='full_history_context_uniform_v1'
+
+    def __init__(self, validation_ids=(), seed=42):
         self.validation_ids = set(map(int, validation_ids))
-        self.anchor = []; self.recent = []; self.visits = {}; self.total_added = 0
-        self.members=set()
+        self.records=[];self.by_context=[[] for _ in range(4)]
+        self.visits={};self.members=set();self.migration=None
         self.generator = torch.Generator().manual_seed(seed)
 
     def add(self, records):
         for record in records:
             source = int(record['source'])
+            if source<0:raise ValueError('nonnegative original source required')
             if source in self.validation_ids:
                 raise ValueError('validation label cannot enter training replay')
             values = record['values'].detach().cpu().double().clone()
@@ -36,59 +36,56 @@ class RelationReplay:
             if key in self.members:
                 continue
             row = dict(record, source=source, context=context, values=values)
-            self.total_added += 1
             self.visits.setdefault(key, 0);self.members.add(key)
-            if len(self.anchor)<self.anchor_capacity:
-                self.anchor.append(row)
-            else:
-                self.recent.append(row)
-                if len(self.recent)>self.capacity-self.anchor_capacity:
-                    old=self.recent.pop(0);self.members.remove((old['context'],old['source']))
+            self.records.append(row);self.by_context[context].append(row)
 
     def sample(self, count):
-        if count<1 or not self.anchor:
+        if count<1 or not self.records:
             raise ValueError('positive batch and nonempty replay required')
-        # Recent-only windows do not erase the stable reference distribution.
-        available=sorted({r['context'] for r in self.anchor+self.recent})
+        available=[c for c,pool in enumerate(self.by_context) if pool]
         context=available[int(torch.randint(len(available),(1,),generator=self.generator))]
-        anchor=[r for r in self.anchor if r['context']==context]
-        recent=[r for r in self.recent if r['context']==context]
-        stable = (float(self.anchor_capacity/self.capacity) if recent and anchor else
-                  1. if anchor else 0.)
-        choose = torch.rand(count, generator=self.generator)<stable
+        pool=self.by_context[context]
+        indices=torch.randint(len(pool),(count,),generator=self.generator)
         records=[]
-        for use_anchor in choose.tolist():
-            pool=anchor if use_anchor else recent
-            row=pool[int(torch.randint(len(pool),(1,),generator=self.generator))]
+        for index in indices.tolist():
+            row=pool[index]
             self.visits[(row['context'],row['source'])]+=1;records.append(row)
         return records
 
     def coverage(self):
-        rows=self.anchor+self.recent
+        rows=self.records
         values=torch.tensor([self.visits[(r['context'],r['source'])] for r in rows],dtype=torch.float64)
-        return dict(active_groups=len(rows),stable_groups=len(self.anchor),recent_groups=len(self.recent),
-            unique_labels=len(self.visits),labels_added_total=self.total_added,all_draws=sum(self.visits.values()),
+        return dict(active_groups=len(rows),retention_policy=self.policy,
+            unique_labels=len(self.visits),labels_added_total=len(rows),all_draws=sum(self.visits.values()),
             never_updated_fraction=float((values==0).double().mean()) if len(values) else 0.,
             min_visits=int(values.min()) if len(values) else 0,
             mean_visits=float(values.mean()) if len(values) else 0.,
-            groups_per_context={str(c):sum(r['context']==c for r in rows) for c in range(4)})
+            max_visits=int(values.max()) if len(values) else 0,
+            groups_per_context={str(c):len(pool) for c,pool in enumerate(self.by_context)})
 
     def state_dict(self):
-        return dict(version=2,capacity=self.capacity,anchor_capacity=self.anchor_capacity,
-            validation_ids=sorted(self.validation_ids),anchor=copy.deepcopy(self.anchor),
-            recent=copy.deepcopy(self.recent),visits=dict(self.visits),total_added=self.total_added,
-            rng=self.generator.get_state())
+        return dict(version=3,retention_policy=self.policy,validation_ids=sorted(self.validation_ids),
+            records=copy.deepcopy(self.records),visits=dict(self.visits),
+            migration=self.migration,rng=self.generator.get_state())
 
     def load_state_dict(self,state):
-        if (state['version']!=2 or state['capacity']!=self.capacity or
-            state['anchor_capacity']!=self.anchor_capacity or set(state['validation_ids'])!=self.validation_ids):
+        if state['version'] not in (2,3) or set(state['validation_ids'])!=self.validation_ids:
             raise ValueError('replay identity mismatch')
-        rows=state['anchor']+state['recent']
-        if len(rows)>self.capacity or any(r['source'] in self.validation_ids for r in rows):
-            raise ValueError('invalid training/validation replay')
-        self.anchor=copy.deepcopy(state['anchor']);self.recent=copy.deepcopy(state['recent'])
-        self.visits=dict(state['visits']);self.total_added=int(state['total_added'])
-        self.members={(r['context'],r['source']) for r in rows}
+        if state['version']==3 and state.get('retention_policy')!=self.policy:
+            raise ValueError('replay retention policy mismatch')
+        rows=state['records'] if state['version']==3 else state['anchor']+state['recent']
+        keys={(int(r.get('context',0)),int(r['source'])) for r in rows}
+        visits=dict(state['visits'])
+        if state['version']==2 and set(visits)!=keys:
+            raise ValueError('legacy replay has evicted historical labels; full-history migration requires all labels')
+        if len(keys)!=len(rows) or set(visits)!=keys or any(type(v) is not int or v<0 for v in visits.values()):
+            raise ValueError('invalid historical label identities or visits')
+        temporary=RelationReplay(self.validation_ids)
+        temporary.add(rows)
+        self.records,self.by_context=temporary.records,temporary.by_context
+        self.members=temporary.members;self.visits=visits
+        self.migration=(dict(source_version=2,restored_unique_labels=len(rows),all_labels_preserved=True)
+                        if state['version']==2 else state.get('migration'))
         self.generator.set_state(state['rng'].cpu())
 
 

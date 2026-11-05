@@ -47,7 +47,7 @@ def parser():
         ('updates-per-window',64),('batch-groups',8),('teacher-trials',2),
         ('width',128),('attention-groups',8),('spatial-neighbors',16),('projection-neighbors',16),
         ('feature-batch',8192),('inference-batch',4096),('validation-groups',512),
-        ('replay-capacity',8192),('anchor-capacity',2048),('normalizer-samples',8192)):
+        ('normalizer-samples',8192)):
         p.add_argument('--'+name,type=int,default=value)
     p.add_argument('--learning-rate',type=float,default=1e-4)
     p.add_argument('--weight-decay',type=float,default=1e-4)
@@ -64,12 +64,12 @@ def validate(args):
         raise ValueError('relation experiment uses fixed beta')
     positive=('windows','fit_windows','label_groups','updates_per_window','batch_groups','teacher_trials',
         'width','attention_groups','spatial_neighbors','projection_neighbors','feature_batch',
-        'inference_batch','validation_groups','replay_capacity','anchor_capacity','normalizer_samples',
+        'inference_batch','validation_groups','normalizer_samples',
         'window_views','calibration_views','trials','cpu_threads','validate_every','save_every','image_views')
     if min(getattr(args,k) for k in positive)<1 or args.windows<=args.fit_windows:
         raise ValueError('positive budgets and windows>fit_windows required')
-    if args.anchor_capacity>=args.replay_capacity or args.width%args.attention_groups:
-        raise ValueError('anchor_capacity<replay_capacity and divisible attention width required')
+    if args.width%args.attention_groups:
+        raise ValueError('divisible attention width required')
     if (not math.isfinite(args.learning_rate) or args.learning_rate<=0 or
         not math.isfinite(args.weight_decay) or args.weight_decay<0 or not 0<args.structure_share<1 or
         (args.lambda_s is not None and (not math.isfinite(args.lambda_s) or args.lambda_s<0))):
@@ -93,8 +93,19 @@ def _sha(path):
 
 
 def _settings(args):
-    return {k:v for k,v in vars(args).items() if k not in
+    settings={k:v for k,v in vars(args).items() if k not in
         ('out','resume','dry_run','device','phase','windows','allocation_image_objective')}
+    return dict(settings,replay_policy=RelationReplay.policy)
+
+
+def same_plan(old,new,*,legacy=False):
+    if old==new:return True
+    if not legacy:return False
+    migrated=json.loads(json.dumps(old));settings=migrated.get('settings',{})
+    if 'replay_policy' in settings or not {'replay_capacity','anchor_capacity'}<=settings.keys():return False
+    settings.pop('replay_capacity');settings.pop('anchor_capacity')
+    settings['replay_policy']=RelationReplay.policy
+    return migrated==new
 
 
 def _truncate(path,step):
@@ -112,7 +123,7 @@ def _archive(out):
     current=f"window{current_step:06d}"
     with tarfile.open(temporary,'w:gz') as archive:
         for name in ('plan.json','training.json','preflight.json','preprocess.json','pretrain_complete.json',
-                     'complete.json','review_summary.json'):
+                     'complete.json','review_summary.json','replay_migration.json'):
             if name in ('complete.json','review_summary.json') and not deployment_current:continue
             if (out/name).is_file():archive.add(out/name,arcname=name)
         for folder in ('metrics','evaluation','deployment'):
@@ -157,10 +168,18 @@ def run_loaded(args,model,scene,source_plan,*,max_windows=None,runtime_output_cr
         raise FileExistsError('new output or --resume required')
     latest=out/'checkpoints/latest/state.pt'
     if args.resume and not latest.is_file():raise FileNotFoundError('missing relation checkpoint')
-    if args.resume and json.loads((out/'plan.json').read_text(encoding='utf-8'))!=plan:
+    state=load_checkpoint(latest) if args.resume else None
+    legacy=bool(state and state['replay'].get('version')==2)
+    if args.resume and not same_plan(json.loads((out/'plan.json').read_text(encoding='utf-8')),plan,legacy=legacy):
         raise ValueError('relation source/settings mismatch')
+    replay=None
+    if state:
+        if not same_plan(state['plan'],plan,legacy=legacy) or args.windows<state['progress']['window']:
+            raise ValueError('checkpoint identity mismatch or shrinking target')
+        replay=RelationReplay(validation_ids=state['validation_ids'].tolist(),seed=args.seed+211)
+        replay.load_state_dict(state['replay'])
     out.mkdir(parents=True,exist_ok=True)
-    json_write(out/'plan.json',plan)
+    if not state:json_write(out/'plan.json',plan)
     names=lambda cameras:[str(c.image_name) for c in cameras]
     if len(scene.cameras)<args.window_views or len(scene.val_cameras)<args.calibration_views:
         raise ValueError('separate preparation and calibration cameras required')
@@ -171,12 +190,9 @@ def run_loaded(args,model,scene,source_plan,*,max_windows=None,runtime_output_cr
         raise ValueError('test, calibration and preparation views must be disjoint')
     meter=ExactDeploymentCost(model,scene,codec_id,args.snr,2.)
     q3=torch.full((len(scene.raw),),3,dtype=torch.long)
-    state=load_checkpoint(latest) if args.resume else None
     if state and args.windows>state['progress']['window'] and args.phase!='predict':
         _invalidate_deployment(out,state['progress']['window'])
     if state:
-        if state['plan']!=plan or args.windows<state['progress']['window']:
-            raise ValueError('checkpoint identity mismatch or shrinking target')
         reference=state['reference']
     else:
         calibration_args=argparse.Namespace(**vars(args));calibration_args.lpips=False
@@ -210,6 +226,7 @@ def run_loaded(args,model,scene,source_plan,*,max_windows=None,runtime_output_cr
     else:
         print('Preparing immutable full-tier attributes and relation graphs...',flush=True)
         started=time.perf_counter();bank=prepare_bank(model,scene,preparation,args)
+        print(f"Saving shared input bank ({bank['metadata']['tensor_bytes']/2**30:.2f} GiB)...",flush=True)
         atomic_save(bank_path,bank)
         json_write(out/'preprocess.json',dict(bank['metadata'],seconds=time.perf_counter()-started))
     bank_sha=state['bank_sha256'] if state else _sha(bank_path)
@@ -218,7 +235,7 @@ def run_loaded(args,model,scene,source_plan,*,max_windows=None,runtime_output_cr
     permutation=torch.randperm(n,generator=torch.Generator().manual_seed(args.seed+4021))
     val_count=min(max(1,args.validation_groups//4),max(1,n//8))
     validation_ids=permutation[:val_count];training_ids=permutation[val_count:]
-    replay=RelationReplay(args.replay_capacity,args.anchor_capacity,validation_ids.tolist(),args.seed+211)
+    if replay is None:replay=RelationReplay(validation_ids=validation_ids.tolist(),seed=args.seed+211)
     network=RelationBenefitNetwork(bank['node'].shape[-1],bank['candidate'].shape[-1],
         bank['view_node'].shape[-1],args.width,args.attention_groups,
         context_node_dim=bank['contexts'][0]['node'].shape[-1],
@@ -227,7 +244,7 @@ def run_loaded(args,model,scene,source_plan,*,max_windows=None,runtime_output_cr
     if state:
         if not torch.equal(state['training_ids'],training_ids) or not torch.equal(state['validation_ids'],validation_ids):
             raise ValueError('point-label split changed')
-        learner.load_state_dict(state['learner']);replay.load_state_dict(state['replay'])
+        learner.load_state_dict(state['learner'])
         validation=state['validation'];progress=state['progress'];fit_labels=state['fit_labels']
         for file in ('loss.jsonl','benefit_validation.jsonl'):_truncate(out/'metrics'/file,progress['window'])
         restore_rng(state['rng'])
@@ -236,6 +253,12 @@ def run_loaded(args,model,scene,source_plan,*,max_windows=None,runtime_output_cr
         validation=[]
         progress=dict(window=0,label_cursor=[c*max(1,len(training_ids)//4) for c in range(4)]);fit_labels=[]
     rates=torch.tensor(reference['cost_proxy']['costs'][1:],dtype=torch.float64)*args.beta/reference['c_ref']
+    json_write(out/'plan.json',plan)
+    if legacy:
+        migration=dict(replay.migration,checkpoint_window=state['progress']['window'],
+            target_policy=RelationReplay.policy,reused_bank_sha256=bank_sha)
+        json_write(out/'replay_migration.json',migration)
+        print(f"Migrated all {migration['restored_unique_labels']} historical labels; reusing saved input bank.",flush=True)
     json_write(out/'training.json',dict(plan,**scene.record,spec=scene.spec,objective_reference=reference,
         teacher=teacher_identity,preparation_view_names=names(preparation),
         training_label_count=len(training_ids),validation_label_ids=validation_ids.tolist(),
@@ -252,7 +275,9 @@ def run_loaded(args,model,scene,source_plan,*,max_windows=None,runtime_output_cr
             fit_labels=fit_labels,bank_sha256=bank_sha,rng=capture_rng())
         atomic_save(out/f'checkpoints/{label}/state.pt',snapshot)
 
-    if not state:save()
+    if not state:
+        save()
+        print(f'Input bank and initial checkpoint saved: {latest}. Training windows have not started.',flush=True)
     if not validation:
         print(f'Preparing {4*len(validation_ids)} fixed validation label groups across four contexts...',flush=True)
         validation=[row for context in range(4) for row in teacher.collect(validation_ids.tolist(),step=0,context=context)]

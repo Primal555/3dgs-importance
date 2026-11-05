@@ -48,7 +48,7 @@ def args(out):
         '--width','16','--attention-groups','4','--spatial-neighbors','2',
         '--projection-neighbors','2','--validation-groups','2','--window-views','2',
         '--calibration-views','1','--trials','1','--test-views','2','--image-views','1',
-        '--replay-capacity','8','--anchor-capacity','2','--validate-every','1',
+        '--validate-every','1',
         '--save-every','1','--inference-batch','5','--cpu-threads','1','--no-lpips'])
 
 
@@ -130,3 +130,32 @@ def test_main_accepts_its_own_scene_metadata_directory_and_loads_codec(tmp_path)
         result=entry().main(options,max_windows=1)
     assert result=={'status':'interrupted','step':1}
     assert (Path(options.out)/'checkpoints/latest/state.pt').is_file()
+
+
+def test_untrimmed_legacy_checkpoint_migrates_and_reuses_expensive_input_bank(tmp_path):
+    from gaussian_jscc.budgeted_allocation_state import load_checkpoint
+    from gaussian_jscc.dense_rd_allocation import atomic_save
+    model,scene=runtime();out=tmp_path/'migrate'
+    plan=dict(source=dict(codec='fixture'),spec=scene.spec)
+    with patch('gaussian_jscc.rendering.render',side_effect=renderer):
+        entry().run_loaded(args(out),model,scene,plan,max_windows=2)
+    state=load_checkpoint(out/'checkpoints/latest/state.pt')
+    rows=state['replay']['records'];visits=state['replay']['visits'];rng=state['replay']['rng']
+    state['replay']=dict(version=2,capacity=8192,anchor_capacity=2048,
+        validation_ids=state['validation_ids'].tolist(),anchor=rows[:2],recent=rows[2:],
+        visits=visits,total_added=len(rows),rng=rng)
+    old_settings=state['plan']['settings']
+    old_settings.pop('replay_policy');old_settings.update(replay_capacity=8192,anchor_capacity=2048)
+    atomic_save(out/'checkpoints/latest/state.pt',state)
+    (out/'plan.json').write_text(json.dumps(state['plan']),encoding='utf-8')
+    continued=args(out);continued.resume=True
+    with patch('gaussian_jscc.rendering.render',side_effect=renderer), \
+         patch.object(entry(),'prepare_bank',side_effect=AssertionError('recomputed bank')):
+        result=entry().run_loaded(continued,model,scene,plan)
+    restored=load_checkpoint(out/'checkpoints/latest/state.pt')
+    assert result['status']=='complete' and restored['replay']['version']==3
+    assert len(restored['replay']['records'])>=len(rows)
+    assert restored['plan']['settings']['replay_policy']=='full_history_context_uniform_v1'
+    assert (out/'replay_migration.json').is_file()
+    altered=json.loads(json.dumps(restored['plan']));altered['settings']['beta']=.5
+    assert not entry().same_plan(altered,restored['plan'],legacy=True)

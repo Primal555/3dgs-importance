@@ -41,6 +41,42 @@ def test_projection_graph_front_back_quota_prevents_near_foreground_collapse():
     assert {4, 5}.issubset(chosen)
 
 
+def test_projection_progress_preserves_graph_and_reports_incomplete_bucket_heartbeat(monkeypatch):
+    import itertools
+    import gaussian_jscc.relation_benefit_features as features
+    points=torch.stack((torch.arange(600).float()/1000,torch.zeros(600),
+                        torch.ones(600),torch.ones(600)),1)
+    expected=build_projection_graph(points,8,1)
+    clock=itertools.count(0.,6.)
+    monkeypatch.setattr(features.time,'perf_counter',lambda:next(clock))
+    events=[]
+    actual=build_projection_graph(points,8,1,progress=events.append)
+    assert torch.equal(expected,actual)
+    assert events[0]['completed']==0 and events[0]['total']==600
+    assert events[-1]['completed']==600 and events[-1]['stage']=='complete'
+    assert [e['completed'] for e in events]==sorted(e['completed'] for e in events)
+    heartbeats=[e for e in events if e['stage']=='querying_bucket' and e['completed']==0]
+    assert heartbeats and heartbeats[0]['probe_completed']>0
+    assert heartbeats[0]['eta_seconds'] is None
+    assert events[-1]['broadphase_hits']==600*600
+    assert all(e['elapsed_seconds']>=0 for e in events)
+
+
+def test_projection_progress_is_time_limited_and_completes_small_inputs(monkeypatch):
+    import itertools
+    import gaussian_jscc.relation_benefit_features as features
+    clock=itertools.count(0.,.001)
+    monkeypatch.setattr(features.time,'perf_counter',lambda:next(clock))
+    events=[]
+    points=torch.tensor([[0.,0.,1.,2.],[1.,0.,2.,2.],[100.,0.,3.,0.]])
+    build_projection_graph(points,2,1,progress=events.append)
+    assert len(events)==2
+    assert events[-1]['total']==events[-1]['completed']==2
+    empty=[]
+    build_projection_graph(torch.empty(0,4),2,1,progress=empty.append)
+    assert empty[0]['completed']==0 and empty[-1]['stage']=='complete'
+
+
 @pytest.mark.parametrize('count', [0, 1, 2])
 def test_graph_empty_small_and_zero_radius_padding(count):
     xyz = torch.zeros(count, 3)

@@ -14,21 +14,24 @@ def records(n, first=0):
                  values=torch.full((2,3,2), float(i)*1e-6, dtype=torch.float64)) for i in range(first, first+n)]
 
 
-def test_stable_labels_survive_recent_fifo_and_validation_isolated():
-    replay=entry().RelationReplay(capacity=8, anchor_capacity=2, validation_ids=[99], seed=7)
-    replay.add(records(20))
-    assert [r['source'] for r in replay.anchor] == [0,1]
-    assert [r['source'] for r in replay.recent] == list(range(14,20))
-    assert {0,1} <= {r['source'] for r in replay.sample(128)}
+def test_full_history_never_evicts_and_validation_isolated():
+    replay=entry().RelationReplay(validation_ids=[99999], seed=7)
+    replay.add(records(9000));replay.add(records(20))
+    assert [r['source'] for r in replay.records] == list(range(9000))
+    assert replay.coverage()['active_groups']==9000
+    assert replay.coverage()['retention_policy']=='full_history_context_uniform_v1'
+    sampled=[r['source'] for r in replay.sample(2000)]
+    assert min(sampled)<128 and max(sampled)>8192
+    assert 800<sum(i<4500 for i in sampled)<1200
     with pytest.raises(ValueError, match='validation'):
-        replay.add(records(1,99))
-    clone=entry().RelationReplay(capacity=8,anchor_capacity=2,validation_ids=[99],seed=7)
+        replay.add(records(1,99999))
+    clone=entry().RelationReplay(validation_ids=[99999],seed=7)
     clone.load_state_dict(copy.deepcopy(replay.state_dict()))
     assert [r['source'] for r in replay.sample(30)] == [r['source'] for r in clone.sample(30)]
 
 
 def test_replay_preserves_background_identity_and_balances_single_context_batches():
-    replay=entry().RelationReplay(32,8,validation_ids=[99],seed=3)
+    replay=entry().RelationReplay(validation_ids=[99],seed=3)
     for context in range(4):
         replay.add([dict(g,context=context) for g in records(8)])
     assert replay.coverage()['active_groups']==32
@@ -39,7 +42,7 @@ def test_replay_preserves_background_identity_and_balances_single_context_batche
         contexts.append(rows[0]['context'])
     assert set(contexts)=={0,1,2,3}
     for context in range(4):assert 25<contexts.count(context)<75
-    clone=entry().RelationReplay(32,8,validation_ids=[99],seed=0)
+    clone=entry().RelationReplay(validation_ids=[99],seed=0)
     clone.load_state_dict(copy.deepcopy(replay.state_dict()))
     assert [(g['context'],g['source']) for g in clone.sample(20)]==[
         (g['context'],g['source']) for g in replay.sample(20)]
@@ -48,7 +51,7 @@ def test_replay_preserves_background_identity_and_balances_single_context_batche
 def test_learning_uses_float64_signed_labels_and_updates_model():
     from test_relation_benefit_model import make_bank,make_model
     bank=make_bank(); model=make_model(bank)
-    replay=entry().RelationReplay(capacity=16,anchor_capacity=4,validation_ids=[8],seed=2)
+    replay=entry().RelationReplay(validation_ids=[8],seed=2)
     groups=records(8)
     for g in groups:
         g['values'][:,:,0]=torch.tensor([-3e-5,-1e-5,-2e-5])
@@ -86,3 +89,29 @@ def test_rate_proxy_and_decision_use_same_explicit_units():
     values=torch.tensor([[[0.,0.],[0.,0.],[0.,0.]], [[-2.,0.],[-3.,0.],[-4.,0.]]])
     q=entry().choose_tiers(values,torch.tensor([0.,1.,2.,3.]),beta=.1,c_ref=1.)
     assert q.tolist()==[0,3]
+
+
+def test_legacy_migration_requires_every_historical_label_and_preserves_rng():
+    replay=entry().RelationReplay(validation_ids=[99],seed=8)
+    rows=[dict(g,context=0) for g in records(8)]
+    legacy=dict(version=2,capacity=8,anchor_capacity=2,validation_ids=[99],
+        anchor=rows[:2],recent=rows[2:],visits={(0,i):i for i in range(8)},
+        total_added=8,rng=torch.Generator().manual_seed(42).get_state())
+    replay.load_state_dict(legacy)
+    assert len(replay.records)==8 and replay.migration['source_version']==2
+    assert replay.coverage()['all_draws']==28
+    clone=entry().RelationReplay(validation_ids=[99],seed=99)
+    clone.load_state_dict(replay.state_dict())
+    assert [r['source'] for r in replay.sample(32)]==[r['source'] for r in clone.sample(32)]
+    lost=copy.deepcopy(legacy);lost['recent'].pop()
+    with pytest.raises(ValueError,match='evicted'):
+        entry().RelationReplay(validation_ids=[99]).load_state_dict(lost)
+
+
+def test_context_sampling_uses_preindexed_pool_without_rebuilding_history():
+    replay=entry().RelationReplay(seed=5)
+    for c,n in enumerate((2,20,200,2000)):
+        replay.add([dict(g,context=c) for g in records(n)])
+    contexts=[replay.sample(4)[0]['context'] for _ in range(400)]
+    assert all(65<contexts.count(c)<135 for c in range(4))
+    assert [len(pool) for pool in replay.by_context]==[2,20,200,2000]
