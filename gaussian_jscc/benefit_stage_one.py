@@ -92,6 +92,7 @@ def main(args):
     print('第一阶段：固定检查点与回放；不渲染场景，不更新概率表。', flush=True)
     print('读取检查点快照；原训练可以继续，离线组只读取此刻保存的状态。', flush=True)
     saved = snapshot(run, args.replay_root, args.replay_cache_mib)
+    print(f'评估网络配置来源：{saved["evaluator_settings_source"]}', flush=True)
     if (out.is_relative_to(saved['source_root']) or
             out.is_relative_to(saved['replay'].root) or saved['replay'].root.is_relative_to(out)):
         raise ValueError('offline output must be separate from source and replay')
@@ -125,6 +126,7 @@ def main(args):
     out.mkdir(parents=True)
     (out/'metrics').mkdir()
     settings = dict(version=OBJECTIVE, source_checkpoint=saved['source_checkpoint'],
+        evaluator_settings_source=saved['evaluator_settings_source'],
         source_checkpoint_sha256=saved['source_sha256'], source_step=saved['source_step'],
         source_network_updates=saved['source_network_updates'], additional_updates_per_arm=args.updates,
         training_groups=len(train), available_training_groups=len(replay.training),

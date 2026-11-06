@@ -2,12 +2,57 @@
 import copy
 import hashlib
 import io
+import json
 from pathlib import Path
 
 import torch
 
 from .budgeted_allocation_state import load_checkpoint
 from .full_history_spatial_replay import FullHistorySpatialReplay
+
+
+EVALUATOR_FIELDS = ('hidden', 'benefit_lr', 'dropout', 'weight_decay', 'decision_weight',
+                    'tie_fraction', 'common_weight', 'pair_weight',
+                    'training_probe_groups', 'batch_groups')
+
+
+def evaluator_settings(state, root):
+    """Allocation plans omit evaluator knobs; recover the actual provider config."""
+    settings = dict(state['plan']['settings'])
+    sources = ['checkpoint.plan.settings']
+    if any(key not in settings for key in EVALUATOR_FIELDS):
+        candidates = [root/'benefit_network.pt']
+        specified = settings.get('benefit_checkpoint')
+        if specified:
+            candidates.append(Path(specified))
+        candidates += [root/'pretrain/plan.json', root/'plan.json']
+        visited = set()
+        for path in candidates:
+            path = path.resolve()
+            if path in visited or not path.is_file():
+                continue
+            visited.add(path)
+            if path.suffix == '.pt':
+                artifact = load_checkpoint(path)
+                expected = state.get('positive_provider', {}).get('initial_network_sha256')
+                if expected is not None and artifact.get('network_sha256') != expected:
+                    raise ValueError(f'evaluator initializer identity mismatch: {path}')
+                metadata = artifact.get('settings', {})
+            else:
+                metadata = json.loads(path.read_text(encoding='utf8')).get('settings', {})
+            settings.update({key: metadata[key] for key in EVALUATOR_FIELDS if key in metadata})
+            sources.append(str(path))
+            if all(key in settings for key in EVALUATOR_FIELDS):
+                break
+    missing = [key for key in EVALUATOR_FIELDS if key not in settings]
+    if missing:
+        raise ValueError('missing evaluator settings: '+', '.join(missing)+
+            '; retain benefit_network.pt or the pipeline/pretrain plan.json beside the source run')
+    learner = state.get('positive_provider', {}).get('learner') or state.get('learner')
+    width = learner['network']['points.0.weight'].shape[0]
+    if settings['hidden'] != width:
+        raise ValueError(f'evaluator settings hidden={settings["hidden"]} differs from checkpoint width={width}')
+    return settings, ' + '.join(sources)
 
 
 def snapshot(run, replay_root=None, cache_mib=256.):
@@ -22,6 +67,8 @@ def snapshot(run, replay_root=None, cache_mib=256.):
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:
             raise FileNotFoundError(f'no evaluator checkpoint: {run}')
+    if path.parents[1].name == 'checkpoints' and path.parents[2].name in ('allocation', 'pretrain'):
+        root = path.parents[3]
     # A single file handle survives an atomic replacement by the live trainer.
     with path.open('rb') as stream:
         payload = stream.read()
@@ -33,6 +80,7 @@ def snapshot(run, replay_root=None, cache_mib=256.):
         raise ValueError('a fitted online/pretraining evaluator and its replay are required')
     if replay_state.get('full_history_policy') != FullHistorySpatialReplay.policy:
         raise ValueError('stage one requires the current complete-history experiment')
+    settings, settings_source = evaluator_settings(state, root)
     replay_state = copy.deepcopy(replay_state)
     if replay_root:
         replay_state['root'] = str(Path(replay_root).resolve())
@@ -45,7 +93,7 @@ def snapshot(run, replay_root=None, cache_mib=256.):
     return dict(source_root=root, source_checkpoint=str(path), source_sha256=digest,
         source_step=int(state.get('progress', {}).get('step', 0)),
         source_network_updates=int(learner['updates']), learner=learner,
-        settings=state['plan']['settings'], replay=replay)
+        settings=settings, evaluator_settings_source=settings_source, replay=replay)
 
 
 def fixed_entries(replay, count, seed):
