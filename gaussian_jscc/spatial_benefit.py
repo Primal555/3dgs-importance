@@ -45,7 +45,7 @@ class SpatialBenefitNetwork(nn.Module):
             self.register_buffer(name+'_scale', torch.ones(size))
         self.register_buffer('output_scale', torch.ones(2))
 
-    def forward(self, features, context, states, weights, valid):
+    def state_embeddings(self, features, context, states, weights, valid):
         # All normalizers are fitted only on training data and then frozen.
         c = torch.asinh((context-self.context_mean)/self.context_scale)
         s = torch.asinh((states-self.state_mean)/self.state_scale)
@@ -64,6 +64,10 @@ class SpatialBenefitNetwork(nn.Module):
         x = torch.cat((global_features, weighted, maximum), -1)
         if self.training and self.dropout:
             x = x*F.dropout(torch.ones_like(x[:, :1]), p=self.dropout, training=True)
+        return x
+
+    def forward(self, features, context, states, weights, valid):
+        x = self.state_embeddings(features, context, states, weights, valid)
         score = self.state_head(x)*self.output_scale
         result = score[:, 1:]-score[:, :1]
         identical = ((features[:, 1:]==features[:, :1]).all(-1) &
@@ -86,6 +90,9 @@ def value_losses(prediction, truth, rates, scale, tie_fraction=.02, *, direction
 
 class SpatialLearner(PhysicalLearner):
     direction_loss = staticmethod(decision_loss)
+
+    def pack(self, inputs):
+        return pack_inputs(inputs, self.device)
 
     def __init__(self, replay, device, hidden=64, lr=1e-4, dropout=.05, weight_decay=1e-4,
                  decision_weight=.25, tie_fraction=.02, common_weight=1., pair_weight=1.,
@@ -146,7 +153,7 @@ class SpatialLearner(PhysicalLearner):
             if len(set(sizes)) == 1:
                 return x.reshape(len(groups), sizes[0], *x.shape[1:]).mean(1)
             return torch.stack([chunk.mean(0) for chunk in x.split(sizes)])
-        pred = self.network(*pack_inputs(inputs, self.device)).double()
+        pred = self.network(*self.pack(inputs)).double()
         truth = torch.stack(targets).to(self.device, dtype=torch.float64)
         rates = torch.stack([torch.as_tensor(g['rates']) for g in groups]).to(self.device, dtype=torch.float64)
         losses = value_losses(pred, truth, rates[owner], self.scales['rd'], self.tie_fraction,
@@ -196,7 +203,7 @@ class SpatialLearner(PhysicalLearner):
     @torch.inference_mode()
     def predict(self, inputs, height, width, d_ref):
         self.network.eval()
-        return self.network(*pack_inputs([inputs], self.device))[0].double()
+        return self.network(*self.pack([inputs]))[0].double()
 
     @torch.inference_mode()
     def predict_group_views(self, groups):
@@ -205,7 +212,7 @@ class SpatialLearner(PhysicalLearner):
         counts = [len(views) for views in groups]
         if not counts or min(counts) < 1:
             raise ValueError('nonempty candidate view groups required')
-        packed = pack_inputs([inputs for views in groups for inputs in views], self.device)
+        packed = self.pack([inputs for views in groups for inputs in views])
         result = self.network(*packed).double()
         return [list(values.unbind(0)) for values in result.split(counts)]
 
@@ -215,7 +222,7 @@ class SpatialLearner(PhysicalLearner):
         self.network.eval()
         for group in groups:
             views = group['views']
-            pred = self.network(*pack_inputs([v['inputs'] for v in views], self.device)).double().mean(0).cpu()
+            pred = self.network(*self.pack([v['inputs'] for v in views])).double().mean(0).cpu()
             truth = torch.stack([v['values'].double().cpu() for v in views]).mean(0)
             rows.append(dict(source=group['source'], step=group['step'], rates=group['rates'],
                              truth=truth, prediction=pred))

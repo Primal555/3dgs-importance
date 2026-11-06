@@ -41,7 +41,7 @@ class CorrectionLearner(CalibratedSpatialLearner):
         selected=[groups[i] for i in gaps]
         inputs=[v['inputs'] for g in selected for v in g['views']]
         sizes=[len(g['views']) for g in selected]
-        prediction=self.network(*pack_inputs(inputs,self.device)).double()
+        prediction=self.network(*self.pack(inputs)).double()
         prediction=torch.stack([v.mean(0) for v in prediction.split(sizes)])
         batches.append((gaps,gap_losses(prediction,selected,self.scales['rd'],self.decision_weight,self.tie_fraction)))
         return {key:sum(value[key].new_zeros(len(groups)).index_copy(0,
