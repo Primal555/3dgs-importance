@@ -135,6 +135,8 @@ def main(args):
         validation_scope='independent fixed early contexts; no new on-policy holdout labels',
         recent_scope='latest records within fixed training subset; already trained',
         optimizer='fresh AdamW in both arms', learning_rate=saved['settings']['benefit_lr'],
+        batch_groups=args.batch_groups or saved['settings']['batch_groups'],
+        evaluator_configuration=dict(saved['settings']),
         weight_decay=saved['settings']['weight_decay'], decision_weight=saved['settings']['decision_weight'],
         original_q0_rd_scale=float(learners['original'].scales['rd']),
         positive_component_scales=scales['components'].tolist(), positive_rd_scale=float(scales['rd']),
