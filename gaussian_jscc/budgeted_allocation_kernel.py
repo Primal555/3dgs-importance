@@ -295,6 +295,10 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                 feedback_stats.update(positive_provider.observe_exact(records,side_proxy['step']))
             costs = [scheduler.accumulate_components(tier_ids, components, rate_values, side_proxy['step'],
                 task.distortion.lambda_s, approximate=approximate, exact=exact)]
+            if positive_provider is not None:
+                from .benefit_feedback_audit import current_exact_summary
+                feedback_stats.update(current_exact_summary(costs[0], components, rate_values,
+                    q_source[tier_ids], exact, task.distortion.lambda_s))
             if keep_policy is None:
                 keep_image[:, 1] = scheduler.accumulate_keep(keep_tiers, keep_parts,
                     table.logits.softmax(-1), side_proxy['step'], task.distortion.lambda_s,

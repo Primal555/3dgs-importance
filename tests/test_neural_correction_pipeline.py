@@ -39,6 +39,8 @@ def test_online_exact_teacher_and_resume(source):
     rows=[json.loads(x) for x in (full/'allocation/metrics/loss.jsonl').read_text().splitlines()]
     assert all(r['tier_max_log_odds']==1. and r['neural_exact_training_groups']>0 for r in rows)
     assert all(r['neural_exact_extra_teacher_renders']==0 for r in rows)
+    assert all(r['positive_current_exact_replacements']==r['finite_positive_corrections'] for r in rows)
+    assert all(r['positive_current_exact_gap_max_abs_error']<1e-10 for r in rows)
     assert all('neural_full_state_regression_loss' in r and 'neural_observed_gap_regression_loss' in r for r in rows)
     assert all(r['neural_history_invalidated_rows']==r['neural_candidates'] for r in rows)
     for saved,out in ((a,full),(b,split)):

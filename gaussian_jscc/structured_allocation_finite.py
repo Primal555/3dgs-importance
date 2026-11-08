@@ -101,6 +101,7 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
         agrees = real_rd*proxy_rd > 0 if informative else None
         scheduler.finite_counts[source] += 1
         records.append(dict(source_row=source, old_tier=old, new_tier=new, feedback_kind=branch,
+            prediction_stage='historical_preview_before_current_exact_replacement',
             selection_group=group, measured_delta_mse=float(measured[0]),
             measured_delta_structure=float(measured[1]), measured_delta_distortion=measured_d,
             first_order_delta_mse=float(predicted[0]), first_order_delta_structure=float(predicted[1]),
