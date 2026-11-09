@@ -93,6 +93,15 @@ def stability(history, budget):
     return result
 
 
+def check_resume_settings(stored, requested, resume, *, suite=False):
+    if stored == requested: return
+    budgets = {'sample_budget'} if suite else {'sample_budget', 'optimizer_updates'}
+    same = {k: v for k, v in stored.items() if k not in budgets} == {
+        k: v for k, v in requested.items() if k not in budgets}
+    if not (resume and same and requested['sample_budget'] >= stored['sample_budget']):
+        raise ValueError('suite settings mismatch' if suite else 'resume settings mismatch')
+
+
 def run_arm(args, loaded, out, batch):
     _, replay, training, validation, metadata, initial, previous, groups, references, hashes = loaded
     config = metadata['config']; seed = metadata['seed']; seed_all(seed)
@@ -130,7 +139,7 @@ def run_arm(args, loaded, out, batch):
     stored = json.loads((out/'settings.json').read_text(encoding='utf8')) if (out/'settings.json').is_file() else None
     refs = stored['initial_reference_losses'] if stored else training_references(learner, replay, training, args.evaluation_batch)
     settings['initial_reference_losses'] = refs
-    if stored is not None and stored != settings: raise ValueError('resume settings mismatch')
+    if stored is not None: check_resume_settings(stored, settings, args.resume)
     if out.exists() and not args.resume: raise FileExistsError('new output or --resume required')
     balancer = GradNormBalancer(list(TASKS), refs, device=args.device,
         alpha=args.gradnorm_alpha, lr=args.weight_lr, ema=args.rate_ema)
@@ -145,10 +154,19 @@ def run_arm(args, loaded, out, batch):
         history = trim_records(out/'metrics/history.jsonl', completed*batch)
         trim_records(out/'metrics/optimization.jsonl', completed*batch)
     else:
+        if (out/'complete.json').is_file(): raise FileNotFoundError('completed run needs latest.pt to resume')
         out.mkdir(parents=True, exist_ok=True); (out/'metrics').mkdir(exist_ok=True)
-        json_write(out/'settings.json', settings)
-    if (out/'complete.json').is_file():
+    if (out/'complete.json').is_file() and completed*batch == args.samples:
         return json.loads((out/'summary.json').read_text(encoding='utf8'))
+    if completed*batch < args.samples:
+        for marker in (out/'complete.json', Path(args.out)/'complete.json'):
+            marker.unlink(missing_ok=True)
+        if stored and stored['sample_budget'] < args.samples:
+            review = Path(args.out)/'review.tar.gz'
+            previous_review = review.with_name(f'review_{stored["sample_budget"]}.tar.gz')
+            if review.is_file() and not previous_review.exists(): review.rename(previous_review)
+            print(f'Continue samples={completed*batch}->{args.samples}; optimizer, sampler and GradNorm restored.', flush=True)
+    json_write(out/'settings.json', settings)
     parameters = list(learner.network.parameters())
     shared_ids = {id(p) for p in learner.network.points[2].parameters()}
     shared_indices = [i for i, p in enumerate(parameters) if id(p) in shared_ids]
@@ -289,10 +307,12 @@ def main(args):
     if out.is_relative_to(replay_path) or replay_path.is_relative_to(out): raise ValueError('output/replay overlap')
     plan = dict(version=VIEW_GAP if args.objective == 'view_gap' else OBJECTIVE,
                 source=str(source), batches=batches, sample_budget=args.samples)
-    if (out/'plan.json').is_file() and json.loads((out/'plan.json').read_text(encoding='utf8')) != plan:
-        raise ValueError('suite settings mismatch')
-    out.mkdir(parents=True, exist_ok=True); json_write(out/'plan.json', plan)
+    if (out/'plan.json').is_file():
+        check_resume_settings(json.loads((out/'plan.json').read_text(encoding='utf8')), plan, args.resume, suite=True)
+    out.mkdir(parents=True, exist_ok=True)
+    if not (out/'plan.json').is_file(): json_write(out/'plan.json', plan)
     results = {f'split_batch{batch}': run_arm(args, loaded, out/f'split_batch{batch}', batch) for batch in batches}
+    json_write(out/'plan.json', plan)
     result = dict(status='complete', sample_budget_per_arm=args.samples, arms={k: dict(
         optimizer_updates=r['optimizer_updates'], sample_visits=r['sample_visits'],
         validation=r['after']['validation'], stability=r['stability']) for k, r in results.items()})
