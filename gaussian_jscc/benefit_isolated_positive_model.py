@@ -96,8 +96,8 @@ class IsolatedPositiveLearner(FootprintLearner):
         return result
 
 
-def make_learner(initial, config, device):
-    learner = IsolatedPositiveLearner(None, device, hidden=config['hidden'], lr=config['benefit_lr'],
+def make_learner(initial, config, device, *, learner_class=IsolatedPositiveLearner):
+    learner = learner_class(None, device, hidden=config['hidden'], lr=config['benefit_lr'],
         dropout=config['dropout'], weight_decay=config['weight_decay'], decision_weight=config['decision_weight'],
         tie_fraction=config['tie_fraction'], common_weight=config['common_weight'], pair_weight=config['pair_weight'])
     learner.load_state_dict(copy.deepcopy(initial['learner']))
