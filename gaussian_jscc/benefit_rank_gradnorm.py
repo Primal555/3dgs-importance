@@ -89,7 +89,15 @@ class GradNormBalancer:
             gradients=torch.autograd.grad(loss,parameters,retain_graph=True,allow_unused=True)
             squares=[g.detach().double().square().sum() for g in gradients if g is not None]
             base.append(torch.stack(squares).sum().sqrt() if squares else loss.detach()*0)
-        base=torch.stack(base).detach()
+        return self.measure_gradients(losses,torch.stack(base).detach())
+
+    def measure_gradients(self,losses,base):
+        """Update task statistics after accumulating complete gradient vectors."""
+        losses=losses.detach().to(self.reference)
+        base=base.detach().to(self.reference)
+        if (losses.shape!=self.reference.shape or base.shape!=self.reference.shape or
+                not torch.isfinite(losses).all() or not torch.isfinite(base).all() or (base<0).any()):
+            raise ValueError('finite task losses and nonnegative matching gradient norms required')
         self.progress.mul_(self.ema).add_(losses.detach(),alpha=1-self.ema)
         rate=self.progress/self.reference;rate=rate/rate.mean().clamp_min(1e-30)
         weights=self.weights();weighted=weights*base
