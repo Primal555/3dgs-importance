@@ -66,7 +66,8 @@ def test_wrong_role_rejected_and_architecture_identified(tmp_path):
         controls.main(args)
 
 
-def test_real_cpu_collection_saves_roles_and_resumes_without_new_labels(tmp_path, monkeypatch):
+@pytest.mark.parametrize('response_terms',[False,True])
+def test_real_cpu_collection_saves_roles_and_resumes_without_new_labels(tmp_path, monkeypatch,response_terms):
     from types import SimpleNamespace
     from test_successive_allocation import small_successive
     from gaussian_jscc.model_factory import build_codec
@@ -103,11 +104,16 @@ def test_real_cpu_collection_saves_roles_and_resumes_without_new_labels(tmp_path
     args = controls.parser().parse_args(['--phase', 'collect', '--comparison', 'fixture', '--codec', 'fixture',
         '--pipeline-root', str(pipeline), '--out', str(out), '--device', 'cpu', '--cpu-threads', '1',
         '--train-records', '4', '--validation-records', '2', '--label-groups', '4'])
+    if response_terms:
+        from gaussian_jscc.benefit_response_features import ResponseTermsWindow, SCHEMA
+        def run(a):return collect.collect(a,window_factory=ResponseTermsWindow,label_version=SCHEMA)
+    else:
+        run=controls.main
     args.max_collect_windows = 1
     with pytest.raises(RuntimeError, match='window limit'):
-        controls.main(args)
+        run(args)
     args.max_collect_windows = 150; args.resume = True
-    result = controls.main(args)
+    result = run(args)
     assert result['frozen_codec_verified']
     manifest = json.loads((out/'data_manifest.json').read_text())
     assert len(manifest['training']) == 4 and len(manifest['validation']) == 2
@@ -117,11 +123,17 @@ def test_real_cpu_collection_saves_roles_and_resumes_without_new_labels(tmp_path
     val = [replay._read(e) for e in manifest['validation']]
     assert not {r['source'] for r in train} & {r['source'] for r in val}
     assert all(v['inputs']['footprints'].shape == (4,2,15,9,9) for r in train+val for v in r['views'])
+    if response_terms:
+        for g in train+val:
+            for v in g['views']:
+                assert v['label_schema']==SCHEMA and v['response_terms'][:,1].min()>=0
+                torch.testing.assert_close(v['values'],torch.stack(
+                    (v['response_terms'][:,0]+v['response_terms'][:,1],v['response_terms'][:,2]),-1))
     args.resume = True
-    assert controls.main(args) == result
+    assert run(args) == result
     args.train_records += 1
     with pytest.raises(ValueError, match='completed collection'):
-        controls.main(args)
+        run(args)
 
 
 def test_paired_training_resume_replays_the_same_final_weights(tmp_path, monkeypatch):

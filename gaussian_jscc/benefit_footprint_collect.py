@@ -58,11 +58,12 @@ def verify_source_artifact(saved, artifact, pipeline_settings):
                 reference_sha256=hashlib.sha256(json.dumps(artifact['reference'], sort_keys=True).encode()).hexdigest())
 
 
-def collect(args):
+def collect(args, *, window_factory=FootprintWindow, label_version='candidate_footprint_labels_v1', initial_bundle=None):
     out = Path(args.out).resolve()
     if out.exists() and not args.resume:
         raise FileExistsError('use a new collection output or --resume')
-    saved = load_trial(args.comparison, pipeline_root=args.pipeline_root, require_replay=False)
+    saved = initial_bundle if initial_bundle is not None else load_trial(
+        args.comparison, pipeline_root=args.pipeline_root, require_replay=False)
     original = saved['initial']['settings']
     pipeline = Path(args.pipeline_root) if args.pipeline_root else Path(original['source_checkpoint']).parents[3]
     payload = (pipeline/'benefit_network.pt').read_bytes()
@@ -78,6 +79,7 @@ def collect(args):
         source_initial_sha256=saved['initial_sha256'], source_artifact_sha256=hashlib.sha256(payload).hexdigest(),
         source_plan_sha256=hashlib.sha256(plan_payload).hexdigest(),
         codec_run=str(Path(args.codec).resolve()), comparison=str(Path(args.comparison).resolve()))
+    if label_version != 'candidate_footprint_labels_v1': declared['label_version'] = label_version
     if (out/'complete.json').is_file() and args.resume:
         existing = json.loads((out/'metadata.json').read_text(encoding='utf8'))
         if any(existing.get(k) != v for k, v in declared.items()):
@@ -117,8 +119,8 @@ def collect(args):
     reference = artifact['reference']
     replay = FullHistorySpatialReplay(out/'replay', seed=options.seed+123,
         max_groups=args.train_records, validation_groups=args.validation_records, cache_mib=32)
-    window = FootprintWindow(model, scene, table, scheduler, reference, options)
-    metadata = dict(declared, version='candidate_footprint_labels_v1', config=saved['config'],
+    window = window_factory(model, scene, table, scheduler, reference, options)
+    metadata = dict(declared, version=label_version, config=saved['config'],
         source_identity=source_identity,
         seed=original['seed'], collection_seed=options.seed, codec_id=codec_identity,
         reference=reference, scene_fingerprint=scene.fingerprint,

@@ -103,17 +103,18 @@ def sampling_weights(labels, sampler, chosen):
 
 class TaskAccumulator:
     """Store sums of task gradients, freeing each microbatch graph immediately."""
-    def __init__(self, parameters, shared_indices):
+    def __init__(self, parameters, shared_indices, names=TASKS):
         self.parameters = list(parameters)
         self.shared_indices = list(shared_indices)
-        self.gradients = [[torch.zeros_like(p) for p in self.parameters] for _ in TASKS]
-        self.losses = torch.zeros(len(TASKS), dtype=torch.double, device=self.parameters[0].device)
+        self.names = tuple(names)
+        self.gradients = [[torch.zeros_like(p) for p in self.parameters] for _ in self.names]
+        self.losses = torch.zeros(len(self.names), dtype=torch.double, device=self.parameters[0].device)
         self.strata = {s: dict(records=0, losses=torch.zeros_like(self.losses),
-            gradients=[[torch.zeros_like(self.parameters[i]) for i in self.shared_indices] for _ in TASKS])
+            gradients=[[torch.zeros_like(self.parameters[i]) for i in self.shared_indices] for _ in self.names])
             for s in (0, 1)}
 
     def add(self, per_record, weights, labels, *, diagnostics=False):
-        if per_record.ndim != 2 or per_record.shape[1] != len(TASKS):
+        if per_record.ndim != 2 or per_record.shape[1] != len(self.names):
             raise ValueError('one loss per record and task required')
         weights = weights.to(per_record); labels = torch.as_tensor(labels, device=per_record.device)
         tasks = (per_record*weights[:, None]).sum(0)
@@ -131,7 +132,7 @@ class TaskAccumulator:
                     for buffer, grad in zip(record['gradients'][k], grads):
                         if grad is not None: buffer.add_(grad.detach())
         for k, value in enumerate(tasks):
-            grads = torch.autograd.grad(value, self.parameters, retain_graph=k+1 < len(TASKS), allow_unused=True)
+            grads = torch.autograd.grad(value, self.parameters, retain_graph=k+1 < len(self.names), allow_unused=True)
             for buffer, grad in zip(self.gradients[k], grads):
                 if grad is not None: buffer.add_(grad.detach())
 
@@ -141,14 +142,14 @@ class TaskAccumulator:
 
     def assign(self, weights):
         for i, p in enumerate(self.parameters):
-            p.grad = sum(weights[k].to(p)*self.gradients[k][i] for k in range(len(TASKS)))
+            p.grad = sum(weights[k].to(p)*self.gradients[k][i] for k in range(len(self.names)))
 
     def stratum_report(self, weights):
         report = {}
         vectors = []
         for s, name in ((0, 'ordinary'), (1, 'large_gap')):
             record = self.strata[s]
-            combined = [sum(weights[k].to(g)*record['gradients'][k][j] for k in range(len(TASKS)))
+            combined = [sum(weights[k].to(g)*record['gradients'][k][j] for k in range(len(self.names)))
                         for j, g in enumerate(record['gradients'][0])]
             vectors.append(combined)
             report[name] = dict(records=record['records'], weighted_loss_contributions=record['losses'].cpu().tolist(),

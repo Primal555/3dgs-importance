@@ -48,8 +48,9 @@ def _intersects(p, tile, height, width):
 
 
 @torch.no_grad()
-def _label_chunks(scene, ids, projected, target, lambda_s, tiles, affected):
+def _label_chunks(scene, ids, projected, target, lambda_s, tiles, affected, *, density_fn=None):
     """Exact teacher shared by dense and integrated supervision."""
+    if density_fn is None: density_fn = pixel_density_labels
     device = scene.projected.device
     h, w = scene.height, scene.width
     if not len(tiles):
@@ -84,7 +85,7 @@ def _label_chunks(scene, ids, projected, target, lambda_s, tiles, affected):
                 continue
             replacement = rendered[slots.clamp_min(0), :, sy.remainder(16), sx.remainder(16)].permute(0,3,1,2)
             candidates.append(torch.where(changed[:,None], replacement, image))
-        density = pixel_density_labels(torch.stack(candidates,1), reference, lambda_s)
+        density = density_fn(torch.stack(candidates,1), reference, lambda_s)
         yield chosen, density
 
 

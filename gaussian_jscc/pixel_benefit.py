@@ -9,6 +9,15 @@ from utils.loss_utils import create_window
 
 
 def pixel_density_labels(images, target, lambda_s):
+    return _pixel_density_labels(images, target, lambda_s, separate_mse=False)
+
+
+def response_density_labels(images, target, lambda_s):
+    """Exact signed cross term, nonnegative energy, weighted structure delta."""
+    return _pixel_density_labels(images, target, lambda_s, separate_mse=True)
+
+
+def _pixel_density_labels(images, target, lambda_s, *, separate_mse):
     """Return q1..q3 minus q0 local MSE and weighted structural error.
 
     Each input patch contains the five-pixel halo around its 16-pixel core.
@@ -23,7 +32,9 @@ def pixel_density_labels(images, target, lambda_s):
         raise ValueError('lambda_s must be finite and nonnegative')
     x, y = images.double(), target.detach().double()
     delta=x[:,1:]-x[:,:1]
-    mse = (2*(x[:,:1]-y[:,None])*delta+delta.square()).mean(dim=2)[...,5:21,5:21]
+    cross = 2*(x[:,:1]-y[:,None])*delta
+    energy = delta.square()
+    mse = (cross+energy).mean(dim=2)[...,5:21,5:21]
     x, y = x.clamp(0, 1), y.clamp(0, 1)
     batch = x.shape[0]
     x = x.reshape(batch * 4, 3, 26, 26)
@@ -38,8 +49,9 @@ def pixel_density_labels(images, target, lambda_s):
     structural = ((2*mx*my+.01**2)*(2*cov+.03**2) /
                   ((mx.square()+my.square()+.01**2)*(vx+vy+.03**2)))
     structural = structural.mean(dim=1).reshape(batch, 4, 26, 26)[..., 5:21, 5:21]
-    result = torch.stack((mse,
-                          float(lambda_s)*(structural[:, :1]-structural[:, 1:])), dim=2)
+    structure = float(lambda_s)*(structural[:, :1]-structural[:, 1:])
+    result = (torch.stack((cross.mean(2)[...,5:21,5:21], energy.mean(2)[...,5:21,5:21], structure), dim=2)
+              if separate_mse else torch.stack((mse, structure), dim=2))
     return result[0] if single else result
 
 
