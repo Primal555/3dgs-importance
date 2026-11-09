@@ -105,7 +105,7 @@ def response_report(groups,terms,threshold):
     return result
 
 
-def train(args):
+def train(args, *, experiment=None):
     data=Path(args.data or Path(args.out)/'data').resolve();out=Path(args.out).resolve()/'training'
     if data.is_relative_to(out) or out.is_relative_to(data):raise ValueError('dataset/training output overlap')
     replay,training,validation,groups,metadata,initial,hashes=load_data(data)
@@ -116,7 +116,9 @@ def train(args):
     targets=fit_choice_targets(groups['training']);threshold=targets['large_gap_threshold'];temperature=targets['temperature']
     term_scales=fit_term_scales(groups['training']).to(args.device)
     base=make_learner(initial,config,args.device,temperature,objective=VIEW_GAP)
-    network=ResponseTermsNetwork.from_spatial(base.network.state_dict(),config['dropout'],float(term_scales[1])).to(args.device)
+    version=VERSION if experiment is None else experiment.version
+    network=(ResponseTermsNetwork.from_spatial(base.network.state_dict(),config['dropout'],float(term_scales[1]))
+             if experiment is None else experiment.build_network(base.network.state_dict(),config,groups['training'],term_scales)).to(args.device)
     rd_scale=float(base.scales['rd']); initial_digests=branch_digests(network)
     del base
     initial_digests['energy_head']=tensor_digest(network.energy_head.state_dict())
@@ -126,7 +128,7 @@ def train(args):
     sampler=StratifiedCycles(labels,64,seed+1)
     probe_order=torch.randperm(len(training),generator=torch.Generator().manual_seed(seed+2))
     probe=[training[i] for i in probe_order[:min(args.training_probe,len(training))].tolist()]
-    settings=dict(version=VERSION,data=str(data),source_hashes=hashes,seed=seed,config=config,
+    settings=dict(version=version,data=str(data),source_hashes=hashes,seed=seed,config=config,
         samples=args.samples,batch=64,microbatch=args.microbatch,term_scales=term_scales.cpu().tolist(),
         rd_scale=rd_scale,temperature=temperature,threshold=threshold,initial_branch_digests=initial_digests,
         main_value_weight=1.,auxiliary_total_weight=1.,ranking_gain=temperature/rd_scale,
@@ -136,6 +138,7 @@ def train(args):
         evaluation_batch=args.evaluation_batch,training_probe_ids=[v['id'] for v in probe],
         device=args.device,cpu_threads=args.cpu_threads,selection='final update only')
     settings['stratum_loss_scope']='importance and sampling corrected batch mean, before task weighting'
+    if experiment is not None:settings.update(experiment.settings)
     stored=json.loads((out/'settings.json').read_text(encoding='utf8')) if (out/'settings.json').is_file() else None
     if stored and {k:v for k,v in stored.items() if k!='auxiliary_reference_losses'}!=settings:
         raise ValueError('response training resume settings mismatch')
@@ -159,6 +162,7 @@ def train(args):
         network.load_state_dict(state['network']);optimizer.load_state_dict(state['optimizer'])
         balancer.load_state_dict(state['balancer']);sampler.load_state_dict(state['sampler'])
         completed=state['completed'];last=state['last'];totals=state['gradient_totals']
+        if experiment is not None:experiment.budget.load_state_dict(state['gradient_budget'])
         history=trim_records(out/'metrics/history.jsonl',completed*64)
         trim_records(out/'metrics/optimization.jsonl',completed*64)
     elif args.resume and out.exists():raise FileNotFoundError('resume requires training/latest.pt')
@@ -180,6 +184,7 @@ def train(args):
             response_quality=response_report(compact_val,latest_terms,threshold),
             training_response_quality=response_report(compact_train,train_terms,threshold),
             task_weights=task_weights(balancer.weights().detach()).cpu().tolist(),gradient_totals=dict(totals))
+        if experiment is not None:row['gradient_budget']=experiment.budget.state_dict()
         if tensor_digest(dict(network.named_buffers()))!=buffers:raise RuntimeError('normalizers changed')
         history.append(row);append_json(out/'metrics/history.jsonl',row)
         print(f'\nsamples={completed*64}/{args.samples}, updates={completed}, weights={row["task_weights"]}',flush=True)
@@ -191,8 +196,10 @@ def train(args):
                       f'term_RMSE={row["response_quality"][scope]["per_view_term_rmse"]}',flush=True)
         return row
     def save():
-        atomic_save(dict(network=network.state_dict(),optimizer=optimizer.state_dict(),balancer=balancer.state_dict(),
-            sampler=sampler.state_dict(),completed=completed,last=last,gradient_totals=totals),out/'latest.pt')
+        state=dict(network=network.state_dict(),optimizer=optimizer.state_dict(),balancer=balancer.state_dict(),
+            sampler=sampler.state_dict(),completed=completed,last=last,gradient_totals=totals)
+        if experiment is not None:state['gradient_budget']=experiment.budget.state_dict()
+        atomic_save(state,out/'latest.pt')
     if not history:measure();save()
     started=time.perf_counter()
     for update in range(completed+1,args.samples//64+1):
@@ -200,7 +207,8 @@ def train(args):
         records=list(read_groups(replay,[training[i] for i in chosen]))
         weights=importance(records,args.device)*correction/64
         network.train();optimizer.zero_grad(set_to_none=True)
-        accumulator=TaskAccumulator(parameters,shared_indices,names=TASKS)
+        accumulator_type=TaskAccumulator if experiment is None else experiment.accumulator_type
+        accumulator=accumulator_type(parameters,shared_indices,names=TASKS)
         diagnostics=update==1 or update*64%args.gradient_every_samples==0 or update*64==args.samples
         for first in range(0,64,args.microbatch):
             end=min(first+args.microbatch,64)
@@ -213,7 +221,8 @@ def train(args):
         requested=task_weights(balancer.weights().detach())
         balance['raw_weight_sum']=float(sum(balance['weights']))
         balance['scope']='raw auxiliary GradNorm controller; divide weighted/target norms by raw_weight_sum for applied auxiliary units'
-        applied,budget=assign_gradients(accumulator,requested)
+        applied,budget=(assign_gradients(accumulator,requested) if experiment is None else
+                        experiment.budget.assign(accumulator,requested))
         norm=torch.nn.utils.clip_grad_norm_(parameters,10.,error_if_nonfinite=True)
         optimizer.step();balancer.update_weights();completed=update
         totals['updates']+=1;totals['clipped']+=int(norm>10);totals['rank_limited']+=int(budget['rank_gradient_limited'])
@@ -225,6 +234,13 @@ def train(args):
                   auxiliary_gradient_scope='shared parameters; actual auxiliary weights sum1; before global clip',
                   clipped=bool(norm>10),applied_weighted_loss=float((accumulator.losses*applied).sum()),**budget,
                   strata=accumulator.stratum_report(applied) if diagnostics else None)
+        if experiment is not None:
+            last['auxiliary_unbudgeted_weighted_gradient_norms']=last['auxiliary_weighted_gradient_norms']
+            last['auxiliary_weighted_gradient_norms']=(accumulator.budgeted_shared_norms()[1:4]*requested[1:4]).cpu().tolist()
+            last['auxiliary_gradient_scope']='shared parameters; actual group-budgeted auxiliary gradients; before global clip'
+            last['auxiliary_target_gradient_scope']='unbudgeted shared GradNorm targets; before record-stratum budgeting'
+            last['applied_weighted_loss']=accumulator.applied_loss(applied)
+            last['applied_weighted_loss_scope']='current group and rank factors detached; before global clip'
         if diagnostics:
             append_json(out/'metrics/optimization.jsonl',last)
             print(f'update={update}, samples={update*64}, grad={float(norm):.5g}, '
@@ -233,6 +249,13 @@ def train(args):
                   f'value_weight={float(applied[0]):.1f}, elapsed={time.perf_counter()-started:.1f}s',flush=True)
             print(f'  value/cross/energy/structure/rank losses={last["losses"]}; '
                   f'applied_weights={last["applied_task_weights"]}',flush=True)
+            if experiment is not None:
+                print(f'  group budget: ordinary={budget["ordinary_numeric_gradient_norm"]:.5g}, '
+                      f'tail={budget["raw_tail_numeric_gradient_norm"]:.5g}->'
+                      f'{budget["applied_tail_numeric_gradient_norm"]:.5g}, '
+                      f'alpha={budget["tail_gradient_factor"]:.4f}, '
+                      f'ordinary_EMA={budget["ordinary_gradient_reference"]}, '
+                      f'fallback={budget["ordinary_reference_fallback"]}',flush=True)
         if update*64%args.evaluate_every_samples==0 or update*64==args.samples:measure();save()
     if latest_predictions is None:
         _,latest_terms,latest_predictions=evaluate(network,replay,validation,args.evaluation_batch)
@@ -243,20 +266,22 @@ def train(args):
                 response=p.tolist(),predicted_terms=t.tolist())
             stream.write(json.dumps(row,allow_nan=False)+'\n')
     final=dict(network=network.state_dict(),settings=settings,optimizer=optimizer.state_dict(),balancer=balancer.state_dict())
+    if experiment is not None:final['gradient_budget']=experiment.budget.state_dict()
     atomic_save(final,out/'final.pt')
     final_digests=branch_digests(network)
     final_digests['energy_head']=tensor_digest(network.energy_head.state_dict())
-    result=dict(status='complete',version=VERSION,sample_visits=completed*64,optimizer_updates=completed,
+    result=dict(status='complete',version=version,sample_visits=completed*64,optimizer_updates=completed,
         before=history[0],after=history[-1],gradient_totals=totals,
         branch_changed={k:final_digests[k]!=v for k,v in initial_digests.items()},
         training_coverage=dict(draws=sum(sampler.visits),min_visits=min(sampler.visits),max_visits=max(sampler.visits),
                                never_visited=sum(v==0 for v in sampler.visits)),
         normalizers_unchanged=tensor_digest(dict(network.named_buffers()))==buffers)
+    if experiment is not None:result['gradient_budget']=experiment.budget.state_dict()
     json_write(out/'summary.json',result);json_write(out/'complete.json',dict(status='complete',sample_visits=completed*64))
     return result
 
 
-def main(args):
+def main(args, *, experiment=None):
     numbers=(args.cpu_threads,args.train_records,args.validation_records,args.label_groups,args.candidate_batch,
         args.max_collect_windows,args.samples,args.microbatch,args.evaluate_every_samples,args.gradient_every_samples,
         args.evaluation_batch,args.training_probe)
@@ -269,14 +294,14 @@ def main(args):
     if args.phase=='collect':return
     if args.phase=='all' and torch.device(args.device).type=='cpu' and torch.cuda.is_initialized():
         gc.collect();torch.cuda.empty_cache()
-    result=train(args)
+    result=train(args,experiment=experiment)
     with tarfile.open(out/'review.tmp','w:gz') as archive:
         for n in ('settings.json','summary.json','metrics/history.jsonl','metrics/optimization.jsonl','metrics/final_predictions.jsonl'):
             archive.add(out/'training'/n,arcname='training/'+n)
         data=Path(args.data or out/'data')
         archive.add(data/'metadata.json',arcname='data/metadata.json')
     (out/'review.tmp').replace(out/'review.tar.gz')
-    json_write(out/'complete.json',dict(status='complete',version=VERSION,sample_visits=args.samples,optimizer_updates=args.samples//64))
+    json_write(out/'complete.json',dict(status='complete',version=result['version'],sample_visits=args.samples,optimizer_updates=args.samples//64))
     print(f'Complete. Download {out/"review.tar.gz"}',flush=True)
     return result
 
