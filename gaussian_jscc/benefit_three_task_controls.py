@@ -19,6 +19,8 @@ from .benefit_rd_choice_report import stratified_report
 from .benefit_stage_one_data import read_groups
 from .benefit_three_task import (OBJECTIVE, TASKS, TaskAccumulator, make_learner,
                                 make_sampler, sampling_weights)
+from .benefit_view_gap import (OBJECTIVE as VIEW_GAP, RD_DIRECTION_WEIGHT, RANK_NUMERIC_RATIO,
+                               assign_with_rank_budget, gap_report)
 from .budgeted_allocation_state import load_checkpoint
 from .cli import seed_all
 from .modular_experiment import json_write
@@ -29,6 +31,7 @@ def parser():
     p.add_argument('--source', required=True, help='completed footprint_split run with data and training')
     p.add_argument('--out', required=True)
     p.add_argument('--arm', choices=('both', 'batch8', 'batch64'), default='both')
+    p.add_argument('--objective', choices=('original', 'view_gap'), default='original')
     p.add_argument('--samples', type=int, default=16000, help='record visits per arm, including repeats')
     p.add_argument('--microbatch', type=int, default=8)
     p.add_argument('--evaluate-every-samples', type=int, default=2048)
@@ -94,14 +97,15 @@ def run_arm(args, loaded, out, batch):
     _, replay, training, validation, metadata, initial, previous, groups, references, hashes = loaded
     config = metadata['config']; seed = metadata['seed']; seed_all(seed)
     temperature = previous['choice_targets']['temperature']; threshold = previous['choice_targets']['large_gap_threshold']
-    learner = make_learner(initial, config, args.device, temperature)
+    objective = VIEW_GAP if args.objective == 'view_gap' else OBJECTIVE
+    learner = make_learner(initial, config, args.device, temperature, objective=objective)
     initial_digests = branch_digests(learner.network)
     normalizers = tensor_digest(dict(learner.network.named_buffers()))
     labels = [stratum(g, threshold) for g in read_groups(replay, training)]
     sampler = make_sampler(labels, batch, seed+1, stratified=batch == 64)
     order = torch.randperm(len(training), generator=torch.Generator().manual_seed(seed+2))
     probe = [training[i] for i in order[:min(args.training_probe, len(training))].tolist()]
-    settings = dict(version=OBJECTIVE, source=str(Path(args.source).resolve()), source_hashes=hashes,
+    settings = dict(version=objective, source=str(Path(args.source).resolve()), source_hashes=hashes,
         source_config=config, initialization='data/initial.pt; shared original footprint construction',
         initial_branch_digests=initial_digests, seed=seed, device=args.device, cpu_threads=args.cpu_threads,
         sample_budget=args.samples, effective_batch=batch, microbatch=args.microbatch,
@@ -118,6 +122,11 @@ def run_arm(args, loaded, out, batch):
         evaluate_every_samples=args.evaluate_every_samples, gradient_every_samples=args.gradient_every_samples,
         evaluation_batch=args.evaluation_batch, training_probe_ids=[e['id'] for e in probe],
         trainable_parameters=sum(p.numel() for p in learner.network.parameters()), selection='final update only')
+    if args.objective == 'view_gap':
+        settings.update(rank_loss_gain=temperature/float(learner.scales['rd']),
+            relative_rd_direction_weight=RD_DIRECTION_WEIGHT, relative_component_contrast_weight=1.,
+            relative_scope='per view, tier-centered RD sum and component contrast',
+            rank_numeric_gradient_ratio=RANK_NUMERIC_RATIO, rank_budget_parameters='all trainable parameters')
     stored = json.loads((out/'settings.json').read_text(encoding='utf8')) if (out/'settings.json').is_file() else None
     refs = stored['initial_reference_losses'] if stored else training_references(learner, replay, training, args.evaluation_batch)
     settings['initial_reference_losses'] = refs
@@ -126,11 +135,13 @@ def run_arm(args, loaded, out, batch):
     balancer = GradNormBalancer(list(TASKS), refs, device=args.device,
         alpha=args.gradnorm_alpha, lr=args.weight_lr, ema=args.rate_ema)
     completed = 0; history = []; last_stats = None
+    gradient_totals = dict(updates=0, clipped=0, rank_limited=0, rank_factor_sum=0., max_gradient=0.)
     if (out/'latest.pt').is_file():
         checkpoint = load_checkpoint(out/'latest.pt')
         learner.load_state_dict(checkpoint['learner']); balancer.load_state_dict(checkpoint['balancer'])
         sampler.load_state_dict(checkpoint['sampler']); completed = checkpoint['completed']
         last_stats = checkpoint['last_stats']
+        if args.objective == 'view_gap': gradient_totals = checkpoint['gradient_totals']
         history = trim_records(out/'metrics/history.jsonl', completed*batch)
         trim_records(out/'metrics/optimization.jsonl', completed*batch)
     else:
@@ -152,6 +163,9 @@ def run_arm(args, loaded, out, batch):
             validation=stratified_report(groups, last_predictions, threshold),
             training_probe=stratified_report(tg, tp, threshold), task_weights=balancer.weights().detach().cpu().tolist(),
             **{'against_'+k: compare_choices(groups, p, last_predictions) for k, p in references.items()})
+        if args.objective == 'view_gap':
+            row.update(gap_quality=gap_report(groups, last_predictions, threshold),
+                training_gap_quality=gap_report(tg, tp, threshold), gradient_totals=dict(gradient_totals))
         if tensor_digest(dict(learner.network.named_buffers())) != normalizers: raise RuntimeError('normalizers changed')
         history.append(row); append_json(out/'metrics/history.jsonl', row)
         print(f'\n[{out.name}] samples={completed*batch}/{args.samples}, updates={completed}, weights={row["task_weights"]}', flush=True)
@@ -161,13 +175,24 @@ def run_arm(args, loaded, out, batch):
                 print(f'  {scope}: n={m["records"]}, regret={m["three_tier"]["regret_mean"]:.7g}, '
                       f'hit={m["three_tier"]["best_tier_hit_fraction"]:.2%}, '
                       f'max_regret={m["selection_tail"]["max_regret"]:.7g}', flush=True)
+                if args.objective == 'view_gap':
+                    gap = row['gap_quality'][scope]
+                    print(f'    view_gap_RMSE={gap["per_view_pair_rmse"]:.7g}, '
+                          f'window_gap_RMSE={gap["window_pair_rmse"]:.7g}, '
+                          f'complete_order={gap["complete_order_correct_fraction"]:.2%}, '
+                          f'correct_choice_gap_RMSE={gap["correct_choice_pair_rmse"]}', flush=True)
+        if args.objective == 'view_gap' and gradient_totals['updates']:
+            n = gradient_totals['updates']
+            print(f'  all updates: clipped={gradient_totals["clipped"]/n:.2%}, '
+                  f'rank_limited={gradient_totals["rank_limited"]/n:.2%}, '
+                  f'mean_rank_factor={gradient_totals["rank_factor_sum"]/n:.4f}', flush=True)
         train_regret = row['training_probe']['all']['three_tier']['regret_mean']
         print(f'  fixed_training_probe_regret={train_regret:.7g}', flush=True)
         return row
 
     def save():
         atomic_save(dict(learner=learner.state_dict(), balancer=balancer.state_dict(), sampler=sampler.state_dict(),
-                         completed=completed, last_stats=last_stats), out/'latest.pt')
+                         completed=completed, last_stats=last_stats, gradient_totals=gradient_totals), out/'latest.pt')
 
     if not history: measure(); save()
     for update in range(completed+1, args.samples//batch+1):
@@ -186,18 +211,35 @@ def run_arm(args, loaded, out, batch):
                             [labels[i] for i in sampled[start:end]], diagnostics=diagnostics)
         last_stats = balancer.measure_gradients(accumulator.losses, accumulator.shared_norms())
         task_weights = balancer.weights().detach()
-        accumulator.assign(task_weights)
+        if args.objective == 'view_gap':
+            applied_weights, budget_report = assign_with_rank_budget(accumulator, task_weights)
+            last_stats.update(budget_report)
+        else:
+            applied_weights = task_weights
+            accumulator.assign(task_weights)
         norm = torch.nn.utils.clip_grad_norm_(parameters, 10., error_if_nonfinite=True)
         learner.optimizer.step(); balancer.update_weights(); learner.updates += 1; completed = update
         last_stats.update(update=update, sample_visits=update*batch, network_grad_norm=float(norm),
             clipped=bool(norm > 10), network_loss=float((accumulator.losses*task_weights).sum()),
-            strata=accumulator.stratum_report(task_weights) if diagnostics else None)
+            strata=accumulator.stratum_report(applied_weights) if diagnostics else None)
+        if args.objective == 'view_gap':
+            gradient_totals['updates'] += 1
+            gradient_totals['clipped'] += int(norm > 10)
+            gradient_totals['rank_limited'] += int(budget_report['rank_gradient_limited'])
+            gradient_totals['rank_factor_sum'] += budget_report['rank_gradient_factor']
+            gradient_totals['max_gradient'] = max(gradient_totals['max_gradient'], float(norm))
+            last_stats['applied_weighted_loss'] = float((accumulator.losses*applied_weights).sum())
         if diagnostics:
             append_json(out/'metrics/optimization.jsonl', last_stats)
             print(f'[{out.name}] samples={update*batch}/{args.samples}, update={update}, '
                   f'loss={last_stats["network_loss"]:.6g}, grad={float(norm):.5g}, elapsed={time.perf_counter()-started:.1f}s', flush=True)
             sr = last_stats['strata']
             print(f'  common/relative/rank losses={last_stats["losses"]}, weights={last_stats["weights"]}', flush=True)
+            if args.objective == 'view_gap':
+                print(f'  all-parameter numeric_grad={last_stats["numeric_gradient_norm"]:.5g}, '
+                      f'rank_grad={last_stats["requested_rank_gradient_norm"]:.5g}'
+                      f'->{last_stats["applied_rank_gradient_norm"]:.5g}, '
+                      f'rank_factor={last_stats["rank_gradient_factor"]:.4f}', flush=True)
             print(f'  shared-gradient contributions: ordinary(n={sr["ordinary"]["records"]})='
                   f'{sr["ordinary"]["combined_shared_gradient_norm"]:.5g}, '
                   f'large_gap(n={sr["large_gap"]["records"]})={sr["large_gap"]["combined_shared_gradient_norm"]:.5g}, '
@@ -222,6 +264,7 @@ def run_arm(args, loaded, out, batch):
         baselines={k: stratified_report(groups, p, threshold) for k, p in references.items()},
         training_coverage=dict(draws=sum(sampler.visits), min_visits=min(sampler.visits), max_visits=max(sampler.visits),
                                never_visited=sum(v == 0 for v in sampler.visits)), last_optimization=last_stats)
+    if args.objective == 'view_gap': result['gradient_totals'] = gradient_totals
     json_write(out/'summary.json', result)
     json_write(out/'complete.json', dict(status='complete', sample_visits=completed*batch, optimizer_updates=completed))
     return result
@@ -244,7 +287,8 @@ def main(args):
     loaded = load_data(source)
     replay_path = loaded[1].root.resolve()
     if out.is_relative_to(replay_path) or replay_path.is_relative_to(out): raise ValueError('output/replay overlap')
-    plan = dict(version=OBJECTIVE, source=str(source), batches=batches, sample_budget=args.samples)
+    plan = dict(version=VIEW_GAP if args.objective == 'view_gap' else OBJECTIVE,
+                source=str(source), batches=batches, sample_budget=args.samples)
     if (out/'plan.json').is_file() and json.loads((out/'plan.json').read_text(encoding='utf8')) != plan:
         raise ValueError('suite settings mismatch')
     out.mkdir(parents=True, exist_ok=True); json_write(out/'plan.json', plan)

@@ -31,6 +31,9 @@ def three_losses(prediction, truth, rates, scale, temperature, common_weight, pa
 
 
 class ThreeTaskLearner(FootprintLearner):
+    objective = OBJECTIVE
+    loss_function = staticmethod(three_losses)
+
     def _batch_losses(self, groups):
         if not groups or any(g.get('supervision') == 'action_gap' or not g['views'] for g in groups):
             raise ValueError('nonempty complete teacher groups required')
@@ -40,23 +43,23 @@ class ThreeTaskLearner(FootprintLearner):
         rates = torch.stack([torch.as_tensor(g['rates']) for g in groups]).to(prediction)
         owner = torch.repeat_interleave(torch.arange(len(groups), device=prediction.device),
                                         torch.tensor(sizes, device=prediction.device))
-        per_view = three_losses(prediction, truth, rates[owner], self.scales['rd'], self.rank_temperature,
+        per_view = self.loss_function(prediction, truth, rates[owner], self.scales['rd'], self.rank_temperature,
                                 self.common_weight, self.pair_weight)
         result = {k: torch.stack([v.mean() for v in per_view[k].split(sizes)]) for k in ('common', 'relative')}
         mean_p = torch.stack([v.mean(0) for v in prediction.split(sizes)])
         mean_t = torch.stack([v.mean(0) for v in truth.split(sizes)])
-        result['ranking'] = three_losses(mean_p, mean_t, rates, self.scales['rd'], self.rank_temperature,
+        result['ranking'] = self.loss_function(mean_p, mean_t, rates, self.scales['rd'], self.rank_temperature,
                                          self.common_weight, self.pair_weight)['ranking']
         return result
 
     def state_dict(self):
-        return dict(PhysicalLearner.state_dict(self), direction_objective=OBJECTIVE,
+        return dict(PhysicalLearner.state_dict(self), direction_objective=self.objective,
                     rank_temperature=self.rank_temperature, common_weight=self.common_weight,
                     pair_weight=self.pair_weight)
 
     def load_state_dict(self, state):
         if hasattr(self, 'rank_temperature'):
-            if (state.get('direction_objective') != OBJECTIVE or
+            if (state.get('direction_objective') != self.objective or
                     any(state[k] != getattr(self, k) for k in ('rank_temperature', 'common_weight', 'pair_weight'))):
                 raise ValueError('three-task resume objective mismatch')
             PhysicalLearner.load_state_dict(self, state)
@@ -64,10 +67,16 @@ class ThreeTaskLearner(FootprintLearner):
             super().load_state_dict(state)
 
 
-def make_learner(initial, config, device, temperature):
+def make_learner(initial, config, device, temperature, objective=OBJECTIVE):
+    if objective == OBJECTIVE:
+        learner_type = ThreeTaskLearner
+    else:
+        from .benefit_view_gap import ViewGapLearner, OBJECTIVE as VIEW_GAP
+        if objective != VIEW_GAP: raise ValueError('unknown benefit objective')
+        learner_type = ViewGapLearner
     # Same construction RNG and initial function as the existing footprint arms.
     make_original(dict(settings=config, learner=initial['learner']), device)
-    learner = ThreeTaskLearner(None, device, hidden=config['hidden'], lr=config['benefit_lr'],
+    learner = learner_type(None, device, hidden=config['hidden'], lr=config['benefit_lr'],
         dropout=config['dropout'], weight_decay=config['weight_decay'], decision_weight=config['decision_weight'],
         tie_fraction=config['tie_fraction'], common_weight=config['common_weight'], pair_weight=config['pair_weight'])
     learner.load_state_dict(copy.deepcopy(initial['learner']))

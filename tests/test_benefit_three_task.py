@@ -69,14 +69,15 @@ def test_stratum_weighting_preserves_population_mean_and_resume():
     assert model.sampling_weights([0]*5, empty_tail, empty_tail.next()).eq(1).all()
 
 
-def test_runner_equal_draw_budgets_initialization_and_readonly_source(tmp_path):
+@pytest.mark.parametrize('objective', ['original', 'view_gap'])
+def test_runner_equal_draw_budgets_initialization_and_readonly_source(tmp_path, objective):
     from test_benefit_isolated_positive_controls import prepared
     from gaussian_jscc import benefit_three_task_controls as controls
     source = prepared(tmp_path)
     hashes = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.rglob('*') if p.is_file()}
     out = tmp_path/'suite'
     args = controls.parser().parse_args(['--source', str(source), '--out', str(out),
-        '--samples', '64', '--evaluate-every-samples', '64', '--cpu-threads', '1'])
+        '--samples', '64', '--evaluate-every-samples', '64', '--cpu-threads', '1', '--objective', objective])
     result = controls.main(args)
     assert result['status'] == 'complete'
     a = json.loads((out/'split_batch8/summary.json').read_text())
@@ -92,17 +93,23 @@ def test_runner_equal_draw_budgets_initialization_and_readonly_source(tmp_path):
     rows = [json.loads(s) for s in (out/'split_batch64/metrics/optimization.jsonl').read_text().splitlines()]
     assert rows[0]['sample_visits'] == 64 and rows[0]['update'] == 1
     assert sum(rows[0]['strata'][s]['records'] for s in ('ordinary', 'large_gap')) == 64
+    if objective == 'view_gap':
+        assert 'gap_quality' in b['after']
+        assert b['gradient_totals']['updates'] == 1
+        assert rows[0]['applied_rank_gradient_norm'] <= rows[0]['numeric_gradient_norm']+1e-12
+        assert settings['rank_loss_gain'] == pytest.approx(settings['temperature']/settings['regression_scale'])
     assert (out/'review.tar.gz').is_file()
     assert all(hashlib.sha256(p.read_bytes()).hexdigest() == h for p, h in hashes.items())
 
 
-def test_accumulated_runner_exact_resume_and_settings_guard(tmp_path, monkeypatch):
+@pytest.mark.parametrize('objective', ['original', 'view_gap'])
+def test_accumulated_runner_exact_resume_and_settings_guard(tmp_path, monkeypatch, objective):
     from test_benefit_isolated_positive_controls import prepared
     from gaussian_jscc import benefit_three_task_controls as controls
     source = prepared(tmp_path)
     def args(out):
         return controls.parser().parse_args(['--source', str(source), '--out', str(out), '--arm', 'batch64',
-            '--samples', '128', '--evaluate-every-samples', '64', '--cpu-threads', '1'])
+            '--samples', '128', '--evaluate-every-samples', '64', '--cpu-threads', '1', '--objective', objective])
     interrupted = tmp_path/'interrupted'; a = args(interrupted)
     step = torch.optim.AdamW.step; calls = 0
     def stop(self, *pos, **kw):
@@ -123,6 +130,9 @@ def test_accumulated_runner_exact_resume_and_settings_guard(tmp_path, monkeypatc
     for k, v in left['learner']['network'].items(): torch.testing.assert_close(v, right['learner']['network'][k], rtol=0, atol=0)
     assert torch.equal(left['balancer']['logits'], right['balancer']['logits'])
     assert left['sampler']['visits'] == right['sampler']['visits']
+    if objective == 'view_gap':
+        assert left['gradient_totals'] == right['gradient_totals']
+        assert left['gradient_totals']['updates'] == 2
     (interrupted/'review.tar.gz').unlink()
     assert controls.main(a)['status'] == 'complete'
     a.microbatch = 4
