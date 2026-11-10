@@ -9,7 +9,7 @@ from .structured_evidence import risk_choices
 @torch.no_grad()
 def correct_components(model, features, id_batches, cache, geometry, task, scene, scheduler,
                        tier_ids, locations, components, rates, keep_parts, keep_tiers, table,
-                       d_ref, price, c_ref, side_proxy, snr, kind, *, external_keep=False):
+                       d_ref, price, c_ref, side_proxy, snr, kind, *, external_keep=False, execution=None):
     from .budgeted_allocation_kernel import raw_batches, set_rng
     n = len(scheduler.counts); device = scene.device; step = side_proxy['step']
     exact = torch.zeros(len(tier_ids), 3, dtype=torch.bool)
@@ -68,13 +68,20 @@ def correct_components(model, features, id_batches, cache, geometry, task, scene
         f = features[batch].to(device); ids = id_batches[batch].to(device); valid = ids >= 0
         q, _, y, _, rng = cache[batch]; old = int(q[row, col]); source = int(ids[row, col])
         alt = q.clone(); alt[row, col] = new
-        with preserved_rng(device):
-            set_rng(rng, device)
-            pred = model.forward_tier_batches(f, f[..., :3], F.one_hot(alt, 4).to(f), snr, kind,
-                paired_noise=True, **({'_semantic_y': y} if old > 0 and new > 0 else {}))[0]
-        changed = scene.detach().clone(); raw = raw_batches(pred, geometry, model)
-        start, count = offsets[batch], int(valid.sum())
-        changed[start:start+count] = torch.cat((raw[valid], (alt[valid] > 0).to(raw)[:, None]), -1)
+        changed = scene.detach().clone()
+        if execution is None:
+            with preserved_rng(device):
+                set_rng(rng, device)
+                pred = model.forward_tier_batches(f, f[..., :3], F.one_hot(alt, 4).to(f), snr, kind,
+                    paired_noise=True, **({'_semantic_y': y} if old > 0 and new > 0 else {}))[0]
+            raw = raw_batches(pred, geometry, model)
+            start, count = offsets[batch], int(valid.sum())
+            changed[start:start+count] = torch.cat((raw[valid], (alt[valid] > 0).to(raw)[:, None]), -1)
+        else:
+            pred = execution.intervention(model, f, q, row, col, new, y, rng, snr, kind)
+            raw = raw_batches(pred, geometry, model)[0]; kept = valid[row]
+            start = offsets[batch]+int(valid[:row].sum()); count = int(kept.sum())
+            changed[start:start+count] = torch.cat((raw[kept], (alt[row, kept] > 0).to(raw)[:, None]), -1)
         measured = task.delta_components(changed)
         if branch == 'positive':
             predicted = components[position, new-1].clone()*d_ref

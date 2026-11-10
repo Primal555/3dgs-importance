@@ -5,6 +5,7 @@ is detached, never inferred from attributes. No custom CUDA extension is needed.
 """
 import torch
 from torch import nn
+from contextlib import contextmanager
 
 
 def gather(values, indices):
@@ -73,13 +74,18 @@ class SetAbstraction(nn.Module):
         self.branches = nn.ModuleList(mlp(hidden+4, hidden) for _ in radii)
         self.merge = mlp(len(radii)*hidden, hidden)
 
-    def forward(self, h, xyz, active):
+    def geometry(self, xyz, active):
         ids, valid_centers = farthest_points(xyz, active, self.centers)
         centers = gather(xyz, ids).masked_fill(~valid_centers[..., None], 0)
         base_radius = spacing(xyz, active)[:, None].expand_as(valid_centers)
+        neighbors = [radius_neighbors(xyz, centers, active, valid_centers, base_radius*m, k)
+                     for m, k in zip(self.radii, self.neighbors)]
+        return centers, valid_centers, neighbors
+
+    def forward(self, h, xyz, active, geometry=None):
+        centers, valid_centers, neighbors = self.geometry(xyz, active) if geometry is None else geometry
         scales = []
-        for branch, multiplier, count in zip(self.branches, self.radii, self.neighbors):
-            idx, valid, relative = radius_neighbors(xyz, centers, active, valid_centers, base_radius*multiplier, count)
+        for branch, (idx, valid, relative) in zip(self.branches, neighbors):
             features = torch.cat((gather(h, idx), relative, relative.norm(dim=-1, keepdim=True)), -1)
             values = branch(features).masked_fill(~valid[..., None], -torch.finfo(h.dtype).max)
             pooled = values.amax(2).masked_fill(~valid.any(-1)[..., None], 0)
@@ -92,13 +98,17 @@ class FeaturePropagation(nn.Module):
         super().__init__()
         self.fuse = mlp(2*hidden, hidden)
 
-    def forward(self, fine, xyz, active, coarse, centers, center_active):
+    def geometry(self, xyz, active, centers, center_active):
         with torch.no_grad():
             distance = torch.cdist(xyz.float(), centers.float(), compute_mode='donot_use_mm_for_euclid_dist')
             distance = distance.masked_fill(~center_active[:, None, :], float('inf'))
             d, ids = distance.topk(min(3, centers.shape[1]), dim=-1, largest=False)
             weights = d.clamp_min(1e-8).reciprocal() * active[..., None]
             weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-8)
+        return ids, weights
+
+    def forward(self, fine, xyz, active, coarse, centers, center_active, geometry=None):
+        ids, weights = self.geometry(xyz, active, centers, center_active) if geometry is None else geometry
         interpolated = (gather(coarse, ids)*weights[..., None]).sum(2)
         return self.fuse(torch.cat((fine, interpolated), -1))*active[..., None]
 
@@ -124,11 +134,61 @@ class SpatialPointContext(nn.Module):
         if h.shape[1] == 0:
             return h
         xyz = metric_coordinates(unit_xyz, self.scene_span, active)
-        h1, x1, a1 = self.sa1(h, xyz, active)
-        h2, x2, a2 = self.sa2(h1, x1, a1)
-        up1 = self.fp1(h1, x1, a1, h2, x2, a2)
-        up0 = self.fp0(h, xyz, active, up1, x1, a1)
+        cache = getattr(self, '_allocation_geometry_cache', None)
+        plan = cache.get(self, xyz, active) if cache is not None else (None,)*4
+        h1, x1, a1 = self.sa1(h, xyz, active, plan[0])
+        h2, x2, a2 = self.sa2(h1, x1, a1, plan[1])
+        up1 = self.fp1(h1, x1, a1, h2, x2, a2, plan[2])
+        up0 = self.fp0(h, xyz, active, up1, x1, a1, plan[3])
         return (h + self.gate.tanh()*up0)*active[..., None]
+
+
+class _AllocationGeometryCache:
+    """One candidate batch's detached geometry; never reused across updates."""
+    def __init__(self, block_rows):
+        self.block_rows = block_rows
+        self.entries = {}
+        self.builds = self.hits = 0
+
+    @torch.no_grad()
+    def get(self, module, xyz, active):
+        n = min(self.block_rows, len(xyz))
+        repeat = len(xyz)//n
+        base_x, base_a = xyz[:n], active[:n]
+        if len(xyz)%n or not torch.equal(xyz, base_x.repeat(repeat, 1, 1)) or not torch.equal(active, base_a.repeat(repeat, 1)):
+            # Different keep sets/positions must receive their own neighborhood.
+            n, repeat, base_x, base_a = len(xyz), 1, xyz, active
+        previous = self.entries.get(module)
+        if previous is not None and torch.equal(previous[0], base_x) and torch.equal(previous[1], base_a):
+            plan = previous[2]; self.hits += 1
+        else:
+            sa1 = module.sa1.geometry(base_x, base_a)
+            sa2 = module.sa2.geometry(sa1[0], sa1[1])
+            plan = (sa1, sa2, module.fp1.geometry(sa1[0], sa1[1], sa2[0], sa2[1]),
+                    module.fp0.geometry(base_x, base_a, sa1[0], sa1[1]))
+            self.entries[module] = (base_x.clone(), base_a.clone(), plan)
+            self.builds += 1
+        def expand(value):
+            if isinstance(value, torch.Tensor):
+                return value if repeat == 1 else value.repeat((repeat,)+(1,)*(value.ndim-1))
+            return type(value)(expand(v) for v in value)
+        return expand(plan)
+
+
+@contextmanager
+def allocation_geometry_reuse(model, block_rows):
+    if torch.is_grad_enabled() or model.training:
+        raise ValueError('allocation geometry reuse requires eval and no_grad')
+    cache = _AllocationGeometryCache(block_rows)
+    modules = [m for m in model.modules() if isinstance(m, SpatialPointContext)]
+    previous = [getattr(m, '_allocation_geometry_cache', None) for m in modules]
+    try:
+        for m in modules: m._allocation_geometry_cache = cache
+        yield cache
+    finally:
+        for m, old in zip(modules, previous):
+            if old is None: delattr(m, '_allocation_geometry_cache')
+            else: m._allocation_geometry_cache = old
 
 
 @torch.no_grad()

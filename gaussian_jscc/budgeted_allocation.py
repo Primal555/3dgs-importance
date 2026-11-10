@@ -86,11 +86,14 @@ def make_plan(args,family,source,spec,codec_config):
                                      codec_config=codec_config,writes_output=False)))
 
 
-def main(args, max_updates=None, *, positive_factory=None, family_override=None,table_factory=None,scheduler_factory=None):
+def main(args, max_updates=None, *, positive_factory=None, family_override=None,table_factory=None,scheduler_factory=None,
+         execution=None, stopping=None):
     validate(args)
     fixed_rd = getattr(args, 'beta', None) is not None
     evidence = getattr(args, 'evidence_experiment', False)
     structured = getattr(args, 'structured_evidence', False)
+    if stopping is not None and not (fixed_rd and structured):
+        raise ValueError('calibration stopping requires structured fixed-beta allocation')
     if evidence:
         from .evidence_allocation import validate as validate_evidence
         validate_evidence(args)
@@ -114,6 +117,8 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
     raw, degree = read_ply(spec['ply'])
     scene = make_scene(spec, raw, degree, model, options, out, old=old); del raw
     model.set_scene_geometry(scene.geometry)
+    if execution is not None:
+        execution.verify(model, scene, args.snr, out)
     chosen = set(spaced_indices(len(scene.cameras), args.calibration_views))
     calibration = [c for i,c in enumerate(scene.cameras) if i in chosen]
     training = [c for i,c in enumerate(scene.cameras) if i not in chosen]
@@ -197,6 +202,8 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             json_write(out/'training.json',document)
 
     distortion_key = 'source_distortion' if structured else 'source_mse'
+    if stopping is not None and args.resume:
+        stopping.load_state_dict(progress['stopping'])
     if structured:
         from .allocation_distortion import ImageDistortion
         args.allocation_image_objective = ImageDistortion(args.distortion, reference['lambda_s'])
@@ -225,11 +232,13 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
 
     def save(label='latest', map_q=None):
         if model_id(model) != identity: raise RuntimeError('frozen codec or attribute statistics changed')
+        if stopping is not None: progress['stopping'] = stopping.state_dict()
         result = save_state(out,label,model,table,controller,blocks,views,progress,plan,scene_record,reference,
                             q if map_q is None else map_q,positive_provider=positive_provider)
         json_write(out/'progress.json',dict(status='running',step=progress['step'],phase='allocation',
             **objective_fields(), pending=progress['pending'],
-            **{'best_rd' if fixed_rd else 'best_feasible': progress['best']}))
+            **{'best_rd' if fixed_rd else 'best_feasible': progress['best']},
+            **({'stopping': stopping.last_event} if stopping is not None else {})))
         return result
 
     def proxy(cost, deployed):
@@ -269,6 +278,14 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             if previous is None or (candidate['total_channel_uses'],candidate['source_mse']) < (previous['total_channel_uses'],previous['source_mse']):
                 progress['lowest'] = candidate; save('lowest_violation')
 
+    def observe_stopping(row):
+        if stopping is None: return
+        event = stopping.observe(progress['step'], row['rd_score'], row['total_channel_uses'], q)
+        upsert_jsonl(out/'metrics/stopping.jsonl', dict(event, event='calibration_stopping'))
+        print(f'  stopping: {event["action"]}, LR scale={event["lr_scale"]:.3g}, '
+              f'RD={row["rd_score"]:.7g}, map drift={event["map_drift"]:.2%}, '
+              f'cost drift={event["cost_drift"]:.2%}', flush=True)
+
     def pending():
         nonlocal q
         while progress['pending']:
@@ -277,6 +294,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             if event in ('initial','fork_initial'):
                 label='calibration_000000' if event=='initial' else f'calibration_{progress["step"]:06d}'
                 row = measure(label,calibration); consider(row)
+                observe_stopping(row)
                 if event=='initial':reference['side_proxy'] = proxy(row,q)
                 measure('initial',scene.test_cameras,True)
             elif event == 'control':
@@ -288,6 +306,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
                     tier_counts=torch.bincount(q,minlength=4).tolist(),cost_seconds=time.perf_counter()-started))
             elif event == 'calibration':
                 row = measure(f'calibration_{progress["step"]:06d}',calibration); consider(row)
+                observe_stopping(row)
             else: raise RuntimeError('unknown pending allocation event')
             progress['pending'].pop(0); save()
 
@@ -296,7 +315,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         save()
     pending()
     updates = 0
-    while progress['step'] < args.allocation_steps:
+    while progress['step'] < args.allocation_steps and not (stopping is not None and stopping.stopped):
         step = progress['step']+1
         indices = views.next(args.window_views)
         if structured: blocks.set_view_window(indices)
@@ -317,10 +336,12 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             args.snr,'awgn',d_ref=reference['d_ref'],price=args.beta if fixed_rd else controller.price,
             rate_normalizer=rate_normalizer,
             side_proxy=dict(reference['side_proxy'],step=step),timings=timings,audit_limit=audit_count,
-            **({'positive_provider':positive_provider} if positive_provider is not None else {}))
+            **({'positive_provider':positive_provider} if positive_provider is not None else {}),
+            **({'execution':execution} if execution is not None else {}))
+        lr_scale = stopping.scale if stopping is not None else 1.
         with timings.measure('mirror_update_seconds'):
             table.update(result.pop('keep_costs'),result.pop('tier_ids'),result.pop('tier_costs'),
-                         args.keep_lr,args.tier_lr,len(scene.raw))
+                         args.keep_lr*lr_scale,args.tier_lr*lr_scale,len(scene.raw))
         result.pop('keep_image_costs'); sampled_q = result.pop('q'); audits = result.pop('audit')
         timing_row = timings.summary()
         if structured: result.update(table.update_stats)
@@ -334,6 +355,9 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             step_seconds=time.perf_counter()-started,**blocks.coverage(sampled_q),
             peak_allocated_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type=='cuda' else None)
         row['d_ref'] = reference['d_ref']
+        if stopping is not None:
+            row.update(lr_scale=lr_scale, effective_keep_lr=args.keep_lr*lr_scale,
+                       effective_tier_lr=args.tier_lr*lr_scale)
         if evidence:
             row['candidate_evaluations_this_step'] = int(blocks.last.eq(step).sum())
             row['candidate_evaluations_per_second'] = row['candidate_evaluations_this_step']/row['step_seconds']
@@ -359,6 +383,10 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             print(f'allocation {step}/{args.allocation_steps}: MSE={mse:.6g}, {coefficient}, '
                   f'sampled={row["sampled_tier_counts"]}, covered={row["evaluated_rows"]}/{len(scene.raw)}, '
                   f'sec={row["step_seconds"]:.2f}',flush=True)
+            if execution is not None:
+                print(f'  execution: candidate calls={row["candidate_codec_calls"]}, '
+                      f'geometry builds/hits={row["candidate_geometry_builds"]}/{row["candidate_geometry_hits"]}, '
+                      f'finite blocks={row["finite_block_codec_calls"]}, LR scale={lr_scale:.3g}',flush=True)
             if evidence:
                 print(f'  evidence: candidates={row["candidate_evaluations_this_step"]}, '
                       f'per_sec={row["candidate_evaluations_per_second"]:.1f}, '
@@ -414,6 +442,10 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
     else:
         result['selection_rd_score'] = selected['progress']['best']['rd_score']
         result['selection_rd_scope'] = 'calibration views only; final rd_score uses test views'
+    if stopping is not None:
+        result.update(stop_reason='stable_calibration_plateau' if stopping.stopped else 'step_limit',
+                      step_limit=args.allocation_steps, final_lr_scale=stopping.scale,
+                      stopping=stopping.last_event)
     if positive_provider is not None:
         verification = positive_provider.state_dict()
         result.update(network_mode=args.network_mode,network_updates=positive_provider.learner.updates,

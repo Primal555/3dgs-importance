@@ -34,6 +34,8 @@
 
 ## 服务器运行
 
+β=0.5 的提速与收尾实验使用独立入口，见 [运行说明](fast_first_order_allocation.md)。下方入口保留历史执行流程。
+
 ```bash
 cd /data/home/zhangyueheng/projects/3dgs-importance
 git -c submodule.recurse=false pull --ff-only --no-recurse-submodules origin main

@@ -114,9 +114,14 @@ def audit_interventions(model, features, q, positive, ids, columns, geometry, sc
 
 def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task, scheduler,
                        snr, kind, *, d_ref, price, side_proxy, timings, audit_limit=0,
-                       rate_normalizer=None, budget=None, inspector=None, benefit=None, positive_provider=None):
+                       rate_normalizer=None, budget=None, inspector=None, benefit=None, positive_provider=None,
+                       execution=None):
     if model.training or any(p.requires_grad for p in model.parameters()):
         raise ValueError('budgeted allocation requires an eval-mode, fully frozen codec')
+    if execution is not None:
+        if positive_provider is not None or benefit is not None:
+            raise ValueError('fast execution applies to first-order allocation only')
+        execution.reset()
     if rate_normalizer is not None and budget is not None:
         raise ValueError('supply one rate normalization, not both rate_normalizer and legacy budget')
     rate_normalizer = budget if rate_normalizer is None else rate_normalizer
@@ -218,7 +223,9 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                     component_g.append(part)
             if benefit is not None:
                 basis = benefit.batch(f, ids, entry, scene[offset:offset+n], component_g)
-            for columns in rounds:
+            combined = (execution.candidates(model, f, q, [c[batch_index] for c in rounds], snr, kind, geometry,
+                semantic_y=y, actual=actual, actual_rng=state, timings=timings) if execution is not None else None)
+            for round_index, columns in enumerate(rounds):
                 cols = columns[batch_index]
                 active = cols >= 0
                 if active.any():
@@ -230,7 +237,9 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                         action_parts = torch.zeros(len(rows), 3, 2, dtype=torch.float64, device=device)
                     position_start = sum(x.numel() for x in selected)
                     block_scale_base = present_scales(q).sum(-1)
-                    if positive_provider is None:
+                    if combined is not None:
+                        candidates = combined[round_index]
+                    elif positive_provider is None:
                         candidates = mixed_point_candidates(model, f, q, cols, snr, kind, geometry,
                             semantic_y=y, actual=actual, actual_rng=state, timings=timings)
                     else:
@@ -290,7 +299,8 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                 records, feedback_stats, exact, keep_exact = correct_components(model, feature_batches,
                     id_batches, cache, geometry, task, scene, scheduler, tier_ids, locations, components,
                     rate_values, keep_parts, keep_tiers, table, d_ref, price, rate_normalizer, side_proxy, snr, kind,
-                    **({'external_keep':True} if keep_policy is not None else {}))
+                    **({'external_keep':True} if keep_policy is not None else {}),
+                    **({'execution':execution} if execution is not None else {}))
             if positive_provider is not None and hasattr(positive_provider,'observe_exact'):
                 feedback_stats.update(positive_provider.observe_exact(records,side_proxy['step']))
             costs = [scheduler.accumulate_components(tier_ids, components, rate_values, side_proxy['step'],
@@ -353,7 +363,7 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
                              keep_estimator='dense_neural_gate' if keep_policy is not None else 'dense_first_order')
         if hasattr(positive_provider,'finish_step'):
             feedback_stats.update(positive_provider.finish_step(side_proxy['step']))
-    return dict(render_loss=loss, keep_image_costs=keep_image, keep_costs=keep_costs,
+    output = dict(render_loss=loss, keep_image_costs=keep_image, keep_costs=keep_costs,
         tier_ids=tier_ids, tier_costs=torch.cat(costs) if costs else torch.empty(0, 3, device=device),
         q=q_source, sampled_tier_counts=torch.bincount(q_source, minlength=4).tolist(),
         q0_feedback_rows=q0_rows, expected_cost_proxy=expected, sampled_cost_proxy=sampled,
@@ -362,3 +372,5 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
             feedback_stats.get('neural_exact_candidate_decode_calls',0), actual_codec_calls=len(cache),
         q0_codec_calls=sum(bool(((ids>=0)&(e[0].cpu()==0)).any()) for ids,e in zip(id_batches,cache)),
         cache_peak_mib=cache_bytes/2**20, audit=all_audits, **feedback_stats, **actual_stats)
+    if execution is not None: output.update(execution.diagnostics())
+    return output
