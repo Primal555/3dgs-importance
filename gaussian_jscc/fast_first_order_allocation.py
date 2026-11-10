@@ -1,6 +1,8 @@
 """Calibrated first-order allocation with batched execution and plateau ending."""
 import argparse
 import json
+import math
+from functools import partial
 from pathlib import Path
 import tarfile
 from . import structured_evidence_allocation as previous
@@ -14,6 +16,8 @@ def parser():
     p = previous.parser(); p.description = __doc__
     p.set_defaults(validate_every=100, fast_execution_version='batched_first_order_v1')
     p.add_argument('--candidate-batch', type=int, default=128)
+    p.add_argument('--tier-max-log-odds', type=float, default=argparse.SUPPRESS,
+                   help='Override the positive-tier cap; keep uses --max-log-odds')
     p.add_argument('--early-stop', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--stop-min-steps', type=int, default=1250)
     p.add_argument('--stop-patience', type=int, default=2)
@@ -21,6 +25,15 @@ def parser():
     p.add_argument('--stop-map-tolerance', type=float, default=.005)
     p.add_argument('--stop-cost-tolerance', type=float, default=.005)
     return p
+
+
+def table_factory_for(args):
+    cap = getattr(args, 'tier_max_log_odds', None)
+    if cap is None: return None
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError('tier-max-log-odds must be finite and positive')
+    from .hybrid_tier_step_table import TierStepTable
+    return partial(TierStepTable, tier_max_log_odds=cap)
 
 
 def review(out, result):
@@ -53,10 +66,12 @@ def review(out, result):
 
 def main(args, max_updates=None):
     previous.validate(args)
+    table_factory = table_factory_for(args)
     execution = FastFirstOrderExecution(args.candidate_batch)
     stopping = FirstOrderStopping(args.stop_min_steps, args.stop_patience, args.stop_relative_improvement,
                                  args.stop_map_tolerance, args.stop_cost_tolerance) if args.early_stop else None
-    result = engine.main(args, max_updates=max_updates, execution=execution, stopping=stopping)
+    result = engine.main(args, max_updates=max_updates, execution=execution, stopping=stopping,
+                         table_factory=table_factory)
     if result.get('status') == 'complete': review(args.out, result)
     return result
 

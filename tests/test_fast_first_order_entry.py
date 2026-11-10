@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import tarfile
+import pytest
 from unittest.mock import patch
 import torch
 from gaussian_jscc import fast_first_order_allocation as entry
@@ -20,14 +21,19 @@ def args_for(parent, out):
     return args
 
 
-def test_early_finish_resume_and_reports(source):
+@pytest.mark.parametrize('tier_cap', [None, 1.])
+def test_early_finish_resume_and_reports(source, tier_cap):
     parent, root = source
+    def configured(out):
+        args = args_for(parent, out)
+        if tier_cap is not None: args.tier_max_log_odds = tier_cap
+        return args
     with patch('gaussian_jscc.rendering.load_cameras', side_effect=fixture.cameras), \
          patch('gaussian_jscc.rendering.render', side_effect=fixture.render), contextlib.redirect_stdout(io.StringIO()):
-        out = root/'fast'; result = entry.main(args_for(parent, out))
+        out = root/'fast'; result = entry.main(configured(out))
         assert result['step'] == 2 and result['stop_reason'] == 'stable_calibration_plateau'
         full = torch.load(out/'checkpoints/latest/state.pt', weights_only=True)
-        dest = root/'fast_resume'; args = args_for(parent, dest)
+        dest = root/'fast_resume'; args = configured(dest)
         assert entry.main(args, max_updates=1)['status'] == 'interrupted'
         args.resume = True; resumed_result = entry.main(args)
         assert resumed_result['step'] == 2
@@ -45,3 +51,7 @@ def test_early_finish_resume_and_reports(source):
         assert 'deployment/selected_tiers.npy' in names
         assert not any(n.startswith('checkpoints/') for n in names)
         assert resumed_result['frozen_codec_verified']
+        if tier_cap is not None:
+            assert resumed['plan']['settings']['tier_max_log_odds'] == tier_cap
+            updates = [json.loads(s) for s in (dest/'metrics/loss.jsonl').read_text().splitlines()]
+            assert all(r['tier_max_log_odds'] == tier_cap and r['max_log_odds'] == .25 for r in updates)
