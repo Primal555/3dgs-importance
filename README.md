@@ -2,6 +2,21 @@
 
 ## Gaussian JSCC codec extension
 
+### Current mainline: calibrated first-order tier allocation
+
+As of 2026-11-10, the allocation mainline uses
+`gaussian_jscc.structured_evidence_allocation`
+(`calibrated_structured_allocation_v2`, algorithm reference `c1162c2`).
+Launch with `scripts/train_mainline_allocation.sh CODEC_RUN SCENE NEW_OUT --beta BETA`.
+It combines dense keep feedback, first-order positive-tier changes, accumulated
+evidence and exact corrections under a normalized MSE+SSIM rate-distortion objective.
+The codec is frozen; defaults are 2000 allocation updates and 0/8/24/48 attribute
+symbols at 10 dB. Calibration RD selects the final deployment map.
+
+See [current configuration, historical runs and server commands](docs/mainline_first_order.md).
+Neural-benefit and entropy-allocation experiments remain available through their
+individual launchers. The codec launchers below document earlier experiments.
+
 ### Coordinate-cost speed fix
 
 New `train-learned` runs use zlib level 6 for compressed 16-bit XYZ, consistently
@@ -30,9 +45,9 @@ alongside the usual PSNR, images and training diagnostics, all in one folder.
 See [design, compatibility and background server launch](docs/progressive_attribute_jscc.md).
 The earlier adaptive-prefix launcher below remains available as the control.
 
-### Active research baseline: compressed 16-bit XYZ + render-only attribute JSCC
+### Historical September baseline: compressed 16-bit XYZ + render-only attribute JSCC
 
-Mainline has been restored to **9f2810e** (2026-09-18). The active launcher is now
+This September experiment is based on **9f2810e** (2026-09-18). Its launcher is
 `scripts/train_quantized16_render_only.sh`: reliable 16-bit-per-axis coordinates
 with lossless delta/byte-plane/zlib coding, attribute JSCC,
 source-scene multiview RGB MSE only, LR 1e-4, replay, no attribute bootstrap or
