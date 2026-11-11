@@ -27,6 +27,17 @@ def args_for(parent, teacher, out, *extra):
         '--trials', '1', '--image-views', '1', '--cpu-threads', '1', '--device', 'cpu', '--no-lpips', *extra])
 
 
+def test_teacher_constraint_stays_active_through_final_rd_step():
+    args = entry.parser().parse_args(['--run', 'codec', '--scene', 'truck', '--out', 'student',
+                                     '--teacher-weight-schedule', 'constant'])
+    assert [entry.teacher_weight_at(args, step) for step in (1, 326, 500, 501, 1000)] == [.1]*5
+    args.teacher_weight = .2
+    assert entry.teacher_weight_at(args, 1000) == .2
+    args.teacher_weight_schedule = 'linear_decay'; args.teacher_weight = .1
+    assert entry.teacher_weight_at(args, 326) == pytest.approx(.035)
+    assert entry.teacher_weight_at(args, 501) == 0.
+
+
 @pytest.mark.parametrize('interrupt_after,soft', [(1, False), (3, False), (1, True), (3, True)])
 def test_two_phase_exact_resume_zero_update_prediction_and_compact_review(source, interrupt_after, soft):
     parent, root = source
@@ -35,7 +46,7 @@ def test_two_phase_exact_resume_zero_update_prediction_and_compact_review(source
          patch('gaussian_jscc.student_policy_features.capture_view', side_effect=capture_view), \
          contextlib.redirect_stdout(io.StringIO()):
         teacher = root/'teacher'; teacher_entry.main(options(parent, teacher))
-        extra = ['--distill-target', 'soft_deployment'] if soft else []
+        extra = ['--distill-target', 'soft_deployment', '--teacher-weight-schedule', 'constant'] if soft else []
         out = root/'student'; result = entry.main(args_for(parent, teacher, out, *extra))
         assert result['status'] == 'complete' and result['rd_updates'] == 2 and result['distill_epochs'] == 2
         full = torch.load(out/'checkpoints/latest/student.pt', weights_only=True)
@@ -50,10 +61,14 @@ def test_two_phase_exact_resume_zero_update_prediction_and_compact_review(source
         assert resumed_result['frozen_codec_verified'] and resumed_result['frozen_attributes_verified']
         plan = json.loads((out/'plan.json').read_text())
         if soft:
+            assert plan['settings']['teacher_weight_schedule'] == 'constant'
             assert plan['teacher']['soft_target']['draws'] == 10
             loss_rows = [json.loads(line) for line in (out/'metrics/loss.jsonl').read_text().splitlines()]
             assert all('teacher_keep_kl' in row and 'teacher_tier_kl' in row for row in loss_rows)
             assert {row['phase'] for row in loss_rows} == {'distill', 'rd'}
+            assert all(row['teacher_weight'] == .1 for row in loss_rows if row['phase'] == 'rd')
+        else:
+            assert 'teacher_weight_schedule' not in plan['settings']
         validation = [json.loads(line) for line in (out/'metrics/validation.jsonl').read_text().splitlines()]
         intermediate = [row for row in validation if row['event'] == 'calibration_000001']
         assert len(intermediate) == 1

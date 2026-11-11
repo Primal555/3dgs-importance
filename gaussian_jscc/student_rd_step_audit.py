@@ -144,7 +144,7 @@ def main(cli):
     side = copy.deepcopy(state['progress'].get('side_proxy'))
     if side is None or 'control' in state['progress'].get('pending', []):
         side = make_proxy(meter.details(base_q), base_q, options.net_bits_per_use, reference)
-    weight = args.teacher_weight*max(0., 1.-(step-1)/max(args.rd_steps/2, 1.))
+    weight = entry.teacher_weight_at(args, step)
     audit_plan = dict(version='student_rd_paired_step_audit_v1', source=str(source),
         source_checkpoint=str(checkpoint_path), checkpoint_sha256=hashlib.sha256(blob).hexdigest(),
         source_step=state['progress']['step'], source_rd_step=state['progress']['rd_step'],

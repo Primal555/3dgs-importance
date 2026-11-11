@@ -65,7 +65,8 @@ def test_audit_runs_from_pinned_checkpoint_without_changing_source(source, soft)
          contextlib.redirect_stdout(io.StringIO()):
         teacher = root/'teacher'; teacher_entry.main(options(parent, teacher))
         run = root/'student'
-        args = args_for(parent, teacher, run, *(['--distill-target', 'soft_deployment'] if soft else []))
+        args = args_for(parent, teacher, run, *(['--distill-target', 'soft_deployment',
+            '--teacher-weight-schedule', 'constant'] if soft else []))
         student.main(args, max_updates=3)
         original = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in run.rglob('*') if p.is_file()}
         out = root/'audit'
@@ -75,7 +76,9 @@ def test_audit_runs_from_pinned_checkpoint_without_changing_source(source, soft)
         rows = json.loads((out/'review_summary.json').read_text())['probes']
         for row in rows:
             assert row['baseline_gradient_render_error'] < 1e-9
-            assert {'full', 'small_step', 'keep_only', 'positive_only', 'positive_evaluated', 'positive_unseen', 'anchor_restored'} <= set(row['maps'])
+            assert {'full', 'small_step', 'keep_only', 'positive_only', 'positive_evaluated', 'positive_unseen'} <= set(row['maps'])
+            assert ('anchor_restored' in row['maps']) == (not soft)
+            assert row['teacher_weight'] == (.1 if soft else 0.)
             assert all(set(m['evaluation']) == {'training', 'calibration'} for m in row['maps'].values())
             assert row['source_weights_reloaded'] and row['source_optimizer_reloaded']
         assert rows[0]['source_model_hash'] == rows[1]['source_model_hash']

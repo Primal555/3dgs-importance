@@ -8,5 +8,6 @@ shift 3
 echo 'Soft deployment distillation: exact ten-draw teacher probabilities, required positive cap1.0.'
 echo 'Random student initialization; 1000 distillation passes + 1000 RD updates by default.'
 echo 'Teacher probabilities must reproduce the selected map in original PLY order.'
+echo 'RD teacher constraint: constant weight (default0.1) throughout RD training.'
 exec bash "$PROJECT/scripts/train_student_policy.sh" "$RUN" "$TEACHER" "$OUT" "$@" \
-  --distill-target soft_deployment --required-teacher-tier-cap 1.0
+  --distill-target soft_deployment --required-teacher-tier-cap 1.0 --teacher-weight-schedule constant

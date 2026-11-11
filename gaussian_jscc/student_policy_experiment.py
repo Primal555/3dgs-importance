@@ -41,6 +41,8 @@ def parser():
     p.add_argument('--teacher-run'); p.add_argument('--student-checkpoint'); p.add_argument('--manifest')
     p.add_argument('--distill-target', choices=('hard', 'soft_deployment'), default='hard')
     p.add_argument('--required-teacher-tier-cap', type=float)
+    p.add_argument('--teacher-weight-schedule', choices=('linear_decay', 'constant'), default='linear_decay',
+                   help='RD imitation weight schedule; soft-policy launcher uses constant')
     p.add_argument('--phase', choices=('train', 'predict'), default='train')
     p.add_argument('--device', default='cuda'); p.add_argument('--resume', action='store_true')
     p.add_argument('--dry-run', action='store_true')
@@ -85,6 +87,11 @@ def validate(args):
 def optimizer_for(student, args, phase):
     return torch.optim.AdamW(student.parameters(), lr=args.distill_lr if phase == 'distill' else args.rd_lr,
                              weight_decay=args.weight_decay)
+
+
+def teacher_weight_at(args, step):
+    if args.teacher_weight_schedule == 'constant': return args.teacher_weight
+    return args.teacher_weight*max(0., 1.-(step-1)/max(args.rd_steps/2, 1.))
 
 
 def controls_for(args, reference, count, device):
@@ -204,6 +211,7 @@ def main(args, max_updates=None):
     # Keep existing hard-target checkpoints resumable with their original plan.
     if args.distill_target == 'hard': settings.pop('distill_target')
     if args.required_teacher_tier_cap is None: settings.pop('required_teacher_tier_cap')
+    if args.teacher_weight_schedule == 'linear_decay': settings.pop('teacher_weight_schedule')
     plan = dict(version=FAMILY, settings=settings, source=source, scene=scene.record, codec_id=codec_id,
         teacher=teacher, reference=reference, feature_signature=features['signature'], config=network_cfg.to_dict(),
         train_view_names=[str(c.image_name) for c in training], calibration_view_names=[str(c.image_name) for c in calibration],
@@ -212,6 +220,8 @@ def main(args, max_updates=None):
         feedback='current paired context; dense keep and uniform inverse-inclusion positive')
     if not (out/'plan.json').is_file(): json_write(out/'plan.json', plan)
     elif json_read(out/'plan.json') != plan: raise ValueError('student run plan changed')
+    if args.phase == 'train':
+        print(f'RD teacher constraint: schedule={args.teacher_weight_schedule}; weight={args.teacher_weight:g}', flush=True)
     objective = FixedRateDistortion(args.beta, reference['d_ref'], reference['c_ref'], 'source_distortion')
     def sync():
         if device.type == 'cuda': torch.cuda.synchronize(device)
@@ -347,7 +357,7 @@ def main(args, max_updates=None):
         keep, tier = forward()
         surrogate, stats = policy_surrogate(keep, tier, keep_costs, ids, costs, inverse)
         imitation, imitation_stats = imitation_loss(keep, tier)
-        teacher_weight = args.teacher_weight*max(0., 1.-(step-1)/max(args.rd_steps/2, 1.))
+        teacher_weight = teacher_weight_at(args, step)
         loss = surrogate+teacher_weight*imitation
         loss.backward(); norm = torch.nn.utils.clip_grad_norm_(student.parameters(), args.grad_clip, error_if_nonfinite=True)
         optimizer.step(); sync()
@@ -356,6 +366,7 @@ def main(args, max_updates=None):
         for key in ('keep_costs', 'keep_image_costs', 'q'): feedback.pop(key)
         row = dict(feedback, **timings.summary(), **stats, **imitation_stats, step=progress['step'],
             event='update', phase='rd', rd_step=step, loss=float(loss.detach()), teacher_weight=teacher_weight,
+            teacher_weight_schedule=args.teacher_weight_schedule,
             grad_norm=float(norm), step_seconds=time.perf_counter()-started,
             training_view_names=[str(training[i].image_name) for i in indices],
             objective_scope='hard current render distortion; marginal-rate/VJP training surrogate',
@@ -388,6 +399,7 @@ def main(args, max_updates=None):
     original = torch.empty_like(scene.raw); original[scene.order] = scene.raw
     complete = dict(status='complete', family=FAMILY, phase='train', step=progress['step'],
         distill_epochs=progress['distill_epoch'], rd_updates=progress['rd_step'], optimizer_resets=progress['optimizer_resets'],
+        teacher_weight=args.teacher_weight, teacher_weight_schedule=args.teacher_weight_schedule,
         selected_step=progress['best']['step'], codec_id=codec_id, tier_sha256=tier_hash(selected_q),
         rd_score=selected_row['rd_score'], selected_source_psnr=selected_row['source_psnr'],
         selected_total_channel_uses=selected_row['total_channel_uses'], beta=args.beta,
