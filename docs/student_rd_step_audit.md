@@ -1,0 +1,41 @@
+# 学生 RD 单步配对诊断
+
+入口：`scripts/test_student_rd_step_audit.sh STUDENT_RUN NEW_OUT`。默认读取`checkpoints/latest/student.pt`。如需检查刚结束蒸馏时的状态，可加`--checkpoint distilled`。
+
+默认运行3个独立窗口。每个窗口恢复同一组学生权重及Adam状态，沿用源实验的学习率、梯度裁剪、教师权重衰减、32个真实纠偏、候选采样和逆纳入概率。窗口之间推进视角调度和噪声，学生参数不连续训练。第一窗口对齐检查点的下一次训练；余下窗口用于判断该更新在不同条件下是否一致。
+
+源码、编解码器、学生输入缓存均只读使用。源实验可继续运行；脚本开头把读到的检查点固定在内存中，并记录其SHA256。源运行需保留`preparation/features.pt`、教师文件、编解码器与原场景数据。软标签学生同样可检查。
+
+## 输出内容
+
+| 项目 | 观察问题 |
+|---|---|
+| baseline／full | 相同视角和AWGN下，一次实际Adam更新是否改善完整硬RD |
+| small_step | 执行原参数位移的0.1倍，比较档位边界跳变及RD变化 |
+| keep_only | 使用新保留决策和旧正档位头，查看删点分支的影响 |
+| positive_only | 使用旧保留决策和新正档位头，查看正档位分支的影响 |
+| positive_evaluated／positive_unseen | 固定旧保留集合，分开执行本轮已评价点、未评价点的正档位变化 |
+| anchor_restored | 当教师权重已衰减时，用相同权重起点、Adam、反馈恢复原始教师权重执行一步 |
+| 梯度范数、余弦、沿Adam参数步的内积 | 保留、正档位、教师监督之间的方向关系；共享层及独立头分别记录 |
+| 固定反馈代理变化、硬动作预测变化 | 代理改善是否转化为真实硬部署改善 |
+| 4×4档位转移、边界间隔 | 参数小变化是否引起大量点的硬档位改变 |
+| 非可加变化 | 完整变化与两组单独变化之和的差异，包含编解码、渲染和侧信息的联动 |
+
+每张档位图重新按真实上下文解码，供训练窗口与校准视角共用。相同图只解码评估一次。全部地图使用与梯度采集一致的随机状态。基线失真必须与梯度采集值一致，否则停止并报告。完整成本使用原有`ExactDeploymentCost`；同时报告边际代理成本，以观察计费近似误差。这里每个窗口使用一次配对噪声；3个窗口给出3组条件。正式测试视角和LPIPS不参与本次诊断。
+
+keep分支仍是全点反馈。因此，`positive_unseen`专指未获取本轮正档位反馈的点。反事实地图只用于归因，不回写学生或分配表。
+
+## 启动
+
+```bash
+GPU=3
+SOURCE="/data/home/zhangyueheng/projects/3dgs-importance/output/你的学生实验目录"
+OUT="$PWD/output/truck_student_rd_audit_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES="$GPU" nohup bash scripts/test_student_rd_step_audit.sh \
+  "$SOURCE" "$OUT" --checkpoint latest --probes 3 \
+  >"${OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}.pid"
+tail -n 40 -F "${OUT}.log"
+```
+
+查看`review_summary.json`中的`diagnosis`及逐窗口`probes`。下载`review.tar.gz`即可，它包含计划、完整指标和完成标记。`same_window_rd_worsened`统计训练窗口实测退步的次数；`training_improved_calibration_worsened`统计跨视角退步；其余字段指明缩小步长、未评价点、教师约束对照分别支持什么现象。一次短测验提供局部证据，持续训练能否改善仍需后续运行验证。
