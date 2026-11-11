@@ -27,18 +27,19 @@ def args_for(parent, teacher, out, *extra):
         '--trials', '1', '--image-views', '1', '--cpu-threads', '1', '--device', 'cpu', '--no-lpips', *extra])
 
 
-@pytest.mark.parametrize('interrupt_after', [1, 3])
-def test_two_phase_exact_resume_zero_update_prediction_and_compact_review(source, interrupt_after):
+@pytest.mark.parametrize('interrupt_after,soft', [(1, False), (3, False), (1, True), (3, True)])
+def test_two_phase_exact_resume_zero_update_prediction_and_compact_review(source, interrupt_after, soft):
     parent, root = source
     with patch('gaussian_jscc.rendering.load_cameras', side_effect=fixture.cameras), \
          patch('gaussian_jscc.rendering.render', side_effect=fixture.render), \
          patch('gaussian_jscc.student_policy_features.capture_view', side_effect=capture_view), \
          contextlib.redirect_stdout(io.StringIO()):
         teacher = root/'teacher'; teacher_entry.main(options(parent, teacher))
-        out = root/'student'; result = entry.main(args_for(parent, teacher, out))
+        extra = ['--distill-target', 'soft_deployment'] if soft else []
+        out = root/'student'; result = entry.main(args_for(parent, teacher, out, *extra))
         assert result['status'] == 'complete' and result['rd_updates'] == 2 and result['distill_epochs'] == 2
         full = torch.load(out/'checkpoints/latest/student.pt', weights_only=True)
-        resumed_out = root/'resumed'; args = args_for(parent, teacher, resumed_out)
+        resumed_out = root/'resumed'; args = args_for(parent, teacher, resumed_out, *extra)
         assert entry.main(args, max_updates=interrupt_after)['status'] == 'interrupted'
         args.resume = True; resumed_result = entry.main(args)
         resumed = torch.load(resumed_out/'checkpoints/latest/student.pt', weights_only=True)
@@ -48,6 +49,11 @@ def test_two_phase_exact_resume_zero_update_prediction_and_compact_review(source
         assert result['tier_sha256'] == resumed_result['tier_sha256']
         assert resumed_result['frozen_codec_verified'] and resumed_result['frozen_attributes_verified']
         plan = json.loads((out/'plan.json').read_text())
+        if soft:
+            assert plan['teacher']['soft_target']['draws'] == 10
+            loss_rows = [json.loads(line) for line in (out/'metrics/loss.jsonl').read_text().splitlines()]
+            assert all('teacher_keep_kl' in row and 'teacher_tier_kl' in row for row in loss_rows)
+            assert {row['phase'] for row in loss_rows} == {'distill', 'rd'}
         validation = [json.loads(line) for line in (out/'metrics/validation.jsonl').read_text().splitlines()]
         intermediate = [row for row in validation if row['event'] == 'calibration_000001']
         assert len(intermediate) == 1

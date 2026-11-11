@@ -28,6 +28,7 @@ from .student_policy_feedback import CurrentPolicy, UniformFeedback, policy_surr
 from .student_policy_graph import graph_to
 from .student_policy_inputs import load_student_source, load_teacher, split_student_cameras, json_read
 from .student_policy_model import StudentConfig, StudentPolicy, hard_tiers, teacher_loss, teacher_metrics
+from .student_policy_soft import load_soft_teacher, soft_teacher_loss
 from .student_policy_report import finish_student_report
 from .student_policy_state import FAMILY, save_student, read_student, restore_student
 from .successive_multiscene_inputs import make_scene
@@ -38,6 +39,8 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('run', 'scene', 'out'): p.add_argument('--'+name, required=True)
     p.add_argument('--teacher-run'); p.add_argument('--student-checkpoint'); p.add_argument('--manifest')
+    p.add_argument('--distill-target', choices=('hard', 'soft_deployment'), default='hard')
+    p.add_argument('--required-teacher-tier-cap', type=float)
     p.add_argument('--phase', choices=('train', 'predict'), default='train')
     p.add_argument('--device', default='cuda'); p.add_argument('--resume', action='store_true')
     p.add_argument('--dry-run', action='store_true')
@@ -69,6 +72,9 @@ def validate(args):
         raise ValueError('invalid auxiliary loss/decay')
     if args.phase == 'train' and not args.teacher_run: raise ValueError('--teacher-run required for distillation')
     if args.phase == 'predict' and not args.student_checkpoint: raise ValueError('--student-checkpoint required for prediction')
+    if args.required_teacher_tier_cap is not None and (not math.isfinite(args.required_teacher_tier_cap) or
+            args.required_teacher_tier_cap <= 0 or args.distill_target != 'soft_deployment'):
+        raise ValueError('teacher cap check requires soft_deployment and a positive finite cap')
     run, out = Path(args.run).resolve(), Path(args.out).resolve()
     if out.is_relative_to(run) or run.is_relative_to(out): raise ValueError('codec source and student output must be separate')
     if args.teacher_run:
@@ -138,10 +144,18 @@ def main(args, max_updates=None):
     scene = make_scene(spec, raw, degree, model, options, out, old=old); del raw
     model.set_scene_geometry(scene.geometry)
     (out/'metrics').mkdir(parents=True, exist_ok=True)
-    teacher_q = None; prediction_state = None
+    teacher_q = None; teacher_soft = None; prediction_state = None
     if args.phase == 'train':
         teacher_q, reference, teacher = load_teacher(args.teacher_run, scene, codec_id, args.beta,
             cfg.to_dict(), seed=args.seed, snr=args.snr, trials=args.trials)
+        if args.distill_target == 'soft_deployment':
+            teacher_soft, soft_record = load_soft_teacher(args.teacher_run, teacher_q, out,
+                seed=args.seed, required_cap=args.required_teacher_tier_cap)
+            teacher['soft_target'] = soft_record
+            teacher_soft = teacher_soft.to(device)
+            print(f'Teacher: {teacher["path"]}; selected step={soft_record["selected_step"]}; '
+                  f'positive cap={soft_record["teacher_tier_cap"]}; exact ten-draw soft targets; '
+                  f'probability SHA256={soft_record["probability_sha256"]}', flush=True)
         training, calibration, preparation = split_student_cameras(scene, teacher, args.preparation_views)
     else:
         prediction_state = read_student(args.student_checkpoint)
@@ -187,6 +201,9 @@ def main(args, max_updates=None):
     else: student.load_state_dict(prediction_state['student'])
     graph = graph_to(features['graph'], device); controls = controls_for(args, reference, len(scene.raw), device)
     settings = {k: v for k, v in vars(args).items() if k not in ('out', 'resume', 'dry_run', 'device', 'allocation_image_objective')}
+    # Keep existing hard-target checkpoints resumable with their original plan.
+    if args.distill_target == 'hard': settings.pop('distill_target')
+    if args.required_teacher_tier_cap is None: settings.pop('required_teacher_tier_cap')
     plan = dict(version=FAMILY, settings=settings, source=source, scene=scene.record, codec_id=codec_id,
         teacher=teacher, reference=reference, feature_signature=features['signature'], config=network_cfg.to_dict(),
         train_view_names=[str(c.image_name) for c in training], calibration_view_names=[str(c.image_name) for c in calibration],
@@ -200,6 +217,9 @@ def main(args, max_updates=None):
         if device.type == 'cuda': torch.cuda.synchronize(device)
     def forward():
         return student(features['attributes'], features['latent'], features['visibility'], graph, controls)
+    def imitation_loss(keep, tier):
+        if teacher_soft is not None: return soft_teacher_loss(keep, tier, teacher_soft)
+        return teacher_loss(keep, tier, teacher_q)
     @torch.no_grad()
     def infer():
         student.eval(); sync(); started = time.perf_counter()
@@ -275,7 +295,7 @@ def main(args, max_updates=None):
     pending(); updates = 0
     while progress['distill_epoch'] < args.distill_epochs:
         started = time.perf_counter(); student.train(); optimizer.zero_grad(set_to_none=True)
-        keep, tier = forward(); loss, stats = teacher_loss(keep, tier, teacher_q)
+        keep, tier = forward(); loss, stats = imitation_loss(keep, tier)
         loss.backward(); norm = torch.nn.utils.clip_grad_norm_(student.parameters(), args.grad_clip, error_if_nonfinite=True)
         optimizer.step(); sync()
         progress['distill_epoch'] += 1; progress['step'] += 1
@@ -293,6 +313,10 @@ def main(args, max_updates=None):
             positive = stats['teacher_positive_tier_accuracy']
             positive_text = 'NA' if positive is None else f'{positive:.2%}'
             print(f'distill {progress["distill_epoch"]}/{args.distill_epochs}: loss={row["loss"]:.6g}, keep={stats["teacher_keep_accuracy"]:.2%}, action={stats["teacher_action_accuracy"]:.2%}, positive={positive_text}, q0/q1/q2/q3={by_tier}, sec={row["seconds"]:.2f}', flush=True)
+            if teacher_soft is not None:
+                print(f'  soft teacher: keep_KL={stats["teacher_keep_kl"]:.6g}, tier_KL={stats["teacher_tier_kl"]:.6g}, '
+                      f'expected_action_agreement={stats["teacher_expected_action_agreement"]:.2%}; '
+                      'keep/action/positive above compare the exported sampled map', flush=True)
         del keep, tier, loss
         pending()
         updates += 1
@@ -322,7 +346,7 @@ def main(args, max_updates=None):
         student.train(); optimizer.zero_grad(set_to_none=True)
         keep, tier = forward()
         surrogate, stats = policy_surrogate(keep, tier, keep_costs, ids, costs, inverse)
-        imitation, imitation_stats = teacher_loss(keep, tier, teacher_q)
+        imitation, imitation_stats = imitation_loss(keep, tier)
         teacher_weight = args.teacher_weight*max(0., 1.-(step-1)/max(args.rd_steps/2, 1.))
         loss = surrogate+teacher_weight*imitation
         loss.backward(); norm = torch.nn.utils.clip_grad_norm_(student.parameters(), args.grad_clip, error_if_nonfinite=True)
