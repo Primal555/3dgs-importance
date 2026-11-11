@@ -48,6 +48,14 @@ def test_two_phase_exact_resume_zero_update_prediction_and_compact_review(source
         assert result['tier_sha256'] == resumed_result['tier_sha256']
         assert resumed_result['frozen_codec_verified'] and resumed_result['frozen_attributes_verified']
         plan = json.loads((out/'plan.json').read_text())
+        validation = [json.loads(line) for line in (out/'metrics/validation.jsonl').read_text().splitlines()]
+        intermediate = [row for row in validation if row['event'] == 'calibration_000001']
+        assert len(intermediate) == 1
+        assert intermediate[0]['views'] == len(plan['calibration_view_names'])
+        assert {str(row['view']) for row in intermediate[0]['per_view_trial']} == set(plan['calibration_view_names'])
+        assert (resumed_out/'metrics/validation.jsonl').read_bytes() != b''
+        resumed_validation = [json.loads(line) for line in (resumed_out/'metrics/validation.jsonl').read_text().splitlines()]
+        assert len([r for r in resumed_validation if r['event'] == 'calibration_000001']) == 1
         assert not (set(plan['preparation_view_names']) & set(plan['calibration_view_names']))
         assert not (set(plan['preparation_view_names']) & set(plan['test_view_names']))
         with tarfile.open(out/'review.tar.gz') as archive: names = archive.getnames()

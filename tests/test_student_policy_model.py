@@ -5,6 +5,22 @@ from gaussian_jscc.student_policy_graph import build_graph
 from gaussian_jscc.student_policy_model import StudentConfig, StudentPolicy, hard_tiers
 
 
+def test_teacher_metrics_separate_keep_errors_from_positive_tier_errors():
+    from gaussian_jscc.student_policy_model import teacher_metrics
+    target = torch.tensor([0, 1, 2, 3])
+    keep = torch.tensor([[0., 1.], [1., 0.], [0., 1.], [0., 1.]])
+    tier = torch.tensor([[1., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 1., 0.]])
+    metrics = teacher_metrics(keep, tier, target)
+    assert metrics['teacher_keep_accuracy'] == .5
+    assert metrics['teacher_action_accuracy'] == .25
+    assert metrics['teacher_positive_tier_accuracy'] == pytest.approx(2/3)
+    assert metrics['action_accuracy_by_teacher_tier'] == [0., 0., 1., 0.]
+    assert metrics['student_tier_counts'] == [1, 1, 2, 0]
+    absent = teacher_metrics(keep, tier, torch.zeros(4, dtype=torch.long))
+    assert absent['teacher_positive_tier_accuracy'] is None
+    assert absent['action_accuracy_by_teacher_tier'][1:] == [None, None, None]
+
+
 def inputs(n=37):
     torch.manual_seed(82)
     a, y, v = torch.randn(n, 12), torch.randn(n, 48), torch.randn(n, 43)

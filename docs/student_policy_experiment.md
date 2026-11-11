@@ -2,7 +2,7 @@
 
 独立分支：`experiment/feedforward-student`。代码入口为 `gaussian_jscc.student_policy_experiment`。
 
-本轮先在 Truck 上验证：学生由教师最终档位初始化，随后学习属性、latent、空间关系与交付 RD 的联系。冻结原有四个编解码模块及源高斯属性。独立预测入口支持同一场景与 manifest 指定的新场景，执行0次优化器更新；新场景实际泛化效果由后续实验评价。
+本轮先在 Truck 上验证：学生网络从随机权重开始，通过教师最终档位进行蒸馏，随后学习属性、latent、空间关系与交付 RD 的联系。冻结原有四个编解码模块及源高斯属性。独立预测入口支持同一场景与 manifest 指定的新场景，执行0次优化器更新；新场景实际泛化效果由后续实验评价。
 
 ## 结构与输入
 
@@ -20,7 +20,7 @@
 | 阶段 | 默认预算 | 学习目标 |
 |---|---:|---|
 | 源场景准备 | 一次；8训练相机 | 属性统计、全保留latent、可见性及空间图 |
-| 动作蒸馏 | 50次完整点集遍历 | 全点keep交叉熵＋教师保留点的三档交叉熵 |
+| 动作蒸馏 | 1000次完整点集遍历 | 全点keep交叉熵＋教师保留点的三档交叉熵 |
 | RD微调 | 1000次场景更新 | 当前硬交付的全点保留反馈与正档位反馈 |
 
 蒸馏AdamW学习率1e-4，RD学习率1e-5；切换阶段创建新优化器。梯度裁剪上限1。RD阶段前半段蒸馏权重从0.1线性降为0，后半段仅使用RD反馈。权重与预算为首版工程设置，可通过命令行调整。
@@ -31,7 +31,9 @@ RD训练每次轮换4个训练视角。保留分支持续覆盖全点；正档�
 
 目标沿用 `D/D_ref + beta*C/C_ref`，`D=MSE+lambda_s*(1-SSIM)`。训练的keep梯度固定本次恢复属性，并用当前硬条件档位的载荷成本；真实纠偏补充部分重新编码影响。正档位梯度包含整块受影响属性与块尺度变化。训练侧信息使用边际代理，真实校准与最终评价重新计算完整XYZ、尺度、元数据及属性信道使用。`hard_rd_proxy`明确是单训练窗口的成本代理，最终结论看`metrics/validation.jsonl`的完整部署RD。
 
-教师要求已完成，默认使用beta0.5旧一阶组；核对codec、PLY、相机、beta、随机种子、试验数、部署图哈希及RD参考。校准相机和测试相机均不进入学生输入统计或梯度训练。每100次RD更新评价校准集，保存最佳与末步。最终对selected／latest／teacher／全q2／全q3报告源PLY与照片的PSNR、SSIM、LPIPS、通信成本及RD。
+教师要求已完成，默认使用beta0.5旧一阶组；核对codec、PLY、相机、beta、随机种子、试验数、部署图哈希及RD参考。校准相机和测试相机均不进入学生输入统计或梯度训练。蒸馏阶段和RD阶段每100次更新评价校准集，保存最佳与末步。蒸馏结束时的initial表示蒸馏后学生的测试结果。最终对selected／latest／teacher／全q2／全q3报告源PLY与照片的PSNR、SSIM、LPIPS、通信成本及RD。
+
+蒸馏日志中keep是全点保留判断准确率，action是完整四档动作准确率，positive是仅在教师保留点上、不考虑保留头判断的正档位头准确率，q0/q1/q2/q3分别是各教师类别的最终动作命中率。训练准确率和CE来自本次优化前的前向；校准评价使用优化后的权重。
 
 ## 服务器启动
 
@@ -49,7 +51,7 @@ OUT="$PWD/output/truck_student_policy_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
 
 CUDA_VISIBLE_DEVICES="$GPU" RESUME=0 nohup bash scripts/train_student_policy.sh \
   "$RUN" "$TEACHER" "$OUT" --beta 0.5 \
-  --distill-epochs 50 --rd-steps 1000 --candidate-batch 128 \
+  --distill-epochs 1000 --rd-steps 1000 --candidate-batch 128 \
   >"${OUT}.log" 2>&1 &
 printf '%s\n' "$!" >"${OUT}.pid"
 printf '实验目录：%s\n' "$OUT"

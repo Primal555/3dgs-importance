@@ -130,6 +130,21 @@ def hard_tiers(keep_logits, tier_logits):
     return torch.where(keep_logits[:, 1] >= keep_logits[:, 0], tier_logits.argmax(-1)+1, 0)
 
 
+@torch.no_grad()
+def teacher_metrics(keep_logits, tier_logits, teacher_q):
+    target = teacher_q.to(keep_logits.device)
+    q = hard_tiers(keep_logits, tier_logits)
+    retained = target > 0
+    return dict(teacher_action_accuracy=float((q == target).float().mean()),
+        teacher_keep_accuracy=float(((q > 0) == retained).float().mean()),
+        teacher_positive_tier_accuracy=float((tier_logits[retained].argmax(-1)+1 == target[retained]).float().mean())
+            if retained.any() else None,
+        student_tier_counts=torch.bincount(q, minlength=4).tolist(),
+        teacher_tier_counts=torch.bincount(target, minlength=4).tolist(),
+        action_accuracy_by_teacher_tier=[float((q[target == k] == k).float().mean())
+            if (target == k).any() else None for k in range(4)])
+
+
 def teacher_loss(keep_logits, tier_logits, teacher_q):
     target = teacher_q.to(keep_logits.device)
     keep = F.cross_entropy(keep_logits, (target > 0).long())

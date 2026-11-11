@@ -27,7 +27,7 @@ from .student_policy_features import prepare_features, digest
 from .student_policy_feedback import CurrentPolicy, UniformFeedback, policy_surrogate, actual_tier_keep_cost
 from .student_policy_graph import graph_to
 from .student_policy_inputs import load_student_source, load_teacher, split_student_cameras, json_read
-from .student_policy_model import StudentConfig, StudentPolicy, hard_tiers, teacher_loss
+from .student_policy_model import StudentConfig, StudentPolicy, hard_tiers, teacher_loss, teacher_metrics
 from .student_policy_report import finish_student_report
 from .student_policy_state import FAMILY, save_student, read_student, restore_student
 from .successive_multiscene_inputs import make_scene
@@ -45,7 +45,7 @@ def parser():
     for name, default in (('beta', .5), ('snr', 10.), ('distill-lr', 1e-4), ('rd-lr', 1e-5),
                           ('weight-decay', .01), ('teacher-weight', .1), ('grad-clip', 1.)):
         p.add_argument('--'+name, type=float, default=default)
-    for name, default in (('distill-epochs', 50), ('rd-steps', 1000), ('preparation-views', 8),
+    for name, default in (('distill-epochs', 1000), ('rd-steps', 1000), ('preparation-views', 8),
         ('window-views', 4), ('calibration-views', 4), ('test-views', 32), ('trials', 4), ('image-views', 2),
         ('width', 128), ('coarse-width', 256), ('blocks', 2), ('chunk-size', 16384),
         ('fine-points', 16), ('coarse-points', 4), ('neighbors', 16), ('candidate-batch', 128),
@@ -266,7 +266,7 @@ def main(args, max_updates=None):
             if event == 'distilled':
                 row = measure(f'calibration_{progress["step"]:06d}', q, calibration); consider(row, q)
                 measure('initial', q, scene.test_cameras, True); refresh_proxy(q)
-            elif event == 'calibration':
+            elif event in ('calibration', 'distill_calibration'):
                 row = measure(f'calibration_{progress["step"]:06d}', q, calibration); consider(row, q)
             elif event == 'control': refresh_proxy(q)
             else: raise RuntimeError('unknown pending student event')
@@ -280,19 +280,21 @@ def main(args, max_updates=None):
         optimizer.step(); sync()
         progress['distill_epoch'] += 1; progress['step'] += 1
         q = hard_tiers(keep.detach(), tier.detach()).cpu()
-        stats.update(teacher_action_accuracy=float((q == teacher_q).float().mean()),
-            teacher_keep_accuracy=float(((q > 0) == (teacher_q > 0)).float().mean()),
-            student_tier_counts=torch.bincount(q, minlength=4).tolist(),
-            teacher_tier_counts=torch.bincount(teacher_q, minlength=4).tolist(),
-            action_accuracy_by_teacher_tier=[float((q[teacher_q == k] == k).float().mean())
-                if (teacher_q == k).any() else None for k in range(4)])
+        stats.update(teacher_metrics(keep.detach(), tier.detach(), teacher_q))
         row = dict(stats, step=progress['step'], event='update', phase='distill', epoch=progress['distill_epoch'],
             loss=float(loss.detach()), grad_norm=float(norm), seconds=time.perf_counter()-started,
             samples=len(q), full_point_pass=True, codec_updated=False)
-        append_json(out/'metrics/loss.jsonl', row); save()
+        append_json(out/'metrics/loss.jsonl', row)
+        if progress['distill_epoch']%args.validate_every == 0 and progress['distill_epoch'] < args.distill_epochs:
+            progress['pending'] = ['distill_calibration']
+        save()
         if progress['distill_epoch'] == 1 or progress['distill_epoch']%5 == 0 or progress['distill_epoch'] == args.distill_epochs:
-            print(f'distill {progress["distill_epoch"]}/{args.distill_epochs}: loss={row["loss"]:.6g}, keep={stats["teacher_keep_accuracy"]:.2%}, action={stats["teacher_action_accuracy"]:.2%}, sec={row["seconds"]:.2f}', flush=True)
+            by_tier = '/'.join('NA' if value is None else f'{value:.1%}' for value in stats['action_accuracy_by_teacher_tier'])
+            positive = stats['teacher_positive_tier_accuracy']
+            positive_text = 'NA' if positive is None else f'{positive:.2%}'
+            print(f'distill {progress["distill_epoch"]}/{args.distill_epochs}: loss={row["loss"]:.6g}, keep={stats["teacher_keep_accuracy"]:.2%}, action={stats["teacher_action_accuracy"]:.2%}, positive={positive_text}, q0/q1/q2/q3={by_tier}, sec={row["seconds"]:.2f}', flush=True)
         del keep, tier, loss
+        pending()
         updates += 1
         if max_updates is not None and updates >= max_updates:
             save(); return dict(status='interrupted', step=progress['step'])
