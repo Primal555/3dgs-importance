@@ -133,8 +133,20 @@ def main(args):
                         seed_all(seed+1000+trial)
                         qs = [torch.where(ids>=0,q[ids.clamp_min(0)],0) for ids in scene.group_ids]
                         ideal = decode_path(model,scene,qs,'awgn',snr)[0] if (q>0).any() else scene.raw[:0].to(device)
-                    torch.testing.assert_close(packet_raw,ideal,atol=2e-5,rtol=1e-5)
+                    difference = (packet_raw-ideal).abs()
+                    diagnostic = dict(status='checking',device=str(device),
+                        xyz_wire_quantizer_exact=True,
+                        max_absolute_error=float(difference.max()) if ideal.numel() else 0.,
+                        mismatched_elements=int((difference > 2e-5+1e-5*ideal.abs()).sum()),
+                        max_error_per_attribute=difference.amax(0).tolist() if ideal.numel() else [])
+                    try:
+                        torch.testing.assert_close(packet_raw,ideal,atol=2e-5,rtol=1e-5)
+                    except AssertionError:
+                        diagnostic['status']='failed'
+                        json_write(out/'execution_check.json',diagnostic)
+                        raise
                     json_write(out/'execution_check.json',dict(status='passed',device=str(device),
+                        xyz_wire_quantizer_exact=True,
                         packet_matches_original_batched_codec=True,
                         max_absolute_error=float((packet_raw-ideal).abs().max()) if ideal.numel() else 0.))
                     del packet_raw,ideal

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from .codec import channel, pack, unpack
 from .data import Geometry, to_raw
-from .position_delivery import encode_positions, decode_positions
+from .position_delivery import encode_positions, decode_positions, delivered_positions
 from .successive_channel import present_scales
 from .transport import model_id, encode_metadata, decode_metadata
 
@@ -49,7 +49,13 @@ def export_packet(model, scene, original_q, snr, seed, out, *, noiseless=False):
     # Reuse the exact normalized source coordinates used by the codec, including
     # device arithmetic performed when the scene feature blocks were prepared.
     units = torch.cat([f[..., :3][ids>=0] for f,ids in zip(scene.groups,scene.group_ids)])
-    (out/'xyz.bin').write_bytes(encode_positions(units, packet_q, model.cfg))
+    units = units.to(device); wire_q = packet_q.to(device)
+    xyz_frame = encode_positions(units, wire_q, model.cfg)
+    (out/'xyz.bin').write_bytes(xyz_frame)
+    torch.testing.assert_close(decode_positions(xyz_frame, wire_q, model.cfg),
+        delivered_positions(units, wire_q, model.cfg), atol=0, rtol=0,
+        msg='Packet XYZ differs from the original device quantizer')
+    del units, wire_q
     payload = []; frames = []
     for features, ids, lengths in zip(scene.groups, scene.group_ids, layout):
         if features.shape[:2] != (len(lengths), max(lengths)): raise ValueError('packet batch padding differs')
@@ -75,7 +81,8 @@ def receive_packet(model, packet):
             header['config'] != json.loads(json.dumps(model.cfg.to_dict())) or header['model_id'] != model_id(model)):
         raise ValueError('received codec identity/protocol mismatch')
     geometry = Geometry(**header['geometry']); model.eval(); model.set_scene_geometry(geometry)
-    xyz = decode_positions((packet/'xyz.bin').read_bytes(), q, model.cfg)
+    device = next(model.parameters()).device
+    xyz = decode_positions((packet/'xyz.bin').read_bytes(), q.to(device), model.cfg)
     symbols = np.load(packet/'received.npy', mmap_mode='r', allow_pickle=False)
     expected = int(torch.tensor(model.cfg.rates)[q].sum())
     if symbols.dtype != np.float32 or symbols.shape != (expected, 2) or not np.isfinite(symbols).all():

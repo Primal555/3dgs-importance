@@ -114,7 +114,7 @@ def decode_positions(data, q, cfg):
         integers = delta.view('<i4').reshape(3, count).T.cumsum(axis=0, dtype=np.int64)
         if ((integers < 0) | (integers > 2**bits-1)).any():
             raise ValueError('decoded XYZ integer outside quantization range')
-        xyz = integers.astype(np.float32)/(2**bits-1)
+        xyz = integers.astype(np.float32)
     elif mode == 1:
         xyz = np.frombuffer(data[18:], dtype='<f4').copy().reshape(-1, 3)
     else:
@@ -123,11 +123,17 @@ def decode_positions(data, q, cfg):
         if binary[valid:].any():
             raise ValueError('nonzero XYZ padding bits')
         integers = (binary[:valid].reshape(-1, bits).astype(np.uint32) << np.arange(bits, dtype=np.uint32)).sum(1)
-        xyz = (integers.astype(np.float32)/(2**bits-1)).reshape(-1, 3)
-    if not np.isfinite(xyz).all() or ((xyz < 0) | (xyz > 1)).any():
+        xyz = integers.astype(np.float32).reshape(-1, 3)
+    # Match delivered_positions on the receiver device. CPU NumPy division
+    # followed by a CUDA copy can differ by one ULP from CUDA division;
+    # spatial neighbor selection can amplify that difference.
+    xyz = torch.from_numpy(xyz).to(q.device)
+    if mode != 1:
+        xyz = xyz / (2**bits-1)
+    if not torch.isfinite(xyz).all() or ((xyz < 0) | (xyz > 1)).any():
         raise ValueError('invalid decoded XYZ')
     result = torch.zeros((*q.shape, 3), dtype=torch.float32, device=q.device)
-    result[q > 0] = torch.from_numpy(xyz).to(q.device)
+    result[q > 0] = xyz
     return result
 
 

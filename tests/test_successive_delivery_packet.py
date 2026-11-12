@@ -34,12 +34,15 @@ def scene_model(count=19, block_size=8, blocks_per_batch=2, degree=1):
 
 @pytest.mark.parametrize('noiseless', [False, True])
 @pytest.mark.parametrize('all_drop', [False, True])
-def test_receiver_packet_matches_original_batched_codec_without_encoders(tmp_path, noiseless, all_drop):
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='CUDA required for device arithmetic parity'))])
+def test_receiver_packet_matches_original_batched_codec_without_encoders(tmp_path, noiseless, all_drop, device):
     model, scene = scene_model(); q = torch.arange(len(scene.raw))%4
+    model.to(device)
     if all_drop: q.zero_()
     qs = [torch.where(ids>=0, q[ids.clamp_min(0)], 0) for ids in scene.group_ids]
     torch.manual_seed(42)
-    expected = decode_path(model, scene, qs, 'finite_noiseless' if noiseless else 'awgn', 10.)[0] if not all_drop else scene.raw[:0]
+    expected = decode_path(model, scene, qs, 'finite_noiseless' if noiseless else 'awgn', 10.)[0] if not all_drop else scene.raw[:0].to(device)
     sender = tmp_path/'sender'
     record = export_packet(model, scene, q, 10., 42, sender, noiseless=noiseless)
     assert record['payload_complex_symbols'] == sum(model.cfg.rates[v] for v in q)
@@ -57,6 +60,21 @@ def test_receiver_packet_matches_original_batched_codec_without_encoders(tmp_pat
         path.write_bytes(saved)
     scales = receiver/'scales.bin'; scales.write_bytes(scales.read_bytes()+b'X')
     with pytest.raises(ValueError, match='framing'): receive_packet(model, receiver)
+
+
+@pytest.mark.parametrize('compression', ['none', 'delta_zlib'])
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='CUDA required for device arithmetic parity'))])
+def test_all_16bit_xyz_codes_match_device_quantizer(compression, device):
+    from gaussian_jscc.position_delivery import encode_positions, decode_positions, delivered_positions
+    cfg = SimpleNamespace(position_delivery='quantized', position_bits=16,
+        position_compression=compression, position_compression_level=9)
+    codes = torch.arange(65536, device=device, dtype=torch.float32)
+    units = torch.stack((codes, codes.flip(0), codes.roll(31)), -1)/65535
+    q = (torch.arange(len(codes), device=device)%4).long()
+    frame = encode_positions(units, q, cfg)
+    got = decode_positions(frame, q, cfg)
+    torch.testing.assert_close(got, delivered_positions(units,q,cfg), atol=0,rtol=0)
 
 
 def test_server_shaped_batch_and_partial_tail_preserve_xyz_rows(tmp_path):
