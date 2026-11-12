@@ -48,12 +48,20 @@ def load_teacher(root, scene, codec_id, beta, cfg, *, seed, snr, trials):
         test_names=meta['test_view_names'], deployment_rule='teacher final ten-draw action labels')
 
 
-def split_student_cameras(scene, teacher, preparation_views):
+def split_student_cameras(scene, teacher, preparation_views, calibration_views=None):
     lookup = {str(c.image_name): c for c in scene.cameras}
     train, calibration, test = teacher['train_names'], teacher['calibration_names'], teacher['test_names']
     if (not train or not calibration or len(set(train+calibration)) != len(train+calibration) or
             set(train+calibration) != set(lookup) or set(train+calibration) & set(test)):
         raise ValueError('student training/calibration/test camera boundary mismatch')
+    if calibration_views is not None and calibration_views != len(calibration):
+        if not 0 < calibration_views < len(lookup):
+            raise ValueError('student calibration count must leave training cameras')
+        # Stable trajectory order; teacher identity/targets and RD references stay fixed.
+        names = list(lookup)
+        held_indices = set(spaced_indices(len(names), calibration_views))
+        calibration = [n for i, n in enumerate(names) if i in held_indices]
+        train = [n for i, n in enumerate(names) if i not in held_indices]
     training, held = [lookup[n] for n in train], [lookup[n] for n in calibration]
     preparation = [training[i] for i in spaced_indices(len(training), min(preparation_views, len(training))) ]
     return training, held, preparation

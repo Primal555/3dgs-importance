@@ -9,15 +9,50 @@ from .modular_checkpoint import restore_rng
 from .budgeted_allocation_kernel import raw_batches
 
 
-def split_action_maps(before, after, ids):
+def split_action_maps(before, after, ids, *, directions=False):
     before, after = [x.detach().cpu() for x in before], [x.detach().cpu() for x in after]
     old, new = hard_tiers(*before), hard_tiers(*after)
     keep = torch.where(new > 0, before[1].argmax(1)+1, 0)
     positive = torch.where(old > 0, after[1].argmax(1)+1, 0)
     evaluated = torch.zeros(len(old), dtype=torch.bool); evaluated[ids.cpu()] = True
-    return dict(baseline=old, full=new, keep_only=keep, positive_only=positive,
+    maps = dict(baseline=old, full=new, keep_only=keep, positive_only=positive,
                 positive_evaluated=torch.where(evaluated, positive, old),
                 positive_unseen=torch.where(~evaluated, positive, old))
+    if directions:
+        maps.update(positive_down_only=torch.where((old > 0) & (positive < old), positive, old),
+                    positive_up_only=torch.where((old > 0) & (positive > old), positive, old))
+    return maps
+
+
+def direction_summary(records):
+    """Pre-correction tangent versus paired exact single-action labels, by stratum."""
+    def summarize(rows):
+        if not rows: return dict(count=0)
+        pred = [r['first_order_delta_rd'] for r in rows]
+        truth = [r['measured_delta_rd'] for r in rows]
+        false_good = [t for p, t in zip(pred, truth) if p < 0 < t]
+        missed = [-t for p, t in zip(pred, truth) if t < 0 <= p]
+        return dict(count=len(rows), predicted_delta_rd_mean=sum(pred)/len(rows),
+            measured_delta_rd_mean=sum(truth)/len(rows),
+            prediction_bias_mean=sum(p-t for p,t in zip(pred,truth))/len(rows),
+            optimistic_fraction=sum(p<t for p,t in zip(pred,truth))/len(rows),
+            sign_error_fraction=sum((p<0)!=(t<0) for p,t in zip(pred,truth))/len(rows),
+            false_beneficial_count=len(false_good), missed_beneficial_count=len(missed),
+            false_beneficial_cost_sum=sum(false_good), missed_beneficial_cost_sum=sum(missed),
+            regret_mean=(sum(false_good)+sum(missed))/len(rows))
+    result = {}
+    for name in ('up', 'down', 'keep'):
+        rows = [r for r in records if ('first_order_delta_rd' in r and 'measured_delta_rd' in r) and
+                (r.get('feedback_kind') == 'keep' if name == 'keep' else
+                 r.get('feedback_kind') == 'positive' and
+                 (r['new_tier'] > r['old_tier'] if name == 'up' else r['new_tier'] < r['old_tier']))]
+        result[name] = dict(all=summarize(rows), by_selection_group={
+            group: summarize([r for r in rows if r.get('selection_group', 'unspecified') == group])
+            for group in sorted({r.get('selection_group', 'unspecified') for r in rows})})
+    result['scope'] = ('pre-replacement estimates on the existing stratified finite-action checks; '
+        'exact rendering with the training marginal-rate proxy, not population error rates; '
+        'whole-map evaluations use actual serialized file costs')
+    return result
 
 
 def transition_stats(before, after, ids):
@@ -97,16 +132,19 @@ def paired_decode(model, scene, q, snr, rng):
 def paired_evaluate(model, scene, q, cameras, snr, rng, distortion, meter, reference):
     from .rendering import render
     decoded = paired_decode(model, scene, q, snr, rng)
-    cost = meter.details(q); result = {}
+    cost = meter.details(q); result = {}; view_cache = {}
     for group, views in cameras.items():
         rows = []
         for camera in views:
-            image = render(decoded[:, :-1], camera, scene.degree, scene.white_background, decoded[:, -1])
-            source = scene.reference.get(camera, decoded.device)
-            components = distortion.components(image, source)
-            rows.append(dict(view=str(camera.image_name), mse=float(components[0]),
-                structure=float(components[1]), distortion=float(distortion.combine(components)),
-                psnr=float(-10*components[0].clamp_min(1e-12).log10())))
+            name = str(camera.image_name)
+            if name not in view_cache:
+                image = render(decoded[:, :-1], camera, scene.degree, scene.white_background, decoded[:, -1])
+                source = scene.reference.get(camera, decoded.device)
+                components = distortion.components(image, source)
+                view_cache[name] = dict(view=name, mse=float(components[0]),
+                    structure=float(components[1]), distortion=float(distortion.combine(components)),
+                    psnr=float(-10*components[0].clamp_min(1e-12).log10()))
+            rows.append(view_cache[name])
         d = sum(r['distortion'] for r in rows)/len(rows)
         result[group] = dict(distortion=d, normalized_distortion=d/reference['d_ref'],
             normalized_cost=cost['total_channel_uses']/reference['c_ref'],

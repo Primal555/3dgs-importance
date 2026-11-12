@@ -4,7 +4,7 @@ import json
 from unittest.mock import patch
 import torch
 import pytest
-from gaussian_jscc.student_rd_audit_tools import split_action_maps, transition_stats, take_step, paired_decode
+from gaussian_jscc.student_rd_audit_tools import split_action_maps, transition_stats, take_step, paired_decode, direction_summary
 from gaussian_jscc.student_policy_model import hard_tiers
 from gaussian_jscc.modular_checkpoint import capture_rng
 
@@ -50,8 +50,26 @@ def test_fixed_surrogate_uses_double_precision_for_both_sides():
     assert first == same
 
 
-@pytest.mark.parametrize('soft', [False, True])
-def test_audit_runs_from_pinned_checkpoint_without_changing_source(source, soft):
+def test_direction_maps_hold_keep_mask_fixed_and_summary_counts_costly_errors():
+    keep = torch.tensor([[0., 1.], [0., 1.], [1., 0.], [0., 1.]])
+    old = torch.nn.functional.one_hot(torch.tensor([2, 0, 2, 1]), 3).float()
+    new = torch.nn.functional.one_hot(torch.tensor([0, 2, 0, 2]), 3).float()
+    maps = split_action_maps((keep, old), (keep.flip(1), new), torch.tensor([0, 1]), directions=True)
+    assert maps['positive_down_only'].tolist() == [1, 1, 0, 2]
+    assert maps['positive_up_only'].tolist() == [3, 3, 0, 3]
+    records = [dict(old_tier=3, new_tier=1, feedback_kind='positive', selection_group='boundary',
+                    first_order_delta_rd=p, measured_delta_rd=t) for p,t in [(-2., 3.), (1., -2.)]]
+    summary = direction_summary(records)
+    down = summary['down']['all']
+    assert down['false_beneficial_cost_sum'] == 3.
+    assert down['missed_beneficial_cost_sum'] == 2.
+    assert down['regret_mean'] == 2.5 and down['sign_error_fraction'] == 1.
+    assert down['prediction_bias_mean'] == -1.
+    assert summary['up']['all']['count'] == 0
+
+
+@pytest.mark.parametrize('soft,digital', [(False, False), (True, False), (True, True)])
+def test_audit_runs_from_pinned_checkpoint_without_changing_source(source, soft, digital):
     from gaussian_jscc import student_policy_experiment as student
     from gaussian_jscc import structured_evidence_allocation as teacher_entry
     from gaussian_jscc import student_rd_step_audit as audit
@@ -65,21 +83,40 @@ def test_audit_runs_from_pinned_checkpoint_without_changing_source(source, soft)
          contextlib.redirect_stdout(io.StringIO()):
         teacher = root/'teacher'; teacher_entry.main(options(parent, teacher))
         run = root/'student'
-        args = args_for(parent, teacher, run, *(['--distill-target', 'soft_deployment',
-            '--teacher-weight-schedule', 'constant'] if soft else []))
+        extra = ['--distill-target', 'soft_deployment', '--teacher-weight-schedule', 'constant'] if soft else []
+        if digital: extra += ['--cost-protocol', 'digital_side_file_v1', '--calibration-views', '2', '--window-views', '2']
+        args = args_for(parent, teacher, run, *extra)
         student.main(args, max_updates=3)
         original = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in run.rglob('*') if p.is_file()}
         out = root/'audit'
-        result = audit.main(audit.parser().parse_args(['--source', str(run), '--out', str(out), '--device', 'cpu', '--probes', '2']))
+        diagnostic_options = ['--diagnostic-views', '3', '--direction-maps'] if digital else []
+        result = audit.main(audit.parser().parse_args(['--source', str(run), '--out', str(out),
+            '--device', 'cpu', '--probes', '2', *diagnostic_options]))
         assert result['status'] == 'complete' and result['probes'] == 2
         assert original == {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in run.rglob('*') if p.is_file()}
-        rows = json.loads((out/'review_summary.json').read_text())['probes']
+        report = json.loads((out/'review_summary.json').read_text())
+        rows = report['probes']
+        if digital:
+            assert report['plan']['cost_protocol'] == 'digital_side_file_v1'
+            assert len(report['plan']['original_calibration_view_names']) == 2
+            diagnostic = report['plan']['diagnostic_views']
+            assert len(diagnostic['camera_names']) == 3
+            assert diagnostic['overlap_with_student_training']
         for row in rows:
             assert row['baseline_gradient_render_error'] < 1e-9
             assert {'full', 'small_step', 'keep_only', 'positive_only', 'positive_evaluated', 'positive_unseen'} <= set(row['maps'])
             assert ('anchor_restored' in row['maps']) == (not soft)
             assert row['teacher_weight'] == (.1 if soft else 0.)
-            assert all(set(m['evaluation']) == {'training', 'calibration'} for m in row['maps'].values())
+            groups = {'training', 'calibration', 'expanded_diagnostic'} if digital else {'training', 'calibration'}
+            assert all(set(m['evaluation']) == groups for m in row['maps'].values())
+            if digital:
+                assert {'positive_down_only', 'positive_up_only'} <= set(row['maps'])
+                for m in row['maps'].values():
+                    assert m['cost']['total_channel_uses'] == m['cost']['comparison_accounting']['total_channel_uses']
+                    for value in m['evaluation'].values():
+                        ref = report['plan']['reference']
+                        assert value['rd'] == pytest.approx(value['distortion']/ref['d_ref']+
+                            ref['beta']*m['cost']['total_channel_uses']/ref['c_ref'])
             assert row['source_weights_reloaded'] and row['source_optimizer_reloaded']
         assert rows[0]['source_model_hash'] == rows[1]['source_model_hash']
         assert (out/'review.tar.gz').is_file()

@@ -17,7 +17,7 @@ from .student_policy_features import digest, VERSION as FEATURE_VERSION
 from .student_policy_graph import graph_to
 from .student_policy_feedback import CurrentPolicy, UniformFeedback, policy_surrogate, actual_tier_keep_cost
 from .student_rd_audit_tools import (split_action_maps, transition_stats, take_step, paired_evaluate,
-                                     discrete_prediction)
+                                     discrete_prediction, direction_summary)
 from .modular_checkpoint import capture_rng, restore_rng
 from .optimization import preserved_rng
 from .modular_experiment import json_write
@@ -30,6 +30,9 @@ def parser():
     p.add_argument('--source', required=True); p.add_argument('--out', required=True)
     p.add_argument('--checkpoint', choices=('latest', 'distilled', 'best'), default='latest')
     p.add_argument('--probes', type=int, default=3); p.add_argument('--small-step', type=float, default=.1)
+    p.add_argument('--diagnostic-views', type=int, default=0,
+                   help='additional fixed non-test views; report overlap with prior student training')
+    p.add_argument('--direction-maps', action='store_true', help='also render separate downgrade/upgrade maps')
     p.add_argument('--device', default='cuda'); p.add_argument('--cpu-threads', type=int)
     return p
 
@@ -83,7 +86,7 @@ def diagnosis(rows):
 
 def main(cli):
     source, out = Path(cli.source).resolve(), Path(cli.out).resolve()
-    if cli.probes < 1 or not 0 < cli.small_step < 1 or (cli.cpu_threads is not None and cli.cpu_threads < 1):
+    if cli.probes < 1 or cli.diagnostic_views < 0 or not 0 < cli.small_step < 1 or (cli.cpu_threads is not None and cli.cpu_threads < 1):
         raise ValueError('invalid probe budget')
     if out.is_relative_to(source) or source.is_relative_to(out): raise ValueError('audit output must be separate from source')
     if out.exists(): raise FileExistsError('use a new audit output')
@@ -115,14 +118,36 @@ def main(cli):
         teacher_soft, soft_record = load_soft_teacher(args.teacher_run, teacher_q, out,
             seed=args.seed, required_cap=args.required_teacher_tier_cap)
         teacher['soft_target'] = soft_record; teacher_soft = teacher_soft.to(device)
+    digital_cost = args.cost_protocol == 'digital_side_file_v1'
+    if digital_cost:
+        from .student_digital_cost import DigitalDeploymentCost, digital_side_proxy
+    meter_type = DigitalDeploymentCost if digital_cost else ExactDeploymentCost
+    meter = meter_type(model, scene, codec, args.snr, options.net_bits_per_use)
+    if digital_cost:
+        teacher['historical_rd_reference'] = copy.deepcopy(loaded_ref)
+        full_cost = meter.details(torch.full((len(scene.raw),), 3, dtype=torch.long))
+        loaded_ref.update(c_ref=full_cost['total_channel_uses'], q3_cost=full_cost, cost_protocol=args.cost_protocol)
     if teacher != plan['teacher'] or reference != loaded_ref: raise ValueError('student teacher/reference changed')
-    training, calibration, preparation = split_student_cameras(scene, teacher, args.preparation_views)
+    boundary = dict(train_names=plan['train_view_names'], calibration_names=plan['calibration_view_names'],
+                    test_names=plan['test_view_names'])
+    training, calibration, preparation = split_student_cameras(scene, boundary, args.preparation_views)
+    if [str(c.image_name) for c in preparation] != plan['preparation_view_names']:
+        raise ValueError('source student preparation cameras changed')
+    diagnostic = []
+    if cli.diagnostic_views:
+        _, diagnostic, _ = split_student_cameras(scene, boundary, args.preparation_views, cli.diagnostic_views)
+    diagnostic_names = [str(c.image_name) for c in diagnostic]
+    diagnostic_scope = dict(camera_names=diagnostic_names,
+        overlap_with_student_training=sorted(set(diagnostic_names) & set(plan['train_view_names'])),
+        overlap_with_student_preparation=sorted(set(diagnostic_names) & set(plan['preparation_view_names'])),
+        interpretation='expanded diagnostic coverage; training overlap is explicit; original held-out calibration is reported separately')
     feature_path = source/'preparation/features.pt'
     features = torch.load(feature_path, map_location='cpu', weights_only=True)
     expected_protocol = dict(version=FEATURE_VERSION,
         identity=dict(codec_id=codec, scene=scene.record, source=source_info),
         camera_names=[str(c.image_name) for c in preparation], fine_points=args.fine_points,
         coarse_points=args.coarse_points, neighbors=args.neighbors)
+    if digital_cost: expected_protocol['visibility_reduction'] = 'visible_welford_float64_v1'
     if features['protocol'] != expected_protocol or features['signature'] != digest(expected_protocol) or features['signature'] != plan['feature_signature']:
         raise ValueError('source feature cache identity mismatch')
     student = StudentPolicy(StudentConfig(**state['config'])).to(device)
@@ -135,7 +160,6 @@ def main(cli):
     sampler = UniformFeedback(scene.group_ids, args.candidate_rounds, args.finite_samples, args.seed+1103)
     sampler.load_state_dict(state['sampler'])
     views = entry.ViewWindowScheduler(plan['train_view_names'], args.seed+9001); views.load_state_dict(state['views'])
-    meter = ExactDeploymentCost(model, scene, codec, args.snr, options.net_bits_per_use)
     distortion = entry.ImageDistortion('mse_ssim', reference['lambda_s'])
     execution = entry.FastFirstOrderExecution(args.candidate_batch); execution.verify(model, scene, args.snr, out)
     student.load_state_dict(state['student']); before = heads(); base_q = hard_tiers(*before)
@@ -143,13 +167,17 @@ def main(cli):
     step = state['progress']['rd_step']+1
     side = copy.deepcopy(state['progress'].get('side_proxy'))
     if side is None or 'control' in state['progress'].get('pending', []):
-        side = make_proxy(meter.details(base_q), base_q, options.net_bits_per_use, reference)
+        cost = meter.details(base_q)
+        side = (digital_side_proxy(cost, int((base_q > 0).sum()), reference['q3_cost'], len(base_q))
+                if digital_cost else make_proxy(cost, base_q, options.net_bits_per_use, reference))
     weight = entry.teacher_weight_at(args, step)
     audit_plan = dict(version='student_rd_paired_step_audit_v1', source=str(source),
         source_checkpoint=str(checkpoint_path), checkpoint_sha256=hashlib.sha256(blob).hexdigest(),
         source_step=state['progress']['step'], source_rd_step=state['progress']['rd_step'],
         probes=cli.probes, small_step_fraction=cli.small_step, settings=settings,
         reference=reference, teacher_weight=weight, initial_teacher_weight=args.teacher_weight,
+        cost_protocol=args.cost_protocol, direction_maps=cli.direction_maps,
+        original_calibration_view_names=plan['calibration_view_names'], diagnostic_views=diagnostic_scope,
         feature_signature=features['signature'], codec_id=codec, source_model_hash=original_id,
         design='same saved weights/Adam per probe; rotating training windows, paired AWGN per map; calibration evaluation only')
     json_write(out/'plan.json', audit_plan)
@@ -161,6 +189,7 @@ def main(cli):
         optimizer = entry.optimizer_for(student, args, 'rd'); optimizer.load_state_dict(copy.deepcopy(state['optimizer']))
         indices = views.next(args.window_views); selected_views = [training[i] for i in indices]
         cameras = dict(training=selected_views, calibration=calibration)
+        if diagnostic: cameras['expanded_diagnostic'] = diagnostic
         restore_rng(next_rng); paired_rng = capture_rng()
         task = entry.ComponentRenderTask(selected_views, scene.reference, scene.degree,
             scene.white_background, distortion=distortion)
@@ -177,8 +206,9 @@ def main(cli):
         update = take_step(student, optimizer, dict(keep=a, positive=b, teacher=weight*aux), args.grad_clip)
         del h, a, b, aux
         after = heads(); full_model_hash = model_id(student); full_state = cpu_copy(student.state_dict())
-        maps = split_action_maps(before, after, ids)
-        predicted = dict(full=discrete_prediction(base_q, maps['full'], keep_costs, ids, costs, inverse))
+        maps = split_action_maps(before, after, ids, directions=cli.direction_maps)
+        predicted = {label: discrete_prediction(base_q, q, keep_costs, ids, costs, inverse)
+                     for label, q in maps.items() if label != 'baseline'}
         with torch.no_grad():
             full_surrogate = diagnostic_surrogate(after, keep_costs, ids, costs, inverse)
             for key, value in full_state.items():
@@ -217,8 +247,11 @@ def main(cli):
                 cost_term=reference['beta']*(value['normalized_cost']-base['evaluation'][group]['normalized_cost']),
                 source_psnr=value['source_psnr']-base['evaluation'][group]['source_psnr'])
                 for group, value in result['evaluation'].items()}
+            expanded = (f', expanded RD={result["evaluation"]["expanded_diagnostic"]["rd"]:.7g}'
+                        if diagnostic else '')
             print(f'probe {probe}/{cli.probes} {label}: train RD={result["evaluation"]["training"]["rd"]:.7g}, '
-                f'cal RD={result["evaluation"]["calibration"]["rd"]:.7g}, cost={result["cost"]["total_channel_uses"]/1e6:.5f}M', flush=True)
+                f'cal RD={result["evaluation"]["calibration"]["rd"]:.7g}{expanded}, '
+                f'cost={result["cost"]["total_channel_uses"]/1e6:.5f}M', flush=True)
         interactions = {}
         for group in cameras:
             rd = {k: v['evaluation'][group]['rd'] for k, v in results.items()}
@@ -232,9 +265,20 @@ def main(cli):
             soft_surrogate_change=dict(full=full_surrogate-initial_surrogate, small_step=small_surrogate-initial_surrogate),
             predicted_discrete_change=predicted, maps=results, interactions=interactions,
             baseline_gradient_render_error=error, elapsed_seconds=time.perf_counter()-started,
-            exact_corrections=feedback['audit'])
+            exact_corrections=feedback['audit'], action_directions=direction_summary(feedback['audit']))
         rows.append(record); json_write(out/'probes'/f'{probe:03d}.json', record)
-        json_write(out/'review_summary.json', dict(plan=audit_plan, diagnosis=diagnosis(rows), probes=rows))
+        json_write(out/'review_summary.json', dict(plan=audit_plan, diagnosis=diagnosis(rows), probes=rows,
+            action_directions=direction_summary([r for row in rows for r in row['exact_corrections']])))
+        down = record['action_directions']['down']['all']
+        print(f'probe {probe}: changed={record["transitions"]["changed_points"]}, '
+              f'positive changes outside candidates={record["transitions"]["positive_unseen_changes"]}; '
+              f'soft surrogate delta={record["soft_surrogate_change"]["full"]:+.6g}, '
+              f'predicted hard RD delta={predicted["full"]["total"]:+.6g}, '
+              f'actual train RD delta={results["full"]["delta_vs_baseline"]["training"]["rd"]:+.6g}', flush=True)
+        if down['count']:
+            print(f'  checked downgrades={down["count"]}: mean predicted RD delta='
+                  f'{down["predicted_delta_rd_mean"]:+.6g}, exact={down["measured_delta_rd_mean"]:+.6g}, '
+                  f'false beneficial={down["false_beneficial_count"]}, regret={down["regret_mean"]:.6g}', flush=True)
         del feedback, task, keep_costs, costs, full_state, cache, adapter
     if model_id(model) != codec: raise RuntimeError('frozen codec changed')
     complete = dict(status='complete', probes=cli.probes, source_checkpoint_sha256=audit_plan['checkpoint_sha256'],

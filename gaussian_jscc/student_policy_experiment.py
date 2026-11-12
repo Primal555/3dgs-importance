@@ -169,7 +169,8 @@ def main(args, max_updates=None):
             print(f'Teacher: {teacher["path"]}; selected step={soft_record["selected_step"]}; '
                   f'positive cap={soft_record["teacher_tier_cap"]}; exact ten-draw soft targets; '
                   f'probability SHA256={soft_record["probability_sha256"]}', flush=True)
-        training, calibration, preparation = split_student_cameras(scene, teacher, args.preparation_views)
+        training, calibration, preparation = split_student_cameras(
+            scene, teacher, args.preparation_views, args.calibration_views)
     else:
         prediction_state = read_student(args.student_checkpoint)
         protocol = prediction_state['plan']

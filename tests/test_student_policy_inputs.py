@@ -39,3 +39,23 @@ def test_teacher_identity_reference_and_camera_split(tmp_path):
     with pytest.raises(ValueError): load_teacher(root, scene, 'abc', .1, {'rates': [0, 8, 24, 48]}, seed=42, snr=10., trials=4)
     np.save(root/'deployment/selected_tiers.npy', np.ones(4, dtype='uint8'))
     with pytest.raises(ValueError): load_teacher(root, scene, 'abc', .5, {'rates': [0, 8, 24, 48]}, seed=42, snr=10., trials=4)
+
+
+def test_expanded_calibration_is_deterministic_and_excluded_from_student_inputs():
+    names = [f'{i:06d}' for i in range(215)]
+    scene = SimpleNamespace(cameras=[SimpleNamespace(image_name=n) for n in names])
+    boundary = dict(train_names=names[4:], calibration_names=names[:4], test_names=['test'])
+    training, calibration, preparation = split_student_cameras(scene, boundary, 64, 32)
+    name_set = lambda views: {c.image_name for c in views}
+    assert len(training) == 183 and len(calibration) == 32 and len(preparation) == 64
+    assert not name_set(training) & name_set(calibration)
+    assert not name_set(preparation) & name_set(calibration)
+    assert name_set(preparation) <= name_set(training)
+    assert name_set(training) | name_set(calibration) == set(names)
+    assert 'test' not in name_set(training) | name_set(calibration)
+    again = split_student_cameras(scene, boundary, 64, 32)
+    assert [[c.image_name for c in part] for part in again] == [[c.image_name for c in part] for part in (training, calibration, preparation)]
+    inherited = split_student_cameras(scene, boundary, 64, 4)
+    assert [c.image_name for c in inherited[1]] == names[:4]
+    for invalid in (0, 215):
+        with pytest.raises(ValueError, match='leave training'): split_student_cameras(scene, boundary, 64, invalid)
