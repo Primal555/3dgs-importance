@@ -48,7 +48,7 @@ def export_packet(model, scene, original_q, snr, seed, out, *, noiseless=False):
     (out/'metadata.bin').write_bytes(encode_metadata(header, packet_q.numpy()))
     # Reuse the exact normalized source coordinates used by the codec, including
     # device arithmetic performed when the scene feature blocks were prepared.
-    units = torch.cat([f[ids>=0, :3] for f,ids in zip(scene.groups,scene.group_ids)])
+    units = torch.cat([f[..., :3][ids>=0] for f,ids in zip(scene.groups,scene.group_ids)])
     (out/'xyz.bin').write_bytes(encode_positions(units, packet_q, model.cfg))
     payload = []; frames = []
     for features, ids, lengths in zip(scene.groups, scene.group_ids, layout):

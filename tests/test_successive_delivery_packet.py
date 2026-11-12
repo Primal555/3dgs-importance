@@ -12,10 +12,10 @@ from gaussian_jscc.modular_evaluation import decode_path
 from gaussian_jscc.successive_delivery_packet import export_packet, receive_packet, SIDE_FILES
 
 
-def scene_model():
+def scene_model(count=19, block_size=8, blocks_per_batch=2, degree=1):
     torch.set_num_threads(1); torch.manual_seed(8)
-    raw, _ = fixture(19, 1)
-    cfg = ModularCodecConfig(sh_degree=1, hidden=16, grid_dim=4, levels=(2,), block_size=8,
+    raw, _ = fixture(count, degree)
+    cfg = ModularCodecConfig(sh_degree=degree, hidden=16, grid_dim=4, levels=(2,), block_size=block_size,
         channel_variant='successive', rates=(0,8,24,48), channel_hidden=16, context_variant='both',
         channel_power_mode='block', channel_prefix_mode='full_prefix', channel_neighbor_mode='plain',
         channel_neighbor_neighbors=3,
@@ -26,9 +26,9 @@ def scene_model():
     # Packet ordering may differ arbitrarily from original PLY order.
     ordered = raw[order]; _, geom, _ = prepare(raw, cfg.morton_bits)
     f = to_features(ordered, geom, model)[0]
-    blocks = list(f.split(8)); ids = list(order.split(8))
-    groups = [pad_sequence(blocks[i:i+2], batch_first=True) for i in range(0, len(blocks), 2)]
-    gids = [pad_sequence(ids[i:i+2], batch_first=True, padding_value=-1) for i in range(0, len(ids), 2)]
+    blocks = list(f.split(block_size)); ids = list(order.split(block_size))
+    groups = [pad_sequence(blocks[i:i+blocks_per_batch], batch_first=True) for i in range(0, len(blocks), blocks_per_batch)]
+    gids = [pad_sequence(ids[i:i+blocks_per_batch], batch_first=True, padding_value=-1) for i in range(0, len(ids), blocks_per_batch)]
     return model, SimpleNamespace(raw=ordered, order=order, geometry=geom, groups=groups, group_ids=gids)
 
 
@@ -57,3 +57,18 @@ def test_receiver_packet_matches_original_batched_codec_without_encoders(tmp_pat
         path.write_bytes(saved)
     scales = receiver/'scales.bin'; scales.write_bytes(scales.read_bytes()+b'X')
     with pytest.raises(ValueError, match='framing'): receive_packet(model, receiver)
+
+
+def test_server_shaped_batch_and_partial_tail_preserve_xyz_rows(tmp_path):
+    from gaussian_jscc.position_delivery import decode_positions, delivered_positions
+    model, scene = scene_model(count=64*256+17, block_size=256, blocks_per_batch=64, degree=3)
+    assert scene.groups[0].shape == (64,256,59)
+    q = torch.arange(len(scene.raw))%4
+    packet = tmp_path/'packet'
+    export_packet(model,scene,q,10.,42,packet,noiseless=True)
+    actual = decode_positions((packet/'xyz.bin').read_bytes(),q[scene.order],model.cfg)
+    units = torch.cat([f[..., :3][ids>=0] for f,ids in zip(scene.groups,scene.group_ids)])
+    expected = delivered_positions(units,q[scene.order],model.cfg)
+    torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+    decoded, packet_q = receive_packet(model,packet)
+    assert len(decoded)==int((q>0).sum()) and torch.isfinite(decoded).all()
