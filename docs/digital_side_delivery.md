@@ -1,5 +1,20 @@
 # 侧信息数字链路交付验证
 
+## 后续实验采用的统一计费标准
+
+自2026-11-12起，新实验的正式通信成本按实际复信道使用次数统计。设属性发送量为N_attr个复符号，三路实际序列化文件大小分别为B_xyz、B_metadata、B_scales字节，则默认协议下：
+
+```text
+N_file(B) = ceil((B + 48) / 508) * 1536
+C = N_attr + N_file(B_xyz) + N_file(B_metadata) + N_file(B_scales)
+```
+
+LDPC的4096个信息位含每码字4字节CRC，因此每码字可承载508字节文件数据。6144个编码位经16QAM占1536次复信道使用。48字节文件头在每个独立文件中计入一次，末码字补齐完整计费。文件本身已有的GXYZ、元数据及SCL1帧头均包含在B中。
+
+代码复用`comparison_baselines.digital_link.file_channel_cost`及`comparison_baselines.side_information_accounting.side_information_cost`。新实验的C_ref、基线、RD评价和选模使用相同口径；训练中的成本代理需标明。历史实验保留原始RD与参考常数，统一口径的重算结果单独列出。共享模型预装，默认无ARQ；实际链路失败仍计入发送成本，成功率与成功条件下画质同时报告。
+
+服务器实测记录`truck_actual_side_delivery_gpu2_20261112_114308`的selected每次成本：属性14366104、XYZ7277568、元数据536064、尺度52224，合计22231960次复信道使用。CUDA打包解码预检最大绝对误差为0。本地已同步的前两次完整试验画质与原实验同噪声试次一致，第三次已有三路文件接收成功记录；该本地副本尚无完整四次试验及uniform_q2汇总。
+
 入口：`scripts/test_digital_side_delivery.sh COMPLETED_ALLOCATION NEW_OUT`。
 
 对已完成的分配结果进行独立最终交付测试，默认评价 selected 和全 q2。模型与档位保持固定；继承源实验的 SNR、测试相机、试验次数及图像指标。当前 Truck 为10 dB、32个测试相机、4次试验。可用`--labels selected latest uniform_q2 uniform_q3`选择已有档位图。
