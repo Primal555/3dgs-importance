@@ -12,6 +12,14 @@ from .transport import model_id, encode_metadata, decode_metadata
 SIDE_FILES = ('xyz.bin', 'metadata.bin', 'scales.bin')
 
 
+def packet_header(model, scene, q, snr, *, noiseless=False, codec_id=None):
+    return dict(version=2, config=model.cfg.to_dict(), model_id=codec_id or model_id(model),
+        count=int((q>0).sum()), source_count=len(q), geometry=scene.geometry.to_dict(),
+        snr_db=float(snr), channel='none' if noiseless else 'awgn',
+        tx_condition_snr_db=model.resolve_condition_snr(snr), rx_condition_snr_db=model.resolve_condition_snr(snr),
+        packet_protocol='successive_side_files_v1', blocks_per_batch=scene.groups[0].shape[0])
+
+
 def batch_layout(count, block_size, blocks_per_batch):
     if min(count, block_size, blocks_per_batch) < 1: raise ValueError('positive packet dimensions required')
     lengths = [min(block_size, count-i) for i in range(0, count, block_size)]
@@ -40,11 +48,7 @@ def export_packet(model, scene, original_q, snr, seed, out, *, noiseless=False):
     model.eval(); model.set_scene_geometry(scene.geometry)
     device = next(model.parameters()).device
     generator = torch.Generator(device=device).manual_seed(seed)
-    header = dict(version=2, config=model.cfg.to_dict(), model_id=model_id(model),
-        count=int((q>0).sum()), source_count=len(q), geometry=scene.geometry.to_dict(),
-        snr_db=float(snr), channel='none' if noiseless else 'awgn',
-        tx_condition_snr_db=model.resolve_condition_snr(snr), rx_condition_snr_db=model.resolve_condition_snr(snr),
-        packet_protocol='successive_side_files_v1', blocks_per_batch=blocks_per_batch)
+    header = packet_header(model, scene, q, snr, noiseless=noiseless)
     (out/'metadata.bin').write_bytes(encode_metadata(header, packet_q.numpy()))
     # Reuse the exact normalized source coordinates used by the codec, including
     # device arithmetic performed when the scene feature blocks were prepared.

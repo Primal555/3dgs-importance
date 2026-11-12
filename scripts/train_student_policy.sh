@@ -16,7 +16,7 @@ echo "GPU: $CUDA_VISIBLE_DEVICES; codec: $RUN; teacher: $TEACHER; output: $OUT"
 echo 'Student: source attributes/latent/visibility, two-scale spatial context, independent keep/tier heads.'
 echo 'Defaults: Truck, beta0.5, 1000 full distillation passes + 1000 RD updates; frozen codec.'
 echo 'Distillation: calibration RD every100 updates; keep/action/positive-tier and q0-q3 accuracies.'
-echo 'Preparation: 8 independent training cameras, original-row caches; hard policy in training and deployment.'
+echo 'Preparation: independent training cameras, original-row caches; actual view counts printed by Python.'
 echo 'RD: dense keep, 2 uniform positive points/block, inverse-inclusion weighting, 32 paired corrections.'
 echo 'Download OUT/review.tar.gz. Resume uses same OUT/settings and RESUME=1.'
 exec "$PYTHON" -u -m gaussian_jscc.student_policy_experiment \

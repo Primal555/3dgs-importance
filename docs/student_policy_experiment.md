@@ -100,3 +100,15 @@ CUDA_VISIBLE_DEVICES=3 nohup bash scripts/predict_student_policy.sh \
 - 下载`review.tar.gz`检查结果。包内只有日志、最终档位、运行身份及初始／最终图像，排除准备缓存和优化器。
 
 蒸馏阶段以完整点集遍历计数，RD阶段以场景更新计数，日志分别标记。单个Truck实验检验一次前馈和继续学习的有效性，多场景训练与完整留出场景的泛化验证另行开展。
+# 32视角教师与64视角准备实验
+
+入口：`scripts/train_student_views32.sh CODEC_RUN VIEWS32_CAP2_TEACHER NEW_OUT`。
+本组教师为`truck_first_order_views32_cap2_beta0p5_gpu2_20261111_213320`的selected权重与对应软分布。启动时核对教师每步32视角、正档位限幅2、已完成状态、源PLY及编解码器身份。
+
+学生从随机权重开始，1000步全点软蒸馏，再进行1000步RD微调。预先从训练视角池均匀选择64个视角统计可见性；RD每步轮换32个训练视角；4个校准视角与32个测试视角保持独立。β=0.5，教师约束全程0.1，蒸馏学习率1e-4，RD学习率1e-5，候选批量128。编解码器与源高斯属性冻结，阶段转换时清空Adam状态。预先统计使用逐视角Welford累计，保留可见条件下均值、总体标准差、最大值及可见比例，输入维数不变。
+
+本组使用`digital_side_file_v1`计费。实际XYZ、元数据与尺度文件字节均按LDPC4096/6144、16QAM及文件封装计算，元数据头与实际交付入口共用。全q3成本重新生成C_ref，教师、学生及均匀档位在同一口径下重新计费和选模；D_ref与结构损失权重继承教师。原教师的历史RD参考保留在plan的teacher.historical_rd_reference中。
+
+RD梯度使用平均每保留点的XYZ成本和尺度内容代理，数字CRC开销已计入每码字有效载荷效率；文件头和补齐在代理刷新时归入固定项。每25步以当前完整文件成本刷新代理，评估与选模始终使用真实字节账本。压缩长度及码字补齐的离散变化不作为精确可导梯度。日志分别记录cost_protocol、cost_proxy_scope、hard_rd_proxy和校准时的rd_score。最终实际侧信息接收测试沿用`test_digital_side_delivery.sh`，训练汇总明确标记side_link_simulated=false。
+
+输出仍保留selected和latest的独立测试结果，便于比较后期收益是否保持；最佳权重同时保存实际评估的档位图。全新OUT启动，续跑须使用相同OUT与RESUME=1。统计64视角改变了特征缓存签名，不能复用之前8视角的准备缓存。

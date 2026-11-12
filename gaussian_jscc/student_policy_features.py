@@ -81,10 +81,36 @@ def summarize_visibility(features, visible):
     return torch.cat((mean, maximum, variance.sqrt(), visible.float().mean(0)[:, None]), -1)
 
 
-def prepare_features(model, scene, cameras, identity, out, *, fine_points=16, coarse_points=4, neighbors=16):
+class VisibilityAccumulator:
+    """Visible-only Welford statistics with memory independent of camera count."""
+    def __init__(self, count):
+        self.count = torch.zeros(count, dtype=torch.float64)
+        self.mean = torch.zeros(count, 14, dtype=torch.float64)
+        self.m2 = torch.zeros_like(self.mean)
+        self.maximum = torch.full((count,14), -torch.inf)
+        self.views = 0
+
+    def add(self, features, visible):
+        x = features.cpu().double(); valid = visible.cpu().bool()
+        self.count += valid
+        delta = (x-self.mean).masked_fill(~valid[:,None],0)
+        self.mean += delta/self.count.clamp_min(1)[:,None]
+        self.m2 += delta*(x-self.mean).masked_fill(~valid[:,None],0)
+        self.maximum = torch.maximum(self.maximum, features.cpu().masked_fill(~valid[:,None],-torch.inf))
+        self.views += 1
+
+    def result(self):
+        std = (self.m2/self.count.clamp_min(1)[:,None]).clamp_min(0).sqrt()
+        maximum = self.maximum.masked_fill(self.count[:,None]==0,0)
+        return torch.cat((self.mean.float(),maximum,std.float(),(self.count/self.views).float()[:,None]),-1)
+
+
+def prepare_features(model, scene, cameras, identity, out, *, fine_points=16, coarse_points=4, neighbors=16,
+                     streaming=False):
     out = Path(out); path = out/'preparation/features.pt'
     protocol = dict(version=VERSION, identity=identity, camera_names=[str(c.image_name) for c in cameras],
                     fine_points=fine_points, coarse_points=coarse_points, neighbors=neighbors)
+    if streaming: protocol['visibility_reduction'] = 'visible_welford_float64_v1'
     signature = digest(protocol)
     if path.is_file():
         saved = torch.load(path, map_location='cpu', weights_only=True)
@@ -103,7 +129,8 @@ def prepare_features(model, scene, cameras, identity, out, *, fine_points=16, co
     graph = build_graph(raw[:, :3], fine_points, coarse_points, neighbors)
     print('Preparing all-retained semantic latent in original PLY order...', flush=True)
     latent = retained_latent(model, scene)
-    rows = []
+    rows = []; maximum_error = 0.
+    accumulator = VisibilityAccumulator(len(raw)) if streaming else None
     for i, camera in enumerate(cameras):
         view_path = out/'preparation/visibility'/f'{i:03d}.pt'
         if view_path.is_file():
@@ -114,14 +141,16 @@ def prepare_features(model, scene, cameras, identity, out, *, fine_points=16, co
             record = dict(capture_view(model, scene, camera, verify=i == 0), signature=signature,
                           name=str(camera.image_name))
             atomic_torch(view_path, record)
-        rows.append(record)
+        maximum_error = max(maximum_error, record['max_renderer_error'])
+        if accumulator is not None: accumulator.add(record['features'], record['visible'])
+        else: rows.append(record)
         print(f'Source visibility {i+1}/{len(cameras)}: {camera.image_name}', flush=True)
-    visibility = summarize_visibility(torch.stack([r['features'] for r in rows]),
-                                      torch.stack([r['visible'] for r in rows]))
+    visibility = (accumulator.result() if accumulator is not None else
+        summarize_visibility(torch.stack([r['features'] for r in rows]), torch.stack([r['visible'] for r in rows])))
     if not all(torch.isfinite(x).all() for x in (attributes, latent, visibility)):
         raise ValueError('nonfinite source student features')
     saved = dict(signature=signature, protocol=protocol, attributes=attributes, latent=latent,
         visibility=visibility, graph=graph, preparation_seconds=time.perf_counter()-started,
-        max_renderer_error=max(r['max_renderer_error'] for r in rows))
+        max_renderer_error=maximum_error)
     atomic_torch(path, saved)
     return saved

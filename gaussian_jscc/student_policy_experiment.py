@@ -41,6 +41,8 @@ def parser():
     p.add_argument('--teacher-run'); p.add_argument('--student-checkpoint'); p.add_argument('--manifest')
     p.add_argument('--distill-target', choices=('hard', 'soft_deployment'), default='hard')
     p.add_argument('--required-teacher-tier-cap', type=float)
+    p.add_argument('--required-teacher-window-views', type=int)
+    p.add_argument('--cost-protocol', choices=('legacy', 'digital_side_file_v1'), default='legacy')
     p.add_argument('--teacher-weight-schedule', choices=('linear_decay', 'constant'), default='linear_decay',
                    help='RD imitation weight schedule; soft-policy launcher uses constant')
     p.add_argument('--phase', choices=('train', 'predict'), default='train')
@@ -155,6 +157,10 @@ def main(args, max_updates=None):
     if args.phase == 'train':
         teacher_q, reference, teacher = load_teacher(args.teacher_run, scene, codec_id, args.beta,
             cfg.to_dict(), seed=args.seed, snr=args.snr, trials=args.trials)
+        if args.required_teacher_window_views is not None:
+            actual_views = json_read(Path(args.teacher_run)/'plan.json')['settings']['window_views']
+            if actual_views != args.required_teacher_window_views:
+                raise ValueError(f'teacher window views: expected {args.required_teacher_window_views}, got {actual_views}')
         if args.distill_target == 'soft_deployment':
             teacher_soft, soft_record = load_soft_teacher(args.teacher_run, teacher_q, out,
                 seed=args.seed, required_cap=args.required_teacher_tier_cap)
@@ -167,6 +173,8 @@ def main(args, max_updates=None):
     else:
         prediction_state = read_student(args.student_checkpoint)
         protocol = prediction_state['plan']
+        if args.cost_protocol != protocol['settings'].get('cost_protocol', 'legacy'):
+            raise ValueError('prediction cost protocol differs from trained student')
         if protocol['codec_id'] != codec_id or protocol['settings']['beta'] != args.beta or protocol['settings']['snr'] != args.snr:
             raise ValueError('prediction must retain the trained codec/beta/SNR')
         for key in ('fine_points', 'coarse_points', 'neighbors', 'preparation_views'):
@@ -187,18 +195,32 @@ def main(args, max_updates=None):
             preparation = [training[i] for i in spaced_indices(len(training), min(args.preparation_views, len(training))) ]
             reference = None
     if len(training) < args.window_views: raise ValueError('insufficient independent training/preparation cameras')
-    meter = ExactDeploymentCost(model, scene, codec_id, args.snr, options.net_bits_per_use)
+    if len(preparation) != args.preparation_views:
+        raise ValueError('insufficient training cameras for requested preparation views')
+    digital_cost = args.cost_protocol == 'digital_side_file_v1'
+    if digital_cost:
+        from .student_digital_cost import DigitalDeploymentCost, digital_side_proxy
+    meter_type = DigitalDeploymentCost if digital_cost else ExactDeploymentCost
+    meter = meter_type(model, scene, codec_id, args.snr, options.net_bits_per_use)
     reference_seconds = 0.
     if reference is None:
         reference, reference_seconds = prepare_prediction_reference(model, scene, calibration, args, meter, out)
     if args.phase == 'train':
         full_cost = meter.details(torch.full((len(scene.raw),), 3, dtype=torch.long))
-        if full_cost['total_channel_uses'] != reference['c_ref']: raise ValueError('teacher complete cost accounting differs')
+        if digital_cost:
+            teacher['historical_rd_reference'] = copy.deepcopy(reference)
+            reference.update(c_ref=full_cost['total_channel_uses'], q3_cost=full_cost,
+                             cost_protocol=args.cost_protocol)
+        elif full_cost['total_channel_uses'] != reference['c_ref']:
+            raise ValueError('teacher complete cost accounting differs')
+    print(f'Student cameras: preparation={len(preparation)}, RD per step={args.window_views}, '
+          f'training pool={len(training)}, calibration={len(calibration)}, test={len(scene.test_cameras)}; '
+          f'cost={args.cost_protocol}, C_ref={reference["c_ref"]}', flush=True)
     args.allocation_image_objective = ImageDistortion('mse_ssim', reference['lambda_s'])
     identity = dict(codec_id=codec_id, scene=scene.record, source=source)
     feature_start = time.perf_counter(); cache_hit = (out/'preparation/features.pt').is_file()
     features = prepare_features(model, scene, preparation, identity, out, fine_points=args.fine_points,
-                                coarse_points=args.coarse_points, neighbors=args.neighbors)
+                                coarse_points=args.coarse_points, neighbors=args.neighbors, streaming=digital_cost)
     preparation_seconds = time.perf_counter()-feature_start
     network_cfg = StudentConfig(features['attributes'].shape[1], features['latent'].shape[1], features['visibility'].shape[1],
         width=args.width, coarse_width=args.coarse_width, blocks=args.blocks, chunk_size=args.chunk_size)
@@ -211,6 +233,8 @@ def main(args, max_updates=None):
     # Keep existing hard-target checkpoints resumable with their original plan.
     if args.distill_target == 'hard': settings.pop('distill_target')
     if args.required_teacher_tier_cap is None: settings.pop('required_teacher_tier_cap')
+    if args.required_teacher_window_views is None: settings.pop('required_teacher_window_views')
+    if args.cost_protocol == 'legacy': settings.pop('cost_protocol')
     if args.teacher_weight_schedule == 'linear_decay': settings.pop('teacher_weight_schedule')
     plan = dict(version=FAMILY, settings=settings, source=source, scene=scene.record, codec_id=codec_id,
         teacher=teacher, reference=reference, feature_signature=features['signature'], config=network_cfg.to_dict(),
@@ -287,6 +311,10 @@ def main(args, max_updates=None):
             save('best', evaluated_tiers=q)
     def refresh_proxy(q):
         cost = meter.details(q); retained = int((q > 0).sum())
+        if digital_cost:
+            fallback = meter.details(torch.full_like(q,3)) if not retained else cost
+            progress['side_proxy'] = digital_side_proxy(cost, retained, fallback, len(q))
+            return
         progress['side_proxy'] = dict(xyz_per_retained=cost['coordinate_channel_uses']/retained if retained else reference['q3_cost']['coordinate_channel_uses']/len(q),
             scale_per_retained=cost['scale_content_bits']/options.net_bits_per_use/retained if retained else 0.,
             fixed_uses=cost['metadata_channel_uses']+cost['scale_framing_bytes']*8/options.net_bits_per_use,
@@ -373,6 +401,8 @@ def main(args, max_updates=None):
             objective_scope='hard current render distortion; marginal-rate/VJP training surrogate',
             hard_rd_proxy=feedback['source_distortion']/reference['d_ref']+args.beta*feedback['sampled_cost_proxy']/reference['c_ref'],
             peak_allocated_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type == 'cuda' else None)
+        if digital_cost:
+            row.update(cost_protocol=args.cost_protocol, cost_proxy_scope=progress['side_proxy']['proxy_scope'])
         append_json(out/'metrics/loss.jsonl', row)
         for a in audits: append_json(out/'metrics/audit.jsonl', dict(a, step=progress['step'], event=f'{a["source_row"]}_{a["new_tier"]}'))
         progress['pending'] = []
@@ -419,6 +449,9 @@ def main(args, max_updates=None):
         latest_forward_seconds=seconds, **allocation_timing(preparation_seconds, reference_seconds, selected_seconds),
         preparation_cache_hit=cache_hit,
         deployment_rule=plan['deployment_rule'])
+    if digital_cost:
+        complete.update(cost_protocol=args.cost_protocol, c_ref=reference['c_ref'],
+                        side_link_simulated=False)
     json_write(out/'complete.json', complete); json_write(out/'progress.json', complete)
     json_write(export/'selection.json', complete); finish_student_report(out, complete)
     print(json.dumps(complete), flush=True)
