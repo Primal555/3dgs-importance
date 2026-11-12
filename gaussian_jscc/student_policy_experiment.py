@@ -30,7 +30,7 @@ from .student_policy_inputs import load_student_source, load_teacher, split_stud
 from .student_policy_model import StudentConfig, StudentPolicy, hard_tiers, teacher_loss, teacher_metrics
 from .student_policy_soft import load_soft_teacher, soft_teacher_loss
 from .student_policy_report import finish_student_report
-from .student_policy_state import FAMILY, save_student, read_student, restore_student
+from .student_policy_state import FAMILY, save_student, read_student, restore_student, recoverable_selected_map
 from .successive_multiscene_inputs import make_scene
 from .transport import model_id
 
@@ -276,14 +276,15 @@ def main(args, max_updates=None):
         parameters=sum(p.numel() for p in student.parameters()), frozen_codec=True,
         preparation_seconds_this_run=preparation_seconds, preparation_cache_hit=cache_hit,
         optimizer='AdamW; new optimizer at distill/RD transition; no per-point probability optimizer'))
-    def save(label='latest'):
+    def save(label='latest', evaluated_tiers=None):
         if model_id(model) != codec_id: raise RuntimeError('frozen codec changed')
-        state = save_student(out, label, student, optimizer, progress, plan, sampler, views)
+        state = save_student(out, label, student, optimizer, progress, plan, sampler, views,
+                             evaluated_tiers=evaluated_tiers)
         json_write(out/'progress.json', dict(status='running', **progress)); return state
     def consider(row, q):
         if progress['best'] is None or row['rd_score'] < progress['best']['rd_score']:
             progress['best'] = dict(step=progress['step'], rd_score=row['rd_score'], tier_sha256=tier_hash(q))
-            save('best')
+            save('best', evaluated_tiers=q)
     def refresh_proxy(q):
         cost = meter.details(q); retained = int((q > 0).sum())
         progress['side_proxy'] = dict(xyz_per_retained=cost['coordinate_channel_uses']/retained if retained else reference['q3_cost']['coordinate_channel_uses']/len(q),
@@ -387,8 +388,17 @@ def main(args, max_updates=None):
             save(); return dict(status='interrupted', step=progress['step'])
     latest_q, seconds = infer(); save()
     selected_state = read_student(out/'checkpoints/best/student.pt')
-    student.load_state_dict(selected_state['student']); selected_q, selected_seconds = infer()
-    if tier_hash(selected_q) != progress['best']['tier_sha256']: raise RuntimeError('best student map hash changed')
+    student.load_state_dict(selected_state['student']); inferred_q, selected_seconds = infer()
+    selected_q, selection_check = recoverable_selected_map(selected_state, inferred_q, progress['best'],
+        out/'checkpoints/best/student.pt', out/'checkpoints/recovered_selection.pt')
+    if not selection_check['matches_original_evaluation']:
+        recovered = measure('recovered_best_calibration', selected_q, calibration)
+        selection_check.update(recovered_calibration_rd=recovered['rd_score'],
+            calibration_rd_change=recovered['rd_score']-progress['best']['rd_score'])
+        print('Legacy best map reconstructed; calibration RD '
+              f'{progress["best"]["rd_score"]:.7g}->{recovered["rd_score"]:.7g}; '
+              'see selection_reproducibility.json', flush=True)
+    json_write(out/'evaluation/selection_reproducibility.json',selection_check)
     selected_row = measure('selected', selected_q, scene.test_cameras, True)
     measure('latest', latest_q, scene.test_cameras)
     measure('teacher', teacher_q, scene.test_cameras)
@@ -401,6 +411,7 @@ def main(args, max_updates=None):
         distill_epochs=progress['distill_epoch'], rd_updates=progress['rd_step'], optimizer_resets=progress['optimizer_resets'],
         teacher_weight=args.teacher_weight, teacher_weight_schedule=args.teacher_weight_schedule,
         selected_step=progress['best']['step'], codec_id=codec_id, tier_sha256=tier_hash(selected_q),
+        selection_reproducibility=selection_check,
         rd_score=selected_row['rd_score'], selected_source_psnr=selected_row['source_psnr'],
         selected_total_channel_uses=selected_row['total_channel_uses'], beta=args.beta,
         frozen_codec_verified=model_id(model) == codec_id,

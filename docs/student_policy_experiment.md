@@ -70,6 +70,10 @@ GPU按空闲情况设置。本轮使用上述cap2教师目录；启动日志会�
 
 恢复：相同RUN、TEACHER、OUT和全部参数，将`RESUME=0`改为`RESUME=1`。准备缓存和`checkpoints/latest/student.pt`一起保留；准备阶段只完成部分相机时，可沿用同OUT以`RESUME=1`复用已有相机缓存。
 
+最佳checkpoint同时保存当次校准实际使用的`evaluated_tiers`。收尾以该图进行最终测试和导出，并记录重推理与保存图的差异点数，避免浮点归约在硬判决边界引起档位翻转后中断收尾。已保存图与原选中哈希不一致时仍停止。
+
+历史checkpoint只有权重和哈希时，收尾重建档位，并用checkpoint文件SHA256绑定到`checkpoints/recovered_selection.pt`，供中断后精确继续。若重建图哈希与原校准记录不同，先新增`recovered_best_calibration`评测，保留原校准结果；`evaluation/selection_reproducibility.json`及完成标记记录原哈希、新哈希、原校准RD及恢复校准RD。最终selected图与指标对应本次明确记录的恢复图。训练已经完成时，以相同OUT执行`RESUME=1`只继续最终评测，不增加优化步骤。
+
 ## 直接预测
 
 ```bash
