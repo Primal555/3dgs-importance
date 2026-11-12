@@ -50,3 +50,19 @@ tail -n 40 -F "${OUT}.log"
 - 下载 `review.tar.gz` 即可检查结果。包内包含日志、汇总、图像和部署档位，检查点与概率数组留在服务器上。恢复另需 `checkpoints/latest/state.pt`、原编解码器及场景输入。
 
 本轮首先比较单位时间内完成的等价评价数量，再检查收尾是否缩短总时长及最终 RD 是否保持。服务器尚未运行，因此当前没有 GPU 提速倍数。
+# 64视角教师与正档位打乱对照
+
+入口：`scripts/test_teacher_views64_shuffle.sh CODEC_RUN NEW_OUT`。每步使用64个训练视角，β=0.5，正档位限幅2，保留分支限幅0.25，候选批量128，最多2000步。沿用校准平台期收尾机制；4个校准视角、32个测试视角、4次配对AWGN试验，10 dB。
+
+本组启用`digital_side_file_v1`成本：属性复符号加三路真实侧信息字节的LDPC4096/6144＋16QAM成本。C_ref为同协议全q3成本，选模使用该口径的RD。训练侧信息梯度使用每保留点平均成本代理，日志记录cost_proxy_scope；部署评价重新计量实际文件。历史32视角组采用旧训练计费，故64组与其比较同时涉及视角数与训练计费变化，历史结果需先重算统一成本再比较，不能将全部差异归为视角收益。
+
+训练成功后自动执行`gaussian_jscc.first_order_positive_shuffle`。读取selected档位图，固定q0掩码，在所有保留点中随机置换q1/q2/q3，默认一次置换，种子20261112，可用环境变量SHUFFLE_SEED指定。各档数量和属性符号总数不变，XYZ文件相同；元数据及块尺度重新计费。保持模型冻结，使用相同测试相机、噪声种子、试验次数和图像指标，分别渲染selected与shuffled_positive。
+
+结果位于`OUT/positive_shuffle/review_summary.json`，给出selected减去shuffled的配对画质差、总成本差、RD差和实际更换正档位的比例。该结果检验这一次置换下的空间档位分配收益。summary中明确区分计费与实际侧信息接收测试；本对照不执行额外优化。
+
+下载`OUT/review.tar.gz`和`OUT/positive_shuffle/review.tar.gz`分别检查教师与打乱结果。训练可按相同OUT和RESUME=1恢复；打乱检查会复用配置一致的已完成评价。也可对一个已完成实验单独运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python -u -m gaussian_jscc.first_order_positive_shuffle \
+  --allocation "$OUT" --out "$OUT/positive_shuffle" --shuffle-seed 20261112
+```

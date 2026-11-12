@@ -79,6 +79,7 @@ def deploy(table, args):
 
 def make_plan(args,family,source,spec,codec_config):
     settings={k:v for k,v in vars(args).items() if k not in ('out','resume','dry_run','device','allocation_image_objective')}
+    if settings.get('cost_protocol') == 'legacy': settings.pop('cost_protocol')
     if getattr(args,'beta',None) is None:settings.pop('beta',None)
     else:
         for key in ('budget_total_uses','budget_ratio_to_q3','initial_price','dual_lr','ema_decay'):settings.pop(key,None)
@@ -141,7 +142,11 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
     else:
         blocks = BlockVisitScheduler(scene.group_ids)
     views = ViewWindowScheduler(scene_record['allocation_train_view_names'], args.seed+9001)
-    meter = ExactDeploymentCost(model,scene,identity,args.snr,options.net_bits_per_use)
+    digital_cost = getattr(args,'cost_protocol','legacy') == 'digital_side_file_v1'
+    if digital_cost:
+        from .student_digital_cost import DigitalDeploymentCost, digital_side_proxy
+    meter_type = DigitalDeploymentCost if digital_cost else ExactDeploymentCost
+    meter = meter_type(model,scene,identity,args.snr,options.net_bits_per_use)
     if args.resume:
         state = restore_state(latest, plan, scene_record)
         model.load_state_dict(state['state_dict']); table.load_state_dict(state['table'])
@@ -174,6 +179,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             reference['calibration_trials'] = args.trials
         if fixed_rd:
             reference.update(beta=args.beta, c_ref=full_cost['total_channel_uses'])
+            if digital_cost: reference['cost_protocol'] = args.cost_protocol
             controller = None
         else:
             reference['budget'] = int(budget)
@@ -243,6 +249,8 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
 
     def proxy(cost, deployed):
         kept = int((deployed>0).sum())
+        if digital_cost:
+            return digital_side_proxy(cost,kept,reference['q3_cost'],len(scene.raw))
         fallback = reference['q3_cost']['coordinate_channel_uses']/len(scene.raw)
         return dict(xyz_per_retained=cost['coordinate_channel_uses']/kept if kept else fallback,
             scale_per_retained=cost['scale_content_bits']/options.net_bits_per_use/kept if kept else 0.,
@@ -355,6 +363,8 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             step_seconds=time.perf_counter()-started,**blocks.coverage(sampled_q),
             peak_allocated_mib=torch.cuda.max_memory_allocated(device)/2**20 if device.type=='cuda' else None)
         row['d_ref'] = reference['d_ref']
+        if digital_cost:
+            row.update(cost_protocol=args.cost_protocol,cost_proxy_scope=reference['side_proxy']['proxy_scope'])
         if stopping is not None:
             row.update(lr_scale=lr_scale, effective_keep_lr=args.keep_lr*lr_scale,
                        effective_tier_lr=args.tier_lr*lr_scale)
@@ -438,6 +448,7 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         selection=chosen_label,selected_step=selected['progress']['step'],selected_total_channel_uses=selected_row['total_channel_uses'],
         selected_source_psnr=selected_row['source_psnr'],latest_total_channel_uses=latest_row['total_channel_uses'],
         codec_id=identity,tier_sha256=tier_hash(chosen_q),frozen_codec_verified=progress['frozen_codec_verified'])
+    if digital_cost: result.update(cost_protocol=args.cost_protocol,side_link_simulated=False)
     if not fixed_rd: result['budget_feasible'] = progress['best'] is not None
     else:
         result['selection_rd_score'] = selected['progress']['best']['rd_score']
