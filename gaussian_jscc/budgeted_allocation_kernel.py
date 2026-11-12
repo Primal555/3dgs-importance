@@ -293,6 +293,7 @@ def budgeted_mask_step(model, table, feature_batches, id_batches, geometry, task
             keep_image[:,1] = benefit.keep_image
         elif structured:
             from .structured_allocation_finite import correct_components
+            correct_components = getattr(scheduler, 'correct_components', correct_components)
             components = torch.cat(component_costs) if component_costs else torch.empty(0, 3, 2, device=device, dtype=torch.float64)
             approximate, approximate_keep = components.clone(), keep_parts.clone()
             with timing(timings, 'finite_feedback_seconds'):
