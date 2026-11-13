@@ -2,9 +2,9 @@
 
 入口为 `scripts/test_teacher_calibration32.sh CODEC_RUN REFERENCE_TEACHER NEW_OUT`。
 
-本轮从随机抽样所用的初始概率表重新训练，参考上一组 `truck_teacher_views64_shuffle_gpu2_20261112_145947`。每步仍使用 64 个训练视角，固定校准集扩展到 32 个视角。β=0.5，正档位限幅 2，保留分支限幅 0.25，候选批量 128，最多 2000 步；每 100 步校准，沿用已有的学习率调整和收尾规则。
+本轮从初始概率表重新训练，每步使用 32 个训练视角，固定校准集扩展到 32 个视角。目标尺度取自 `truck_teacher_views64_shuffle_gpu2_20261112_145947`。β=0.5，正档位限幅 2，保留分支限幅 0.25，候选批量 128，最多 2000 步；每 100 步校准，沿用已有的学习率调整和收尾规则。
 
-Truck 原有 251 个视角中，32 个测试视角和 4 个编解码器验证视角维持原名单。从其余 215 个视角按列表等间隔抽取 32 个固定校准视角，剩余 183 个作为分配训练池，每步轮换取 64 个。校准扩展因此也改变了训练池。`training.json` 中的 `allocation_train_view_names`、`calibration_view_names` 和 `test_view_names` 保存实际名单。
+Truck 原有 251 个视角中，32 个测试视角和 4 个编解码器验证视角维持原名单。从其余 215 个视角按列表等间隔抽取 32 个固定校准视角，剩余 183 个作为分配训练池，每步轮换取 32 个。校准扩展因此也改变了训练池。`training.json` 中的 `allocation_train_view_names`、`calibration_view_names` 和 `test_view_names` 保存实际名单。
 
 从参考教师的 `training.json` 固定读取 D_ref、lambda_s 和 C_ref，并核对源 PLY、相机记录、编解码器权重、β、噪声设置及完整数字文件账本。启动日志分别打印训练池、窗口、校准、测试和参考尺度。新的校准视角用于选模和收尾，原来的 4 个参考视角仅说明目标尺度的来源。目标尺度保存在 `objective_reference`，其 `normalization_source` 记录来源；`plan.json` 保存引用文件的 SHA256 和完整参考值。
 
@@ -22,7 +22,7 @@ conda activate maskgs
 GPU=2
 RUN="$PWD/output/successive_mip360_gpu1_20261023_142948/training"
 REFERENCE="$PWD/output/truck_teacher_views64_shuffle_gpu2_20261112_145947"
-OUT="$PWD/output/truck_teacher_views64_cal32_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
+OUT="$PWD/output/truck_teacher_views32_cal32_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
 
 CUDA_VISIBLE_DEVICES="$GPU" RESUME=0 nohup bash scripts/test_teacher_calibration32.sh \
   "$RUN" "$REFERENCE" "$OUT" >"${OUT}.log" 2>&1 &
