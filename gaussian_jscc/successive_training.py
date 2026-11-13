@@ -48,13 +48,13 @@ def inputs(cache,phase,phase_step,step,seed,device):
     return y,q.masked_fill(~active,0),xyz,index,('all_prefixes' if phase=='main' else layout)
 
 
-def loss_for_batch(model,teacher,y,q,xyz,geometry,centers,args,progress):
+def loss_for_batch(model,teacher,y,q,xyz,geometry,centers,args,progress,*,snr=10.):
     phase=progress['successive_phase'];step=progress['step']+1
-    signal,scales=model.channel_encoder(y.detach(),q,10.,model.channel_decoder)
+    signal,scales=model.channel_encoder(y.detach(),q,snr,model.channel_decoder)
     mask=prefix_mask(q.flatten(),model.cfg.rates).reshape_as(signal)
     generator=torch.Generator(device=y.device).manual_seed(args.seed+200003*step)
-    received=channel(signal.reshape(-1,2),10.,'awgn',generator).reshape_as(signal)*mask
-    stages,final=model.channel_decoder(received,mask,q,10.,scales=scales,delivered_xyz=xyz,return_stages=True)
+    received=channel(signal.reshape(-1,2),snr,'awgn',generator).reshape_as(signal)*mask
+    stages,final=model.channel_decoder(received,mask,q,snr,scales=scales,delivered_xyz=xyz,return_stages=True)
     if phase=='main':outputs=[stages[...,i,:] for i in range(3)]
     elif phase=='neighbor':outputs=[final]
     else:outputs=[stages[...,-1,:],final]
@@ -70,7 +70,7 @@ def loss_for_batch(model,teacher,y,q,xyz,geometry,centers,args,progress):
                  prefix_latent_mse=[float((stages[...,i,:][q>0]-y[q>0]).square().mean().detach()) for i in range(3)])
     noiseless=loss.new_zeros(())
     if phase!='neighbor' and step%args.noiseless_every==0:
-        clean_stages,_=model.channel_decoder(signal,mask,q,10.,scales=scales,delivered_xyz=xyz,return_stages=True)
+        clean_stages,_=model.channel_decoder(signal,mask,q,snr,scales=scales,delivered_xyz=xyz,return_stages=True)
         clean_outputs=[clean_stages[...,i,:] for i in range(3)] if phase=='main' else [clean_stages[...,-1,:]]
         noiseless=torch.stack([(value[q>0]-y.detach()[q>0]).square().mean() for value in clean_outputs]).mean()
         loss=loss+args.noiseless_weight*noiseless
