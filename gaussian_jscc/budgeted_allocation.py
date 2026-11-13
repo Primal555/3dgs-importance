@@ -107,6 +107,11 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         family = family_override
     saved, cfg, spec, old, options, source = load_inputs(args)
     plan=make_plan(args,family,source,spec,cfg.to_dict())
+    anchor = None
+    if getattr(args, 'objective_reference_run', None):
+        from .allocation_reference import load_reference_anchor
+        anchor = load_reference_anchor(args, old, cfg.to_dict(), source)
+        plan['objective_reference_anchor'] = anchor
     if args.dry_run:
         print(json.dumps(plan, indent=2)); return plan
     out = Path(args.out).resolve(); latest = out/'checkpoints/latest/state.pt'
@@ -115,6 +120,8 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
     device = device_for(args.device); torch.set_num_threads(args.cpu_threads); seed_all(args.seed)
     model = build_codec(cfg).to(device); model.load_state_dict(saved['state_dict']); del saved
     model.eval().requires_grad_(False); model.set_training_snrs([10.]); identity = model_id(model)
+    if anchor is not None and anchor['codec_id'] != identity:
+        raise ValueError('objective reference codec weights changed')
     raw, degree = read_ply(spec['ply'])
     scene = make_scene(spec, raw, degree, model, options, out, old=old); del raw
     model.set_scene_geometry(scene.geometry)
@@ -125,6 +132,10 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
     training = [c for i,c in enumerate(scene.cameras) if i not in chosen]
     scene_record = dict(scene.record, allocation_train_view_names=[str(c.image_name) for c in training],
                          calibration_view_names=[str(c.image_name) for c in calibration])
+    if anchor is not None:
+        print(f'Allocation views: training pool={len(training)}, window={args.window_views}; '
+              f'fixed calibration={len(calibration)}, test={len(scene.test_cameras)}, '
+              f'noise trials={args.trials}. Calibration every {args.validate_every} updates.', flush=True)
     if structured:
         from .structured_evidence import BoundedMirrorTable
         table = (table_factory or BoundedMirrorTable)(len(scene.raw), max_log_odds=args.max_log_odds).to(device)
@@ -164,19 +175,23 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         if not fixed_rd:
             budget = args.budget_total_uses if args.budget_total_uses is not None else math.floor(args.budget_ratio_to_q3*full_cost['total_channel_uses'])
             if budget < 1: raise ValueError('resolved budget is less than one channel use')
-        base_args = argparse.Namespace(**vars(args)); base_args.lpips = False
-        if structured:
-            from .allocation_distortion import ImageDistortion
-            base_args.allocation_image_objective = ImageDistortion(args.distortion, 0.)
-        baseline = evaluate_map(model,scene,full,calibration,base_args,folder=out/'evaluation/q3_reference',label='q3_reference')
-        reference = dict(q3_cost=full_cost, d_ref_raw=baseline['source_mse'],
-                         d_ref=max(baseline['source_mse'],1e-12), d_ref_floor=1e-12)
-        if structured:
-            from .allocation_distortion import calibrate
-            reference.update(calibrate(baseline['source_objective_mse'], baseline['source_structure_error'],
-                mode=args.distortion, share=args.structure_share, lambda_s=args.lambda_s))
-            reference['calibration_views'] = scene_record['calibration_view_names']
-            reference['calibration_trials'] = args.trials
+        if anchor is not None:
+            from .allocation_reference import anchored_reference
+            reference = anchored_reference(anchor, full_cost)
+        else:
+            base_args = argparse.Namespace(**vars(args)); base_args.lpips = False
+            if structured:
+                from .allocation_distortion import ImageDistortion
+                base_args.allocation_image_objective = ImageDistortion(args.distortion, 0.)
+            baseline = evaluate_map(model,scene,full,calibration,base_args,folder=out/'evaluation/q3_reference',label='q3_reference')
+            reference = dict(q3_cost=full_cost, d_ref_raw=baseline['source_mse'],
+                             d_ref=max(baseline['source_mse'],1e-12), d_ref_floor=1e-12)
+            if structured:
+                from .allocation_distortion import calibrate
+                reference.update(calibrate(baseline['source_objective_mse'], baseline['source_structure_error'],
+                    mode=args.distortion, share=args.structure_share, lambda_s=args.lambda_s))
+                reference['calibration_views'] = scene_record['calibration_view_names']
+                reference['calibration_trials'] = args.trials
         if fixed_rd:
             reference.update(beta=args.beta, c_ref=full_cost['total_channel_uses'])
             if digital_cost: reference['cost_protocol'] = args.cost_protocol
@@ -208,6 +223,10 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
             json_write(out/'training.json',document)
 
     distortion_key = 'source_distortion' if structured else 'source_mse'
+    if anchor is not None:
+        print(f'Fixed objective reference: D_ref={reference["d_ref"]:.12g}, '
+              f'lambda_s={reference["lambda_s"]:.12g}, C_ref={reference["c_ref"]}; '
+              f'normalization views={len(reference["calibration_views"])} from {anchor["run"]}.', flush=True)
     if stopping is not None and args.resume:
         stopping.load_state_dict(progress['stopping'])
     if structured:

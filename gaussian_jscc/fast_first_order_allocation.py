@@ -17,6 +17,8 @@ def parser():
     p.set_defaults(validate_every=100, fast_execution_version='batched_first_order_v1')
     p.add_argument('--candidate-batch', type=int, default=128)
     p.add_argument('--cost-protocol', choices=('legacy', 'digital_side_file_v1'), default='legacy')
+    p.add_argument('--objective-reference-run', default=argparse.SUPPRESS,
+                   help='Completed digital allocation supplying fixed D_ref, lambda_s and C_ref')
     p.add_argument('--tier-max-log-odds', type=float, default=argparse.SUPPRESS,
                    help='Override the positive-tier cap; keep uses --max-log-odds')
     p.add_argument('--early-stop', action=argparse.BooleanOptionalAction, default=True)
