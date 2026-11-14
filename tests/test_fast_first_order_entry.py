@@ -55,3 +55,45 @@ def test_early_finish_resume_and_reports(source, tier_cap):
             assert resumed['plan']['settings']['tier_max_log_odds'] == tier_cap
             updates = [json.loads(s) for s in (dest/'metrics/loss.jsonl').read_text().splitlines()]
             assert all(r['tier_max_log_odds'] == tier_cap and r['max_log_odds'] == .25 for r in updates)
+
+
+def test_constant_lr_runs_full_limit_with_calibration_and_exact_resume(source):
+    parent, root = source
+
+    def configured(out):
+        args = args_for(parent, out)
+        args.early_stop = False
+        args.allocation_steps = 3
+        args.keep_lr, args.tier_lr = .1, .4
+        args.tier_max_log_odds = 2.
+        args.cost_protocol = 'digital_side_file_v1'
+        return args
+
+    with patch('gaussian_jscc.rendering.load_cameras', side_effect=fixture.cameras), \
+         patch('gaussian_jscc.rendering.render', side_effect=fixture.render), \
+         contextlib.redirect_stdout(io.StringIO()):
+        out = root/'constant_lr'
+        result = entry.main(configured(out))
+        assert result['step'] == 3 and result['stop_reason'] == 'step_limit'
+        assert result['final_lr_scale'] == 1. and result['frozen_codec_verified']
+        updates = [json.loads(s) for s in (out/'metrics/loss.jsonl').read_text().splitlines()]
+        assert [r['step'] for r in updates] == [1, 2, 3]
+        assert all(r['lr_scale'] == 1. and r['effective_keep_lr'] == .1 and
+                   r['effective_tier_lr'] == .4 for r in updates)
+        rows = [json.loads(s) for s in (out/'metrics/validation.jsonl').read_text().splitlines()]
+        calibration = [r for r in rows if r['event'].startswith('calibration')]
+        assert [r['step'] for r in calibration] == [0, 1, 2, 3]
+        assert result['selection_rd_score'] == min(r['rd_score'] for r in calibration)
+        assert {'selected', 'latest', 'uniform_q2', 'uniform_q3'} <= {r['event'] for r in rows}
+        assert all(r['cost_protocol'] == 'digital_side_file_v1' for r in rows)
+        dest = root/'constant_lr_resume'; args = configured(dest)
+        assert entry.main(args, max_updates=1)['status'] == 'interrupted'
+        args.resume = True
+        resumed_result = entry.main(args)
+        assert resumed_result == result
+        full = torch.load(out/'checkpoints/latest/state.pt', weights_only=True)
+        resumed = torch.load(dest/'checkpoints/latest/state.pt', weights_only=True)
+        for key, value in full['table'].items():
+            torch.testing.assert_close(value, resumed['table'][key], atol=0, rtol=0)
+        assert torch.equal(full['rng']['torch'], resumed['rng']['torch'])
+        assert torch.equal(full['latest_q'], resumed['latest_q'])

@@ -73,6 +73,11 @@ def main(args, max_updates=None):
     execution = FastFirstOrderExecution(args.candidate_batch)
     stopping = FirstOrderStopping(args.stop_min_steps, args.stop_patience, args.stop_relative_improvement,
                                  args.stop_map_tolerance, args.stop_cost_tolerance) if args.early_stop else None
+    if not args.dry_run:
+        schedule = (f'plateau schedule from step {args.stop_min_steps}, patience {args.stop_patience}'
+                    if args.early_stop else 'constant learning rates, full step limit')
+        print(f'Allocation schedule: {schedule}; keep LR={args.keep_lr:g}, tier LR={args.tier_lr:g}; '
+              f'steps={args.allocation_steps}, calibration every {args.validate_every}.', flush=True)
     result = engine.main(args, max_updates=max_updates, execution=execution, stopping=stopping,
                          table_factory=table_factory)
     if result.get('status') == 'complete': review(args.out, result)

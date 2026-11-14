@@ -384,9 +384,8 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         row['d_ref'] = reference['d_ref']
         if digital_cost:
             row.update(cost_protocol=args.cost_protocol,cost_proxy_scope=reference['side_proxy']['proxy_scope'])
-        if stopping is not None:
-            row.update(lr_scale=lr_scale, effective_keep_lr=args.keep_lr*lr_scale,
-                       effective_tier_lr=args.tier_lr*lr_scale)
+        row.update(lr_scale=lr_scale, effective_keep_lr=args.keep_lr*lr_scale,
+                   effective_tier_lr=args.tier_lr*lr_scale)
         if evidence:
             row['candidate_evaluations_this_step'] = int(blocks.last.eq(step).sum())
             row['candidate_evaluations_per_second'] = row['candidate_evaluations_this_step']/row['step_seconds']
@@ -476,6 +475,8 @@ def main(args, max_updates=None, *, positive_factory=None, family_override=None,
         result.update(stop_reason='stable_calibration_plateau' if stopping.stopped else 'step_limit',
                       step_limit=args.allocation_steps, final_lr_scale=stopping.scale,
                       stopping=stopping.last_event)
+    elif hasattr(args, 'early_stop') and not args.early_stop:
+        result.update(stop_reason='step_limit', step_limit=args.allocation_steps, final_lr_scale=1.)
     if positive_provider is not None:
         verification = positive_provider.state_dict()
         result.update(network_mode=args.network_mode,network_updates=positive_provider.learner.updates,
