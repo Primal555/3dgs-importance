@@ -88,6 +88,37 @@ tail -n 40 -F "${OUT}.log"
 
 恢复使用相同RUN、OUT和参数，设置 `RESUME=1`。源10 dB检查点需保留，用于恢复固定保持教师。
 
+## 动态信道补充评测
+
+入口 `gaussian_jscc.multisnr_dynamic`、脚本 `scripts/test_multisnr_dynamic.sh` 在训练完成后独立运行，读取本轮保存的 `initial` 与 `final` 检查点。两个模型全部冻结，无优化器更新。已启动的训练可直接接上此评测。
+
+默认Truck全q2，使用下列12次交付的实际SNR轨迹，包含逐渐下降、恢复和突变：
+
+```text
+10 → 9 → 7.5 → 5 → 6 → 10 → 15 → 12.5 → 5 → 15 → 7.5 → 10 dB
+```
+
+每次交付内SNR保持不变；横轴为交付序号。收发双方已知当前SNR，原模型仍以10 dB作为编解码器条件，多SNR模型使用当前SNR。两组侧信息均按同一公开SNR规则选择MCS，当前测试不引入CSI估计误差。每次重新发送完整场景，未启用ARQ。
+
+继承源实验的4次噪声试验，默认总计 `12×4×2=96` 次完整交付。每个序号的噪声独立，两模型使用配对种子；重复出现的SNR也重新生成噪声。每次交付都使用原32个测试视角平均，避免相机变化影响曲线。可使用 `--layouts 1 2 3` 扩展三个档位，或通过 `--snr-trace` 指定另一条训练范围内的轨迹。
+
+XYZ、元数据和尺度文件经过实际LDPC/QAM/AWGN，复用现有CRC/SHA校验与字节计费。任一文件失败，该次画质为空并在图上断开；失败仍计入成功率、单次成本和累计成本。`summary.json` 同时给出各组成功条件下的画质，以及两组均成功的配对画质差。PSNR、SSIM、LPIPS及逐视角记录均保留。
+
+图中包含SNR轨迹、源场景／照片PSNR、交付成功率、单次及累计复信道使用次数。PNG、PDF、CSV位于动态评测的 `figures/`，轻量检查包为动态输出根目录下的 `review.tar.gz`。每次完成的交付单独保存，恢复时复用已有记录。
+
+```bash
+# CODEC_RUN指向刚完成的多SNR训练目录；若沿用上方终端，可直接使用$OUT。
+CODEC_RUN="$OUT"
+GPU=3
+DYNAMIC_OUT="${CODEC_RUN}_dynamic_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES="$GPU" RESUME=0 nohup bash scripts/test_multisnr_dynamic.sh \
+  "$CODEC_RUN" "$DYNAMIC_OUT" >"${DYNAMIC_OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${DYNAMIC_OUT}.pid"
+tail -n 40 -F "${DYNAMIC_OUT}.log"
+```
+
+恢复使用相同的 `CODEC_RUN`、`DYNAMIC_OUT` 和参数，设置 `RESUME=1`。动态评测检查包单独下载，原训练的曲线与检查包保持原路径。
+
 ## 参考流程
 
 Compatible NTSCC+从10 dB模型继续进行多SNR训练；SwinJSCC采用固定条件、多码率、多SNR的分阶段流程。本轮把这两个原则用于已有四模块系统，具体源场景监督和10 dB保持约束由本项目的诊断结果确定。

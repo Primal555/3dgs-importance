@@ -123,9 +123,7 @@ def evaluate_matrix(model, scene, args, out, label, *, scope='test', fixed_condi
 
 def actual_delivery(model, scene, args, out, *, perceptual=None):
     """Run the same no-ARQ digital link as the baselines in its own environment."""
-    from comparison_baselines.run import _execute, summarize_trials
-    from .digital_side_delivery import transmit_sides
-    from .successive_delivery_packet import export_packet, receive_packet, SIDE_FILES
+    from comparison_baselines.run import summarize_trials
     root = Path(out)/'actual_delivery'/scene.name
     identity = model_id(model); rows = []
     model.eval(); model.set_training_snrs(args.snr_range)
@@ -142,50 +140,61 @@ def actual_delivery(model, scene, args, out, *, perceptual=None):
                     if row['comparison_accounting']['link']!=asdict(config):
                         raise RuntimeError('delivery side-link configuration changed')
                     rows.append(row); continue
-                folder.mkdir(parents=True, exist_ok=True)
                 print(f'Actual side files: {scene.name}, {snr:g} dB, q={layout}, trial={trial}', flush=True)
-                with tempfile.TemporaryDirectory(prefix='packet-', dir=folder) as tmp:
-                    sender, receiver = Path(tmp)/'sender', Path(tmp)/'receiver'
-                    accounting = export_packet(model, scene, q, snr, args.seed+1000+trial, sender)
-                    if not (folder/'execution_check.json').exists():
-                        packet_raw, packet_q = receive_packet(model, sender)
-                        with preserved_rng(next(model.parameters()).device):
-                            seed_all(args.seed+1000+trial)
-                            qs = [torch.where(ids>=0, q[ids.clamp_min(0)], 0) for ids in scene.group_ids]
-                            ideal, _ = decode_path(model, scene, qs, 'awgn', snr)
-                        torch.testing.assert_close(packet_raw, ideal, atol=2e-5, rtol=1e-5)
-                        if not torch.equal(packet_q, q[scene.order]): raise RuntimeError('packet row order mismatch')
-                        json_write(folder/'execution_check.json', dict(status='passed',
-                            maximum_absolute_error=float((packet_raw-ideal).abs().max())))
-                        del packet_raw, ideal
-
-                    def runner(src, dest, report, link_seed):
-                        params = ['transmit','--source',src,'--destination',dest,'--report',report,
-                                  '--snr-db',snr,'--seed',link_seed]
-                        params += [x for k,v in asdict(config).items() for x in ('--'+k.replace('_','-'),v)]
-                        _execute(args.digital_python, 'comparison_baselines.digital_link', params, folder/'link.log')
-                        return read(report)
-
-                    link = transmit_sides(sender, receiver, folder/'links', config, snr,
-                                          args.seed+100000+3*trial, runner)
-                    cost = side_information_cost(accounting, config)
-                    if link['side_channel_uses'] != cost['side_channel_uses']: raise RuntimeError('digital accounting mismatch')
-                    cost.update(side_link_simulated=True,
-                        reliability=f'actual LDPC{config.k}/{config.n}, {2**config.bits_per_symbol}QAM, AWGN, no ARQ')
-                    row = dict(codec_id=identity, method=layout, snr_db=snr, trial=trial,
-                        status=link['status'], metrics=None, comparison_accounting=cost,
-                        total_channel_uses=cost['total_channel_uses'],
-                        quality_conditioning='successful reception of all three side files',
-                        side_file_status={k:v['status'] for k,v in link['streams'].items()})
-                    if link['status'] == 'success':
-                        shutil.copyfile(sender/'received.npy', receiver/'received.npy')
-                        for name in SIDE_FILES: (sender/name).unlink()
-                        raw, received_q = receive_packet(model, receiver)
-                        if not torch.equal(received_q, q[scene.order]): raise RuntimeError('receiver tier map mismatch')
-                        row['metrics'], views = measure(model, scene, raw, scene.test_cameras, perceptual)
-                        json_write(folder/'per_view.json', views)
-                    json_write(result, row); rows.append(row)
+                row = deliver_trial(model,scene,q,snr,args.seed+1000+trial,args.seed+100000+3*trial,
+                                    config,args.digital_python,folder,perceptual=perceptual)
+                row.update(method=layout,trial=trial)
+                json_write(result, row); rows.append(row)
     report = dict(status='complete', codec_id=identity, trials=rows, results=summarize_trials(rows),
                   side_link_policy=getattr(args,'side_link_policy','fixed_16qam_v1'))
     json_write(root/'summary.json', report)
     return report
+
+
+@torch.no_grad()
+def deliver_trial(model,scene,q,snr,seed,digital_seed,config,digital_python,folder,*,perceptual=None):
+    """One complete delivery through the original packet and digital-link boundaries."""
+    from comparison_baselines.run import _execute
+    from .digital_side_delivery import transmit_sides
+    from .successive_delivery_packet import export_packet,receive_packet,SIDE_FILES
+    folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='packet-',dir=folder) as tmp:
+        sender,receiver=Path(tmp)/'sender',Path(tmp)/'receiver'
+        accounting=export_packet(model,scene,q,snr,seed,sender)
+        if not (folder/'execution_check.json').exists():
+            packet_raw,packet_q=receive_packet(model,sender)
+            with preserved_rng(next(model.parameters()).device):
+                seed_all(seed)
+                qs=[torch.where(ids>=0,q[ids.clamp_min(0)],0) for ids in scene.group_ids]
+                ideal,_=decode_path(model,scene,qs,'awgn',snr)
+            torch.testing.assert_close(packet_raw,ideal,atol=2e-5,rtol=1e-5)
+            if not torch.equal(packet_q,q[scene.order]): raise RuntimeError('packet row order mismatch')
+            json_write(folder/'execution_check.json',dict(status='passed',
+                maximum_absolute_error=float((packet_raw-ideal).abs().max())))
+            del packet_raw,ideal
+
+        def runner(src,dest,report,link_seed):
+            params=['transmit','--source',src,'--destination',dest,'--report',report,
+                    '--snr-db',snr,'--seed',link_seed]
+            params += [x for k,v in asdict(config).items() for x in ('--'+k.replace('_','-'),v)]
+            _execute(digital_python,'comparison_baselines.digital_link',params,folder/'link.log')
+            return read(report)
+
+        link=transmit_sides(sender,receiver,folder/'links',config,snr,digital_seed,runner)
+        cost=side_information_cost(accounting,config)
+        if link['side_channel_uses']!=cost['side_channel_uses']: raise RuntimeError('digital accounting mismatch')
+        cost.update(side_link_simulated=True,
+            reliability=f'actual LDPC{config.k}/{config.n}, {2**config.bits_per_symbol}QAM, AWGN, no ARQ')
+        row=dict(codec_id=model_id(model),snr_db=snr,condition_snr_db=model.resolve_condition_snr(snr),
+            seed=seed,digital_seed=digital_seed,status=link['status'],metrics=None,comparison_accounting=cost,
+            total_channel_uses=cost['total_channel_uses'],
+            quality_conditioning='successful reception of all three side files',
+            side_file_status={k:v['status'] for k,v in link['streams'].items()})
+        if link['status']=='success':
+            shutil.copyfile(sender/'received.npy',receiver/'received.npy')
+            for name in SIDE_FILES: (sender/name).unlink()
+            raw,received_q=receive_packet(model,receiver)
+            if not torch.equal(received_q,q[scene.order]): raise RuntimeError('receiver tier map mismatch')
+            row['metrics'],views=measure(model,scene,raw,scene.test_cameras,perceptual)
+            json_write(folder/'per_view.json',views)
+    return row
