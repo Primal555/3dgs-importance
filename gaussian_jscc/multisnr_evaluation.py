@@ -8,8 +8,8 @@ import tempfile
 import numpy as np
 import torch
 
-from comparison_baselines.digital_link import LinkConfig
 from comparison_baselines.side_information_accounting import side_information_cost
+from comparison_baselines.side_link_policy import side_link_config
 from .cli import seed_all
 from .modular_evaluation import decode_path
 from .modular_experiment import json_write
@@ -57,9 +57,13 @@ def evaluate_matrix(model, scene, args, out, label, *, scope='test', fixed_condi
     cameras = scene.test_cameras if scope == 'test' else scene.val_cameras
     identity = model_id(model)
     model.eval(); model.set_training_snrs([10.] if fixed_condition else args.snr_range)
-    paths = [('clean', 10., '3', 0)]
-    paths += [('finite_noiseless', snr, q, 0) for snr in args.eval_snrs for q in LAYOUTS]
-    paths += [('awgn', snr, q, trial) for snr in args.eval_snrs for q in LAYOUTS for trial in range(args.trials)]
+    layouts=getattr(args,'eval_layouts',LAYOUTS)
+    kinds=getattr(args,'eval_paths',('clean','finite_noiseless','awgn'))
+    paths = [('clean', 10., '3', 0)] if 'clean' in kinds else []
+    if 'finite_noiseless' in kinds:
+        paths += [('finite_noiseless', snr, q, 0) for snr in args.eval_snrs for q in layouts]
+    if 'awgn' in kinds:
+        paths += [('awgn', snr, q, trial) for snr in args.eval_snrs for q in layouts for trial in range(args.trials)]
     rows = []
     meter = DigitalDeploymentCost(model, scene, identity, args.eval_snrs[0], 2.)
     cost_cache = {}
@@ -75,10 +79,15 @@ def evaluate_matrix(model, scene, args, out, label, *, scope='test', fixed_condi
         json_write(root/'source_photo.json', dict(views=source_rows,
             mean={k: float(np.mean([r[k] for r in source_rows])) for k in source_rows[0] if k != 'view'}))
         for path, snr, layout, trial in paths:
+            config=side_link_config(snr,getattr(args,'side_link_policy','fixed_16qam_v1'),
+                                    getattr(args,'digital_device','cuda'))
             file = root/'rows'/f'{path}_{snr:g}_{layout}_{trial}.json'
             if file.exists():
                 row = read(file)
                 if row['codec_id'] != identity: raise RuntimeError('evaluation checkpoint identity changed')
+                if path!='clean' and any(row['comparison_accounting']['link'][key]!=getattr(config,key)
+                                         for key in ('k','n','bits_per_symbol')):
+                    raise RuntimeError('evaluation side-link configuration changed')
                 rows.append(row); continue
             q = fixed_map(scene, layout, args.seed)
             qs = [torch.where(ids>=0, q[ids.clamp_min(0)], 0) for ids in scene.group_ids]
@@ -96,7 +105,7 @@ def evaluate_matrix(model, scene, args, out, label, *, scope='test', fixed_condi
                     ledger = meter.details(q)
                     header = packet_header(model,scene,q,snr,noiseless=path=='finite_noiseless',codec_id=identity)
                     ledger['metadata_bytes'] = len(encode_metadata(header,q[scene.order].numpy()))
-                    cost_cache[key] = side_information_cost(ledger)
+                    cost_cache[key] = side_information_cost(ledger,config)
                 cost = cost_cache[key]
             row = dict(codec_id=identity, scene=scene.name, endpoint=label, scope=scope,
                 path=path, snr_db=snr, condition_snr_db=model.resolve_condition_snr(snr),
@@ -118,10 +127,10 @@ def actual_delivery(model, scene, args, out, *, perceptual=None):
     from .digital_side_delivery import transmit_sides
     from .successive_delivery_packet import export_packet, receive_packet, SIDE_FILES
     root = Path(out)/'actual_delivery'/scene.name
-    config = LinkConfig(device=args.digital_device)
     identity = model_id(model); rows = []
     model.eval(); model.set_training_snrs(args.snr_range)
     for snr in args.eval_snrs:
+        config=side_link_config(snr,getattr(args,'side_link_policy','fixed_16qam_v1'),args.digital_device)
         for layout in args.delivery_layouts:
             q = fixed_map(scene, layout, args.seed)
             for trial in range(args.trials):
@@ -130,6 +139,8 @@ def actual_delivery(model, scene, args, out, *, perceptual=None):
                 if result.exists():
                     row = read(result)
                     if row['codec_id'] != identity: raise RuntimeError('delivery checkpoint identity changed')
+                    if row['comparison_accounting']['link']!=asdict(config):
+                        raise RuntimeError('delivery side-link configuration changed')
                     rows.append(row); continue
                 folder.mkdir(parents=True, exist_ok=True)
                 print(f'Actual side files: {scene.name}, {snr:g} dB, q={layout}, trial={trial}', flush=True)
@@ -159,7 +170,8 @@ def actual_delivery(model, scene, args, out, *, perceptual=None):
                                           args.seed+100000+3*trial, runner)
                     cost = side_information_cost(accounting, config)
                     if link['side_channel_uses'] != cost['side_channel_uses']: raise RuntimeError('digital accounting mismatch')
-                    cost.update(side_link_simulated=True, reliability='actual LDPC/16QAM/AWGN, no ARQ')
+                    cost.update(side_link_simulated=True,
+                        reliability=f'actual LDPC{config.k}/{config.n}, {2**config.bits_per_symbol}QAM, AWGN, no ARQ')
                     row = dict(codec_id=identity, method=layout, snr_db=snr, trial=trial,
                         status=link['status'], metrics=None, comparison_accounting=cost,
                         total_channel_uses=cost['total_channel_uses'],
@@ -173,6 +185,7 @@ def actual_delivery(model, scene, args, out, *, perceptual=None):
                         row['metrics'], views = measure(model, scene, raw, scene.test_cameras, perceptual)
                         json_write(folder/'per_view.json', views)
                     json_write(result, row); rows.append(row)
-    report = dict(status='complete', codec_id=identity, trials=rows, results=summarize_trials(rows))
+    report = dict(status='complete', codec_id=identity, trials=rows, results=summarize_trials(rows),
+                  side_link_policy=getattr(args,'side_link_policy','fixed_16qam_v1'))
     json_write(root/'summary.json', report)
     return report

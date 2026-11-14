@@ -8,6 +8,7 @@ import random
 import tarfile
 import time
 import statistics
+import copy
 
 import torch
 
@@ -114,7 +115,11 @@ def inputs(args):
     args.validation_views = old['validation_views']; args.test_views = old['test_views']
     args.net_bits_per_use = 2.  # Scene legacy constructor only; every reported cost uses digital_side_file_v1.
     settings = {k:v for k,v in vars(args).items() if k not in ('run','out','resume','dry_run','net_bits_per_use')}
-    plan = dict(version=FAMILY, **identity, source_run=str(source), settings=settings,
+    aligned = getattr(args,'source_aligned',False)
+    if aligned:
+        from .multisnr_adaptation import validate
+        validate(args,specs)
+    plan = dict(version='successive_multisnr_source_v2' if aligned else FAMILY, **identity, source_run=str(source), settings=settings,
         selected_scenes=specs, heldout_scene=heldouts, codec_config=cfg.to_dict(),
         total_updates=len(specs)*(args.channel_steps_per_scene+args.joint_steps_per_scene),
         phase_updates={p: len(specs)*n for p,n in zip(PHASES,[args.channel_steps_per_scene,args.joint_steps_per_scene])},
@@ -122,6 +127,12 @@ def inputs(args):
         cost_protocol='digital_side_file_v1', selection='fixed final update',
         semantic_encoder_frozen=True, attribute_statistics_frozen=True, allocation_training=False,
         actual_delivery_scope=dict(scenes=args.delivery_scenes, layouts=args.delivery_layouts, snrs=args.eval_snrs, trials=args.trials))
+    if aligned:
+        plan.update(side_link_policy=args.side_link_policy,
+            source_supervision='original PLY local responses; periodic full-scene source RGB from channel phase',
+            anchor='frozen initial 10dB received latent and decoded attributes, paired noise',
+            prefix_supervision='three independently delivered prefixes, matched source block and AWGN',
+            monitoring='fixed validation cameras and noise; reporting only; fixed final checkpoint')
     return saved, metadata, cfg, specs, heldouts, json.loads(json.dumps(plan))
 
 
@@ -129,9 +140,9 @@ def write_review(out):
     out = Path(out)
     # Checkpoints, cached features and temporary analogue payloads stay off the review bundle.
     with tarfile.open(out/'review.tar.gz', 'w:gz') as archive:
-        for root in ('evaluation','actual_delivery','metrics'):
+        for root in ('evaluation','actual_delivery','metrics','figures'):
             for path in sorted((out/root).rglob('*')):
-                if path.is_file() and path.suffix in ('.json','.jsonl','.csv','.png','.log'):
+                if path.is_file() and path.suffix in ('.json','.jsonl','.csv','.png','.pdf','.log'):
                     archive.add(path, arcname=path.relative_to(out))
         for name in ('plan.json','training.json','complete.json','review_summary.json','progress.json'):
             if (out/name).exists(): archive.add(out/name, arcname=name)
@@ -168,6 +179,7 @@ def summarize(out, plan):
         source_ply_vs_photos=sources,
         cost_protocol='digital_side_file_v1', quality_conditioning='reliable-side assumption; actual link results reported separately',
         actual_delivery={p.parent.name:read(p)['results'] for p in (Path(out)/'actual_delivery').glob('*/summary.json')})
+    report['side_link_policy'] = plan.get('side_link_policy','fixed_16qam_v1')
     json_write(Path(out)/'review_summary.json', report)
     return report
 
@@ -195,6 +207,15 @@ def main(args, max_updates=None):
             encoder_sha256=encoder_digest(model.state_dict()), decoder_sha256=subset_digest(model,'semantic_decoder.'),
             training_objective=dict(version=FAMILY))
         rng = capture_rng(); old_records = None
+    aligned = getattr(args,'source_aligned',False)
+    teacher = None
+    if aligned:
+        # Built inside an RNG fork: construction must not alter the training draws.
+        with preserved_rng(device):
+            teacher = build_codec(cfg).to(device); teacher.load_state_dict(saved['state_dict'])
+        teacher.eval().requires_grad_(False); teacher.set_training_snrs([10.])
+        progress['training_family'] = plan['version']
+        progress['training_objective'] = dict(version=plan['version'])
     del saved
     model.set_training_snrs(args.snr_range)
     scenes = []
@@ -216,6 +237,31 @@ def main(args, max_updates=None):
     restore_rng(rng)
     perceptual = None
     cache = {}; packed_cache = {}
+
+    def monitor():
+        if not aligned or progress['next_scene'] != 0: return
+        phase = progress['phase']; visits = progress['completed'][phase]//len(scenes)
+        due = (progress['step']==0 or visits in args.monitor_early or visits%args.monitor_every==0
+               or progress['completed'][phase]==plan['phase_updates'][phase])
+        if not due or progress.get('monitor_done_step')==progress['step']: return
+        nonlocal perceptual
+        if args.lpips and perceptual is None:
+            with preserved_rng(device): perceptual = LPIPSEvaluator(device)
+        save()  # A partial monitor always has a resumable matching checkpoint.
+        options = copy.copy(args)
+        options.trials=args.monitor_trials; options.eval_layouts=['1','2','3']; options.eval_paths=['awgn']
+        label=f'monitor_{progress["step"]:06d}'
+        with preserved_rng(device):
+            for scene in scenes:
+                if scene.name not in args.monitor_scenes: continue
+                evaluate_matrix(model,scene,options,out,label,scope='validation',
+                    fixed_condition=progress['step']==0,perceptual=perceptual)
+        json_write(out/'evaluation'/label/'progress.json',dict(step=progress['step'],phase=phase,
+            scene_step=visits,optimization_seconds=progress.get('optimization_seconds',0.),
+            scope='validation',selection=False))
+        progress['monitor_done_step']=progress['step']; save()
+        from .multisnr_plots import write_figures
+        with preserved_rng(device): write_figures(out)
 
     def save(label='latest'):
         if encoder_digest(model.state_dict()) != progress['encoder_sha256']:
@@ -248,10 +294,19 @@ def main(args, max_updates=None):
     if not args.resume: save('initial'); save()
     if not progress.get('digital_preflight_done'):
         from comparison_baselines.run import _execute
-        _execute(args.digital_python,'comparison_baselines.digital_link',
-            ['self-test','--device',args.digital_device,'--snr-db',30],out/'metrics/digital_preflight.log')
+        from comparison_baselines.side_link_policy import side_link_config
+        from dataclasses import asdict
+        configurations={}
+        for snr in args.eval_snrs:
+            c=side_link_config(snr,getattr(args,'side_link_policy','fixed_16qam_v1'),args.digital_device)
+            configurations[(c.n,c.bits_per_symbol)]=c
+        for (n,bits),config in configurations.items():
+            _execute(args.digital_python,'comparison_baselines.digital_link',
+                ['self-test','--snr-db',30]+[x for k,v in asdict(config).items() for x in ('--'+k.replace('_','-'),v)],
+                out/f'metrics/digital_preflight_{n}_{bits}.log')
         progress['digital_preflight_done'] = True; save()
     if not progress['initial_done']: evaluate('initial')
+    monitor()
     updated = 0
     while progress['step'] < plan['total_updates']:
         phase = progress['phase']
@@ -276,7 +331,25 @@ def main(args, max_updates=None):
         before = {n:p.detach().clone() for n,p in model.named_parameters()}
         if device.type == 'cuda': torch.cuda.synchronize(device)
         start = time.perf_counter()
-        if phase == PHASES[0]:
+        if aligned:
+            from .multisnr_adaptation import source_batch_loss,anchor_loss
+            index=random.Random(args.seed+100003*step).randrange(len(cache[s.name]))
+            batch=cache[s.name][index]; features=s.groups[index]
+            loss=torch.zeros((),device=device); stats={}
+            if phase==PHASES[0]:
+                centers=torch.stack([torch.as_tensor(c.camera_center).detach().cpu() for c in s.cameras]).to(device)
+                local,stats=source_batch_loss(model,features,batch,s.geometry,centers,args,progress,snr,layout)
+                local.backward(); loss=local.detach()
+            if visit%args.anchor_every==0 and args.anchor_weight:
+                # Independent rotation covers all positive layouts at 10 dB.
+                anchor_layout=('1','2','3','mixed')[(visit//args.anchor_every-1)%4]
+                q=tiers(batch['active'],anchor_layout,args.seed+300007*step)
+                anchor,anchor_stats=anchor_loss(model,teacher,features,batch,q,s.geometry,args.seed+600007*step)
+                (args.anchor_weight*anchor).backward()
+                loss=loss+args.anchor_weight*anchor.detach(); stats.update(anchor_stats,anchor_weight=args.anchor_weight)
+            render_now=phase==PHASES[1] or visit==1 or visit%args.render_every==0
+            stats.update(batch_index=index,render_update=render_now,source_aligned=True)
+        if not aligned and phase == PHASES[0]:
             index = random.Random(args.seed+100003*step).randrange(len(cache[s.name]))
             batch = cache[s.name][index]
             y, xyz = batch['y'].to(device), batch['xyz'].to(device)
@@ -284,18 +357,24 @@ def main(args, max_updates=None):
             centers = torch.stack([torch.as_tensor(c.camera_center).detach().cpu() for c in s.cameras]).to(device)
             loss, stats = loss_for_batch(model,model.semantic_decoder,y,q,xyz,s.geometry,centers,args,progress,snr=snr)
             loss.backward(); stats['batch_index'] = index
-        else:
+        elif phase == PHASES[1] or (aligned and render_now):
             if s.name not in packed_cache:
                 packed_cache[s.name] = [torch.cat((f,c['y']),-1) for f,c in zip(s.groups,cache[s.name])]
             qs = [tiers(ids>=0,layout,args.seed+300007*step+i) for i,ids in enumerate(s.group_ids)]
             indices = random.Random(args.seed+400009*step).sample(range(len(s.cameras)),args.views_per_step)
             task = MultiViewRenderTask([s.cameras[i] for i in indices],s.reference,s.degree,s.white_background)
-            loss, stats = cached_render_step(model,list(zip(packed_cache[s.name],qs)),s.geometry,snr,task,args.latent_weight)
+            render_latent_weight=0. if aligned and phase==PHASES[0] else args.latent_weight
+            render_loss, render_stats = cached_render_step(model,list(zip(packed_cache[s.name],qs)),s.geometry,snr,task,render_latent_weight)
+            if aligned:
+                loss=loss+render_loss; stats.update(render_stats)
+            else: loss,stats=render_loss,render_stats
             stats['training_view_indices'] = indices
+        if aligned: stats['objective']='source_aligned_multisnr_v2'
         stats.update(finish_update(model,optimizer,before))
         if device.type == 'cuda': torch.cuda.synchronize(device)
         progress.update(step=step,phase_step=progress['phase_step']+1,next_scene=(scene_index+1)%len(scenes))
         progress['completed'][phase] += 1; progress['scene_completed'][phase][s.name] = visit
+        progress['optimization_seconds']=progress.get('optimization_seconds',0.)+time.perf_counter()-start
         row = dict(stats,step=step,phase=phase,scene=s.name,scene_step=visit,snr_db=snr,
             tx_condition_snr_db=snr,rx_condition_snr_db=snr,snr_stratum=stratum,layout=layout,
             loss=float(loss.detach()),step_seconds=time.perf_counter()-start,module_lrs=progress['module_lrs'])
@@ -305,6 +384,7 @@ def main(args, max_updates=None):
                   f'loss={row["loss"]:.6g}, sec={row["step_seconds"]:.2f}',flush=True)
         if progress['next_scene'] == 0 and (visit%args.save_every == 0 or
                 progress['completed'][phase] == plan['phase_updates'][phase]): save()
+        monitor()
         updated += 1
         if max_updates is not None and updated >= max_updates: save(); return dict(progress,status='interrupted')
     progress['phase_complete'] = True
@@ -324,7 +404,11 @@ def main(args, max_updates=None):
         frozen_attribute_statistics_verified=True,selection='fixed_final',codec_id=model_id(model),
         train_snrs=args.snr_range,actual_side_delivery_completed=True)
     json_write(out/'complete.json',result); json_write(out/'progress.json',dict(progress,status='complete'))
-    summarize(out,plan); write_review(out)
+    summarize(out,plan)
+    if aligned:
+        from .multisnr_plots import write_figures
+        write_figures(out)
+    write_review(out)
     print(json.dumps(result),flush=True)
     return result
 

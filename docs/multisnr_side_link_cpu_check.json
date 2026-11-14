@@ -1,0 +1,163 @@
+{
+  "scope": "actual CPU LDPC/QAM/AWGN, one 256-codeword file per condition; full-scene CUDA validation follows on server",
+  "trials": [
+    {
+      "status": "success",
+      "snr_db": 10.0,
+      "config": {
+        "k": 4096,
+        "n": 6144,
+        "bits_per_symbol": 4,
+        "decoder_iterations": 20,
+        "batch_size": 32,
+        "device": "cpu"
+      },
+      "source_bytes": 130000,
+      "source_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "received_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "failure_reasons": [],
+      "codewords": 256,
+      "bit_errors": 0,
+      "crc_error_blocks": 0,
+      "total_channel_uses": 393216,
+      "elapsed_seconds": 3.388083600002574,
+      "seed": 123,
+      "noiseless": false,
+      "versions": {
+        "python": "3.12.12",
+        "torch": "2.9.0+cpu",
+        "sionna": "2.2.0",
+        "numpy": "2.3.3"
+      },
+      "torch_meets_requirement": false
+    },
+    {
+      "status": "failed",
+      "snr_db": 5.0,
+      "config": {
+        "k": 4096,
+        "n": 6144,
+        "bits_per_symbol": 4,
+        "decoder_iterations": 20,
+        "batch_size": 32,
+        "device": "cpu"
+      },
+      "source_bytes": 130000,
+      "source_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "received_sha256": null,
+      "failure_reasons": [
+        "crc32_mismatch",
+        "invalid_magic",
+        "invalid_length"
+      ],
+      "codewords": 256,
+      "bit_errors": 162912,
+      "crc_error_blocks": 256,
+      "total_channel_uses": 393216,
+      "elapsed_seconds": 8.930964300001506,
+      "seed": 123,
+      "noiseless": false,
+      "versions": {
+        "python": "3.12.12",
+        "torch": "2.9.0+cpu",
+        "sionna": "2.2.0",
+        "numpy": "2.3.3"
+      },
+      "torch_meets_requirement": false
+    },
+    {
+      "status": "success",
+      "snr_db": 5.0,
+      "config": {
+        "k": 4096,
+        "n": 8192,
+        "bits_per_symbol": 2,
+        "decoder_iterations": 20,
+        "batch_size": 32,
+        "device": "cpu"
+      },
+      "source_bytes": 130000,
+      "source_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "received_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "failure_reasons": [],
+      "codewords": 256,
+      "bit_errors": 0,
+      "crc_error_blocks": 0,
+      "total_channel_uses": 1048576,
+      "elapsed_seconds": 6.2851373000012245,
+      "seed": 123,
+      "noiseless": false,
+      "versions": {
+        "python": "3.12.12",
+        "torch": "2.9.0+cpu",
+        "sionna": "2.2.0",
+        "numpy": "2.3.3"
+      },
+      "torch_meets_requirement": false
+    },
+    {
+      "status": "failed",
+      "snr_db": 7.5,
+      "config": {
+        "k": 4096,
+        "n": 6144,
+        "bits_per_symbol": 4,
+        "decoder_iterations": 20,
+        "batch_size": 32,
+        "device": "cpu"
+      },
+      "source_bytes": 130000,
+      "source_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "received_sha256": null,
+      "failure_reasons": [
+        "crc32_mismatch",
+        "invalid_magic",
+        "invalid_length"
+      ],
+      "codewords": 256,
+      "bit_errors": 91950,
+      "crc_error_blocks": 256,
+      "total_channel_uses": 393216,
+      "elapsed_seconds": 3.338367200020002,
+      "seed": 123,
+      "noiseless": false,
+      "versions": {
+        "python": "3.12.12",
+        "torch": "2.9.0+cpu",
+        "sionna": "2.2.0",
+        "numpy": "2.3.3"
+      },
+      "torch_meets_requirement": false
+    },
+    {
+      "status": "success",
+      "snr_db": 7.5,
+      "config": {
+        "k": 4096,
+        "n": 8192,
+        "bits_per_symbol": 2,
+        "decoder_iterations": 20,
+        "batch_size": 32,
+        "device": "cpu"
+      },
+      "source_bytes": 130000,
+      "source_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "received_sha256": "9ac8aef4d374ad851db25f9a50829f808118d358dd9886b1adf24e283d73991f",
+      "failure_reasons": [],
+      "codewords": 256,
+      "bit_errors": 0,
+      "crc_error_blocks": 0,
+      "total_channel_uses": 1048576,
+      "elapsed_seconds": 6.596329399995739,
+      "seed": 123,
+      "noiseless": false,
+      "versions": {
+        "python": "3.12.12",
+        "torch": "2.9.0+cpu",
+        "sionna": "2.2.0",
+        "numpy": "2.3.3"
+      },
+      "torch_meets_requirement": false
+    }
+  ]
+}

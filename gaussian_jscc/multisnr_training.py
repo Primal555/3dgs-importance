@@ -51,6 +51,8 @@ def cached_render_step(model, batches, geometry, snr, task, latent_weight):
     semantic decoder still use current trainable parameters.
     """
     model.train(); model.semantic_encoder.eval(); model.set_scene_geometry(geometry)
+    if not any(p.requires_grad for p in model.semantic_decoder.parameters()):
+        model.semantic_decoder.eval()
     width = model.cfg.latent_dim
 
     def forward(packed, q):
