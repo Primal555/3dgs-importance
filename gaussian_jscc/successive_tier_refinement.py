@@ -2,7 +2,6 @@
 import copy
 import json
 from pathlib import Path
-import random
 import statistics
 import time
 
@@ -21,11 +20,12 @@ from .optimization import clip_codec_gradients, preserved_rng
 from .perceptual_metrics import LPIPSEvaluator
 from .render_objective import MultiViewRenderTask
 from .render_validation import append_json
+from .refinement_views import RefinementViewCycle, make_refinement_scene, refinement_split
 from .successive_multiscene_inputs import make_scene
 from .successive_multisnr import write_review
 from .transport import model_id
 
-FAMILY = 'successive_tier_refinement_v1'
+FAMILY = 'successive_tier_refinement_multiview_v2'
 ENDPOINTS = ('initial', 'after_q1', 'after_q2', 'final')
 LAYOUTS = ('1', '2', '3', 'mixed')
 
@@ -42,6 +42,9 @@ ALL_STAGES = tuple(p for tier in (1, 2, 3) for p in prefixes(tier))
 def parser():
     p = base.parser()
     p.description = __doc__
+    p.set_defaults(steps_per_scene=150)
+    p.add_argument('--views-per-step', type=int, default=32)
+    p.add_argument('--validation-views', type=int, default=16)
     return p
 
 
@@ -59,7 +62,12 @@ def configure_optimizer(model, tier, lr):
 
 
 def inputs(args):
+    requested_views = dict(views_per_step=args.views_per_step, validation_views=args.validation_views)
     saved, metadata, cfg, specs, heldouts, plan = base.inputs(args)
+    for key, value in requested_views.items():
+        setattr(args, key, value)
+    splits = {s['name']: refinement_split(metadata['scene_records'][s['name']],
+                                        args.validation_views, args.views_per_step) for s in specs}
     args.eval_layouts = list(LAYOUTS)
     args.delivery_layouts = list(LAYOUTS)
     per_stage = len(specs)*args.steps_per_scene
@@ -72,9 +80,36 @@ def inputs(args):
         stage_scope={f'q{q}': list(prefixes(q)) for q in (1, 2, 3)},
         endpoint_evaluation='initial, after_q1, after_q2, final; all positive tiers and fixed mixed map',
         lower_tier_checks='uniform q1 after q2; uniform q1/q2 after q3, paired views/noise',
+        camera_splits=splits,
+        view_sampling='independent scene/stage shuffled cycles; distinct views per update; exact resume',
+        view_loss_reduction='mean over cameras observing the same noisy decoded scene',
+        validation_protocol=dict(trials=args.trials, source_validation_retained=True,
+            added_views='held out from this refinement; previously used in source codec training',
+            selection=False, paired_seeds=[args.seed+1000+i for i in range(args.trials)]),
         actual_delivery_scope=dict(scenes=args.delivery_scenes, layouts=list(LAYOUTS), snrs=[10.], trials=args.trials))
-    plan['settings'].update(eval_layouts=list(LAYOUTS), delivery_layouts=list(LAYOUTS))
+    plan['settings'].update(requested_views, eval_layouts=list(LAYOUTS), delivery_layouts=list(LAYOUTS))
     return saved, metadata, cfg, specs, heldouts, json.loads(json.dumps(plan))
+
+
+def monitor_metrics(rows, args, scene, tier):
+    names = [str(c.image_name) for c in scene.val_cameras]
+    if (len(rows) != args.trials or {r['trial'] for r in rows} != set(range(args.trials)) or
+            any(r['path'] != 'awgn' or r['layout'] != str(tier) or r['snr_db'] != 10. or
+                r['scope'] != 'validation' or r['seed'] != args.seed+1000+r['trial'] or
+                [v['view'] for v in r['views']] != names for r in rows)):
+        raise RuntimeError('validation trials, views or paired noise changed')
+    result = dict(trials=len(rows), trial_seeds=sorted(r['seed'] for r in rows),
+                  validation_view_names=names, validation_views=len(names))
+    for key in base.METRICS:
+        if key in rows[0]:
+            values = [r[key] for r in rows]
+            result[key] = statistics.mean(values)
+            result[key+'_std_trials'] = statistics.pstdev(values)
+    for key in ('latent_mse', 'latent_nmse'):
+        values = [r['diagnostics'][key] for r in rows]
+        result[key] = statistics.mean(values)
+        result[key+'_std_trials'] = statistics.pstdev(values)
+    return result
 
 
 def summarize(out, plan):
@@ -158,6 +193,7 @@ def main(args, max_updates=None):
         progress = dict(training_family=FAMILY, step=0, phase='channel_render', phase_step=0,
             stage=1, stage_step=0, channel_trained=True, train_snrs=[10.], phase_complete=False,
             evaluated=[], completed_stages=[], next_scene=0, monitor_done_step=-1,
+            view_schedulers={}, view_coverage={f'q{q}': {} for q in (1, 2, 3)},
             scene_completed={f'q{q}': {s['name']: 0 for s in specs} for q in (1, 2, 3)},
             stage_frozen_sha256=base.frozen_digest(model.state_dict(), prefixes(1)))
         json_write(out/'plan.json', plan)
@@ -180,7 +216,8 @@ def main(args, max_updates=None):
     scenes = []
     for spec in specs:
         raw, degree = read_ply(spec['ply'])
-        scenes.append(make_scene(spec, raw, degree, model, args, out, old=metadata['scene_records'][spec['name']]))
+        scenes.append(make_refinement_scene(spec, raw, degree, model, args, out,
+            metadata['scene_records'][spec['name']], plan['camera_splits'][spec['name']]))
         del raw
     records = {s.name: s.record for s in scenes}
     if len({s.fingerprint for s in scenes}) != len(scenes):
@@ -191,6 +228,17 @@ def main(args, max_updates=None):
     (out/'metrics').mkdir(parents=True, exist_ok=True)
     restore_rng(rng)
     perceptual, targets = None, {}
+
+    def view_cycles():
+        return {s.name: RefinementViewCycle(records[s.name]['train_view_names'], args.seed,
+                s.name, progress['stage'], progress['view_schedulers'].get(s.name)) for s in scenes}
+
+    cycles = view_cycles()
+    for s in scenes:
+        if cycles[s.name].updates != progress['scene_completed'][f'q{progress["stage"]}'][s.name]:
+            raise ValueError('view scheduler and scene update count disagree')
+        print(f'{s.name} cameras: training={len(s.cameras)}, per step={args.views_per_step}, '
+              f'validation={len(s.val_cameras)} x {args.trials} trials, test={len(s.test_cameras)}.', flush=True)
 
     def save(label='latest'):
         verify_frozen()
@@ -225,7 +273,7 @@ def main(args, max_updates=None):
         if (progress['next_scene'] != 0 or progress['monitor_done_step'] == progress['step'] or
                 (visits % args.validate_every and visits != args.steps_per_scene)):
             return
-        options = copy.copy(args); options.trials = 1
+        options = copy.copy(args)
         options.eval_layouts = [str(progress['stage'])]; options.eval_paths = ['awgn']
         label = f'monitor_q{progress["stage"]}_{visits:06d}'
         save()
@@ -234,12 +282,16 @@ def main(args, max_updates=None):
                   if line.strip() and (r := json.loads(line))} if log.exists() else set()
         with preserved_rng(device):
             for s in scenes:
-                row = evaluate_matrix(model, s, options, out, label, scope='validation')[0]
+                rows = evaluate_matrix(model, s, options, out, label, scope='validation')
+                row = monitor_metrics(rows, args, s, progress['stage'])
                 if (progress['step'], s.name) not in logged:
                     append_json(log, dict(step=progress['step'], stage=progress['stage'], scene_step=visits,
-                        scene=s.name, source_psnr=row['source_psnr'], photo_psnr=row['photo_psnr'],
-                        source_mse=row['source_mse'], latent_mse=row['diagnostics']['latent_mse'],
+                        scene=s.name, **row,
                         scope='validation', selection=False))
+                    print(f'validation q{progress["stage"]} {s.name} {visits}/{args.steps_per_scene}: '
+                          f'source PSNR={row["source_psnr"]:.4f} +/- {row["source_psnr_std_trials"]:.4f}, '
+                          f'photo PSNR={row["photo_psnr"]:.4f} +/- {row["photo_psnr_std_trials"]:.4f}; '
+                          f'{row["validation_views"]} views x {row["trials"]} trials.', flush=True)
         progress['monitor_done_step'] = progress['step']; save()
 
     if not args.resume: save('initial'); save()
@@ -250,7 +302,8 @@ def main(args, max_updates=None):
         progress['digital_preflight_done'] = True; save()
     evaluate('initial'); monitor()
     print(f'Sequential q1 -> q2 -> q3: {args.steps_per_scene} updates/scene/STAGE; '
-          f'{plan["total_updates"]} total; 10dB, LR={args.lr:g}.', flush=True)
+          f'{plan["total_updates"]} total; {args.views_per_step} rotating views/update; '
+          f'10dB, LR={args.lr:g}.', flush=True)
     updated = 0
     while True:
         tier = progress['stage']
@@ -261,8 +314,9 @@ def main(args, max_updates=None):
             save('final' if tier == 3 else f'after_q{tier}'); save()
             if tier == 3: break
             verify_frozen()
-            progress.update(stage=tier+1, stage_step=0, next_scene=0,
+            progress.update(stage=tier+1, stage_step=0, next_scene=0, view_schedulers={},
                 stage_frozen_sha256=base.frozen_digest(model.state_dict(), prefixes(tier+1)))
+            cycles = view_cycles()
             optimizer = configure_optimizer(model, tier+1, args.lr)
             save()
             print(f'Begin q{tier+1}: lower stages fixed; new Adam for stage {tier+1}.', flush=True)
@@ -272,7 +326,7 @@ def main(args, max_updates=None):
         if s.name not in targets:
             print(f'Caching fixed semantic latent: {s.name}', flush=True)
             with preserved_rng(device): targets[s.name] = [b['y'] for b in cache_teacher(model, s)]
-        indices = random.Random(args.seed+400009*step).sample(range(len(s.cameras)), args.views_per_step)
+        indices = cycles[s.name].next(args.views_per_step)
         task = MultiViewRenderTask([s.cameras[i] for i in indices], s.reference, s.degree, s.white_background)
         optimizer.zero_grad(set_to_none=True)
         if device.type == 'cuda': torch.cuda.synchronize(device)
@@ -286,12 +340,18 @@ def main(args, max_updates=None):
         progress.update(step=step, phase_step=step, stage_step=progress['stage_step']+1,
                         next_scene=(progress['next_scene']+1)%len(scenes))
         progress['scene_completed'][f'q{tier}'][s.name] = visit
+        progress['view_schedulers'][s.name] = cycles[s.name].state_dict()
+        coverage = cycles[s.name].coverage()
+        progress['view_coverage'][f'q{tier}'][s.name] = coverage
         append_json(out/'metrics/loss.jsonl', dict(stats, step=step, stage=tier, scene=s.name, scene_step=visit,
             layout=str(tier), snr_db=10., loss=float(loss), lr=args.lr, training_view_indices=indices,
+            training_view_names=[str(s.cameras[i].image_name) for i in indices], view_coverage=coverage,
             step_seconds=seconds, weighted_latent_loss=args.latent_weight*stats['latent_mse']))
         if visit == 1 or visit % 10 == 0 or visit == args.steps_per_scene:
             print(f'q{tier} {s.name} {visit}/{args.steps_per_scene} (global {step}/{plan["total_updates"]}): '
-                  f'render MSE={stats["render_loss"]:.7g}, latent MSE={stats["latent_mse"]:.7g}, sec={seconds:.2f}', flush=True)
+                  f'render MSE={stats["render_loss"]:.7g}, latent MSE={stats["latent_mse"]:.7g}, '
+                  f'views={len(indices)}, covered={coverage["covered"]}/{coverage["pool"]}, '
+                  f'mean visits={coverage["mean_visits"]:.2f}, sec={seconds:.2f}', flush=True)
         if progress['next_scene'] == 0 and (visit % args.save_every == 0 or visit == args.steps_per_scene): save()
         monitor(); updated += 1
         if max_updates is not None and updated >= max_updates:
@@ -306,6 +366,7 @@ def main(args, max_updates=None):
         actual_delivery(model, s, args, out, perceptual=perceptual)
     report = summarize(out, plan)
     result = dict(status='complete', version=FAMILY, step=progress['step'], scene_completed=progress['scene_completed'],
+        view_coverage=progress['view_coverage'],
         completed_stages=progress['completed_stages'], frozen_state_verified=True,
         lower_tiers_unchanged=report['lower_tiers_unchanged'], selection='fixed_stage_endpoints',
         heldout_optimizer_updates=0, actual_side_delivery_completed=True, codec_id=model_id(model))

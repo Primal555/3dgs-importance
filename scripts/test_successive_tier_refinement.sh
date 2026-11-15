@@ -14,7 +14,9 @@ INIT=()
 if [[ "${RESUME:-0}" == 1 ]]; then INIT=(--resume); fi
 echo "GPU: $CUDA_VISIBLE_DEVICES; original 10dB source: $RUN; output: $OUT"
 echo 'Sequential q1 -> q2 -> q3; only current channel sender/receiver stage trains; fresh Adam each stage.'
-echo '250 updates per scene per stage; nine scenes: 2250/stage, 6750 total; LR1e-5.'
+echo 'Defaults: 150 updates per scene per stage; nine scenes: 1350/stage, 4050 total; LR1e-5.'
+echo 'Defaults: 32 distinct rotating training views/update; separate scene/stage cycles and exact resume.'
+echo 'Defaults: 16 validation views x 4 paired noise trials every 50 updates/scene; fixed stage endpoints.'
 echo 'Fixed semantic codec and neighbor refinement; source RGB MSE + latent MSE; immutable y cached once.'
 echo 'All tiers and mixed map evaluated at initial/after_q1/after_q2/final; Room heldout.'
 echo 'Final Truck q1/q2/q3/mixed actual side delivery: LDPC4096/6144 + 16QAM; four trials.'
