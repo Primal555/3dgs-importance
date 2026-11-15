@@ -59,7 +59,8 @@ def review(out, result):
         for path in sorted(out.rglob('*')):
             relative = path.relative_to(out)
             if path.is_file() and relative.parts[0] in ('evaluation', 'metrics', 'charts', 'comparison',
-                    'plan.json', 'training.json', 'complete.json', 'progress.json', 'execution_check.json', 'review_summary.json'):
+                    'plan.json', 'training.json', 'complete.json', 'progress.json', 'execution_check.json', 'review_summary.json',
+                    'continuation.json', 'actual_delivery'):
                 if '.uncheckpointed_' not in path.name:
                     archive.add(path, arcname=relative.as_posix(), recursive=False)
         for name in ('selected_tiers.npy', 'latest_tiers.npy', 'selection.json'):

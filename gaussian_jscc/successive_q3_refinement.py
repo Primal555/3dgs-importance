@@ -55,10 +55,10 @@ def parser():
     return p
 
 
-def frozen_digest(state):
+def frozen_digest(state, trainable=TRAINABLE):
     digest = hashlib.sha256()
     for name, value in sorted(state.items()):
-        if name.startswith(TRAINABLE):
+        if name.startswith(trainable):
             continue
         value = value.detach().cpu().contiguous()
         digest.update(name.encode())
@@ -141,10 +141,13 @@ def inputs(args):
 
 class CachedQ3Batches:
     """Cache y only; construct one packed CPU batch at a time in both replay passes."""
-    def __init__(self, scene, targets):
+    def __init__(self, scene, targets, tier=3):
         if len(scene.groups) != len(targets):
             raise ValueError('latent cache does not match original batches')
+        if tier not in (1, 2, 3):
+            raise ValueError('expected a positive delivery tier')
         self.scene, self.targets = scene, targets
+        self.tier = tier
 
     def __len__(self):
         return len(self.targets)
@@ -153,7 +156,7 @@ class CachedQ3Batches:
         for features, ids, y in zip(self.scene.groups, self.scene.group_ids, self.targets):
             if features.shape[:2] != y.shape[:2] or features.shape[:2] != ids.shape:
                 raise ValueError('cached block layout changed')
-            yield torch.cat((features, y), -1), (ids >= 0).long()*3
+            yield torch.cat((features, y), -1), (ids >= 0).long()*self.tier
 
 
 def step_optimizer(model, optimizer, before):
