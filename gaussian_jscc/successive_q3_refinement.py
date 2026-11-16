@@ -81,11 +81,11 @@ def configure_optimizer(model, lr):
     return torch.optim.Adam(groups)
 
 
-def inputs(args):
+def inputs(args, source_loader=None):
     run, out = Path(args.run).resolve(), Path(args.out).resolve()
     if out.is_relative_to(run) or run.is_relative_to(out):
         raise ValueError('use an output separate from the source run')
-    saved, metadata, cfg, identity = load_source(run)
+    saved, metadata, cfg, identity = (source_loader or load_source)(run)
     if saved['training']['progress'].get('train_snrs') != [10.]:
         raise ValueError('initialize from the completed 10 dB multi-scene codec')
     lookup = {s['name']: s for s in metadata['selected_scenes']}

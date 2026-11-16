@@ -61,9 +61,9 @@ def configure_optimizer(model, tier, lr):
     return torch.optim.Adam(groups)
 
 
-def inputs(args):
+def inputs(args, source_loader=None):
     requested_views = dict(views_per_step=args.views_per_step, validation_views=args.validation_views)
-    saved, metadata, cfg, specs, heldouts, plan = base.inputs(args)
+    saved, metadata, cfg, specs, heldouts, plan = base.inputs(args, source_loader=source_loader)
     for key, value in requested_views.items():
         setattr(args, key, value)
     splits = {s['name']: refinement_split(metadata['scene_records'][s['name']],
@@ -112,21 +112,21 @@ def monitor_metrics(rows, args, scene, tier):
     return result
 
 
-def summarize(out, plan):
+def summarize(out, plan, endpoints=ENDPOINTS, check_lower=True):
     rows, paired, checks = [], {}, []
-    for index, endpoint in enumerate(ENDPOINTS):
+    for index, endpoint in enumerate(endpoints):
         for spec in plan['selected_scenes']+plan['heldout_scene']:
             records = read(out/'evaluation'/endpoint/spec['name']/'summary.json')['rows']
             for r in records:
                 key = (spec['name'], r['path'], r['layout'], r['trial'])
                 if index:
-                    before = paired[ENDPOINTS[index-1], key]
+                    before = paired[endpoints[index-1], key]
                     if (r['seed'] != before['seed'] or r['snr_db'] != before['snr_db'] or
                             [v['view'] for v in r['views']] != [v['view'] for v in before['views']]):
                         raise RuntimeError('stage evaluation cameras/noise changed')
                     if r['total_channel_uses'] != before['total_channel_uses']:
                         raise RuntimeError('fixed-budget stage accounting changed')
-                    if r['layout'] != 'mixed' and int(r['layout']) < index:
+                    if check_lower and r['layout'] != 'mixed' and int(r['layout']) < index:
                         errors = {k: abs(r[k]-before[k]) for k in base.METRICS if k in r}
                         errors.update({k: abs(r['diagnostics'][k]-before['diagnostics'][k])
                                        for k in ('latent_mse', 'latent_nmse')})
@@ -153,9 +153,9 @@ def summarize(out, plan):
                     rows.append(row)
     lookup = {(r['endpoint'], r['scene'], r['path'], r['layout']): r for r in rows}
     for r in rows:
-        index = ENDPOINTS.index(r['endpoint'])
+        index = endpoints.index(r['endpoint'])
         if index:
-            for name, endpoint in [('change_from_initial', 'initial'), ('change_from_previous_stage', ENDPOINTS[index-1])]:
+            for name, endpoint in [('change_from_initial', 'initial'), ('change_from_previous_stage', endpoints[index-1])]:
                 before = lookup[endpoint, r['scene'], r['path'], r['layout']]
                 r[name] = {k: r[k]-before[k] for k in base.METRICS+('latent_mse', 'latent_nmse') if k in r}
     report = dict(status='complete' if all(c['passed'] for c in checks) else 'lower_tier_invariance_failed',
@@ -169,8 +169,17 @@ def summarize(out, plan):
     return report
 
 
-def main(args, max_updates=None):
-    saved, metadata, cfg, specs, heldouts, plan = inputs(args)
+def main(args, max_updates=None, recipe=None):
+    # A recipe changes the training layout/scope while sharing checkpoint,
+    # camera, paired evaluation and actual digital-delivery machinery.
+    input_loader = inputs if recipe is None else recipe.inputs
+    optimizer_factory = configure_optimizer if recipe is None else recipe.configure_optimizer
+    active_prefixes = prefixes if recipe is None else recipe.prefixes
+    endpoints = ENDPOINTS if recipe is None else recipe.ENDPOINTS
+    family = FAMILY if recipe is None else recipe.FAMILY
+    saved, metadata, cfg, specs, heldouts, plan = input_loader(args)
+    stage_order = plan['stage_order']
+    stage_key = lambda tier: f'q{tier}' if recipe is None else 'mixed'
     if args.dry_run:
         print(json.dumps(plan, indent=2)); return plan
     out = Path(args.out).resolve()
@@ -185,19 +194,19 @@ def main(args, max_updates=None):
     if args.resume:
         saved = torch.load(out/'checkpoints/latest/codec.pt', map_location='cpu', weights_only=True)
         progress = saved['training']['progress']
-        if progress['training_family'] != FAMILY or saved['config'] != cfg.to_dict():
+        if progress['training_family'] != family or saved['config'] != cfg.to_dict():
             raise ValueError('checkpoint experiment/config mismatch')
     model = build_codec(config_from_dict(saved['config'])).to(device)
     model.load_state_dict(saved['state_dict']); model.set_training_snrs([10.])
     if not args.resume:
-        progress = dict(training_family=FAMILY, step=0, phase='channel_render', phase_step=0,
+        progress = dict(training_family=family, step=0, phase='channel_render', phase_step=0,
             stage=1, stage_step=0, channel_trained=True, train_snrs=[10.], phase_complete=False,
             evaluated=[], completed_stages=[], next_scene=0, monitor_done_step=-1,
-            view_schedulers={}, view_coverage={f'q{q}': {} for q in (1, 2, 3)},
-            scene_completed={f'q{q}': {s['name']: 0 for s in specs} for q in (1, 2, 3)},
-            stage_frozen_sha256=base.frozen_digest(model.state_dict(), prefixes(1)))
+            view_schedulers={}, view_coverage={stage_key(q): {} for q in stage_order},
+            scene_completed={stage_key(q): {s['name']: 0 for s in specs} for q in stage_order},
+            stage_frozen_sha256=base.frozen_digest(model.state_dict(), active_prefixes(1)))
         json_write(out/'plan.json', plan)
-    optimizer = configure_optimizer(model, progress['stage'], args.lr)
+    optimizer = optimizer_factory(model, progress['stage'], args.lr)
     if args.resume:
         optimizer.load_state_dict(saved['training']['optimizer'])
         rng = saved['training']['rng']; old_records = saved['training']['scene_record']
@@ -209,7 +218,7 @@ def main(args, max_updates=None):
     def verify_frozen():
         if base.frozen_digest(model.state_dict(), ALL_STAGES) != plan['frozen_state_sha256']:
             raise RuntimeError('semantic codec, neighbor refinement or statistics changed')
-        if base.frozen_digest(model.state_dict(), prefixes(progress['stage'])) != progress['stage_frozen_sha256']:
+        if base.frozen_digest(model.state_dict(), active_prefixes(progress['stage'])) != progress['stage_frozen_sha256']:
             raise RuntimeError('inactive channel stage changed')
 
     verify_frozen()
@@ -235,7 +244,7 @@ def main(args, max_updates=None):
 
     cycles = view_cycles()
     for s in scenes:
-        if cycles[s.name].updates != progress['scene_completed'][f'q{progress["stage"]}'][s.name]:
+        if cycles[s.name].updates != progress['scene_completed'][stage_key(progress['stage'])][s.name]:
             raise ValueError('view scheduler and scene update count disagree')
         print(f'{s.name} cameras: training={len(s.cameras)}, per step={args.views_per_step}, '
               f'validation={len(s.val_cameras)} x {args.trials} trials, test={len(s.test_cameras)}.', flush=True)
@@ -274,24 +283,25 @@ def main(args, max_updates=None):
                 (visits % args.validate_every and visits != args.steps_per_scene)):
             return
         options = copy.copy(args)
-        options.eval_layouts = [str(progress['stage'])]; options.eval_paths = ['awgn']
-        label = f'monitor_q{progress["stage"]}_{visits:06d}'
+        options.eval_layouts = [str(progress['stage'])] if recipe is None else list(LAYOUTS)
+        options.eval_paths = ['awgn']
+        label = f'monitor_{stage_key(progress["stage"])}_{visits:06d}'
         save()
         log = out/'metrics/validation.jsonl'
-        logged = {(r['step'], r['scene']) for line in log.read_text(encoding='utf8').splitlines()
+        logged = {(r['step'], r['scene'], r.get('layout', str(r['stage']))) for line in log.read_text(encoding='utf8').splitlines()
                   if line.strip() and (r := json.loads(line))} if log.exists() else set()
         with preserved_rng(device):
             for s in scenes:
                 rows = evaluate_matrix(model, s, options, out, label, scope='validation')
-                row = monitor_metrics(rows, args, s, progress['stage'])
-                if (progress['step'], s.name) not in logged:
-                    append_json(log, dict(step=progress['step'], stage=progress['stage'], scene_step=visits,
-                        scene=s.name, **row,
-                        scope='validation', selection=False))
-                    print(f'validation q{progress["stage"]} {s.name} {visits}/{args.steps_per_scene}: '
-                          f'source PSNR={row["source_psnr"]:.4f} +/- {row["source_psnr_std_trials"]:.4f}, '
-                          f'photo PSNR={row["photo_psnr"]:.4f} +/- {row["photo_psnr_std_trials"]:.4f}; '
-                          f'{row["validation_views"]} views x {row["trials"]} trials.', flush=True)
+                for layout in options.eval_layouts:
+                    row = monitor_metrics([r for r in rows if r['layout'] == layout], args, s, layout)
+                    if (progress['step'], s.name, layout) not in logged:
+                        append_json(log, dict(step=progress['step'], stage=progress['stage'], scene_step=visits,
+                            scene=s.name, layout=layout, **row, scope='validation', selection=False))
+                        print(f'validation {layout} {s.name} {visits}/{args.steps_per_scene}: '
+                              f'source PSNR={row["source_psnr"]:.4f} +/- {row["source_psnr_std_trials"]:.4f}, '
+                              f'photo PSNR={row["photo_psnr"]:.4f} +/- {row["photo_psnr_std_trials"]:.4f}; '
+                              f'{row["validation_views"]} views x {row["trials"]} trials.', flush=True)
         progress['monitor_done_step'] = progress['step']; save()
 
     if not args.resume: save('initial'); save()
@@ -301,18 +311,19 @@ def main(args, max_updates=None):
                  ['self-test', '--device', args.digital_device, '--snr-db', 30], out/'metrics/digital_preflight.log')
         progress['digital_preflight_done'] = True; save()
     evaluate('initial'); monitor()
-    print(f'Sequential q1 -> q2 -> q3: {args.steps_per_scene} updates/scene/STAGE; '
+    print(f'{family}: {args.steps_per_scene} updates/scene/stage; '
           f'{plan["total_updates"]} total; {args.views_per_step} rotating views/update; '
           f'10dB, LR={args.lr:g}.', flush=True)
     updated = 0
     while True:
         tier = progress['stage']
-        if progress['stage_step'] == plan['stage_updates'][f'q{tier}']:
-            monitor(); evaluate(ENDPOINTS[tier])
+        key = stage_key(tier)
+        if progress['stage_step'] == plan['stage_updates'][key]:
+            monitor(); evaluate(endpoints[tier])
             if tier not in progress['completed_stages']: progress['completed_stages'].append(tier)
-            if tier == 3: progress['phase_complete'] = True
-            save('final' if tier == 3 else f'after_q{tier}'); save()
-            if tier == 3: break
+            if tier == stage_order[-1]: progress['phase_complete'] = True
+            save('final' if tier == stage_order[-1] else f'after_q{tier}'); save()
+            if tier == stage_order[-1]: break
             verify_frozen()
             progress.update(stage=tier+1, stage_step=0, next_scene=0, view_schedulers={},
                 stage_frozen_sha256=base.frozen_digest(model.state_dict(), prefixes(tier+1)))
@@ -322,7 +333,7 @@ def main(args, max_updates=None):
             print(f'Begin q{tier+1}: lower stages fixed; new Adam for stage {tier+1}.', flush=True)
             continue
         s = scenes[progress['next_scene']]
-        step = progress['step']+1; visit = progress['scene_completed'][f'q{tier}'][s.name]+1
+        step = progress['step']+1; visit = progress['scene_completed'][key][s.name]+1
         if s.name not in targets:
             print(f'Caching fixed semantic latent: {s.name}', flush=True)
             with preserved_rng(device): targets[s.name] = [b['y'] for b in cache_teacher(model, s)]
@@ -331,7 +342,9 @@ def main(args, max_updates=None):
         optimizer.zero_grad(set_to_none=True)
         if device.type == 'cuda': torch.cuda.synchronize(device)
         started = time.perf_counter()
-        loss, stats = cached_render_step(model, base.CachedQ3Batches(s, targets[s.name], tier),
+        batches = (base.CachedQ3Batches(s, targets[s.name], tier) if recipe is None else
+                   recipe.CachedMixedBatches(s, targets[s.name], args.seed, visit))
+        loss, stats = cached_render_step(model, batches,
                                          s.geometry, 10., task, args.latent_weight)
         norm, gradient_stats = clip_codec_gradients(model, mode='none')
         optimizer.step(); stats.update(gradient_stats, grad_norm=float(norm))
@@ -339,16 +352,16 @@ def main(args, max_updates=None):
         seconds = time.perf_counter()-started
         progress.update(step=step, phase_step=step, stage_step=progress['stage_step']+1,
                         next_scene=(progress['next_scene']+1)%len(scenes))
-        progress['scene_completed'][f'q{tier}'][s.name] = visit
+        progress['scene_completed'][key][s.name] = visit
         progress['view_schedulers'][s.name] = cycles[s.name].state_dict()
         coverage = cycles[s.name].coverage()
-        progress['view_coverage'][f'q{tier}'][s.name] = coverage
+        progress['view_coverage'][key][s.name] = coverage
         append_json(out/'metrics/loss.jsonl', dict(stats, step=step, stage=tier, scene=s.name, scene_step=visit,
-            layout=str(tier), snr_db=10., loss=float(loss), lr=args.lr, training_view_indices=indices,
+            layout=str(tier) if recipe is None else 'mixed', snr_db=10., loss=float(loss), lr=args.lr, training_view_indices=indices,
             training_view_names=[str(s.cameras[i].image_name) for i in indices], view_coverage=coverage,
             step_seconds=seconds, weighted_latent_loss=args.latent_weight*stats['latent_mse']))
         if visit == 1 or visit % 10 == 0 or visit == args.steps_per_scene:
-            print(f'q{tier} {s.name} {visit}/{args.steps_per_scene} (global {step}/{plan["total_updates"]}): '
+            print(f'{key} {s.name} {visit}/{args.steps_per_scene} (global {step}/{plan["total_updates"]}): '
                   f'render MSE={stats["render_loss"]:.7g}, latent MSE={stats["latent_mse"]:.7g}, '
                   f'views={len(indices)}, covered={coverage["covered"]}/{coverage["pool"]}, '
                   f'mean visits={coverage["mean_visits"]:.2f}, sec={seconds:.2f}', flush=True)
@@ -364,12 +377,13 @@ def main(args, max_updates=None):
             raw, degree = read_ply(spec['ply']); s = make_scene(spec, raw, degree, model, args, out)
             del raw
         actual_delivery(model, s, args, out, perceptual=perceptual)
-    report = summarize(out, plan)
-    result = dict(status='complete', version=FAMILY, step=progress['step'], scene_completed=progress['scene_completed'],
+    report = summarize(out, plan) if recipe is None else recipe.summarize(out, plan)
+    result = dict(status='complete', version=family, step=progress['step'], scene_completed=progress['scene_completed'],
         view_coverage=progress['view_coverage'],
         completed_stages=progress['completed_stages'], frozen_state_verified=True,
-        lower_tiers_unchanged=report['lower_tiers_unchanged'], selection='fixed_stage_endpoints',
+        selection='fixed_stage_endpoints' if recipe is None else 'fixed_final',
         heldout_optimizer_updates=0, actual_side_delivery_completed=True, codec_id=model_id(model))
+    if recipe is None: result['lower_tiers_unchanged'] = report['lower_tiers_unchanged']
     json_write(out/'complete.json', result); json_write(out/'progress.json', dict(progress, status='complete'))
     write_review(out); print(json.dumps(result), flush=True)
     return result
