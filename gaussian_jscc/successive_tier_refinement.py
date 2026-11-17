@@ -216,8 +216,8 @@ def main(args, max_updates=None, recipe=None):
     del saved
 
     def verify_frozen():
-        if base.frozen_digest(model.state_dict(), ALL_STAGES) != plan['frozen_state_sha256']:
-            raise RuntimeError('semantic codec, neighbor refinement or statistics changed')
+        if base.frozen_digest(model.state_dict(), tuple(plan['trainable_prefixes'])) != plan['frozen_state_sha256']:
+            raise RuntimeError('state outside the declared trainable scope changed')
         if base.frozen_digest(model.state_dict(), active_prefixes(progress['stage'])) != progress['stage_frozen_sha256']:
             raise RuntimeError('inactive channel stage changed')
 
@@ -275,6 +275,8 @@ def main(args, max_updates=None, recipe=None):
                 else: json_write(path, record)
                 evaluate_matrix(model, s, args, out, label, perceptual=perceptual)
                 del raw, s
+            if recipe is not None and hasattr(recipe, 'endpoint_diagnostics'):
+                recipe.endpoint_diagnostics(model, scenes, args, out, label)
         progress['evaluated'].append(label); save()
 
     def monitor():
@@ -344,6 +346,7 @@ def main(args, max_updates=None, recipe=None):
         started = time.perf_counter()
         batches = (base.CachedQ3Batches(s, targets[s.name], tier) if recipe is None else
                    recipe.CachedMixedBatches(s, targets[s.name], args.seed, visit))
+        layout = getattr(batches, 'layout', str(tier) if recipe is None else 'mixed')
         loss, stats = cached_render_step(model, batches,
                                          s.geometry, 10., task, args.latent_weight)
         norm, gradient_stats = clip_codec_gradients(model, mode='none')
@@ -357,11 +360,11 @@ def main(args, max_updates=None, recipe=None):
         coverage = cycles[s.name].coverage()
         progress['view_coverage'][key][s.name] = coverage
         append_json(out/'metrics/loss.jsonl', dict(stats, step=step, stage=tier, scene=s.name, scene_step=visit,
-            layout=str(tier) if recipe is None else 'mixed', snr_db=10., loss=float(loss), lr=args.lr, training_view_indices=indices,
+            layout=layout, snr_db=10., loss=float(loss), lr=args.lr, training_view_indices=indices,
             training_view_names=[str(s.cameras[i].image_name) for i in indices], view_coverage=coverage,
             step_seconds=seconds, weighted_latent_loss=args.latent_weight*stats['latent_mse']))
         if visit == 1 or visit % 10 == 0 or visit == args.steps_per_scene:
-            print(f'{key} {s.name} {visit}/{args.steps_per_scene} (global {step}/{plan["total_updates"]}): '
+            print(f'{key} {s.name} {visit}/{args.steps_per_scene} (global {step}/{plan["total_updates"]}, layout={layout}): '
                   f'render MSE={stats["render_loss"]:.7g}, latent MSE={stats["latent_mse"]:.7g}, '
                   f'views={len(indices)}, covered={coverage["covered"]}/{coverage["pool"]}, '
                   f'mean visits={coverage["mean_visits"]:.2f}, sec={seconds:.2f}', flush=True)
