@@ -57,7 +57,14 @@ def paired_decode(model, features, y, q, snr, noise, *, with_main=False):
     return recovered, pred
 
 
-def source_batch_loss(model, features, cached, geometry, centers, args, progress, snr, layout):
+def noiseless_tier(scene_visit, every):
+    """Per-scene auxiliary clock, independent of scene count and global step."""
+    if scene_visit < 1 or every < 1:
+        raise ValueError('positive scene visit and auxiliary period required')
+    return (scene_visit//every-1)%3+1 if scene_visit%every == 0 else None
+
+
+def source_batch_loss(model, features, cached, geometry, centers, args, progress, snr, layout, *, scene_visit=None):
     """All three delivered prefixes share one source block and AWGN realization.
 
     Each tier executes its own encoder/decoder, including conditional block scales
@@ -94,14 +101,16 @@ def source_batch_loss(model, features, cached, geometry, centers, args, progress
                  latent_mse=sum(v['latent_mse'] for v in diagnostics)/len(diagnostics),
                  supervised_layouts=['1','2','3']+(['mixed'] if layout=='mixed' else []))
     # Source-aligned noiseless constraint, with its own actual tier execution.
-    if step%args.noiseless_every == 0:
-        q=maps[(step//args.noiseless_every-1)%3]
+    auxiliary_tier=noiseless_tier(step if scene_visit is None else scene_visit,args.noiseless_every)
+    if auxiliary_tier is not None:
+        q=maps[auxiliary_tier-1]
         recovered,pred=paired_decode(model,f,y,q,snr,torch.zeros_like(noise))
         latent,_=latent_reconstruction_loss(y,recovered,q)
         response,_=local_response_loss(pred[active],f[active],geometry,model,directions=views)
         clean=args.latent_weight*latent+args.response_weight*response
         loss=loss+args.noiseless_weight*clean
         stats['noiseless_source_objective']=float(clean.detach())
+        stats['noiseless_tier']=auxiliary_tier
     stats['source_batch_loss']=float(loss.detach())
     return loss,stats
 

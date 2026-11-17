@@ -56,6 +56,7 @@ class ModularCodecConfig:
     channel_neighbor_hidden: int = 64
     channel_neighbor_neighbors: int = 16
     experimental_multirate: bool = False
+    channel_snr_adapter_hidden: int = 0
 
     def __post_init__(self):
         if self.architecture != 'modular_jscc_v1':
@@ -78,6 +79,10 @@ class ModularCodecConfig:
         values = asdict(self)
         values.pop('latent_dim')
         values.pop('experimental_multirate')
+        values.pop('channel_snr_adapter_hidden')
+        if (type(self.channel_snr_adapter_hidden) is not int or self.channel_snr_adapter_hidden < 0 or
+                (self.channel_snr_adapter_hidden and self.channel_variant != 'successive')):
+            raise ValueError('SNR adapters require successive channels and a nonnegative integer width')
         values.pop('channel_power_mode')
         values.pop('channel_power_momentum')
         if (self.channel_power_mode not in ('point','statistical','block') or
@@ -140,6 +145,7 @@ class ModularCodecConfig:
         if self.channel_power_mode == 'point': values.pop('channel_power_mode')
         if self.channel_power_momentum == .01: values.pop('channel_power_momentum')
         if not self.experimental_multirate: values.pop('experimental_multirate')
+        if not self.channel_snr_adapter_hidden: values.pop('channel_snr_adapter_hidden')
         # Baseline checkpoints/packet identities keep their historical syntax.
         if self.context_variant == 'baseline':
             for key in ('context_variant','context_centers','context_neighbors','context_radii'):

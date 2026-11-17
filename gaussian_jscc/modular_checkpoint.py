@@ -58,7 +58,10 @@ def restore_training_checkpoint(path, device):
     model=build_codec(config_from_dict(saved['config'])).to(device)
     model.load_state_dict(saved['state_dict'])
     model.set_training_snrs(progress.get('train_snrs',()))
-    if model.cfg.channel_variant=='successive' and not progress.get('successive_joint',False):
+    if progress.get('snr_adapter_only',False):
+        from .snr_adapter import configure_optimizer as adapter_optimizer
+        optimizer=adapter_optimizer(model,progress['module_lrs']['snr_adapter'])
+    elif model.cfg.channel_variant=='successive' and not progress.get('successive_joint',False):
         from .successive_training import configure_optimizer
         optimizer=configure_optimizer(model,progress['successive_phase'],progress['module_lrs'])
     else:

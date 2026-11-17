@@ -67,7 +67,7 @@ def decode_scales(data,q,*,dtype=torch.float32):
 
 
 class ChannelMapping(nn.Module):
-    def __init__(self,inputs,outputs,hidden,*,residual=False):
+    def __init__(self,inputs,outputs,hidden,*,residual=False,adapter_hidden=0):
         super().__init__()
         self.input=nn.Linear(inputs,hidden)
         self.snr=nn.Sequential(nn.Linear(1,hidden),nn.GELU(),nn.Linear(hidden,hidden))
@@ -76,10 +76,15 @@ class ChannelMapping(nn.Module):
         if residual:
             nn.init.normal_(self.readout[-1].weight,std=1e-3)
             nn.init.zeros_(self.readout[-1].bias)
+        if adapter_hidden:
+            from .snr_adapter import AnchoredSNRAdapter
+            self.snr_adapter=AnchoredSNRAdapter(adapter_hidden,hidden)
 
     def forward(self,value,snr):
         if not math.isfinite(float(snr)):raise ValueError('finite SNR required')
-        condition=self.snr(value.new_full((*value.shape[:-1],1),float(snr)/20))
+        condition=self.snr(value.new_full((*value.shape[:-1],1),
+            .5 if hasattr(self,'snr_adapter') else float(snr)/20))
+        if hasattr(self,'snr_adapter'): condition=condition+self.snr_adapter(snr)
         hidden=self.input(value)+condition
         for block in self.blocks:hidden=block(hidden,condition)
         return self.readout(hidden)
@@ -89,7 +94,8 @@ class SuccessiveChannelEncoder(nn.Module):
     def __init__(self,cfg):
         super().__init__();self.cfg=cfg
         self.stages=nn.ModuleList(ChannelMapping(cfg.latent_dim*(1 if i==0 else 2),
-            2*(end-start),cfg.channel_hidden) for i,(start,end) in enumerate(zip(cfg.rates[:-1],cfg.rates[1:])))
+            2*(end-start),cfg.channel_hidden,adapter_hidden=cfg.channel_snr_adapter_hidden)
+            for i,(start,end) in enumerate(zip(cfg.rates[:-1],cfg.rates[1:])))
 
     def forward(self,y,q,snr,decoder):
         validate_q(q)
@@ -122,9 +128,13 @@ class SuccessiveChannelDecoder(nn.Module):
     def __init__(self,cfg):
         super().__init__();self.cfg=cfg
         self.stages=nn.ModuleList(ChannelMapping(2*end+tier+(cfg.latent_dim if tier>1 else 0),
-            cfg.latent_dim,cfg.channel_hidden,residual=tier>1) for tier,end in enumerate(cfg.rates[1:],1))
+            cfg.latent_dim,cfg.channel_hidden,residual=tier>1,adapter_hidden=cfg.channel_snr_adapter_hidden)
+            for tier,end in enumerate(cfg.rates[1:],1))
         from .channel_spatial import ChannelNeighborRefiner
         self.neighbor_refiner=ChannelNeighborRefiner(cfg)
+        if cfg.channel_snr_adapter_hidden:
+            from .snr_adapter import AnchoredSNRAdapter
+            self.neighbor_refiner.snr_adapter=AnchoredSNRAdapter(cfg.channel_snr_adapter_hidden,cfg.channel_neighbor_hidden)
         self.register_buffer('neighbor_enabled',torch.tensor(False))
 
     def advance(self,tier,prefix,scales,previous,active,snr):

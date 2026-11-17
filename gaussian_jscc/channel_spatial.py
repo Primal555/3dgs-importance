@@ -64,8 +64,11 @@ class ChannelSpatialDenoiser(nn.Module):
         stage_mask &= active[...,None]
         signal=received.masked_fill(~stage_mask,0)
         own=previous.masked_fill(~active[...,None],0)
-        inputs=torch.cat((own,signal,stage_mask.to(signal),signal.new_full((*active.shape,1),float(snr)/20)),-1)
+        condition=.5 if hasattr(self,'snr_adapter') else float(snr)/20
+        inputs=torch.cat((own,signal,stage_mask.to(signal),signal.new_full((*active.shape,1),condition)),-1)
         h=self.input(inputs).masked_fill(~active[...,None],0)
+        if hasattr(self,'snr_adapter'):
+            h=(h+self.snr_adapter(snr)).masked_fill(~active[...,None],0)
         keys=gather(self.key(h),ids); values=gather(self.value(h),ids)+self.relative(relative)
         logits=(self.query(h)[:,:,None]*keys).sum(-1)/math.sqrt(h.shape[-1])
         logits=logits.masked_fill(~valid,-torch.finfo(logits.dtype).max)
@@ -103,6 +106,7 @@ class ChannelNeighborRefiner(ChannelSpatialDenoiser):
         from dataclasses import replace
         # This local config describes only the reusable spatial residual block.
         local=replace(cfg,channel_variant='progressive' if cfg.channel_variant=='successive' else cfg.channel_variant,
+                      channel_snr_adapter_hidden=0,
                       channel_denoiser_mode='spatial',channel_denoiser_scope='final',
                       channel_denoiser_hidden=cfg.channel_neighbor_hidden,channel_denoiser_neighbors=cfg.channel_neighbor_neighbors)
         super().__init__(local,len(local.rates)-1)

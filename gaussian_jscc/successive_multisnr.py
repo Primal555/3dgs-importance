@@ -338,7 +338,7 @@ def main(args, max_updates=None):
             loss=torch.zeros((),device=device); stats={}
             if phase==PHASES[0]:
                 centers=torch.stack([torch.as_tensor(c.camera_center).detach().cpu() for c in s.cameras]).to(device)
-                local,stats=source_batch_loss(model,features,batch,s.geometry,centers,args,progress,snr,layout)
+                local,stats=source_batch_loss(model,features,batch,s.geometry,centers,args,progress,snr,layout,scene_visit=visit)
                 local.backward(); loss=local.detach()
             if visit%args.anchor_every==0 and args.anchor_weight:
                 # Independent rotation covers all positive layouts at 10 dB.
