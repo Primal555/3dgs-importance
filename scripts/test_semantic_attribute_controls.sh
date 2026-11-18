@@ -9,7 +9,7 @@ shift 2
 INIT=()
 if [[ "${RESUME:-0}" == 1 ]]; then INIT=(--resume); fi
 echo "GPU: $CUDA_VISIBLE_DEVICES; scene metadata: $RUN; output: $OUT"
-echo 'Random semantic-only controls: shared128, shared256, split128, split256; sequential by default.'
+echo "Random semantic-only training. Overrides: $* (default arms: shared128 shared256 split128 split256)."
 echo 'Each arm: TOTAL 3000 attribute updates + 1000 render updates, alternating Truck/Playroom.'
 echo '32 rotating training views/update; 32 separate validation views; original test views (up to32).'
 echo 'DrJohnson heldout; no channel/noise/allocation. Fixed bootstrap/final endpoints; no test selection.'

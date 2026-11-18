@@ -21,7 +21,7 @@ from .perceptual_metrics import LPIPSEvaluator, image_metric_protocol
 from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewRenderTask
 from .refinement_views import RefinementViewCycle, refinement_split, make_refinement_scene
 from .render_validation import append_json
-from .semantic_attribute_codec import ARMS, SemanticAttributeCodec, make_config, fit_loss_scales, attribute_objective
+from .semantic_attribute_codec import ARMS, TRAINABLE_ARMS, SemanticAttributeCodec, make_config, fit_loss_scales, attribute_objective
 from .semantic_attribute_metrics import evaluate, latent_diagnostics, directions_for, write_plots, diagnostic_plots
 from .successive_multiscene_inputs import make_scene
 from .training import full_scene_step
@@ -37,7 +37,7 @@ def parser():
     p.add_argument('--heldout-manifest', default='configs/multiscene_tandt_db.json')
     p.add_argument('--scenes', nargs='+', default=['truck', 'playroom'])
     p.add_argument('--heldout-scene', default='drjohnson')
-    p.add_argument('--arms', nargs='+', choices=ARMS, default=list(ARMS))
+    p.add_argument('--arms', nargs='+', choices=TRAINABLE_ARMS, default=list(ARMS))
     p.add_argument('--bootstrap-steps', type=int, default=3000, help='TOTAL updates per arm across training scenes')
     p.add_argument('--render-steps', type=int, default=1000, help='TOTAL updates per arm across training scenes')
     p.add_argument('--bootstrap-lr', type=float, default=1e-4)

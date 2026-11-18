@@ -11,6 +11,8 @@ from .position_delivery import delivered_positions
 
 
 ARMS = ('shared128', 'shared256', 'split128', 'split256')
+REBALANCED = 'split_g32_dc8_sh64_s24_128'
+TRAINABLE_ARMS = (*ARMS, REBALANCED)
 FULL_GEOMETRY = 'split_full_geometry128'
 GROUPS = {'geometry': (0, 8), 'dc': (8, 11), 'sh': (11, 56)}
 
@@ -34,7 +36,11 @@ class _SharedGeometry:
         return plan
 
 
-def latent_slices(width, split):
+def latent_slices(width, split, *, rebalanced=False):
+    if rebalanced:
+        if width != 128 or not split:
+            raise ValueError('rebalanced layout requires a split 128-dimensional latent')
+        return {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104), 'shared': (104, 128)}
     if width not in (128, 256):
         raise ValueError('semantic experiment supports 128 or 256 real dimensions')
     if not split:
@@ -70,9 +76,9 @@ class AttributeEncoder(nn.Module):
 
 
 class AttributeDecoder(nn.Module):
-    def __init__(self, cfg, split, full_geometry=False):
+    def __init__(self, cfg, split, full_geometry=False, *, rebalanced=False):
         super().__init__()
-        self.slices = latent_slices(cfg.latent_dim, split)
+        self.slices = latent_slices(cfg.latent_dim, split, rebalanced=rebalanced)
         self.split = split
         self.full_geometry = full_geometry
         if not split:
@@ -115,7 +121,7 @@ class SemanticAttributeCodec(nn.Module):
     """Receiver consumes only the latent, active mask and delivered XYZ."""
     def __init__(self, arm, cfg=None):
         super().__init__()
-        if arm not in (*ARMS, FULL_GEOMETRY):
+        if arm not in (*TRAINABLE_ARMS, FULL_GEOMETRY):
             raise ValueError('unknown semantic arm')
         self.arm = arm
         self.cfg = cfg or make_config(int(arm[-3:]))
@@ -125,8 +131,9 @@ class SemanticAttributeCodec(nn.Module):
         self.register_buffer('attr_std', torch.ones(56))
         # Width-independent common encoder modules precede the latent projection.
         self.semantic_encoder = AttributeEncoder(self.cfg)
-        self.semantic_decoder = AttributeDecoder(self.cfg, arm.startswith('split'), arm == FULL_GEOMETRY)
-        self.slices = latent_slices(self.cfg.latent_dim, arm.startswith('split'))
+        self.semantic_decoder = AttributeDecoder(self.cfg, arm.startswith('split'), arm == FULL_GEOMETRY,
+            rebalanced=arm == REBALANCED)
+        self.slices = self.semantic_decoder.slices
 
     def set_scene_geometry(self, geometry):
         for module in self.modules():

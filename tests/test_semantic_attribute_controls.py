@@ -52,7 +52,7 @@ def model_data(arm='split128'):
     return model, raw, geometry, f, active
 
 
-@pytest.mark.parametrize('arm', entry.ARMS)
+@pytest.mark.parametrize('arm', entry.TRAINABLE_ARMS)
 def test_interface_and_private_latent_isolation(arm):
     model, raw, geometry, f, active = model_data(arm)
     assert not any('channel' in n for n, _ in model.named_modules())
@@ -90,6 +90,37 @@ def test_log_covariance_invariances_and_loss_identity():
     assert float(loss.detach()) == 0
     loss.backward(); assert torch.isfinite(x.grad).all()
     assert sum(b-a for a, b in latent_slices(256, True).values()) == 256
+
+
+def test_rebalanced_routing_and_single_arm_checkpoint(tmp_path):
+    from gaussian_jscc.progressive_attribute_channel import load_semantic_slot
+    from gaussian_jscc.semantic_attribute_codec import REBALANCED
+    assert REBALANCED not in entry.parser().get_default('arms')
+    with patch('gaussian_jscc.rendering.render', side_effect=synthetic_render), \
+         patch('gaussian_jscc.rendering.load_cameras', side_effect=cameras), \
+         patch.object(entry, 'diagnostic_plots'), patch.object(entry, 'write_plots'):
+        source, held = build_fixture(tmp_path)
+        out = tmp_path/'fresh'
+        entry.main(options(source, held, out, arm=REBALANCED))
+    assert entry.read(out/'review_summary.json')['completed_arms'] == [REBALANCED]
+    model, _ = load_semantic_slot(out/REBALANCED/'checkpoints/final.pt')
+    assert model.slices == {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104), 'shared': (104, 128)}
+    _, _, geometry, f, active = model_data()
+    model.set_scene_geometry(geometry)
+    z = torch.arange(128, dtype=f.dtype).expand(*active.shape, 128)
+    inputs = {}
+    def capture(name):
+        def hook(module, args):
+            inputs[name] = args[0].clone()
+        return hook
+    hooks = [branch.register_forward_pre_hook(capture(name)) for name, branch in model.semantic_decoder.branches.items()]
+    try:
+        model.decode(z, active, f[..., :3])
+    finally:
+        for hook in hooks:
+            hook.remove()
+    for name, (a, b) in {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104)}.items():
+        torch.testing.assert_close(inputs[name], torch.cat((z[..., a:b], z[..., 104:]), -1))
 
 
 def synthetic_render(raw, camera, *args, **kwargs):

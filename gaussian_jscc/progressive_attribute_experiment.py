@@ -33,7 +33,7 @@ FAMILY = 'progressive_attribute_eight_v1'
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--semantic-checkpoint', help='shared128/shared256/split128/split256 fixed-final .pt; required to train')
+    p.add_argument('--semantic-checkpoint', help='completed semantic attribute codec final.pt; required to train')
     p.add_argument('--out', required=True)
     p.add_argument('--manifest', help='relocated PLY/photo paths; scene fingerprints and camera split must match')
     p.add_argument('--bootstrap-steps', type=int, default=500, help='total per layer, alternating source training scenes')
@@ -97,6 +97,8 @@ def prepare(args):
         cost_protocol='digital_side_file_v1; actual LDPC4096/6144 + 16QAM; no ARQ',
         cache='frozen semantic latents in CPU RAM, rebuilt on resume; never cache noisy receiver outputs')
     if args.dry_run and not args.semantic_checkpoint:
+        from .semantic_attribute_codec import REBALANCED
+        plan['semantic_slot']['accepted'].append(REBALANCED)
         return None, None, json.loads(json.dumps(plan))
     if not args.semantic_checkpoint:
         raise ValueError('set --semantic-checkpoint after the semantic experiment finishes')
@@ -105,6 +107,8 @@ def prepare(args):
     if out.is_relative_to(source.parent) or source.is_relative_to(out):
         raise ValueError('channel output must be separate from the semantic checkpoint')
     semantic, saved = load_semantic_slot(source)
+    if semantic.arm not in plan['semantic_slot']['accepted']:
+        plan['semantic_slot']['accepted'].append(semantic.arm)
     plan['semantic_slot'].update(arm=semantic.arm, latent_dim=semantic.cfg.latent_dim,
         config=semantic.cfg.to_dict(), sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         state_sha256=state_digest(semantic.state_dict()))
