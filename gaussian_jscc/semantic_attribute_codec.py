@@ -11,6 +11,7 @@ from .position_delivery import delivered_positions
 
 
 ARMS = ('shared128', 'shared256', 'split128', 'split256')
+FULL_GEOMETRY = 'split_full_geometry128'
 GROUPS = {'geometry': (0, 8), 'dc': (8, 11), 'sh': (11, 56)}
 
 
@@ -69,10 +70,11 @@ class AttributeEncoder(nn.Module):
 
 
 class AttributeDecoder(nn.Module):
-    def __init__(self, cfg, split):
+    def __init__(self, cfg, split, full_geometry=False):
         super().__init__()
         self.slices = latent_slices(cfg.latent_dim, split)
         self.split = split
+        self.full_geometry = full_geometry
         if not split:
             self.shared = SemanticDecoder(cfg)
             self.shared.blocks = nn.ModuleList()
@@ -82,7 +84,8 @@ class AttributeDecoder(nn.Module):
             for name, (start, end) in GROUPS.items():
                 a, b = self.slices[name]
                 c, d = self.slices['shared']
-                branch = SemanticDecoder(replace(cfg, latent_dim=b-a+d-c))
+                width = cfg.latent_dim if full_geometry and name == 'geometry' else b-a+d-c
+                branch = SemanticDecoder(replace(cfg, latent_dim=width))
                 branch.blocks = nn.ModuleList()
                 branch.spatial_context = SpatialPointContext(cfg)
                 keys = {'geometry': ('opacity', 'scale', 'rotation'), 'dc': ('dc',), 'sh': ('sh',)}[name]
@@ -101,7 +104,8 @@ class AttributeDecoder(nn.Module):
             a, b = self.slices[name]
             branch.spatial_context._allocation_geometry_cache = cache
             try:
-                result.append(branch(torch.cat((z[..., a:b], z[..., c:d]), -1), active, xyz))
+                inputs = z if self.full_geometry and name == 'geometry' else torch.cat((z[..., a:b], z[..., c:d]), -1)
+                result.append(branch(inputs, active, xyz))
             finally:
                 del branch.spatial_context._allocation_geometry_cache
         return torch.cat(result, -1)
@@ -111,7 +115,7 @@ class SemanticAttributeCodec(nn.Module):
     """Receiver consumes only the latent, active mask and delivered XYZ."""
     def __init__(self, arm, cfg=None):
         super().__init__()
-        if arm not in ARMS:
+        if arm not in (*ARMS, FULL_GEOMETRY):
             raise ValueError('unknown semantic arm')
         self.arm = arm
         self.cfg = cfg or make_config(int(arm[-3:]))
@@ -121,7 +125,7 @@ class SemanticAttributeCodec(nn.Module):
         self.register_buffer('attr_std', torch.ones(56))
         # Width-independent common encoder modules precede the latent projection.
         self.semantic_encoder = AttributeEncoder(self.cfg)
-        self.semantic_decoder = AttributeDecoder(self.cfg, arm.startswith('split'))
+        self.semantic_decoder = AttributeDecoder(self.cfg, arm.startswith('split'), arm == FULL_GEOMETRY)
         self.slices = latent_slices(self.cfg.latent_dim, arm.startswith('split'))
 
     def set_scene_geometry(self, geometry):

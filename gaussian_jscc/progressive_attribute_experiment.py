@@ -87,7 +87,7 @@ def prepare(args):
     validate_settings(args)
     plan = dict(version=FAMILY, channel=LayerConfig(hidden=args.hidden).to_dict(), schedule=schedule(args),
         total_updates=8*(args.bootstrap_steps+args.render_steps)+args.neighbor_steps,
-        semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256']),
+        semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
         settings={k: v for k, v in vars(args).items() if k not in ('resume', 'dry_run', 'out', 'device')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
