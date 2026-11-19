@@ -209,3 +209,24 @@ git -C comparison_baselines/MaskGaussian submodule status --recursive
 无损打包恢复后的 MaskGaussian PLY 应与发送前逐字节一致。MesonGS 应从接收的压缩包独立解压并渲染，评估使用统一的相机、分辨率和指标实现。
 
 共享的原始图像和 PLY 继续存放在主项目 `data/` 下，实验输出放在主项目 `output/` 下，各基线直接引用其绝对路径。
+
+## 固定 XYZ 的属性编解码对照
+
+本组复用 `split_g40_dc16_sh72_128` 的固定末步权重、源 PLY 和测试相机。三组保留同一高斯点集，使用同一份 16 bit 接收坐标，以该坐标配原始属性的渲染作为属性失真的参照。依次渲染全部恢复属性、仅替换几何与透明度、仅替换颜色。图像指标与点级误差使用主项目实现。
+
+- **FCGS** 使用官方预训练权重，默认 `λ=1e-4`。保留颜色路径选择、量化、上下文和实际熵编码。收发两端共享坐标和点顺序，代替原生 GPCC 坐标流。
+- **C3DGS** 保留原生的渲染敏感度统计、码本拟合和属性量化。关闭点剪枝、重排和场景微调。量化范围用压缩后的码本与属性校准，接收端从属性 NPZ 及共享坐标重建。Truck 和 Playroom 使用原语义实验的训练视角。DrJohnson 使用自己的数据集训练视角构建码本，因此该场景的 C3DGS 属于场景内编码。
+- 基线记录实际属性文件字节数，含掩码、索引、码本和量化参数。语义组是连续 latent，属性字节数留空。本组结论对应各自编码设置下的属性失真。通信开销比较使用完整数字交付实验。
+
+服务器首次运行时，在主项目环境中执行：
+
+```bash
+bash scripts/setup_attribute_codec_comparison.sh
+
+RUN="$PWD/output/semantic_private128_gpu3_20261119_082002"
+GPU=3
+OUT="$PWD/output/semantic_codec_comparison_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES="$GPU" bash scripts/test_attribute_codec_comparison.sh "$RUN" "$OUT"
+```
+
+默认场景为 Truck、Playroom、DrJohnson。`--scenes truck` 可单独验证 Truck，`--methods semantic fcgs` 可单独运行语义与 FCGS。`--manifest` 支持迁移后的数据路径，仍检查源 PLY 和相机指纹。使用同一条命令加上 `RESUME=1`，可在同一目录跳过已完成的场景和方法。`review.tar.gz` 包含配置、逐视角指标、少量同视角图和日志。属性流在解码及计数后清理。
