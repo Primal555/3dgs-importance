@@ -206,12 +206,18 @@ class LayeredAttributeCodec(nn.Module):
 
 def configure_stage(model, stage, lr):
     neighbor_stage = model.layer_config.layer_count+1
-    if stage not in range(1, neighbor_stage+1) or not math.isfinite(lr) or lr <= 0:
-        raise ValueError(f'stage 1..{neighbor_stage} and positive LR required')
+    if ((stage != 'joint' and stage not in range(1, neighbor_stage+1)) or
+            not math.isfinite(lr) or lr <= 0):
+        raise ValueError(f'joint or stage 1..{neighbor_stage} and positive LR required')
     model.requires_grad_(False)
     for p in model.parameters():
         p.grad = None
-    modules = [model.neighbor] if stage == neighbor_stage else [model.encoders[stage-1], model.decoders[stage-1]]
+    if stage == 'joint':
+        modules = (model.encoders, model.decoders)
+    elif stage == neighbor_stage:
+        modules = (model.neighbor,)
+    else:
+        modules = (model.encoders[stage-1], model.decoders[stage-1])
     for module in modules:
         module.requires_grad_(True)
     model.neighbor_enabled.fill_(stage == neighbor_stage)

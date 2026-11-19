@@ -37,8 +37,11 @@ def parser():
     p.add_argument('--semantic-checkpoint', help='completed semantic attribute codec final.pt; required to train')
     p.add_argument('--out', required=True)
     p.add_argument('--manifest', help='relocated PLY/photo paths; scene fingerprints and camera split must match')
-    p.add_argument('--three-tier-scratch', action='store_true',
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--three-tier-scratch', action='store_true',
                    help='8/24/48 symbols with frozen prefixes and a completed private128 semantic checkpoint')
+    mode.add_argument('--three-tier-joint', action='store_true',
+                   help='8/24/48 symbols with equally weighted joint channel training and frozen private128 semantics')
     p.add_argument('--bootstrap-steps', type=int,
                    help='total per layer across training scenes (500 eight-tier, 8000 three-tier)')
     p.add_argument('--render-steps', type=int, default=250, help='total per layer')
@@ -69,7 +72,8 @@ def parser():
 
 def schedule(args, layers):
     rows = []
-    for layer in range(1, layers+1):
+    stages = ('joint',) if args.three_tier_joint else range(1, layers+1)
+    for layer in stages:
         rows.extend([dict(stage=layer, phase='bootstrap', steps=args.bootstrap_steps, lr=args.bootstrap_lr),
                      dict(stage=layer, phase='render', steps=args.render_steps, lr=args.render_lr)])
     if args.neighbor_steps:
@@ -89,7 +93,7 @@ def validate_settings(args):
 
 
 def prepare(args):
-    three = args.three_tier_scratch
+    three = args.three_tier_scratch or args.three_tier_joint
     if args.bootstrap_steps is None:
         args.bootstrap_steps = 8000 if three else 500
     if args.neighbor_steps is None:
@@ -98,11 +102,12 @@ def prepare(args):
         args.save_every = 250 if three else 50
     validate_settings(args)
     cfg = LayerConfig(rates=THREE_RATES if three else EIGHT_RATES, hidden=args.hidden)
-    plan = dict(version=cfg.family, channel=cfg.to_dict(), schedule=schedule(args, cfg.layer_count),
-        total_updates=cfg.layer_count*(args.bootstrap_steps+args.render_steps)+args.neighbor_steps,
+    phases = schedule(args, cfg.layer_count)
+    plan = dict(version=cfg.family, channel=cfg.to_dict(), schedule=phases,
+        total_updates=sum(phase['steps'] for phase in phases),
         semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
         settings={k: v for k, v in vars(args).items()
-                  if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch')},
+                  if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -116,6 +121,11 @@ def prepare(args):
             {v for v in (500, 2000, 4000, args.bootstrap_steps) if v <= args.bootstrap_steps})
         plan['budget_reference'] = 'old 8/24/48 main had 8000 noisy minibatch updates for each prefix'
         plan['prefix_training'] = 'freeze the semantic model and all channel layers except the current increment'
+    if args.three_tier_joint:
+        plan['training_mode'] = 'joint_prefix_mean'
+        plan['prefix_training'] = 'freeze the semantic model; average the three prefix gradients before each channel update'
+        plan['supervision_per_tier'] = dict(bootstrap=args.bootstrap_steps, render=args.render_steps)
+        plan['trainable_prefixes'] = list(cfg.rates[1:])
     if args.dry_run and not args.semantic_checkpoint:
         if not three:
             from .semantic_attribute_codec import SPLIT128_LAYOUTS
@@ -129,7 +139,7 @@ def prepare(args):
         raise ValueError('channel output must be separate from the semantic checkpoint')
     semantic, saved = load_semantic_slot(source)
     if three and semantic.arm != PRIVATE_ONLY:
-        raise ValueError(f'three-tier scratch requires {PRIVATE_ONLY}/checkpoints/final.pt')
+        raise ValueError(f'three-tier training requires {PRIVATE_ONLY}/checkpoints/final.pt')
     if semantic.arm not in plan['semantic_slot']['accepted']:
         plan['semantic_slot']['accepted'].append(semantic.arm)
     plan['semantic_slot'].update(arm=semantic.arm, latent_dim=semantic.cfg.latent_dim,
@@ -245,9 +255,12 @@ def write_review(out):
             success_rate=len(successes)/len(trials), success_conditioned_metrics=metrics,
             mean_sent_channel_uses=sum(t['total_channel_uses'] for t in trials)/len(trials)))
     plan_file = out/'plan.json'
-    family = json.loads(plan_file.read_text(encoding='utf8'))['version'] if plan_file.is_file() else FAMILY
-    json_write(out/'review_summary.json', dict(version=family, rows=rows, actual_delivery=delivery_summary,
-        cost_unit='complex_channel_use_per_delivery', selection='fixed_final'))
+    plan = json.loads(plan_file.read_text(encoding='utf8')) if plan_file.is_file() else {}
+    review = dict(version=plan.get('version', FAMILY), rows=rows, actual_delivery=delivery_summary,
+        cost_unit='complex_channel_use_per_delivery', selection='fixed_final')
+    if 'training_mode' in plan:
+        review.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
+    json_write(out/'review_summary.json', review)
     temporary = out/'review.tmp.tar.gz'
     with tarfile.open(temporary, 'w:gz') as archive:
         for p in sorted(out.rglob('*')):
@@ -317,11 +330,19 @@ def main(args, max_updates=None):
              ['self-test', '--device', args.digital_device, '--snr-db', 30], out/'digital_preflight.log')
     train_scenes = [s for s in scenes if s.spec['role'] == 'train']
     cycles = {}
+    tier_phases = {}
     for pi, phase in enumerate(plan['schedule']):
-        for scene in train_scenes:
-            key = f'{pi}/{scene.name}'
-            cycles[key] = RefinementViewCycle([str(c.image_name) for c in scene.cameras], args.seed,
-                scene.name, pi, progress['cycles'].get(key))
+        joint = phase['stage'] == 'joint'
+        tiers = range(1, layers+1) if joint else (phase['stage'],)
+        tier_phases[pi] = []
+        for tier in tiers:
+            # Match the frozen run's camera cycle seed for each tier/objective pair.
+            cycle_phase = 2*(tier-1)+pi if joint else (2*layers if args.three_tier_joint else pi)
+            tier_phases[pi].append((cycle_phase, dict(phase, stage=tier)))
+            for scene in train_scenes:
+                key = f'{cycle_phase}/{scene.name}'
+                cycles[key] = RefinementViewCycle([str(c.image_name) for c in scene.cameras], args.seed,
+                    scene.name, cycle_phase, progress['cycles'].get(key))
     perceptual = LPIPSEvaluator(device) if args.lpips else None
     if saved:
         restore_rng(saved['rng'])
@@ -333,23 +354,26 @@ def main(args, max_updates=None):
     def validation(label, layers):
         if label in progress['evaluated']:
             return
-        if args.three_tier_scratch:
+        if args.three_tier_scratch or args.three_tier_joint:
             print(f'Validation {label} at global step {progress["step"]}', flush=True)
         with preserved_rng(device):
             for scene in train_scenes:
                 rows = assess(model, scene, caches[scene.name]['batches'], args, out/'evaluation'/label/scene.name,
                               scope='validation', layers=layers, perceptual=perceptual)
-                if args.three_tier_scratch and rows:
+                if (args.three_tier_scratch or args.three_tier_joint) and rows:
                     awgn = {j: fmean(r['source_psnr'] for r in rows if r['path'] == 'awgn' and r['layer'] == j)
                             for j in layers}
                     details = ', '.join(
                         f'{j if j == "mixed" else model.layer_config.rates[j]}={value:.3f} dB'
                         for j, value in awgn.items())
-                    gain = f' | paired gain {awgn[layers[-1]]-awgn[layers[0]]:+.3f} dB' if len(layers) == 2 else ''
+                    gain = ''.join(f' | paired {model.layer_config.rates[a]}->{model.layer_config.rates[b]} '
+                                   f'{awgn[b]-awgn[a]:+.3f} dB' for a, b in zip(layers, layers[1:]))
                     print(f'{label} {scene.name} | AWGN mean PSNR {details}{gain}', flush=True)
         progress['evaluated'].append(label); checkpoint()
     for pi in range(progress['phase_index'], len(plan['schedule'])):
         phase = plan['schedule'][pi]
+        joint = phase['stage'] == 'joint'
+        tasks = tier_phases[pi]
         optimizer = configure_stage(model, phase['stage'], phase['lr'])
         if saved and saved['optimizer'] is not None and pi == progress['phase_index']:
             optimizer.load_state_dict(saved['optimizer'])
@@ -361,49 +385,66 @@ def main(args, max_updates=None):
         for step in range(progress['phase_step']+1, phase['steps']+1):
             index = (step-1) % len(train_scenes); scene = train_scenes[index]
             visit = (step-1)//len(train_scenes)+1
-            cycle = cycles[f'{pi}/{scene.name}']
-            cameras = [scene.cameras[i] for i in cycle.next(args.views_per_step)]
             optimizer.zero_grad(set_to_none=True)
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             started = time.perf_counter()
-            loss, metrics = train_update(model, scene, caches[scene.name], phase, visit, cameras, scales, args, index)
+            results = {}
+            for cycle_phase, task in tasks:
+                tier = task['stage']
+                cycle = cycles[f'{cycle_phase}/{scene.name}']
+                cameras = [scene.cameras[i] for i in cycle.next(args.views_per_step)]
+                loss, metrics = train_update(model, scene, caches[scene.name], task, visit, cameras, scales, args, index)
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f'nonfinite training loss at layer {tier}')
+                results[tier] = dict(loss=float(loss), views=[str(c.image_name) for c in cameras],
+                                     coverage=cycle.coverage(), **metrics)
+            if joint:
+                # Each tier computes its own full-scene VJP. Reuse .grad to avoid retaining three render graphs.
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(len(tasks))
+                metrics = dict(loss=fmean(r['loss'] for r in results.values()), tier_metrics=results)
+            else:
+                metrics = results[phase['stage']]
             norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
                                                  float('inf'), error_if_nonfinite=True)
-            if not torch.isfinite(loss):
-                raise RuntimeError('nonfinite training loss')
             optimizer.step()
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             progress['step'] += 1; progress['phase_step'] = step
             row = dict(step=progress['step'], phase=phase['phase'], layer=phase['stage'], phase_step=step,
-                scene=scene.name, loss=float(loss), grad_norm=float(norm), seconds=time.perf_counter()-started,
-                views=[str(c.image_name) for c in cameras], coverage=cycle.coverage(), **metrics)
+                scene=scene.name, grad_norm=float(norm), seconds=time.perf_counter()-started, **metrics)
             append_json(out/'metrics/loss.jsonl', row)
             if step == 1 or step % 10 == 0:
-                print(f'layer {phase["stage"]} {phase["phase"]} {step}/{phase["steps"]}: '
-                      f'{scene.name}, loss={float(loss):.7g}, views={len(cameras)}, sec={row["seconds"]:.2f}', flush=True)
+                label = 'joint' if joint else f'layer {phase["stage"]}'
+                detail = ', '.join(f'{model.layer_config.rates[tier]}={r["loss"]:.6g}'
+                                   for tier, r in results.items()) if joint else ''
+                print(f'{label} {phase["phase"]} {step}/{phase["steps"]}: {scene.name}, loss={row["loss"]:.7g}, '
+                      f'views={len(cameras)}, sec={row["seconds"]:.2f}'+(f' | {detail}' if detail else ''), flush=True)
             if step % args.save_every == 0 or step == phase['steps']:
                 if frozen_digest(model) != progress['frozen']:
                     raise RuntimeError('frozen semantic/prior channel layers changed')
                 checkpoint()
             if phase['phase'] != 'bootstrap' and step % args.validate_every == 0 and step != phase['steps']:
                 validation(f'monitor_{progress["step"]:06d}',
-                           ['mixed'] if phase['phase'] == 'neighbor' else [phase['stage']])
+                           ['mixed'] if phase['phase'] == 'neighbor' else list(results))
             if phase['phase'] == 'bootstrap' and step in plan.get('bootstrap_validation_steps', ()):
-                validation(f'layer_{phase["stage"]:02d}_bootstrap_{step:05d}', [phase['stage']])
+                label = 'joint' if joint else f'layer_{phase["stage"]:02d}'
+                validation(f'{label}_bootstrap_{step:05d}', list(results))
             executed += 1
             if max_updates is not None and executed >= max_updates:
                 checkpoint(); return dict(status='interrupted', step=progress['step'])
         if frozen_digest(model) != progress['frozen']:
             raise RuntimeError('completed phase changed frozen modules')
         if phase['phase'] != 'bootstrap':
-            checkpoint(f'layer_{phase["stage"]:02d}')
             stage = phase['stage']
-            checked = ['mixed'] if phase['phase'] == 'neighbor' else [stage]
+            label = 'joint_render' if joint else f'layer_{stage:02d}'
+            checkpoint(label)
+            checked = ['mixed'] if phase['phase'] == 'neighbor' else [task['stage'] for _, task in tasks]
             if args.three_tier_scratch and phase['phase'] == 'render' and stage > 1:
                 checked = [stage-1, stage]
-            validation(f'layer_{stage:02d}', checked)
+            validation(label, checked)
         progress.update(phase_index=pi+1, phase_step=0, frozen=None)
         optimizer = None; checkpoint()
     if state_digest(model.semantic.state_dict()) != plan['semantic_slot']['state_sha256']:
@@ -416,6 +457,8 @@ def main(args, max_updates=None):
                 actual=True, core_comparison=args.neighbor_steps > 0)
     complete = dict(status='complete', version=plan['version'], step=progress['step'], semantic_frozen_verified=True,
                     codec_id=model.identity(), rates=list(model.layer_config.rates), selection='fixed_final')
+    if args.three_tier_joint:
+        complete.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
     json_write(out/'complete.json', complete); write_review(out)
     print(json.dumps(complete), flush=True)
     return complete

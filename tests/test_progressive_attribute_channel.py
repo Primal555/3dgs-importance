@@ -90,6 +90,20 @@ def test_stage_optimizer_freezes_lower_layers_and_semantic(rates):
     assert all(n.startswith('neighbor.') for n, p in model.named_parameters() if p.requires_grad)
 
 
+def test_joint_highest_prefix_updates_every_channel_layer():
+    model, _, f, y, active = fixture(PRIVATE_ONLY, THREE_RATES)
+    optimizer = configure_stage(model, 'joint', 1e-3)
+    frozen = frozen_digest(model)
+    modules = [*model.encoders, *model.decoders]
+    before = [state_digest(module.state_dict()) for module in modules]
+    pred, yh, _ = model.forward_cached(f, y, active.long()*3, 10.)
+    ((yh[active]-y[active]).square().mean()+pred[active][:, 3:].square().mean()).backward()
+    optimizer.step()
+    assert all(state_digest(module.state_dict()) != digest for module, digest in zip(modules, before))
+    assert frozen_digest(model) == frozen
+    assert not model.neighbor_enabled
+
+
 @pytest.mark.parametrize('rates', [EIGHT_RATES, THREE_RATES])
 def test_packet_receiver_and_real_serialized_cost(tmp_path, rates):
     model, geometry, f, y, active = fixture('shared256', rates)
@@ -164,6 +178,12 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     assert three['bootstrap_validation_steps'] == [500, 2000, 4000, 8000]
     assert three['semantic_slot']['accepted'] == [PRIVATE_ONLY]
     assert not (tmp_path/'three').exists()
+    joint = entry.main(entry.parser().parse_args(['--out', str(tmp_path/'joint'), '--dry-run', '--three-tier-joint']))
+    assert joint['channel'] == three['channel'] and joint['total_updates'] == 8250
+    assert joint['supervision_per_tier'] == {'bootstrap': 8000, 'render': 250}
+    assert joint['trainable_prefixes'] == [8, 24, 48]
+    assert joint['bootstrap_validation_steps'] == three['bootstrap_validation_steps']
+    assert not (tmp_path/'joint').exists()
     semantic, _, _, _, _ = model_data()
     path = tmp_path/'early.pt'
     torch.save(dict(family='semantic_attribute_controls_v1', plan=dict(settings=dict(bootstrap_steps=2, render_steps=2)),
@@ -172,14 +192,16 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
         load_semantic_slot(path)
 
 
-@pytest.mark.parametrize('three', [False, True])
-def test_training_resume_across_layer_transition(tmp_path, three):
+@pytest.mark.parametrize('mode', ['eight', 'three-tier-scratch', 'three-tier-joint'])
+def test_training_resume_across_layer_transition(tmp_path, mode):
     # Real source loader, semantic weights, optimizer phases and renderer VJPs.
     # Final digital delivery is tested separately; this test avoids subprocesses.
     with patch('gaussian_jscc.rendering.render', side_effect=synthetic_render), \
          patch('gaussian_jscc.rendering.load_cameras', side_effect=cameras), \
          patch('comparison_baselines.run._execute'):
         source, held = build_fixture(tmp_path)
+        three = mode != 'eight'
+        joint = mode == 'three-tier-joint'
         arm = PRIVATE_ONLY if three else 'split128'
         semantic_args = options(source, held, tmp_path/'semantic', arm=arm)
         with patch.object(semantic_entry, 'diagnostic_plots'), patch.object(semantic_entry, 'write_plots'):
@@ -192,26 +214,43 @@ def test_training_resume_across_layer_transition(tmp_path, three):
                 [torch.where(ids >= 0, 1, 0) for ids in scene.group_ids], 10., 77)
             assert torch.isfinite(result).all()
             return []
-        def args(name):
+        def args(name, profile=mode):
             return entry.parser().parse_args(['--semantic-checkpoint', str(slot), '--out', str(tmp_path/name),
                 '--bootstrap-steps', '2', '--render-steps', '2', '--neighbor-steps', '0' if three else '2', '--hidden', '16',
                 '--views-per-step', '2', '--validate-every', '2', '--save-every', '1', '--trials', '1',
                 '--no-lpips', '--device', 'cpu', '--cpu-threads', '1', '--digital-python', sys.executable]
-                + (['--three-tier-scratch'] if three else []))
+                + (['--'+profile] if profile != 'eight' else []))
         with patch.object(entry, 'assess', side_effect=assessment):
             entry.main(args('full'))
             resumed = args('resumed')
-            entry.main(resumed, max_updates=5)  # Mid layer 2, after a fresh Adam transition.
+            entry.main(resumed, max_updates=3 if joint else 5)
             resumed.resume = True
             entry.main(resumed)
         a = torch.load(tmp_path/'full/checkpoints/latest.pt', weights_only=True)
         b = torch.load(tmp_path/'resumed/checkpoints/latest.pt', weights_only=True)
         for key in a['state']:
             torch.testing.assert_close(a['state'][key], b['state'][key], atol=0, rtol=0)
-        assert a['progress'] == b['progress'] and a['progress']['step'] == (12 if three else 34)
+        expected = {'eight': 34, 'three-tier-scratch': 12, 'three-tier-joint': 4}
+        assert a['progress'] == b['progress'] and a['progress']['step'] == expected[mode]
         assert not any(name == 'drjohnson' and scope == 'validation' for name, scope, _, _, _ in calls)
         assert any(name == 'drjohnson' and actual for name, _, actual, _, _ in calls)
-        if three:
+        if joint:
+            assert ('truck', 'validation', False, 'joint_bootstrap_00002', [1, 2, 3]) in calls
+            assert ('truck', 'validation', False, 'joint_render', [1, 2, 3]) in calls
+            def views(run):
+                path = tmp_path/run/'metrics/loss.jsonl'
+                result = {}
+                for row in map(json.loads, path.read_text().splitlines()):
+                    tier_metrics = row.get('tier_metrics', {str(row['layer']): row})
+                    result.update({(row['phase'], row['phase_step'], tier): item['views']
+                                   for tier, item in tier_metrics.items()})
+                return result
+            with patch.object(entry, 'assess', side_effect=assessment):
+                entry.main(args('frozen', 'three-tier-scratch'))
+            assert views('full') == views('frozen')
+            summary = json.loads((tmp_path/'full/review_summary.json').read_text())
+            assert summary['training_mode'] == 'joint_prefix_mean'
+        elif three:
             assert ('truck', 'validation', False, 'layer_02_bootstrap_00002', [2]) in calls
             assert ('truck', 'validation', False, 'layer_03', [2, 3]) in calls
         assert (tmp_path/'full/review.tar.gz').exists()
