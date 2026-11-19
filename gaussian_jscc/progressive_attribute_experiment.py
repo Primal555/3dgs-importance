@@ -22,6 +22,7 @@ from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewR
 from .progressive_attribute_channel import (EIGHT_FAMILY, EIGHT_RATES, THREE_RATES, LayerConfig,
     LayeredAttributeCodec, load_semantic_slot, configure_stage, frozen_digest, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
+from .progressive_attribute_supervision import WEIGHTS, fit_color_scales, grouped_objective
 from .refinement_views import RefinementViewCycle
 from .render_validation import append_json
 from .semantic_attribute_codec import PRIVATE_ONLY, fit_loss_scales
@@ -42,6 +43,8 @@ def parser():
                    help='8/24/48 symbols with frozen prefixes and a completed private128 semantic checkpoint')
     mode.add_argument('--three-tier-joint', action='store_true',
                    help='8/24/48 symbols with equally weighted joint channel training and frozen private128 semantics')
+    p.add_argument('--grouped-attribute-supervision', action='store_true',
+                   help='replace bootstrap latent loss with four weighted attribute losses in --three-tier-scratch')
     p.add_argument('--bootstrap-steps', type=int,
                    help='total per layer across training scenes (500 eight-tier, 8000 three-tier)')
     p.add_argument('--render-steps', type=int, default=250, help='total per layer')
@@ -82,6 +85,8 @@ def schedule(args, layers):
 
 
 def validate_settings(args):
+    if args.grouped_attribute_supervision and not args.three_tier_scratch:
+        raise ValueError('--grouped-attribute-supervision requires --three-tier-scratch')
     if min(args.bootstrap_steps, args.render_steps, args.views_per_step, args.validate_every,
            args.save_every, args.trials, args.cpu_threads, args.hidden) < 1 or args.neighbor_steps < 0:
         raise ValueError('positive training/view/interval counts required')
@@ -107,7 +112,8 @@ def prepare(args):
         total_updates=sum(phase['steps'] for phase in phases),
         semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
         settings={k: v for k, v in vars(args).items()
-                  if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint')},
+                  if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint',
+                               'grouped_attribute_supervision')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -121,6 +127,12 @@ def prepare(args):
             {v for v in (500, 2000, 4000, args.bootstrap_steps) if v <= args.bootstrap_steps})
         plan['budget_reference'] = 'old 8/24/48 main had 8000 noisy minibatch updates for each prefix'
         plan['prefix_training'] = 'freeze the semantic model and all channel layers except the current increment'
+    if args.grouped_attribute_supervision:
+        plan['bootstrap_objective'] = 'weighted normalized shape, opacity, base RGB and high-order directional RGB MSE'
+        plan['bootstrap_supervision'] = dict(mode='grouped_attributes_v1', latent_weight=0., target='source PLY',
+            weights_by_complex_symbols={str(cfg.rates[tier]): weights for tier, weights in WEIGHTS.items()},
+            scales='fixed train-scene attribute variance; spherical SH energy for high-order RGB',
+            directions='rotating training camera directions; SH degrees 1..3 only')
     if args.three_tier_joint:
         plan['training_mode'] = 'joint_prefix_mean'
         plan['prefix_training'] = 'freeze the semantic model; average the three prefix gradients before each channel update'
@@ -195,13 +207,19 @@ def sample_blocks(blocks, count, visit, seed):
     return data, active
 
 
-def batch_objective(model, scene, data, q, cameras, scales, args):
+def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tier=None):
     from .semantic_attribute_codec import attribute_objective
     f, y, active = data[..., :59], data[..., 59:], q > 0
     pred, yh, wire = model.forward_cached(f, y, q, args.snr)
+    directions = directions_for(scene, f, active, cameras)
+    if grouped_tier is not None:
+        raw = to_raw(pred[active], scene.geometry, model)
+        target = to_raw(f[active], scene.geometry, model)
+        loss, terms = grouped_objective(raw, target, directions, scales, grouped_tier)
+        latent = (yh[active].detach()-y[active]).square().mean()
+        return raw, loss, dict(terms, attributes=loss, latent=latent, transmitted_power=wire['transmitted_power'])
     latent = (yh[active]-y[active]).square().mean()
-    attrs, terms = attribute_objective(pred[active], f[active], scene.geometry, model,
-        directions_for(scene, f, active, cameras), scales)
+    attrs, terms = attribute_objective(pred[active], f[active], scene.geometry, model, directions, scales)
     auxiliary = args.latent_weight*latent+args.attribute_weight*attrs
     terms = dict(terms, latent=latent, attributes=attrs, transmitted_power=wire['transmitted_power'])
     return to_raw(pred[active], scene.geometry, model), auxiliary, terms
@@ -215,7 +233,9 @@ def train_update(model, scene, cache, phase, visit, cameras, scales, args, index
         data, active = sample_blocks(cache['blocks'], scene.record['blocks_per_batch'], visit,
                                      args.seed+index*1009+layer*100003)
         q = active.long()*layer
-        _, loss, terms = batch_objective(model, scene, data.to(device), q.to(device), cameras, scales, args)
+        grouped_tier = layer if args.grouped_attribute_supervision else None
+        _, loss, terms = batch_objective(model, scene, data.to(device), q.to(device), cameras, scales, args,
+                                        grouped_tier=grouped_tier)
         loss.backward()
         return loss.detach(), {k+'_loss': float(v.detach()) for k, v in terms.items()}
     layouts = layout_for(scene, 'mixed' if phase['phase'] == 'neighbor' else layer,
@@ -260,6 +280,8 @@ def write_review(out):
         cost_unit='complex_channel_use_per_delivery', selection='fixed_final')
     if 'training_mode' in plan:
         review.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
+    if 'bootstrap_supervision' in plan:
+        review['bootstrap_supervision'] = plan['bootstrap_supervision']
     json_write(out/'review_summary.json', review)
     temporary = out/'review.tmp.tar.gz'
     with tarfile.open(temporary, 'w:gz') as archive:
@@ -313,7 +335,10 @@ def main(args, max_updates=None):
             train_raws.append(raw)
         scene = make_scene(spec, raw, degree, model, scene_args, out, old=old)
         scenes.append(scene)
-    scales = fit_loss_scales(train_raws); del train_raws
+    scales = fit_loss_scales(train_raws)
+    if args.grouped_attribute_supervision:
+        scales.update(fit_color_scales(train_raws))
+    del train_raws
     if saved and scales != saved['loss_scales']:
         raise ValueError('training-only loss scales changed')
     json_write(out/'attribute_statistics.json', scales)
@@ -420,6 +445,8 @@ def main(args, max_updates=None):
                 label = 'joint' if joint else f'layer {phase["stage"]}'
                 detail = ', '.join(f'{model.layer_config.rates[tier]}={r["loss"]:.6g}'
                                    for tier, r in results.items()) if joint else ''
+                if 'high_order_rgb_loss' in row:
+                    detail = ', '.join(f'{name}={row[name+"_loss"]:.6g}' for name in WEIGHTS[phase['stage']])
                 print(f'{label} {phase["phase"]} {step}/{phase["steps"]}: {scene.name}, loss={row["loss"]:.7g}, '
                       f'views={len(cameras)}, sec={row["seconds"]:.2f}'+(f' | {detail}' if detail else ''), flush=True)
             if step % args.save_every == 0 or step == phase['steps']:
@@ -459,6 +486,8 @@ def main(args, max_updates=None):
                     codec_id=model.identity(), rates=list(model.layer_config.rates), selection='fixed_final')
     if args.three_tier_joint:
         complete.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
+    if args.grouped_attribute_supervision:
+        complete['bootstrap_supervision'] = plan['bootstrap_supervision']['mode']
     json_write(out/'complete.json', complete); write_review(out)
     print(json.dumps(complete), flush=True)
     return complete

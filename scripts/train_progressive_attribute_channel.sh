@@ -28,6 +28,10 @@ esac
 if [[ " $* " != *" --three-tier-joint "* ]]; then
   echo 'Train the current channel layer only. Earlier layers stay frozen.'
 fi
+if [[ " $* " == *" --grouped-attribute-supervision "* ]]; then
+  echo 'Bootstrap: tier-weighted shape, opacity, base RGB and high-order SH RGB. Latent MSE is reporting only.'
+  echo 'Render fine-tuning uses the original training objective.'
+fi
 echo '32 rotating training views; inherit original validation/test cameras and heldout scenes.'
 echo 'Final delivery verifies LDPC4096/6144 + 16QAM side files; all failures remain charged.'
 echo 'Download OUT/review.tar.gz. Resume: same arguments, RESUME=1 and same OUT.'

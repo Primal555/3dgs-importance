@@ -13,6 +13,7 @@ from .digital_side_delivery import transmit_sides
 from .modular_experiment import json_write
 from .position_delivery import delivered_positions
 from .progressive_attribute_packet import export_packet, receive_packet
+from .progressive_attribute_supervision import assess_attributes
 from .render_objective import image_metrics
 from .semantic_attribute_metrics import save_image
 
@@ -94,6 +95,8 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
         clean, _ = decode_cached(model, scene, cached, layout_for(scene, 1, args.seed), args.snr,
                                  args.seed+1000, clean=True)
         clean_metrics = render_metrics(clean, model, scene, cameras, perceptual)
+        if args.grouped_attribute_supervision:
+            clean_metrics['attribute_errors'] = assess_attributes(clean, scene.raw, cameras, next(model.parameters()).device)
         clean_cache[scope] = clean_metrics
         scene._progressive_clean_metrics = clean_cache
         del clean
@@ -128,6 +131,9 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
                         packet_max_error=float((packet_raw-raw).abs().max()),
                         **render_metrics(packet_raw, model, scene, cameras, perceptual,
                             folder/'images' if scope == 'test' and trial == 0 and path == 'awgn' else None))
+                    if args.grouped_attribute_supervision:
+                        row['attribute_errors'] = assess_attributes(packet_raw, scene.raw, cameras,
+                                                                    next(model.parameters()).device)
                     if actual and path == 'awgn':
                         config = LinkConfig(device=args.digital_device)
                         def runner(src, dst, report, link_seed):

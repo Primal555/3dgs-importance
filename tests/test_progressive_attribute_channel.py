@@ -19,6 +19,7 @@ from gaussian_jscc.progressive_attribute_channel import (EIGHT_RATES, THREE_RATE
     configure_stage, frozen_digest, state_digest, load_semantic_slot)
 from gaussian_jscc.progressive_attribute_packet import export_packet, receive_packet
 from gaussian_jscc.progressive_attribute_evaluation import decode_cached, assess
+from gaussian_jscc.progressive_attribute_supervision import FIELDS, WEIGHTS, attribute_errors, fit_color_scales
 from gaussian_jscc.semantic_attribute_codec import PRIVATE_ONLY, fit_loss_scales
 from gaussian_jscc.training import full_scene_step
 from gaussian_jscc.perceptual_objective import PerceptualImageObjective, PerceptualMultiViewRenderTask
@@ -169,6 +170,39 @@ def test_full_scene_replay_gradient_matches_direct():
     torch.testing.assert_close(gradients[0], gradients[1], atol=2e-6, rtol=2e-4)
 
 
+def test_grouped_bootstrap_decouples_rgb_and_excludes_latent_loss():
+    model, geometry, f, y, active = fixture(PRIVATE_ONLY, THREE_RATES)
+    source = to_raw(f[active], geometry, model)
+    candidate = source.clone()
+    candidate[:, 11:14] += .1
+    candidate[:, 7:11] *= -1
+    directions = torch.nn.functional.normalize(torch.randn(len(source), 4, 3), dim=-1)
+    errors = attribute_errors(candidate, source, directions)
+    assert all((errors[key] == 0).all() for key in ('shape', 'opacity', 'high_order_rgb'))
+    assert (errors['base_rgb'] > 0).all()
+    candidate[:, 11:14] = source[:, 11:14]
+    candidate[:, 14:] += .1
+    errors = attribute_errors(candidate, source, directions)
+    assert (errors['base_rgb'] == 0).all() and (errors['high_order_rgb'] > 0).all()
+
+    args = entry.parser().parse_args(['--out', 'unused', '--three-tier-scratch', '--grouped-attribute-supervision'])
+    scales = dict(fit_loss_scales([source]), **fit_color_scales([source]))
+    views = cameras('', split='train')[:2]
+    scene = SimpleNamespace(geometry=geometry)
+    configure_stage(model, 1, 1e-4)
+    old = frozen_digest(model)
+    data, tiers = torch.cat((f, y), dim=-1), active.long()
+    torch.manual_seed(7)
+    _, loss, terms = entry.batch_objective(model, scene, data, tiers, views, scales, args, grouped_tier=1)
+    assert not terms['latent'].requires_grad
+    torch.testing.assert_close(loss, sum(WEIGHTS[1][key] * terms[key] for key in FIELDS))
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.encoders[0].parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.decoders[0].parameters())
+    assert frozen_digest(model) == old
+    assert all(p.grad is None for p in model.semantic.parameters())
+
+
 def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     args = entry.parser().parse_args(['--out', str(tmp_path/'absent'), '--dry-run'])
     plan = entry.main(args)
@@ -184,6 +218,12 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     assert joint['trainable_prefixes'] == [8, 24, 48]
     assert joint['bootstrap_validation_steps'] == three['bootstrap_validation_steps']
     assert not (tmp_path/'joint').exists()
+    grouped = entry.main(entry.parser().parse_args(['--out', str(tmp_path/'grouped'), '--dry-run',
+        '--three-tier-scratch', '--grouped-attribute-supervision']))
+    assert all(grouped[key] == three[key] for key in ('channel', 'schedule', 'settings', 'objective', 'cost_protocol'))
+    assert grouped['bootstrap_supervision']['latent_weight'] == 0.
+    assert grouped['bootstrap_supervision']['weights_by_complex_symbols'] == {
+        str(symbols): WEIGHTS[i] for i, symbols in enumerate((8, 24, 48), 1)}
     semantic, _, _, _, _ = model_data()
     path = tmp_path/'early.pt'
     torch.save(dict(family='semantic_attribute_controls_v1', plan=dict(settings=dict(bootstrap_steps=2, render_steps=2)),
@@ -192,7 +232,7 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
         load_semantic_slot(path)
 
 
-@pytest.mark.parametrize('mode', ['eight', 'three-tier-scratch', 'three-tier-joint'])
+@pytest.mark.parametrize('mode', ['eight', 'three-tier-scratch', 'three-tier-joint', 'grouped-attribute-supervision'])
 def test_training_resume_across_layer_transition(tmp_path, mode):
     # Real source loader, semantic weights, optimizer phases and renderer VJPs.
     # Final digital delivery is tested separately; this test avoids subprocesses.
@@ -215,11 +255,14 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             assert torch.isfinite(result).all()
             return []
         def args(name, profile=mode):
+            flags = [] if profile == 'eight' else ['--'+profile]
+            if profile == 'grouped-attribute-supervision':
+                flags.append('--three-tier-scratch')
             return entry.parser().parse_args(['--semantic-checkpoint', str(slot), '--out', str(tmp_path/name),
                 '--bootstrap-steps', '2', '--render-steps', '2', '--neighbor-steps', '0' if three else '2', '--hidden', '16',
                 '--views-per-step', '2', '--validate-every', '2', '--save-every', '1', '--trials', '1',
                 '--no-lpips', '--device', 'cpu', '--cpu-threads', '1', '--digital-python', sys.executable]
-                + (['--'+profile] if profile != 'eight' else []))
+                + flags)
         with patch.object(entry, 'assess', side_effect=assessment):
             entry.main(args('full'))
             resumed = args('resumed')
@@ -230,7 +273,7 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
         b = torch.load(tmp_path/'resumed/checkpoints/latest.pt', weights_only=True)
         for key in a['state']:
             torch.testing.assert_close(a['state'][key], b['state'][key], atol=0, rtol=0)
-        expected = {'eight': 34, 'three-tier-scratch': 12, 'three-tier-joint': 4}
+        expected = {'eight': 34, 'three-tier-scratch': 12, 'three-tier-joint': 4, 'grouped-attribute-supervision': 12}
         assert a['progress'] == b['progress'] and a['progress']['step'] == expected[mode]
         assert not any(name == 'drjohnson' and scope == 'validation' for name, scope, _, _, _ in calls)
         assert any(name == 'drjohnson' and actual for name, _, actual, _, _ in calls)
@@ -253,6 +296,10 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
         elif three:
             assert ('truck', 'validation', False, 'layer_02_bootstrap_00002', [2]) in calls
             assert ('truck', 'validation', False, 'layer_03', [2, 3]) in calls
+        if mode == 'grouped-attribute-supervision':
+            rows = [json.loads(line) for line in (tmp_path/'full/metrics/loss.jsonl').read_text().splitlines()]
+            assert all(('high_order_rgb_loss' in row) == (row['phase'] == 'bootstrap') for row in rows)
+            assert json.loads((tmp_path/'full/complete.json').read_text())['bootstrap_supervision'] == 'grouped_attributes_v1'
         assert (tmp_path/'full/review.tar.gz').exists()
 
 
@@ -270,7 +317,8 @@ def test_evaluation_received_files_and_failed_cost(tmp_path, failed, rates, laye
     scene = SimpleNamespace(name='tiny', geometry=geometry, groups=[f], group_ids=[ids],
         raw=raw, test_cameras=views, degree=3, white_background=False, reference=Reference(raw))
     args = entry.parser().parse_args(['--out', str(tmp_path), '--device', 'cpu',
-                                     '--digital-device', 'cpu', '--trials', '1'])
+                                     '--digital-device', 'cpu', '--trials', '1']
+                                     + (['--three-tier-scratch', '--grouped-attribute-supervision'] if rates == THREE_RATES else []))
     calls = []
     def execute(python, module, arguments, log):
         assert module == 'comparison_baselines.digital_link'
@@ -291,6 +339,9 @@ def test_evaluation_received_files_and_failed_cost(tmp_path, failed, rates, laye
             tmp_path/'evaluation/final/tiny', scope='test', layers=[layer], actual=True)
     assert calls == ['xyz.bin', 'metadata.bin', 'scales.bin']
     row = next(r for r in rows if r['path'] == 'awgn')
+    if rates == THREE_RATES:
+        assert row['attribute_errors']['points'] == int(active.sum())
+        assert set(row['attribute_errors']['mse']) == set(FIELDS)
     delivered = row['actual_delivery']
     assert delivered['status'] == ('failed' if failed else 'success')
     assert (delivered['metrics'] is None) == failed

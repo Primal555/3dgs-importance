@@ -170,20 +170,27 @@ def log_shape(raw):
     return (rotation * (2*raw[:, 4:7])[:, None, :]) @ rotation.transpose(-1, -2)
 
 
+def shape_opacity_errors(pred, target):
+    return {
+        'shape': (log_shape(pred)-log_shape(target)).square().mean((-1, -2)),
+        'opacity': (pred[:, 3].sigmoid()-target[:, 3].sigmoid()).square(),
+    }
+
+
 def error_rows(pred, target, model, directions):
     """Independent physical/group errors, one row per active Gaussian."""
     from utils.sh_utils import eval_sh
     p, t = pred[:, 3:], target[:, 3:]
     standardized = (p-t) / model.attr_std
-    shape = (log_shape(pred)-log_shape(target)).square().mean((-1, -2))
+    geometry = shape_opacity_errors(pred, target)
 
     def color(raw):
         sh = torch.cat((raw[:, 11:14, None], raw[:, 14:].reshape(-1, 3, 15)), -1)
         dirs = directions if directions.ndim == 3 else directions[None]
         return eval_sh(3, sh[:, None], dirs) + .5
 
-    return {'opacity': (p[:, 0].sigmoid()-t[:, 0].sigmoid()).square(),
-            'shape': shape, 'dc': standardized[:, 8:11].square().mean(-1),
+    return {'opacity': geometry['opacity'], 'shape': geometry['shape'],
+            'dc': standardized[:, 8:11].square().mean(-1),
             'sh': standardized[:, 11:].square().mean(-1),
             'direction_rgb': (color(pred)-color(target)).square().mean((-1, -2))}
 
