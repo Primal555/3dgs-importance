@@ -1,4 +1,4 @@
-"""Eight-tier packet boundary and actual three-file digital side accounting."""
+"""Progressive packet boundary and actual three-file digital side accounting."""
 from pathlib import Path
 import json
 import struct
@@ -7,20 +7,17 @@ import numpy as np
 import torch
 
 from comparison_baselines.side_information_accounting import side_information_cost
-from .codec import unpack, channel
+from .codec import unpack
 from .data import Geometry, to_raw
 from .position_delivery import encode_positions, decode_positions
 from .successive_delivery_packet import batch_layout, pad_rows
 from .transport import encode_metadata, decode_metadata
 
-PROTOCOL = 'progressive_attribute_eight_v1'
-
-
 def present_scales(q):
     return torch.stack([(q >= j).any(1) for j in range(1, int(q.max())+1)], 1)
 
 
-def scale_frame(scales, q):
+def scale_frame(scales, q, *, magic=b'SCE8'):
     present = present_scales(q)
     if scales.shape != present.shape:
         raise ValueError('scale shape mismatch')
@@ -28,13 +25,13 @@ def scale_frame(scales, q):
     if (not torch.isfinite(values).all() or (values <= 0).any() or
             not torch.equal(values, values.half().float())):
         raise ValueError('binary16 positive scales required')
-    return b'SCE8'+struct.pack('<I', len(values))+values.numpy().astype('<f2').tobytes()
+    return magic+struct.pack('<I', len(values))+values.numpy().astype('<f2').tobytes()
 
 
-def read_scale_frame(data, q):
+def read_scale_frame(data, q, *, magic=b'SCE8'):
     present = present_scales(q)
     count = int(present.sum())
-    if len(data) != 8+2*count or data[:4] != b'SCE8' or struct.unpack('<I', data[4:8])[0] != count:
+    if len(data) != 8+2*count or data[:4] != magic or struct.unpack('<I', data[4:8])[0] != count:
         raise ValueError('scale framing mismatch')
     values = torch.from_numpy(np.frombuffer(data[8:], dtype='<f2').astype(np.float32).copy()).to(q.device)
     if not torch.isfinite(values).all() or (values <= 0).any():
@@ -55,7 +52,9 @@ def export_packet(model, scene, cached, layouts, snr, seed, out, *, noiseless=Fa
         raise ValueError('packet groups differ from original semantic blocks')
     qs = torch.cat([q[ids >= 0].cpu() for q, ids in zip(layouts, scene.group_ids)])
     units = torch.cat([f[..., :3][ids >= 0] for f, ids in zip(cached, scene.group_ids)]).to(device)
-    header = dict(packet_protocol=PROTOCOL, model_id=model.identity(),
+    cfg = model.layer_config
+    magic = f'SCE{cfg.layer_count}'.encode('ascii')
+    header = dict(packet_protocol=cfg.family, model_id=model.identity(),
         config=dict(rates=list(model.layer_config.rates)),
         semantic_config=model.cfg.to_dict(), channel_config=model.layer_config.to_dict(),
         arm=model.semantic.arm, count=int((qs > 0).sum()), source_count=len(qs),
@@ -69,12 +68,10 @@ def export_packet(model, scene, cached, layouts, snr, seed, out, *, noiseless=Fa
     for data, q in zip(cached, layouts):
         data, q = data.to(device), q.to(device)
         z, gains = model.encode(data[..., 59:], q, snr)
-        noise = channel(z.new_zeros(*q.shape, 64, 2), snr,
-                        'none' if noiseless else 'awgn', generator).flatten(-2)
-        r = z + noise[..., :z.shape[-1]]
-        mask = torch.arange(r.shape[-1], device=device) < q[..., None]*16
+        r = model.transmit(z, snr, noiseless=noiseless, generator=generator)
+        mask = model.symbol_mask(q, r.shape[-1])
         payload.append(r[mask].reshape(-1, 2).cpu())
-        frames.append(scale_frame(gains, q))
+        frames.append(scale_frame(gains, q, magic=magic))
     symbols = torch.cat(payload)
     np.save(out/'received.npy', symbols.numpy(), allow_pickle=False)
     (out/'scales.bin').write_bytes(b''.join(frames))
@@ -88,9 +85,11 @@ def receive_packet(model, packet):
     """The receiver accepts only shared weights and the received packet files."""
     packet = Path(packet)
     h, q = decode_metadata((packet/'metadata.bin').read_bytes())
-    expected = json.loads(json.dumps(model.layer_config.to_dict()))
-    if (h.get('packet_protocol') != PROTOCOL or h['model_id'] != model.identity() or
+    cfg = model.layer_config
+    expected = json.loads(json.dumps(cfg.to_dict()))
+    if (h.get('packet_protocol') != cfg.family or h['model_id'] != model.identity() or
             h['channel_config'] != expected or h['semantic_config'] != json.loads(json.dumps(model.cfg.to_dict())) or
+            h['config']['rates'] != list(cfg.rates) or
             h['arm'] != model.semantic.arm or h['neighbor'] != bool(model.neighbor_enabled) or
             h['block_size'] != model.cfg.block_size):
         raise ValueError('receiver model/packet identity mismatch')
@@ -99,21 +98,23 @@ def receive_packet(model, packet):
     model.eval(); model.set_scene_geometry(geometry)
     side = decode_positions((packet/'xyz.bin').read_bytes(), q.to(device), model.cfg)
     symbols = np.load(packet/'received.npy', mmap_mode='r', allow_pickle=False)
-    total = int(torch.tensor(model.layer_config.rates)[q].sum())
+    rates = torch.tensor(cfg.rates)
+    total = int(rates[q].sum())
     if symbols.dtype != np.float32 or symbols.shape != (total, 2) or not np.isfinite(symbols).all():
         raise ValueError('invalid analogue payload')
     scales = (packet/'scales.bin').read_bytes()
+    magic = f'SCE{cfg.layer_count}'.encode('ascii')
     rows = []; offset = symbol_offset = scale_offset = 0
     for lengths in batch_layout(len(q), model.cfg.block_size, h['blocks_per_batch']):
         n = sum(lengths)
         tiers = pad_rows(q[offset:offset+n], lengths).to(device)
         xyz = pad_rows(side[offset:offset+n], lengths)
-        count = int(tiers.sum())*8
+        count = int(rates[q[offset:offset+n]].sum())
         length = 8+2*int(present_scales(tiers).sum())
-        gains = read_scale_frame(scales[scale_offset:scale_offset+length], tiers)
+        gains = read_scale_frame(scales[scale_offset:scale_offset+length], tiers, magic=magic)
         z = torch.from_numpy(np.array(symbols[symbol_offset:symbol_offset+count], copy=True)).to(device)
-        signal = unpack(z, tiers.flatten(), model.layer_config.rates).reshape(*tiers.shape, 128)
-        y, _ = model.receive(signal[..., :16*int(tiers.max())], gains, tiers, xyz, h['snr_db'])
+        signal = unpack(z, tiers.flatten(), cfg.rates).reshape(*tiers.shape, model.prefix_widths[-1])
+        y, _ = model.receive(signal[..., :model.prefix_widths[int(tiers.max())]], gains, tiers, xyz, h['snr_db'])
         pred = model.semantic.decode(y, tiers > 0, xyz)
         rows.append(to_raw(pred[tiers > 0], geometry, model).cpu())
         offset += n; symbol_offset += count; scale_offset += length

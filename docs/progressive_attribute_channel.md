@@ -88,3 +88,28 @@ tail -n 40 -F "${OUT}.log"
 断点续训使用同一SEMANTIC、OUT及原参数，将 `RESUME=0` 改为 `RESUME=1`。输入数据迁移时，可通过 `--manifest` 指定新路径，点云指纹与相机划分必须相符。若数字环境位置不同，设置 `DIGITAL_PYTHON`。
 
 正式训练前会在实际运行设备检查八档前缀一致性、发送／接收封包还原一致性，并执行数字链路30 dB自检。实际测试SNR使用实验设置，默认为10 dB。
+
+## 三档从头训练
+
+使用 `--three-tier-scratch` 训练累计 **8／24／48** 复符号，三个阶段分别新增 **8／16／24** 个复符号。读取无共享语义组 `split_g40_dc16_sh72_128` 的固定末步权重，整个语义模型保持冻结。三层信道模块从随机权重启动，每阶段仅更新当前层的发送和接收网络，阶段切换使用新 Adam。训练按照原有的方式在发射功率归一化后加入 10 dB AWGN，并沿用八档组的训练目标、相机轮换和二进制侧信息计费协议。
+
+| 每档训练预算 | 全部训练场景合计 | 默认每个训练场景 |
+| --- | ---: | ---: |
+| latent 与属性恢复，学习率 1e-4 | 8000 步 | 4000 步 |
+| 32 视角渲染微调，学习率 1e-5 | 250 步 | 125 步 |
+
+三档共 **24 750 步**，其中 750 步执行多视角渲染反向传播。8000 步参考旧 8／24／48 主干中每个前缀获得的监督次数。旧组集中在 Truck，本组由 Truck 和 Playroom 平分更新。默认邻域修复为 0 步，直接观察主干。DrJohnson 仅参与最终测试。
+
+每档在属性阶段的第 500、2000、4000、8000 步使用原验证相机统计 AWGN 四次均值和无噪声结果。每档渲染微调结束后，对当前档及可用的上一档进行配对比较。预算曲线用于判断同一档在延长训练后是否改善。三档与八档之间的直接差异也包含符号划分的变化。
+
+```bash
+SEMANTIC="$PWD/output/semantic_private128_gpu3_20261119_082002/split_g40_dc16_sh72_128/checkpoints/final.pt"
+GPU=3
+OUT="$PWD/output/progressive_three_scratch_gpu${GPU}_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES="$GPU" nohup bash scripts/train_progressive_attribute_channel.sh \
+  "$SEMANTIC" "$OUT" --three-tier-scratch >"${OUT}.log" 2>&1 &
+printf '%s\n' "$!" >"${OUT}.pid"
+tail -n 40 -F "${OUT}.log"
+```
+
+默认每 250 步写入 `latest.pt`，保留每个档位的固定末步权重。启动时检查 3 个前缀的符号与尺度一致性，以及接收端封包还原。最终测试按实际属性符号数与序列化侧信息计费，执行 LDPC、16QAM 和 AWGN 验证。结果见 `OUT/review.tar.gz`。续训使用原目录、原参数和 `RESUME=1`。

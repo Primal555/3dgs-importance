@@ -17,10 +17,10 @@ from .render_objective import image_metrics
 from .semantic_attribute_metrics import save_image
 
 
-def layout_for(scene, layer, seed):
+def layout_for(scene, layer, seed, *, layers=8):
     # Draw once in Morton order: evaluation layouts survive batching changes.
     g = torch.Generator().manual_seed(seed)
-    values = (torch.randint(1, 9, (len(scene.raw),), generator=g) if layer == 'mixed'
+    values = (torch.randint(1, layers+1, (len(scene.raw),), generator=g) if layer == 'mixed'
               else torch.full((len(scene.raw),), int(layer), dtype=torch.long))
     rows, offset = [], 0
     for ids in scene.group_ids:
@@ -37,6 +37,7 @@ def decode_cached(model, scene, cached, layouts, snr, seed, *, noiseless=False, 
     generator = torch.Generator(device=device).manual_seed(seed)
     model.eval(); model.set_scene_geometry(scene.geometry)
     rows, squared, count, energy, symbols = [], 0., 0, 0., 0
+    rates = torch.as_tensor(model.layer_config.rates, device=device)
     for data, q in zip(cached, layouts):
         data, q = data.to(device), q.to(device)
         f, y, active = data[..., :59], data[..., 59:], q > 0
@@ -46,7 +47,7 @@ def decode_cached(model, scene, cached, layouts, snr, seed, *, noiseless=False, 
         else:
             pred, yh, wire = model.forward_cached(f, y, q, snr, noiseless=noiseless,
                                                   generator=generator, neighbor=neighbor)
-            n = int(q.sum())*8
+            n = int(rates[q].sum())
             energy += float(wire['transmitted_power'])*n; symbols += n
         squared += float((yh[active]-y[active]).square().sum()); count += int(active.sum())*y.shape[-1]
         rows.append(to_raw(pred[active], scene.geometry, model).cpu())
@@ -87,13 +88,19 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
     rows = []
     identity = model.identity()
     # The semantic reference is identical at every layer endpoint.
-    clean, _ = decode_cached(model, scene, cached, layout_for(scene, 1, args.seed), args.snr,
-                             args.seed+1000, clean=True)
-    clean_metrics = render_metrics(clean, model, scene, cameras, perceptual)
+    clean_cache = getattr(scene, '_progressive_clean_metrics', {})
+    clean_metrics = clean_cache.get(scope)
+    if clean_metrics is None:
+        clean, _ = decode_cached(model, scene, cached, layout_for(scene, 1, args.seed), args.snr,
+                                 args.seed+1000, clean=True)
+        clean_metrics = render_metrics(clean, model, scene, cameras, perceptual)
+        clean_cache[scope] = clean_metrics
+        scene._progressive_clean_metrics = clean_cache
+        del clean
     json_write(out/'clean.json', dict(scene=scene.name, scope=scope, **clean_metrics))
-    del clean
     for layer in layers:
-        layouts = layout_for(scene, layer, args.seed+700001)
+        layouts = layout_for(scene, layer, args.seed+700001, layers=model.layer_config.layer_count)
+        symbols = layer if layer == 'mixed' else model.layer_config.rates[layer]
         for path in ('finite_noiseless', 'awgn'):
             trials = 1 if path == 'finite_noiseless' else args.trials
             for trial in range(trials):
@@ -150,7 +157,7 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
                             noiseless=path == 'finite_noiseless', neighbor=False)
                         row['core_metrics'] = render_metrics(core, model, scene, cameras, perceptual)
                 json_write(result, row); rows.append(row)
-                print(f'{scope} {scene.name} k={layer if layer == "mixed" else 8*int(layer)} '
+                print(f'{scope} {scene.name} k={symbols} '
                       f'{path} trial={trial}: PSNR={row["source_psnr"]:.4f}, '
                       f'photo={row["photo_psnr"]:.4f}, cost={cost["total_channel_uses"]/1e6:.5f}M', flush=True)
     json_write(out/'summary.json', dict(rows=rows, clean=clean_metrics, scope=scope,

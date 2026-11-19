@@ -1,9 +1,10 @@
-"""Fresh eight-layer channel training with a pluggable completed semantic model."""
+"""Fresh progressive channel training with a frozen completed semantic model."""
 import argparse
 import hashlib
 import json
 import math
 from pathlib import Path
+from statistics import fmean
 import tarfile
 import time
 
@@ -18,17 +19,17 @@ from .multiscene import manifest
 from .optimization import preserved_rng
 from .perceptual_metrics import LPIPSEvaluator
 from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewRenderTask
-from .progressive_attribute_channel import (LayerConfig, LayeredAttributeCodec, load_semantic_slot,
-    configure_stage, frozen_digest, state_digest)
+from .progressive_attribute_channel import (EIGHT_FAMILY, EIGHT_RATES, THREE_RATES, LayerConfig,
+    LayeredAttributeCodec, load_semantic_slot, configure_stage, frozen_digest, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
 from .refinement_views import RefinementViewCycle
 from .render_validation import append_json
-from .semantic_attribute_codec import fit_loss_scales
+from .semantic_attribute_codec import PRIVATE_ONLY, fit_loss_scales
 from .semantic_attribute_metrics import directions_for
 from .successive_multiscene_inputs import make_scene
 from .training import full_scene_step
 
-FAMILY = 'progressive_attribute_eight_v1'
+FAMILY = EIGHT_FAMILY
 
 
 def parser():
@@ -36,9 +37,13 @@ def parser():
     p.add_argument('--semantic-checkpoint', help='completed semantic attribute codec final.pt; required to train')
     p.add_argument('--out', required=True)
     p.add_argument('--manifest', help='relocated PLY/photo paths; scene fingerprints and camera split must match')
-    p.add_argument('--bootstrap-steps', type=int, default=500, help='total per layer, alternating source training scenes')
+    p.add_argument('--three-tier-scratch', action='store_true',
+                   help='8/24/48 symbols with frozen prefixes and a completed private128 semantic checkpoint')
+    p.add_argument('--bootstrap-steps', type=int,
+                   help='total per layer across training scenes (500 eight-tier, 8000 three-tier)')
     p.add_argument('--render-steps', type=int, default=250, help='total per layer')
-    p.add_argument('--neighbor-steps', type=int, default=200, help='mixed-layout receiver-only updates after all eight layers; 0 skips')
+    p.add_argument('--neighbor-steps', type=int,
+                   help='mixed-layout receiver-only updates (200 eight-tier, 0 three-tier)')
     p.add_argument('--bootstrap-lr', type=float, default=1e-4)
     p.add_argument('--render-lr', type=float, default=1e-5)
     p.add_argument('--neighbor-lr', type=float, default=1e-5)
@@ -48,7 +53,7 @@ def parser():
     p.add_argument('--hidden', type=int, default=256)
     p.add_argument('--views-per-step', type=int, default=32)
     p.add_argument('--validate-every', type=int, default=250)
-    p.add_argument('--save-every', type=int, default=50)
+    p.add_argument('--save-every', type=int, help='latest checkpoint interval (50 eight-tier, 250 three-tier)')
     p.add_argument('--trials', type=int, default=4)
     p.add_argument('--snr', type=float, default=10.)
     p.add_argument('--seed', type=int, default=42)
@@ -62,13 +67,13 @@ def parser():
     return p
 
 
-def schedule(args):
+def schedule(args, layers):
     rows = []
-    for layer in range(1, 9):
+    for layer in range(1, layers+1):
         rows.extend([dict(stage=layer, phase='bootstrap', steps=args.bootstrap_steps, lr=args.bootstrap_lr),
                      dict(stage=layer, phase='render', steps=args.render_steps, lr=args.render_lr)])
     if args.neighbor_steps:
-        rows.append(dict(stage=9, phase='neighbor', steps=args.neighbor_steps, lr=args.neighbor_lr))
+        rows.append(dict(stage=layers+1, phase='neighbor', steps=args.neighbor_steps, lr=args.neighbor_lr))
     return rows
 
 
@@ -84,11 +89,20 @@ def validate_settings(args):
 
 
 def prepare(args):
+    three = args.three_tier_scratch
+    if args.bootstrap_steps is None:
+        args.bootstrap_steps = 8000 if three else 500
+    if args.neighbor_steps is None:
+        args.neighbor_steps = 0 if three else 200
+    if args.save_every is None:
+        args.save_every = 250 if three else 50
     validate_settings(args)
-    plan = dict(version=FAMILY, channel=LayerConfig(hidden=args.hidden).to_dict(), schedule=schedule(args),
-        total_updates=8*(args.bootstrap_steps+args.render_steps)+args.neighbor_steps,
+    cfg = LayerConfig(rates=THREE_RATES if three else EIGHT_RATES, hidden=args.hidden)
+    plan = dict(version=cfg.family, channel=cfg.to_dict(), schedule=schedule(args, cfg.layer_count),
+        total_updates=cfg.layer_count*(args.bootstrap_steps+args.render_steps)+args.neighbor_steps,
         semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
-        settings={k: v for k, v in vars(args).items() if k not in ('resume', 'dry_run', 'out', 'device')},
+        settings={k: v for k, v in vars(args).items()
+                  if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -96,9 +110,16 @@ def prepare(args):
         selection='fixed final; validation reports only; tests never select weights',
         cost_protocol='digital_side_file_v1; actual LDPC4096/6144 + 16QAM; no ARQ',
         cache='frozen semantic latents in CPU RAM, rebuilt on resume; never cache noisy receiver outputs')
+    if three:
+        plan['semantic_slot']['accepted'] = [PRIVATE_ONLY]
+        plan['bootstrap_validation_steps'] = sorted(
+            {v for v in (500, 2000, 4000, args.bootstrap_steps) if v <= args.bootstrap_steps})
+        plan['budget_reference'] = 'old 8/24/48 main had 8000 noisy minibatch updates for each prefix'
+        plan['prefix_training'] = 'freeze the semantic model and all channel layers except the current increment'
     if args.dry_run and not args.semantic_checkpoint:
-        from .semantic_attribute_codec import SPLIT128_LAYOUTS
-        plan['semantic_slot']['accepted'].extend(SPLIT128_LAYOUTS)
+        if not three:
+            from .semantic_attribute_codec import SPLIT128_LAYOUTS
+            plan['semantic_slot']['accepted'].extend(SPLIT128_LAYOUTS)
         return None, None, json.loads(json.dumps(plan))
     if not args.semantic_checkpoint:
         raise ValueError('set --semantic-checkpoint after the semantic experiment finishes')
@@ -107,6 +128,8 @@ def prepare(args):
     if out.is_relative_to(source.parent) or source.is_relative_to(out):
         raise ValueError('channel output must be separate from the semantic checkpoint')
     semantic, saved = load_semantic_slot(source)
+    if three and semantic.arm != PRIVATE_ONLY:
+        raise ValueError(f'three-tier scratch requires {PRIVATE_ONLY}/checkpoints/final.pt')
     if semantic.arm not in plan['semantic_slot']['accepted']:
         plan['semantic_slot']['accepted'].append(semantic.arm)
     plan['semantic_slot'].update(arm=semantic.arm, latent_dim=semantic.cfg.latent_dim,
@@ -185,7 +208,8 @@ def train_update(model, scene, cache, phase, visit, cameras, scales, args, index
         _, loss, terms = batch_objective(model, scene, data.to(device), q.to(device), cameras, scales, args)
         loss.backward()
         return loss.detach(), {k+'_loss': float(v.detach()) for k, v in terms.items()}
-    layouts = layout_for(scene, 'mixed' if layer == 9 else layer, args.seed+visit*1009+index)
+    layouts = layout_for(scene, 'mixed' if phase['phase'] == 'neighbor' else layer,
+                         args.seed+visit*1009+index, layers=model.layer_config.layer_count)
     objective = PerceptualImageObjective('mse_ssim', args.ssim_weight, device)
     task = PerceptualMultiViewRenderTask(cameras, scene.reference, scene.degree, scene.white_background, objective)
     def forward(data, q):
@@ -198,7 +222,7 @@ def train_update(model, scene, cache, phase, visit, cameras, scales, args, index
 def save(path, model, optimizer, progress, plan, scales):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.tmp')
-    torch.save(dict(family=FAMILY, plan=plan, state=model.state_dict(),
+    torch.save(dict(family=plan['version'], plan=plan, state=model.state_dict(),
         optimizer=optimizer.state_dict() if optimizer else None, progress=progress,
         rng=capture_rng(), loss_scales=scales), temporary)
     temporary.replace(path)
@@ -220,7 +244,9 @@ def write_review(out):
         delivery_summary.append(dict(scene=scene, layer=layer, trials=len(trials),
             success_rate=len(successes)/len(trials), success_conditioned_metrics=metrics,
             mean_sent_channel_uses=sum(t['total_channel_uses'] for t in trials)/len(trials)))
-    json_write(out/'review_summary.json', dict(version=FAMILY, rows=rows, actual_delivery=delivery_summary,
+    plan_file = out/'plan.json'
+    family = json.loads(plan_file.read_text(encoding='utf8'))['version'] if plan_file.is_file() else FAMILY
+    json_write(out/'review_summary.json', dict(version=family, rows=rows, actual_delivery=delivery_summary,
         cost_unit='complex_channel_use_per_delivery', selection='fixed_final'))
     temporary = out/'review.tmp.tar.gz'
     with tarfile.open(temporary, 'w:gz') as archive:
@@ -246,14 +272,15 @@ def main(args, max_updates=None):
         raise FileNotFoundError('actual final side delivery requires --digital-python: '+args.digital_python)
     device = device_for(args.device)
     torch.set_num_threads(args.cpu_threads); seed_all(args.seed)
-    model = LayeredAttributeCodec(semantic, LayerConfig(hidden=args.hidden)).to(device)
+    model = LayeredAttributeCodec(semantic, LayerConfig(**plan['channel'])).to(device)
+    layers = model.layer_config.layer_count
     out.mkdir(parents=True, exist_ok=True); json_write(out/'plan.json', plan)
     (out/'metrics').mkdir(exist_ok=True)
     progress = dict(step=0, phase_index=0, phase_step=0, cycles={}, evaluated=[], frozen=None)
     saved = None
     if args.resume:
         saved = torch.load(out/'checkpoints/latest.pt', map_location='cpu', weights_only=True)
-        if saved['family'] != FAMILY or saved['plan'] != plan:
+        if saved['family'] != plan['version'] or saved['plan'] != plan:
             raise ValueError('checkpoint identity mismatch')
         model.load_state_dict(saved['state']); progress = saved['progress']
         log = out/'metrics/loss.jsonl'
@@ -282,7 +309,7 @@ def main(args, max_updates=None):
         print(f'Caching frozen {model.semantic.arm} latent: {scene.name}', flush=True)
         caches[scene.name] = cache_scene(model, scene)
     from .progressive_attribute_preflight import verify_execution
-    print('Checking eight prefixes and received-file decoding on '+str(device), flush=True)
+    print(f'Checking {layers} prefixes and received-file decoding on {device}', flush=True)
     json_write(out/'execution_check.json', verify_execution(model, scenes[0],
                caches[scenes[0].name]['batches'], args, out))
     from comparison_baselines.run import _execute
@@ -306,10 +333,20 @@ def main(args, max_updates=None):
     def validation(label, layers):
         if label in progress['evaluated']:
             return
+        if args.three_tier_scratch:
+            print(f'Validation {label} at global step {progress["step"]}', flush=True)
         with preserved_rng(device):
             for scene in train_scenes:
-                assess(model, scene, caches[scene.name]['batches'], args, out/'evaluation'/label/scene.name,
-                       scope='validation', layers=layers, perceptual=perceptual)
+                rows = assess(model, scene, caches[scene.name]['batches'], args, out/'evaluation'/label/scene.name,
+                              scope='validation', layers=layers, perceptual=perceptual)
+                if args.three_tier_scratch and rows:
+                    awgn = {j: fmean(r['source_psnr'] for r in rows if r['path'] == 'awgn' and r['layer'] == j)
+                            for j in layers}
+                    details = ', '.join(
+                        f'{j if j == "mixed" else model.layer_config.rates[j]}={value:.3f} dB'
+                        for j, value in awgn.items())
+                    gain = f' | paired gain {awgn[layers[-1]]-awgn[layers[0]]:+.3f} dB' if len(layers) == 2 else ''
+                    print(f'{label} {scene.name} | AWGN mean PSNR {details}{gain}', flush=True)
         progress['evaluated'].append(label); checkpoint()
     for pi in range(progress['phase_index'], len(plan['schedule'])):
         phase = plan['schedule'][pi]
@@ -351,7 +388,10 @@ def main(args, max_updates=None):
                     raise RuntimeError('frozen semantic/prior channel layers changed')
                 checkpoint()
             if phase['phase'] != 'bootstrap' and step % args.validate_every == 0 and step != phase['steps']:
-                validation(f'monitor_{progress["step"]:06d}', ['mixed'] if phase['stage'] == 9 else [phase['stage']])
+                validation(f'monitor_{progress["step"]:06d}',
+                           ['mixed'] if phase['phase'] == 'neighbor' else [phase['stage']])
+            if phase['phase'] == 'bootstrap' and step in plan.get('bootstrap_validation_steps', ()):
+                validation(f'layer_{phase["stage"]:02d}_bootstrap_{step:05d}', [phase['stage']])
             executed += 1
             if max_updates is not None and executed >= max_updates:
                 checkpoint(); return dict(status='interrupted', step=progress['step'])
@@ -359,7 +399,11 @@ def main(args, max_updates=None):
             raise RuntimeError('completed phase changed frozen modules')
         if phase['phase'] != 'bootstrap':
             checkpoint(f'layer_{phase["stage"]:02d}')
-            validation(f'layer_{phase["stage"]:02d}', ['mixed'] if phase['stage'] == 9 else [phase['stage']])
+            stage = phase['stage']
+            checked = ['mixed'] if phase['phase'] == 'neighbor' else [stage]
+            if args.three_tier_scratch and phase['phase'] == 'render' and stage > 1:
+                checked = [stage-1, stage]
+            validation(f'layer_{stage:02d}', checked)
         progress.update(phase_index=pi+1, phase_step=0, frozen=None)
         optimizer = None; checkpoint()
     if state_digest(model.semantic.state_dict()) != plan['semantic_slot']['state_sha256']:
@@ -368,9 +412,9 @@ def main(args, max_updates=None):
     with preserved_rng(device):
         for scene in scenes:
             assess(model, scene, caches[scene.name]['batches'], args, out/'evaluation/final'/scene.name,
-                scope='test', layers=list(range(1, 9))+['mixed'], perceptual=perceptual,
+                scope='test', layers=list(range(1, layers+1))+['mixed'], perceptual=perceptual,
                 actual=True, core_comparison=args.neighbor_steps > 0)
-    complete = dict(status='complete', version=FAMILY, step=progress['step'], semantic_frozen_verified=True,
+    complete = dict(status='complete', version=plan['version'], step=progress['step'], semantic_frozen_verified=True,
                     codec_id=model.identity(), rates=list(model.layer_config.rates), selection='fixed_final')
     json_write(out/'complete.json', complete); write_review(out)
     print(json.dumps(complete), flush=True)
