@@ -32,6 +32,7 @@ from gaussian_jscc.semantic_attribute_metrics import attribute_metrics, decode_s
 
 VERSION = 'fixed_xyz_attribute_comparison_v1'
 METHODS = ('semantic', 'fcgs', 'c3dgs')
+SEMANTIC_XYZ_INPUT = 'shared_16bit_grid'
 
 
 def camera_selection(cameras, names=None, excluded=()):
@@ -113,8 +114,9 @@ def compare_scene(spec, record, model, settings, methods, plan, perceptual, devi
     test = camera_selection(load_cameras(*camera_args, split='test'), record['test_view_names'])
     if camera_fingerprint(test) != record['camera_fingerprints']['test']:
         raise ValueError(f'{name}: test camera data differs from the semantic experiment')
-    common_xyz = scene.geometry.denormalize(delivered_positions(
-        scene.geometry.normalize(scene.raw[:, :3]), torch.ones(len(scene.raw)), model.cfg))
+    common_unit = delivered_positions(scene.geometry.normalize(scene.raw[:, :3]),
+                                      torch.ones(len(scene.raw), dtype=torch.bool), model.cfg)
+    common_xyz = scene.geometry.denormalize(common_unit)
     source = scene.raw
     reference = RenderReference(torch.cat((common_xyz, source[:, 3:]), dim=1), 3, record['white_background'])
     baseline_path = scene.out / 'references.json'
@@ -133,16 +135,13 @@ def compare_scene(spec, record, model, settings, methods, plan, perceptual, devi
     for method in methods:
         folder = scene.out / method
         report = folder / 'metrics.json'
-        if report.is_file():
+        if report.is_file() and (method != 'semantic' or read(report).get('xyz_input') == SEMANTIC_XYZ_INPUT):
             continue
         print(f'{name}/{method}: {len(source)} Gaussians, {len(test)} fixed test views', flush=True)
         folder.mkdir(exist_ok=True)
         payload = None
         if method == 'semantic':
-            recovered = decode_scene(model, scene)
-            # CPU and CUDA may round their final denormalization differently.
-            torch.testing.assert_close(recovered[:, :3], common_xyz, atol=1e-5, rtol=1e-6)
-            recovered[:, :3] = common_xyz
+            recovered = decode_scene(model, scene, received_unit=common_unit)
         else:
             with tempfile.TemporaryDirectory(prefix='.attribute_work_', dir=out) as tmp:
                 worker = Path(tmp)
@@ -179,8 +178,11 @@ def compare_scene(spec, record, model, settings, methods, plan, perceptual, devi
                   f'photo PSNR={psnr:.4f}, loss={baseline_photo - psnr:+.4f} dB', flush=True)
             del rows
         measurements = attribute_metrics(model, scene, recovered, test)
-        json_write(report, dict(method=method, scene=name, recovered_gaussians=len(recovered),
-                                attribute_metrics=measurements, payload=payload, variants=results))
+        row = dict(method=method, scene=name, recovered_gaussians=len(recovered),
+                   attribute_metrics=measurements, payload=payload, variants=results)
+        if method == 'semantic':
+            row['xyz_input'] = SEMANTIC_XYZ_INPUT
+        json_write(report, row)
 
 
 def parser():

@@ -11,16 +11,33 @@ from .semantic_attribute_codec import GROUPS, error_rows, attribute_objective
 
 
 @torch.no_grad()
-def decode_scene(model, scene):
+def decode_scene(model, scene, *, received_unit=None):
+    """Decode in scene row order, optionally with a common CPU XYZ grid."""
+    if received_unit is not None and (received_unit.shape != scene.raw[:, :3].shape or
+            received_unit.device.type != 'cpu' or received_unit.dtype != torch.float32 or
+            not torch.isfinite(received_unit).all() or ((received_unit < 0) | (received_unit > 1)).any()):
+        raise ValueError('expected one finite normalized CPU XYZ row per Gaussian')
     device = next(model.parameters()).device
     model.eval(); model.set_scene_geometry(scene.geometry)
     rows = []
+    offset = 0
     for features, ids in zip(scene.groups, scene.group_ids):
-        f, active = features.to(device), (ids >= 0).to(device)
-        rows.append(to_raw(model(f, active)[active], scene.geometry, model).cpu())
+        valid = ids >= 0
+        f, active = features.to(device), valid.to(device)
+        if received_unit is None:
+            decoded = model(f, active)
+        else:
+            count = int(valid.sum())
+            side = torch.zeros_like(features[..., :3])
+            side[valid] = received_unit[offset:offset+count]
+            decoded = model.decode(model.encode(f, active), active, side.to(device))
+            offset += count
+        rows.append(to_raw(decoded[active], scene.geometry, model).cpu())
     result = torch.cat(rows)
     if result.shape != scene.raw.shape or not torch.isfinite(result).all():
         raise RuntimeError('invalid semantic reconstruction')
+    if received_unit is not None:
+        result[:, :3] = scene.geometry.denormalize(received_unit)
     return result
 
 

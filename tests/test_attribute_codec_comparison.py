@@ -13,6 +13,7 @@ import torch
 from comparison_baselines import attribute_codec_comparison as entry
 from comparison_baselines.attribute_codec_worker import fcgs_roundtrip
 from gaussian_jscc import semantic_attribute_experiment as training
+from gaussian_jscc import semantic_attribute_metrics as semantic_metrics
 from gaussian_jscc.semantic_attribute_codec import PRIVATE_ONLY
 from test_semantic_attribute_controls import build_fixture, cameras, options, raw_points, synthetic_render
 
@@ -84,12 +85,15 @@ def test_comparison_uses_one_reference_and_resumes(tmp_path):
         '--image-views', '0', '--no-lpips',
     ])
     worker_calls = []
+    semantic_xyz = {}
+    seen_semantic = []
 
     def roundtrip(_, module, arguments, log):
         assert module == 'comparison_baselines.attribute_codec_worker'
         method = arguments[0]
         work = Path(arguments[arguments.index('--out') + 1])
         rows = np.load(work / 'input.npy')
+        np.testing.assert_array_equal(rows[:, :3], semantic_xyz[log.parent.parent.name])
         if method == 'c3dgs':
             calibration = entry.read(work / 'cameras.json')
             name = log.parent.parent.name
@@ -103,17 +107,39 @@ def test_comparison_uses_one_reference_and_resumes(tmp_path):
         assert (rows[:, 7:11] != 0).any()
         worker_calls.append(method)
 
+    original_to_raw = semantic_metrics.to_raw
+
+    def roundoff_world_xyz(*args):
+        rows = original_to_raw(*args)
+        rows[:, :3] += 1.52587890625e-05
+        return rows
+
+    def decode_with_shared_grid(model, scene, *, received_unit):
+        canonical = scene.geometry.denormalize(received_unit)
+        with patch.object(semantic_metrics, 'to_raw', side_effect=roundoff_world_xyz), \
+                patch.object(model, 'decode', wraps=model.decode) as decode:
+            rows = semantic_metrics.decode_scene(model, scene, received_unit=received_unit)
+        receiver_xyz = torch.cat([side[active] for _, active, side in (c.args for c in decode.call_args_list)])
+        assert torch.equal(receiver_xyz, received_unit)
+        assert torch.equal(rows[:, :3], canonical)
+        semantic_xyz[scene.name] = canonical.numpy()
+        seen_semantic.append(scene.name)
+        return rows
+
     with patch.object(entry, 'load_cameras', side_effect=cameras), \
             patch.object(entry, 'device_for', return_value=torch.device('cpu')), \
+            patch.object(entry, 'decode_scene', side_effect=decode_with_shared_grid), \
             patch('gaussian_jscc.rendering.render', side_effect=synthetic_render), \
             patch.object(entry, 'render', side_effect=synthetic_render), patch.object(entry, '_execute', side_effect=roundtrip):
         entry.main(args)
         args.resume = True
         entry.main(args)
     assert worker_calls == ['fcgs', 'c3dgs'] * 2
+    assert seen_semantic == ['truck', 'drjohnson']
     for scene in ('truck', 'drjohnson'):
         records = entry.read(out / 'scenes' / scene / 'semantic' / 'metrics.json')
         assert records['payload'] is None
+        assert records['xyz_input'] == 'shared_16bit_grid'
         assert set(records['variants']) == {'all_attributes', 'geometry_opacity_only', 'color_only'}
     with tarfile.open(out / 'review.tar.gz') as tar:
         assert 'review_summary.json' in tar.getnames()
