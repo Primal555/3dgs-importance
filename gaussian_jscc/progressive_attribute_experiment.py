@@ -97,8 +97,8 @@ def prepare(args):
         cost_protocol='digital_side_file_v1; actual LDPC4096/6144 + 16QAM; no ARQ',
         cache='frozen semantic latents in CPU RAM, rebuilt on resume; never cache noisy receiver outputs')
     if args.dry_run and not args.semantic_checkpoint:
-        from .semantic_attribute_codec import REBALANCED
-        plan['semantic_slot']['accepted'].append(REBALANCED)
+        from .semantic_attribute_codec import SPLIT128_LAYOUTS
+        plan['semantic_slot']['accepted'].extend(SPLIT128_LAYOUTS)
         return None, None, json.loads(json.dumps(plan))
     if not args.semantic_checkpoint:
         raise ValueError('set --semantic-checkpoint after the semantic experiment finishes')

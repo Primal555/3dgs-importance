@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from gaussian_jscc import semantic_attribute_experiment as entry
-from gaussian_jscc.semantic_attribute_codec import (SemanticAttributeCodec, make_config,
+from gaussian_jscc.semantic_attribute_codec import (PRIVATE_ONLY, REBALANCED, SemanticAttributeCodec, make_config,
     latent_slices, log_shape, fit_loss_scales, attribute_objective)
 from gaussian_jscc.semantic_attribute_metrics import evaluate, latent_diagnostics
 from gaussian_jscc.data import Geometry, to_features, to_raw, write_ply
@@ -92,19 +92,25 @@ def test_log_covariance_invariances_and_loss_identity():
     assert sum(b-a for a, b in latent_slices(256, True).values()) == 256
 
 
-def test_rebalanced_routing_and_single_arm_checkpoint(tmp_path):
+@pytest.mark.parametrize('arm, expected_slices', [
+    (REBALANCED, {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104), 'shared': (104, 128)}),
+    (PRIVATE_ONLY, {'geometry': (0, 40), 'dc': (40, 56), 'sh': (56, 128)}),
+])
+def test_custom_routing_and_single_arm_checkpoint(tmp_path, arm, expected_slices):
     from gaussian_jscc.progressive_attribute_channel import load_semantic_slot
-    from gaussian_jscc.semantic_attribute_codec import REBALANCED
-    assert REBALANCED not in entry.parser().get_default('arms')
+    assert arm not in entry.parser().get_default('arms')
     with patch('gaussian_jscc.rendering.render', side_effect=synthetic_render), \
          patch('gaussian_jscc.rendering.load_cameras', side_effect=cameras), \
          patch.object(entry, 'diagnostic_plots'), patch.object(entry, 'write_plots'):
         source, held = build_fixture(tmp_path)
         out = tmp_path/'fresh'
-        entry.main(options(source, held, out, arm=REBALANCED))
-    assert entry.read(out/'review_summary.json')['completed_arms'] == [REBALANCED]
-    model, _ = load_semantic_slot(out/REBALANCED/'checkpoints/final.pt')
-    assert model.slices == {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104), 'shared': (104, 128)}
+        entry.main(options(source, held, out, arm=arm))
+    assert entry.read(out/'review_summary.json')['completed_arms'] == [arm]
+    model, _ = load_semantic_slot(out/arm/'checkpoints/final.pt')
+    assert model.slices == expected_slices
+    diagnostic = entry.read(out/arm/'diagnostics/truck.json')
+    assert set(diagnostic['latent']) == set(expected_slices)
+    assert {item['latent'] for item in diagnostic['perturbations']} == set(expected_slices)
     _, _, geometry, f, active = model_data()
     model.set_scene_geometry(geometry)
     z = torch.arange(128, dtype=f.dtype).expand(*active.shape, 128)
@@ -119,8 +125,13 @@ def test_rebalanced_routing_and_single_arm_checkpoint(tmp_path):
     finally:
         for hook in hooks:
             hook.remove()
-    for name, (a, b) in {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104)}.items():
-        torch.testing.assert_close(inputs[name], torch.cat((z[..., a:b], z[..., 104:]), -1))
+    for name in ('geometry', 'dc', 'sh'):
+        a, b = expected_slices[name]
+        expected = z[..., a:b]
+        if 'shared' in expected_slices:
+            c, d = expected_slices['shared']
+            expected = torch.cat((expected, z[..., c:d]), -1)
+        torch.testing.assert_close(inputs[name], expected, atol=0, rtol=0)
 
 
 def synthetic_render(raw, camera, *args, **kwargs):

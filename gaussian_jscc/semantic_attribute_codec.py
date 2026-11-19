@@ -12,7 +12,12 @@ from .position_delivery import delivered_positions
 
 ARMS = ('shared128', 'shared256', 'split128', 'split256')
 REBALANCED = 'split_g32_dc8_sh64_s24_128'
-TRAINABLE_ARMS = (*ARMS, REBALANCED)
+PRIVATE_ONLY = 'split_g40_dc16_sh72_128'
+SPLIT128_LAYOUTS = {
+    REBALANCED: {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104), 'shared': (104, 128)},
+    PRIVATE_ONLY: {'geometry': (0, 40), 'dc': (40, 56), 'sh': (56, 128)},
+}
+TRAINABLE_ARMS = (*ARMS, *SPLIT128_LAYOUTS)
 FULL_GEOMETRY = 'split_full_geometry128'
 GROUPS = {'geometry': (0, 8), 'dc': (8, 11), 'sh': (11, 56)}
 
@@ -36,11 +41,11 @@ class _SharedGeometry:
         return plan
 
 
-def latent_slices(width, split, *, rebalanced=False):
-    if rebalanced:
+def latent_slices(width, split, *, arm=None):
+    if arm in SPLIT128_LAYOUTS:
         if width != 128 or not split:
-            raise ValueError('rebalanced layout requires a split 128-dimensional latent')
-        return {'geometry': (0, 32), 'dc': (32, 40), 'sh': (40, 104), 'shared': (104, 128)}
+            raise ValueError('custom layout requires a split 128-dimensional latent')
+        return SPLIT128_LAYOUTS[arm].copy()
     if width not in (128, 256):
         raise ValueError('semantic experiment supports 128 or 256 real dimensions')
     if not split:
@@ -76,9 +81,9 @@ class AttributeEncoder(nn.Module):
 
 
 class AttributeDecoder(nn.Module):
-    def __init__(self, cfg, split, full_geometry=False, *, rebalanced=False):
+    def __init__(self, cfg, split, full_geometry=False, *, arm=None):
         super().__init__()
-        self.slices = latent_slices(cfg.latent_dim, split, rebalanced=rebalanced)
+        self.slices = latent_slices(cfg.latent_dim, split, arm=arm)
         self.split = split
         self.full_geometry = full_geometry
         if not split:
@@ -87,9 +92,9 @@ class AttributeDecoder(nn.Module):
             self.shared.spatial_context = SpatialPointContext(cfg)
         else:
             self.branches = nn.ModuleDict()
-            for name, (start, end) in GROUPS.items():
+            c, d = self.slices.get('shared', (0, 0))
+            for name in GROUPS:
                 a, b = self.slices[name]
-                c, d = self.slices['shared']
                 width = cfg.latent_dim if full_geometry and name == 'geometry' else b-a+d-c
                 branch = SemanticDecoder(replace(cfg, latent_dim=width))
                 branch.blocks = nn.ModuleList()
@@ -101,7 +106,10 @@ class AttributeDecoder(nn.Module):
     def forward(self, z, active, xyz):
         if not self.split:
             return self.shared(z, active, xyz)
-        c, d = self.slices['shared']
+        shared = None
+        if 'shared' in self.slices:
+            c, d = self.slices['shared']
+            shared = z[..., c:d]
         result = []
         # Identical received coordinates/masks and spatial hyperparameters in all
         # branches. Plans are detached; sharing them preserves each branch's VJP.
@@ -110,7 +118,11 @@ class AttributeDecoder(nn.Module):
             a, b = self.slices[name]
             branch.spatial_context._allocation_geometry_cache = cache
             try:
-                inputs = z if self.full_geometry and name == 'geometry' else torch.cat((z[..., a:b], z[..., c:d]), -1)
+                inputs = z[..., a:b]
+                if self.full_geometry and name == 'geometry':
+                    inputs = z
+                elif shared is not None:
+                    inputs = torch.cat((inputs, shared), -1)
                 result.append(branch(inputs, active, xyz))
             finally:
                 del branch.spatial_context._allocation_geometry_cache
@@ -132,7 +144,7 @@ class SemanticAttributeCodec(nn.Module):
         # Width-independent common encoder modules precede the latent projection.
         self.semantic_encoder = AttributeEncoder(self.cfg)
         self.semantic_decoder = AttributeDecoder(self.cfg, arm.startswith('split'), arm == FULL_GEOMETRY,
-            rebalanced=arm == REBALANCED)
+            arm=arm)
         self.slices = self.semantic_decoder.slices
 
     def set_scene_geometry(self, geometry):
