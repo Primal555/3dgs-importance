@@ -19,7 +19,7 @@ from gaussian_jscc.progressive_attribute_channel import (EIGHT_RATES, THREE_RATE
     configure_stage, frozen_digest, state_digest, load_semantic_slot)
 from gaussian_jscc.progressive_attribute_packet import export_packet, receive_packet
 from gaussian_jscc.progressive_attribute_evaluation import decode_cached, assess
-from gaussian_jscc.progressive_attribute_supervision import FIELDS, WEIGHTS, attribute_errors, fit_color_scales
+from gaussian_jscc.progressive_attribute_supervision import FIELDS, WEIGHTS, attribute_errors, fit_color_scales, grouped_objective
 from gaussian_jscc.semantic_attribute_codec import PRIVATE_ONLY, fit_loss_scales
 from gaussian_jscc.training import full_scene_step
 from gaussian_jscc.perceptual_objective import PerceptualImageObjective, PerceptualMultiViewRenderTask
@@ -137,8 +137,9 @@ def test_packet_receiver_and_real_serialized_cost(tmp_path, rates):
             receive_packet(model, root)
 
 
-def test_full_scene_replay_gradient_matches_direct():
-    model, geometry, f, y, active = fixture()
+@pytest.mark.parametrize('grouped', [False, True])
+def test_full_scene_replay_gradient_matches_direct(grouped):
+    model, geometry, f, y, active = fixture(PRIVATE_ONLY, THREE_RATES) if grouped else fixture()
     configure_stage(model, 2, 1e-4)
     other = copy.deepcopy(model)
     raw = to_raw(f[active], geometry, model)
@@ -147,6 +148,8 @@ def test_full_scene_replay_gradient_matches_direct():
                             reference=Reference(raw))
     args = entry.parser().parse_args(['--out', 'unused', '--device', 'cpu'])
     scales = fit_loss_scales([raw])
+    if grouped:
+        scales.update(fit_color_scales([raw]))
     data = torch.cat((f, y), -1)
     batches = [(data[i:i+1], active[i:i+1].long()*2) for i in range(2)]
     gradients, losses = [], []
@@ -155,7 +158,8 @@ def test_full_scene_replay_gradient_matches_direct():
             torch.manual_seed(991)
             objective = PerceptualImageObjective('mse_ssim', args.ssim_weight, 'cpu')
             task = PerceptualMultiViewRenderTask(views, scene.reference, 3, False, objective)
-            forward = lambda d, q: entry.batch_objective(net, scene, d, q, views, scales, args)
+            forward = lambda d, q: entry.batch_objective(net, scene, d, q, views, scales, args,
+                                                          grouped_tier=2 if grouped else None)
             if replay:
                 loss, _ = full_scene_step(net, batches, geometry, 10., 'awgn', task,
                                           attr_weight=1., batch_forward=forward)
@@ -170,7 +174,7 @@ def test_full_scene_replay_gradient_matches_direct():
     torch.testing.assert_close(gradients[0], gradients[1], atol=2e-6, rtol=2e-4)
 
 
-def test_grouped_bootstrap_decouples_rgb_and_excludes_latent_loss():
+def test_grouped_supervision_decouples_rgb_and_excludes_latent_loss():
     model, geometry, f, y, active = fixture(PRIVATE_ONLY, THREE_RATES)
     source = to_raw(f[active], geometry, model)
     candidate = source.clone()
@@ -187,6 +191,11 @@ def test_grouped_bootstrap_decouples_rgb_and_excludes_latent_loss():
 
     args = entry.parser().parse_args(['--out', 'unused', '--three-tier-scratch', '--grouped-attribute-supervision'])
     scales = dict(fit_loss_scales([source]), **fit_color_scales([source]))
+    tiers = torch.arange(len(source)) % 3 + 1
+    loss, _ = grouped_objective(candidate, source, directions, scales, tiers)
+    separate = sum(grouped_objective(candidate[tiers == k], source[tiers == k], directions[tiers == k], scales, k)[0]
+                   * (tiers == k).float().mean() for k in WEIGHTS)
+    torch.testing.assert_close(loss, separate)
     views = cameras('', split='train')[:2]
     scene = SimpleNamespace(geometry=geometry)
     configure_stage(model, 1, 1e-4)
@@ -220,9 +229,11 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     assert not (tmp_path/'joint').exists()
     grouped = entry.main(entry.parser().parse_args(['--out', str(tmp_path/'grouped'), '--dry-run',
         '--three-tier-scratch', '--grouped-attribute-supervision']))
-    assert all(grouped[key] == three[key] for key in ('channel', 'schedule', 'settings', 'objective', 'cost_protocol'))
-    assert grouped['bootstrap_supervision']['latent_weight'] == 0.
-    assert grouped['bootstrap_supervision']['weights_by_complex_symbols'] == {
+    assert all(grouped[key] == three[key] for key in ('channel', 'schedule', 'cost_protocol'))
+    assert grouped['settings'] == dict(three['settings'], latent_weight=0., attribute_weight=1.)
+    assert grouped['attribute_supervision']['latent_weight'] == 0.
+    assert grouped['attribute_supervision']['attribute_weight']['render'] == 1.
+    assert grouped['attribute_supervision']['weights_by_complex_symbols'] == {
         str(symbols): WEIGHTS[i] for i, symbols in enumerate((8, 24, 48), 1)}
     semantic, _, _, _, _ = model_data()
     path = tmp_path/'early.pt'
@@ -298,8 +309,12 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             assert ('truck', 'validation', False, 'layer_03', [2, 3]) in calls
         if mode == 'grouped-attribute-supervision':
             rows = [json.loads(line) for line in (tmp_path/'full/metrics/loss.jsonl').read_text().splitlines()]
-            assert all(('high_order_rgb_loss' in row) == (row['phase'] == 'bootstrap') for row in rows)
-            assert json.loads((tmp_path/'full/complete.json').read_text())['bootstrap_supervision'] == 'grouped_attributes_v1'
+            for row in rows:
+                attrs = sum(WEIGHTS[row['layer']][k] * row[k+'_loss'] for k in FIELDS)
+                assert row['loss'] == pytest.approx(attrs + row.get('render_loss', 0.), rel=1e-6)
+                if row['phase'] == 'render':
+                    assert row['aux_loss'] == pytest.approx(attrs, rel=1e-6)
+            assert json.loads((tmp_path/'full/complete.json').read_text())['attribute_supervision'] == 'grouped_attributes_v2'
         assert (tmp_path/'full/review.tar.gz').exists()
 
 

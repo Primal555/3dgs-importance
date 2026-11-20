@@ -1,4 +1,4 @@
-"""Physical attribute supervision for 8/24/48-symbol channel bootstrap."""
+"""Physical attribute supervision for the 8/24/48-symbol channel layers."""
 import math
 from statistics import fmean
 
@@ -34,7 +34,12 @@ def attribute_errors(pred, target, directions):
 def grouped_objective(pred, target, directions, scales, tier):
     errors = attribute_errors(pred, target.detach(), directions)
     terms = {name: errors[name].mean() / scales[name] for name in FIELDS}
-    loss = sum(WEIGHTS[tier][name] * value for name, value in terms.items())
+    if isinstance(tier, int):
+        loss = sum(WEIGHTS[tier][name] * value for name, value in terms.items())
+    else:
+        table = pred.new_tensor([[0.] * len(FIELDS), *[[row[name] for name in FIELDS] for row in WEIGHTS.values()]])
+        weights = table[tier]
+        loss = sum((weights[:, i] * errors[name]).mean() / scales[name] for i, name in enumerate(FIELDS))
     return loss, terms
 
 

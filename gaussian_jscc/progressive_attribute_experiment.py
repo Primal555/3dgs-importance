@@ -22,7 +22,7 @@ from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewR
 from .progressive_attribute_channel import (EIGHT_FAMILY, EIGHT_RATES, THREE_RATES, LayerConfig,
     LayeredAttributeCodec, load_semantic_slot, configure_stage, frozen_digest, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
-from .progressive_attribute_supervision import WEIGHTS, fit_color_scales, grouped_objective
+from .progressive_attribute_supervision import FIELDS, WEIGHTS, fit_color_scales, grouped_objective
 from .refinement_views import RefinementViewCycle
 from .render_validation import append_json
 from .semantic_attribute_codec import PRIVATE_ONLY, fit_loss_scales
@@ -44,7 +44,7 @@ def parser():
     mode.add_argument('--three-tier-joint', action='store_true',
                    help='8/24/48 symbols with equally weighted joint channel training and frozen private128 semantics')
     p.add_argument('--grouped-attribute-supervision', action='store_true',
-                   help='replace bootstrap latent loss with four weighted attribute losses in --three-tier-scratch')
+                   help='use the four tier-weighted attribute losses in both training phases of --three-tier-scratch')
     p.add_argument('--bootstrap-steps', type=int,
                    help='total per layer across training scenes (500 eight-tier, 8000 three-tier)')
     p.add_argument('--render-steps', type=int, default=250, help='total per layer')
@@ -53,8 +53,8 @@ def parser():
     p.add_argument('--bootstrap-lr', type=float, default=1e-4)
     p.add_argument('--render-lr', type=float, default=1e-5)
     p.add_argument('--neighbor-lr', type=float, default=1e-5)
-    p.add_argument('--latent-weight', type=float, default=1.)
-    p.add_argument('--attribute-weight', type=float, default=.01)
+    p.add_argument('--latent-weight', type=float, default=1., help='latent MSE weight for the standard objectives')
+    p.add_argument('--attribute-weight', type=float, default=.01, help='attribute weight for the standard objectives')
     p.add_argument('--ssim-weight', type=float, default=1/3)
     p.add_argument('--hidden', type=int, default=256)
     p.add_argument('--views-per-step', type=int, default=32)
@@ -128,8 +128,11 @@ def prepare(args):
         plan['budget_reference'] = 'old 8/24/48 main had 8000 noisy minibatch updates for each prefix'
         plan['prefix_training'] = 'freeze the semantic model and all channel layers except the current increment'
     if args.grouped_attribute_supervision:
+        plan['settings'].update(latent_weight=0., attribute_weight=1.)
+        plan['objective'] = 'source RGB MSE + ssim_weight*(1-SSIM) + the same tier-weighted normalized attribute loss as bootstrap'
         plan['bootstrap_objective'] = 'weighted normalized shape, opacity, base RGB and high-order directional RGB MSE'
-        plan['bootstrap_supervision'] = dict(mode='grouped_attributes_v1', latent_weight=0., target='source PLY',
+        plan['attribute_supervision'] = dict(mode='grouped_attributes_v2', latent_weight=0., target='source PLY',
+            attribute_weight=dict(bootstrap=1., render=1., neighbor=1.),
             weights_by_complex_symbols={str(cfg.rates[tier]): weights for tier, weights in WEIGHTS.items()},
             scales='fixed train-scene attribute variance; spherical SH energy for high-order RGB',
             directions='rotating training camera directions; SH degrees 1..3 only')
@@ -215,7 +218,8 @@ def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tie
     if grouped_tier is not None:
         raw = to_raw(pred[active], scene.geometry, model)
         target = to_raw(f[active], scene.geometry, model)
-        loss, terms = grouped_objective(raw, target, directions, scales, grouped_tier)
+        tier = q[active] if grouped_tier == 'mixed' else grouped_tier
+        loss, terms = grouped_objective(raw, target, directions, scales, tier)
         latent = (yh[active].detach()-y[active]).square().mean()
         return raw, loss, dict(terms, attributes=loss, latent=latent, transmitted_power=wire['transmitted_power'])
     latent = (yh[active]-y[active]).square().mean()
@@ -229,21 +233,21 @@ def train_update(model, scene, cache, phase, visit, cameras, scales, args, index
     device = next(model.parameters()).device
     model.train(); model.set_scene_geometry(scene.geometry)
     layer = phase['stage']
+    layout = 'mixed' if phase['phase'] == 'neighbor' else layer
+    grouped_tier = layout if args.grouped_attribute_supervision else None
     if phase['phase'] == 'bootstrap':
         data, active = sample_blocks(cache['blocks'], scene.record['blocks_per_batch'], visit,
                                      args.seed+index*1009+layer*100003)
         q = active.long()*layer
-        grouped_tier = layer if args.grouped_attribute_supervision else None
         _, loss, terms = batch_objective(model, scene, data.to(device), q.to(device), cameras, scales, args,
                                         grouped_tier=grouped_tier)
         loss.backward()
         return loss.detach(), {k+'_loss': float(v.detach()) for k, v in terms.items()}
-    layouts = layout_for(scene, 'mixed' if phase['phase'] == 'neighbor' else layer,
-                         args.seed+visit*1009+index, layers=model.layer_config.layer_count)
+    layouts = layout_for(scene, layout, args.seed+visit*1009+index, layers=model.layer_config.layer_count)
     objective = PerceptualImageObjective('mse_ssim', args.ssim_weight, device)
     task = PerceptualMultiViewRenderTask(cameras, scene.reference, scene.degree, scene.white_background, objective)
     def forward(data, q):
-        return batch_objective(model, scene, data, q, cameras, scales, args)
+        return batch_objective(model, scene, data, q, cameras, scales, args, grouped_tier=grouped_tier)
     # Auxiliary already contains its explicit latent/attribute weights.
     return full_scene_step(model, list(zip(cache['batches'], layouts)), scene.geometry, args.snr,
         'awgn', task, attr_weight=1., mode='replay', profile=True, batch_forward=forward)
@@ -280,8 +284,8 @@ def write_review(out):
         cost_unit='complex_channel_use_per_delivery', selection='fixed_final')
     if 'training_mode' in plan:
         review.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
-    if 'bootstrap_supervision' in plan:
-        review['bootstrap_supervision'] = plan['bootstrap_supervision']
+    if 'attribute_supervision' in plan:
+        review['attribute_supervision'] = plan['attribute_supervision']
     json_write(out/'review_summary.json', review)
     temporary = out/'review.tmp.tar.gz'
     with tarfile.open(temporary, 'w:gz') as archive:
@@ -446,7 +450,9 @@ def main(args, max_updates=None):
                 detail = ', '.join(f'{model.layer_config.rates[tier]}={r["loss"]:.6g}'
                                    for tier, r in results.items()) if joint else ''
                 if 'high_order_rgb_loss' in row:
-                    detail = ', '.join(f'{name}={row[name+"_loss"]:.6g}' for name in WEIGHTS[phase['stage']])
+                    detail = ', '.join(f'{name}={row[name+"_loss"]:.6g}' for name in FIELDS)
+                    if 'render_loss' in row:
+                        detail = f'render={row["render_loss"]:.6g}, attrs={row["aux_loss"]:.6g} | {detail}'
                 print(f'{label} {phase["phase"]} {step}/{phase["steps"]}: {scene.name}, loss={row["loss"]:.7g}, '
                       f'views={len(cameras)}, sec={row["seconds"]:.2f}'+(f' | {detail}' if detail else ''), flush=True)
             if step % args.save_every == 0 or step == phase['steps']:
@@ -487,7 +493,7 @@ def main(args, max_updates=None):
     if args.three_tier_joint:
         complete.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
     if args.grouped_attribute_supervision:
-        complete['bootstrap_supervision'] = plan['bootstrap_supervision']['mode']
+        complete['attribute_supervision'] = plan['attribute_supervision']['mode']
     json_write(out/'complete.json', complete); write_review(out)
     print(json.dumps(complete), flush=True)
     return complete
