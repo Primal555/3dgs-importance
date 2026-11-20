@@ -47,7 +47,7 @@ def parser():
                    help='use the four tier-weighted attribute losses in both training phases of --three-tier-scratch')
     p.add_argument('--bootstrap-steps', type=int,
                    help='total per layer across training scenes (500 eight-tier, 8000 three-tier)')
-    p.add_argument('--render-steps', type=int, default=250, help='total per layer')
+    p.add_argument('--render-steps', type=int, help='total per layer (500 with grouped attribute supervision, 250 otherwise)')
     p.add_argument('--neighbor-steps', type=int,
                    help='mixed-layout receiver-only updates (200 eight-tier, 0 three-tier)')
     p.add_argument('--bootstrap-lr', type=float, default=1e-4)
@@ -101,6 +101,8 @@ def prepare(args):
     three = args.three_tier_scratch or args.three_tier_joint
     if args.bootstrap_steps is None:
         args.bootstrap_steps = 8000 if three else 500
+    if args.render_steps is None:
+        args.render_steps = 500 if args.grouped_attribute_supervision else 250
     if args.neighbor_steps is None:
         args.neighbor_steps = 0 if three else 200
     if args.save_every is None:
@@ -314,6 +316,9 @@ def main(args, max_updates=None):
     model = LayeredAttributeCodec(semantic, LayerConfig(**plan['channel'])).to(device)
     layers = model.layer_config.layer_count
     out.mkdir(parents=True, exist_ok=True); json_write(out/'plan.json', plan)
+    if args.grouped_attribute_supervision:
+        print(f'Grouped supervision | per tier: {args.bootstrap_steps} attribute + {args.render_steps} render updates; '
+              f'render validation every {args.validate_every} updates; total: {plan["total_updates"]}', flush=True)
     (out/'metrics').mkdir(exist_ok=True)
     progress = dict(step=0, phase_index=0, phase_step=0, cycles={}, evaluated=[], frozen=None)
     saved = None

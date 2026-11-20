@@ -227,10 +227,15 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     assert joint['trainable_prefixes'] == [8, 24, 48]
     assert joint['bootstrap_validation_steps'] == three['bootstrap_validation_steps']
     assert not (tmp_path/'joint').exists()
-    grouped = entry.main(entry.parser().parse_args(['--out', str(tmp_path/'grouped'), '--dry-run',
-        '--three-tier-scratch', '--grouped-attribute-supervision']))
-    assert all(grouped[key] == three[key] for key in ('channel', 'schedule', 'cost_protocol'))
-    assert grouped['settings'] == dict(three['settings'], latent_weight=0., attribute_weight=1.)
+    grouped_flags = ['--out', str(tmp_path/'grouped'), '--dry-run', '--three-tier-scratch', '--grouped-attribute-supervision']
+    grouped = entry.main(entry.parser().parse_args(grouped_flags))
+    assert all(grouped[key] == three[key] for key in ('channel', 'cost_protocol'))
+    assert grouped['settings'] == dict(three['settings'], render_steps=500, latent_weight=0., attribute_weight=1.)
+    assert grouped['settings']['validate_every'] == 250
+    assert [p['steps'] for p in grouped['schedule']] == [8000, 500] * 3
+    assert grouped['total_updates'] == 25500
+    explicit = entry.main(entry.parser().parse_args(grouped_flags + ['--render-steps', '250']))
+    assert explicit['schedule'] == three['schedule'] and explicit['total_updates'] == 24750
     assert grouped['attribute_supervision']['latent_weight'] == 0.
     assert grouped['attribute_supervision']['attribute_weight']['render'] == 1.
     assert grouped['attribute_supervision']['weights_by_complex_symbols'] == {

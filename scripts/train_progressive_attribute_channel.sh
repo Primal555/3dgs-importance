@@ -17,7 +17,7 @@ case " $* " in
     ;;
   *" --three-tier-scratch "*)
     echo '8/24/48 cumulative complex symbols per Gaussian. Fresh channel weights and frozen private128 semantic model.'
-    echo 'Default per layer is 8000 bootstrap + 250 render updates across both training scenes. Total 24750.'
+    echo 'Default per layer is 8000 bootstrap updates across both training scenes.'
     echo 'Bootstrap validation at 500, 2000, 4000 and 8000. Default neighbor steps 0.'
     ;;
   *)
