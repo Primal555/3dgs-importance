@@ -38,7 +38,12 @@ if [[ " $* " == *" --grouped-attribute-supervision "* ]]; then
   else
     echo 'Both phases use the same tier-weighted shape, opacity, base RGB and high-order SH RGB losses.'
   fi
-  echo 'Render fine-tuning adds multiview rendering loss. Latent MSE is reporting only in both phases.'
+  if [[ " $* " == *" --grouped-latent-supervision "* ]]; then
+    echo 'Both phases combine latent MSE and grouped attribute loss. Default coefficients: 1 and 0.01.'
+  else
+    echo 'Latent MSE is reporting only in both phases.'
+  fi
+  echo 'Render fine-tuning adds multiview rendering loss.'
 fi
 echo '32 rotating training views; inherit original validation/test cameras and heldout scenes.'
 echo 'Final delivery verifies LDPC4096/6144 + 16QAM side files; all failures remain charged.'

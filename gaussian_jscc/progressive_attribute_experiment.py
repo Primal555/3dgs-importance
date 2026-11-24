@@ -48,6 +48,8 @@ def parser():
                    help='use the four tier-weighted attribute losses in both training phases of --three-tier-scratch')
     p.add_argument('--equal-attribute-weights', action='store_true',
                    help='give each of the four normalized grouped losses weight 0.25 at every tier')
+    p.add_argument('--grouped-latent-supervision', action='store_true',
+                   help='use --latent-weight and --attribute-weight with the grouped losses in both phases')
     p.add_argument('--q1-content-gate', action='store_true',
                    help='train and evaluate only q1 from scratch with a transmitter content gate')
     p.add_argument('--bootstrap-steps', type=int,
@@ -58,8 +60,8 @@ def parser():
     p.add_argument('--bootstrap-lr', type=float, default=1e-4)
     p.add_argument('--render-lr', type=float, default=1e-5)
     p.add_argument('--neighbor-lr', type=float, default=1e-5)
-    p.add_argument('--latent-weight', type=float, default=1., help='latent MSE weight for the standard objectives')
-    p.add_argument('--attribute-weight', type=float, default=.01, help='attribute weight for the standard objectives')
+    p.add_argument('--latent-weight', type=float, default=1.)
+    p.add_argument('--attribute-weight', type=float, default=.01)
     p.add_argument('--ssim-weight', type=float, default=1/3)
     p.add_argument('--hidden', type=int, default=256)
     p.add_argument('--views-per-step', type=int, default=32)
@@ -94,6 +96,8 @@ def schedule(args, layers):
 def validate_settings(args):
     if args.equal_attribute_weights and not args.grouped_attribute_supervision:
         raise ValueError('--equal-attribute-weights requires --grouped-attribute-supervision')
+    if args.grouped_latent_supervision and not args.grouped_attribute_supervision:
+        raise ValueError('--grouped-latent-supervision requires --grouped-attribute-supervision')
     if args.grouped_attribute_supervision and not args.three_tier_scratch:
         raise ValueError('--grouped-attribute-supervision requires --three-tier-scratch')
     if args.q1_content_gate and (not args.grouped_attribute_supervision or args.neighbor_steps):
@@ -126,7 +130,8 @@ def prepare(args):
         semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
         settings={k: v for k, v in vars(args).items()
                   if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint',
-                               'grouped_attribute_supervision', 'equal_attribute_weights', 'q1_content_gate', 'record_symbol_diagnostics')},
+                               'grouped_attribute_supervision', 'equal_attribute_weights', 'grouped_latent_supervision',
+                               'q1_content_gate', 'record_symbol_diagnostics')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -144,11 +149,13 @@ def prepare(args):
         plan['prefix_training'] = 'freeze the semantic model and all channel layers except the current increment'
     if args.grouped_attribute_supervision:
         weights = EQUAL_WEIGHTS if args.equal_attribute_weights else WEIGHTS
-        plan['settings'].update(latent_weight=0., attribute_weight=1.)
+        latent_weight, attribute_weight = (
+            (args.latent_weight, args.attribute_weight) if args.grouped_latent_supervision else (0., 1.))
+        plan['settings'].update(latent_weight=latent_weight, attribute_weight=attribute_weight)
         plan['objective'] = 'source RGB MSE + ssim_weight*(1-SSIM) + the same tier-weighted normalized attribute loss as bootstrap'
         plan['bootstrap_objective'] = 'weighted normalized shape, opacity, base RGB and high-order directional RGB MSE'
-        plan['attribute_supervision'] = dict(mode='grouped_attributes_v2', latent_weight=0., target='source PLY',
-            attribute_weight=dict(bootstrap=1., render=1., neighbor=1.),
+        plan['attribute_supervision'] = dict(mode='grouped_attributes_v2', latent_weight=latent_weight,
+            target='source PLY', attribute_weight=dict.fromkeys(('bootstrap', 'render', 'neighbor'), attribute_weight),
             weights_by_complex_symbols={str(cfg.rates[tier]): row for tier, row in weights.items()},
             scales='fixed train-scene attribute variance; spherical SH energy for high-order RGB',
             directions='rotating training camera directions; SH degrees 1..3 only')
@@ -156,6 +163,10 @@ def prepare(args):
             plan['attribute_supervision']['mode'] = 'grouped_attributes_equal_v2'
             plan['bootstrap_objective'] = 'mean of normalized shape, opacity, base RGB and high-order directional RGB MSE'
             plan['objective'] = 'source RGB MSE + ssim_weight*(1-SSIM) + the same equal-weight attribute loss as bootstrap'
+        if args.grouped_latent_supervision:
+            plan['attribute_supervision']['mode'] = 'grouped_attributes_latent_v2'
+            plan['bootstrap_objective'] = 'latent_weight*latent_MSE + attribute_weight*grouped_attribute_loss'
+            plan['objective'] = 'source RGB MSE + ssim_weight*(1-SSIM) + ' + plan['bootstrap_objective']
     if args.q1_content_gate:
         plan['q1_content_gate'] = dict(location='q1 transmitter input', initial_multiplier=1.,
                                       symbols_per_gaussian=cfg.rates[1])
@@ -242,10 +253,14 @@ def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tie
         raw = to_raw(pred[active], scene.geometry, model)
         target = to_raw(f[active], scene.geometry, model)
         tier = q[active] if grouped_tier == 'mixed' else grouped_tier
-        loss, terms = grouped_objective(raw, target, directions, scales, tier,
-                                       equal_weights=getattr(args, 'equal_attribute_weights', False))
-        latent = (yh[active].detach()-y[active]).square().mean()
-        return raw, loss, dict(terms, attributes=loss, latent=latent, transmitted_power=wire['transmitted_power'])
+        attrs, terms = grouped_objective(raw, target, directions, scales, tier,
+                                        equal_weights=getattr(args, 'equal_attribute_weights', False))
+        supervise_latent = getattr(args, 'grouped_latent_supervision', False)
+        recovered = yh if supervise_latent else yh.detach()
+        latent = (recovered[active]-y[active]).square().mean()
+        auxiliary = args.latent_weight*latent+args.attribute_weight*attrs if supervise_latent else attrs
+        return raw, auxiliary, dict(terms, attributes=attrs, latent=latent,
+                                    transmitted_power=wire['transmitted_power'])
     latent = (yh[active]-y[active]).square().mean()
     attrs, terms = attribute_objective(pred[active], f[active], scene.geometry, model, directions, scales)
     auxiliary = args.latent_weight*latent+args.attribute_weight*attrs
@@ -485,8 +500,10 @@ def main(args, max_updates=None):
                                    for tier, r in results.items()) if joint else ''
                 if 'high_order_rgb_loss' in row:
                     detail = ', '.join(f'{name}={row[name+"_loss"]:.6g}' for name in FIELDS)
+                    if args.grouped_latent_supervision:
+                        detail = f'latent={row["latent_loss"]:.6g}, ' + detail
                     if 'render_loss' in row:
-                        detail = f'render={row["render_loss"]:.6g}, attrs={row["aux_loss"]:.6g} | {detail}'
+                        detail = f'render={row["render_loss"]:.6g}, aux={row["aux_loss"]:.6g} | {detail}'
                 print(f'{label} {phase["phase"]} {step}/{phase["steps"]}: {scene.name}, loss={row["loss"]:.7g}, '
                       f'views={len(cameras)}, sec={row["seconds"]:.2f}'+(f' | {detail}' if detail else ''), flush=True)
             if step % args.save_every == 0 or step == phase['steps']:

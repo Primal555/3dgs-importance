@@ -174,7 +174,8 @@ def test_full_scene_replay_gradient_matches_direct(grouped):
     torch.testing.assert_close(gradients[0], gradients[1], atol=2e-6, rtol=2e-4)
 
 
-def test_grouped_supervision_decouples_rgb_and_excludes_latent_loss():
+@pytest.mark.parametrize('supervise_latent', [False, True])
+def test_grouped_supervision_decouples_rgb_and_controls_latent_loss(supervise_latent):
     model, geometry, f, y, active = fixture(PRIVATE_ONLY, THREE_RATES)
     source = to_raw(f[active], geometry, model)
     candidate = source.clone()
@@ -190,6 +191,7 @@ def test_grouped_supervision_decouples_rgb_and_excludes_latent_loss():
     assert (errors['base_rgb'] == 0).all() and (errors['high_order_rgb'] > 0).all()
 
     args = entry.parser().parse_args(['--out', 'unused', '--three-tier-scratch', '--grouped-attribute-supervision'])
+    args.grouped_latent_supervision = supervise_latent
     scales = dict(fit_loss_scales([source]), **fit_color_scales([source]))
     tiers = torch.arange(len(source)) % 3 + 1
     loss, _ = grouped_objective(candidate, source, directions, scales, tiers)
@@ -203,8 +205,9 @@ def test_grouped_supervision_decouples_rgb_and_excludes_latent_loss():
     data, tiers = torch.cat((f, y), dim=-1), active.long()
     torch.manual_seed(7)
     _, loss, terms = entry.batch_objective(model, scene, data, tiers, views, scales, args, grouped_tier=1)
-    assert not terms['latent'].requires_grad
-    torch.testing.assert_close(loss, sum(WEIGHTS[1][key] * terms[key] for key in FIELDS))
+    assert terms['latent'].requires_grad == supervise_latent
+    attrs = sum(WEIGHTS[1][key] * terms[key] for key in FIELDS)
+    torch.testing.assert_close(loss, terms['latent'] + .01*attrs if supervise_latent else attrs)
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.encoders[0].parameters())
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.decoders[0].parameters())
@@ -253,6 +256,15 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     assert equal['settings'] == grouped['settings'] and equal['schedule'] == grouped['schedule']
     assert equal['attribute_supervision']['weights_by_complex_symbols'] == {
         str(symbols): dict.fromkeys(FIELDS, 0.25) for symbols in (8, 24, 48)}
+    combined = entry.main(entry.parser().parse_args(grouped_flags + ['--grouped-latent-supervision']))
+    assert combined['schedule'] == grouped['schedule']
+    assert combined['settings'] == dict(grouped['settings'], latent_weight=1., attribute_weight=.01)
+    assert combined['attribute_supervision'] == dict(grouped['attribute_supervision'],
+        mode='grouped_attributes_latent_v2', latent_weight=1.,
+        attribute_weight=dict(bootstrap=.01, render=.01, neighbor=.01))
+    with pytest.raises(ValueError, match='requires --grouped-attribute-supervision'):
+        entry.main(entry.parser().parse_args(['--out', str(tmp_path/'invalid'), '--dry-run',
+            '--three-tier-scratch', '--grouped-latent-supervision']))
     semantic, _, _, _, _ = model_data()
     path = tmp_path/'early.pt'
     torch.save(dict(family='semantic_attribute_controls_v1', plan=dict(settings=dict(bootstrap_steps=2, render_steps=2)),
@@ -262,7 +274,8 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
 
 
 @pytest.mark.parametrize('mode', ['eight', 'three-tier-scratch', 'three-tier-joint',
-                                  'grouped-attribute-supervision', 'equal-attribute-weights', 'q1-content-gate'])
+                                  'grouped-attribute-supervision', 'equal-attribute-weights',
+                                  'grouped-latent-supervision', 'q1-content-gate'])
 def test_training_resume_across_layer_transition(tmp_path, mode):
     # Real source loader, semantic weights, optimizer phases and renderer VJPs.
     # Final digital delivery is tested separately; this test avoids subprocesses.
@@ -287,7 +300,7 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             return []
         def args(name, profile=mode):
             flags = [] if profile == 'eight' else ['--'+profile]
-            if profile in ('q1-content-gate', 'equal-attribute-weights'):
+            if profile in ('q1-content-gate', 'equal-attribute-weights', 'grouped-latent-supervision'):
                 flags.append('--grouped-attribute-supervision')
             if '--grouped-attribute-supervision' in flags:
                 flags.append('--three-tier-scratch')
@@ -301,7 +314,7 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             resumed = args('resumed')
             entry.main(resumed, max_updates=3 if joint or gated else 5)
             resumed.resume = True
-            if mode == 'equal-attribute-weights':
+            if mode in ('equal-attribute-weights', 'grouped-latent-supervision'):
                 wrong = args('resumed', 'grouped-attribute-supervision')
                 wrong.resume = True
                 with pytest.raises(ValueError, match='same semantic checkpoint and experiment settings'):
@@ -312,7 +325,8 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
         for key in a['state']:
             torch.testing.assert_close(a['state'][key], b['state'][key], atol=0, rtol=0)
         expected = {'eight': 34, 'three-tier-scratch': 12, 'three-tier-joint': 4,
-                    'grouped-attribute-supervision': 12, 'equal-attribute-weights': 12, 'q1-content-gate': 4}
+                    'grouped-attribute-supervision': 12, 'equal-attribute-weights': 12,
+                    'grouped-latent-supervision': 12, 'q1-content-gate': 4}
         assert a['progress'] == b['progress'] and a['progress']['step'] == expected[mode]
         assert not any(name == 'drjohnson' and scope == 'validation' for name, scope, _, _, _ in calls)
         assert any(name == 'drjohnson' and actual for name, _, actual, _, _ in calls)
@@ -346,16 +360,17 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
         elif three:
             assert ('truck', 'validation', False, 'layer_02_bootstrap_00002', [2]) in calls
             assert ('truck', 'validation', False, 'layer_03', [2, 3]) in calls
-        if gated or mode in ('grouped-attribute-supervision', 'equal-attribute-weights'):
+        if a['plan'].get('attribute_supervision'):
             rows = [json.loads(line) for line in (tmp_path/'full/metrics/loss.jsonl').read_text().splitlines()]
             for row in rows:
                 weights = dict.fromkeys(FIELDS, 0.25) if mode == 'equal-attribute-weights' else WEIGHTS[row['layer']]
                 attrs = sum(weights[k] * row[k+'_loss'] for k in FIELDS)
-                assert row['loss'] == pytest.approx(attrs + row.get('render_loss', 0.), rel=1e-6)
+                auxiliary = row['latent_loss'] + .01*attrs if mode == 'grouped-latent-supervision' else attrs
+                assert row['loss'] == pytest.approx(auxiliary + row.get('render_loss', 0.), rel=1e-6)
                 if row['phase'] == 'render':
-                    assert row['aux_loss'] == pytest.approx(attrs, rel=1e-6)
-            expected_mode = 'grouped_attributes_equal_v2' if mode == 'equal-attribute-weights' else 'grouped_attributes_v2'
-            assert json.loads((tmp_path/'full/complete.json').read_text())['attribute_supervision'] == expected_mode
+                    assert row['aux_loss'] == pytest.approx(auxiliary, rel=1e-6)
+            assert json.loads((tmp_path/'full/complete.json').read_text())['attribute_supervision'] == (
+                a['plan']['attribute_supervision']['mode'])
         assert (tmp_path/'full/review.tar.gz').exists()
 
 
