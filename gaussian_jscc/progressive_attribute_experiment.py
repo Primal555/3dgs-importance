@@ -23,6 +23,7 @@ from .progressive_attribute_channel import (EIGHT_FAMILY, EIGHT_RATES, THREE_RAT
     LayeredAttributeCodec, load_semantic_slot, configure_stage, frozen_digest, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
 from .progressive_attribute_supervision import FIELDS, WEIGHTS, fit_color_scales, grouped_objective
+from .q1_content_gate import GatedQ1Encoder
 from .refinement_views import RefinementViewCycle
 from .render_validation import append_json
 from .semantic_attribute_codec import PRIVATE_ONLY, fit_loss_scales
@@ -45,6 +46,8 @@ def parser():
                    help='8/24/48 symbols with equally weighted joint channel training and frozen private128 semantics')
     p.add_argument('--grouped-attribute-supervision', action='store_true',
                    help='use the four tier-weighted attribute losses in both training phases of --three-tier-scratch')
+    p.add_argument('--q1-content-gate', action='store_true',
+                   help='train and evaluate only q1 from scratch with a transmitter content gate')
     p.add_argument('--bootstrap-steps', type=int,
                    help='total per layer across training scenes (500 eight-tier, 8000 three-tier)')
     p.add_argument('--render-steps', type=int, help='total per layer (500 with grouped attribute supervision, 250 otherwise)')
@@ -87,6 +90,8 @@ def schedule(args, layers):
 def validate_settings(args):
     if args.grouped_attribute_supervision and not args.three_tier_scratch:
         raise ValueError('--grouped-attribute-supervision requires --three-tier-scratch')
+    if args.q1_content_gate and (not args.grouped_attribute_supervision or args.neighbor_steps):
+        raise ValueError('--q1-content-gate requires grouped attribute supervision and zero neighbor steps')
     if min(args.bootstrap_steps, args.render_steps, args.views_per_step, args.validate_every,
            args.save_every, args.trials, args.cpu_threads, args.hidden) < 1 or args.neighbor_steps < 0:
         raise ValueError('positive training/view/interval counts required')
@@ -109,13 +114,13 @@ def prepare(args):
         args.save_every = 250 if three else 50
     validate_settings(args)
     cfg = LayerConfig(rates=THREE_RATES if three else EIGHT_RATES, hidden=args.hidden)
-    phases = schedule(args, cfg.layer_count)
+    phases = schedule(args, 1 if args.q1_content_gate else cfg.layer_count)
     plan = dict(version=cfg.family, channel=cfg.to_dict(), schedule=phases,
         total_updates=sum(phase['steps'] for phase in phases),
         semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
         settings={k: v for k, v in vars(args).items()
                   if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint',
-                               'grouped_attribute_supervision')},
+                               'grouped_attribute_supervision', 'q1_content_gate')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -138,6 +143,9 @@ def prepare(args):
             weights_by_complex_symbols={str(cfg.rates[tier]): weights for tier, weights in WEIGHTS.items()},
             scales='fixed train-scene attribute variance; spherical SH energy for high-order RGB',
             directions='rotating training camera directions; SH degrees 1..3 only')
+    if args.q1_content_gate:
+        plan['q1_content_gate'] = dict(location='q1 transmitter input', initial_multiplier=1.,
+                                      symbols_per_gaussian=cfg.rates[1])
     if args.three_tier_joint:
         plan['training_mode'] = 'joint_prefix_mean'
         plan['prefix_training'] = 'freeze the semantic model; average the three prefix gradients before each channel update'
@@ -313,8 +321,14 @@ def main(args, max_updates=None):
         raise FileNotFoundError('actual final side delivery requires --digital-python: '+args.digital_python)
     device = device_for(args.device)
     torch.set_num_threads(args.cpu_threads); seed_all(args.seed)
-    model = LayeredAttributeCodec(semantic, LayerConfig(**plan['channel'])).to(device)
+    model = LayeredAttributeCodec(semantic, LayerConfig(**plan['channel']))
+    if args.q1_content_gate:
+        # Preserve the ungated run's noise RNG stream when initializing the extra parameters.
+        with torch.random.fork_rng(devices=[]):
+            model.encoders[0] = GatedQ1Encoder(model.encoders[0], model.cfg.latent_dim)
+    model.to(device)
     layers = model.layer_config.layer_count
+    delivery_layers = [1] if args.q1_content_gate else [*range(1, layers+1), 'mixed']
     out.mkdir(parents=True, exist_ok=True); json_write(out/'plan.json', plan)
     if args.grouped_attribute_supervision:
         print(f'Grouped supervision | per tier: {args.bootstrap_steps} attribute + {args.render_steps} render updates; '
@@ -356,9 +370,10 @@ def main(args, max_updates=None):
         print(f'Caching frozen {model.semantic.arm} latent: {scene.name}', flush=True)
         caches[scene.name] = cache_scene(model, scene)
     from .progressive_attribute_preflight import verify_execution
-    print(f'Checking {layers} prefixes and received-file decoding on {device}', flush=True)
+    check_layers = 1 if args.q1_content_gate else layers
+    print(f'Checking {check_layers} prefixes and received-file decoding on {device}', flush=True)
     json_write(out/'execution_check.json', verify_execution(model, scenes[0],
-               caches[scenes[0].name]['batches'], args, out))
+               caches[scenes[0].name]['batches'], args, out, max_layer=check_layers))
     from comparison_baselines.run import _execute
     _execute(args.digital_python, 'comparison_baselines.digital_link',
              ['self-test', '--device', args.digital_device, '--snr-db', 30], out/'digital_preflight.log')
@@ -491,7 +506,7 @@ def main(args, max_updates=None):
     with preserved_rng(device):
         for scene in scenes:
             assess(model, scene, caches[scene.name]['batches'], args, out/'evaluation/final'/scene.name,
-                scope='test', layers=list(range(1, layers+1))+['mixed'], perceptual=perceptual,
+                scope='test', layers=delivery_layers, perceptual=perceptual,
                 actual=True, core_comparison=args.neighbor_steps > 0)
     complete = dict(status='complete', version=plan['version'], step=progress['step'], semantic_frozen_verified=True,
                     codec_id=model.identity(), rates=list(model.layer_config.rates), selection='fixed_final')
@@ -499,6 +514,8 @@ def main(args, max_updates=None):
         complete.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
     if args.grouped_attribute_supervision:
         complete['attribute_supervision'] = plan['attribute_supervision']['mode']
+    if args.q1_content_gate:
+        complete.update(q1_content_gate=True, rates=[0, model.layer_config.rates[1]])
     json_write(out/'complete.json', complete); write_review(out)
     print(json.dumps(complete), flush=True)
     return complete

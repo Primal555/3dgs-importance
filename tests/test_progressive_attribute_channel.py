@@ -234,6 +234,9 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     assert grouped['settings']['validate_every'] == 250
     assert [p['steps'] for p in grouped['schedule']] == [8000, 500] * 3
     assert grouped['total_updates'] == 25500
+    gated = entry.main(entry.parser().parse_args(grouped_flags + ['--q1-content-gate']))
+    assert gated['schedule'] == grouped['schedule'][:2] and gated['total_updates'] == 8500
+    assert gated['settings'] == grouped['settings'] and gated['q1_content_gate']['symbols_per_gaussian'] == 8
     explicit = entry.main(entry.parser().parse_args(grouped_flags + ['--render-steps', '250']))
     assert explicit['schedule'] == three['schedule'] and explicit['total_updates'] == 24750
     assert grouped['attribute_supervision']['latent_weight'] == 0.
@@ -248,7 +251,8 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
         load_semantic_slot(path)
 
 
-@pytest.mark.parametrize('mode', ['eight', 'three-tier-scratch', 'three-tier-joint', 'grouped-attribute-supervision'])
+@pytest.mark.parametrize('mode', ['eight', 'three-tier-scratch', 'three-tier-joint',
+                                  'grouped-attribute-supervision', 'q1-content-gate'])
 def test_training_resume_across_layer_transition(tmp_path, mode):
     # Real source loader, semantic weights, optimizer phases and renderer VJPs.
     # Final digital delivery is tested separately; this test avoids subprocesses.
@@ -258,6 +262,7 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
         source, held = build_fixture(tmp_path)
         three = mode != 'eight'
         joint = mode == 'three-tier-joint'
+        gated = mode == 'q1-content-gate'
         arm = PRIVATE_ONLY if three else 'split128'
         semantic_args = options(source, held, tmp_path/'semantic', arm=arm)
         with patch.object(semantic_entry, 'diagnostic_plots'), patch.object(semantic_entry, 'write_plots'):
@@ -272,7 +277,9 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             return []
         def args(name, profile=mode):
             flags = [] if profile == 'eight' else ['--'+profile]
-            if profile == 'grouped-attribute-supervision':
+            if profile == 'q1-content-gate':
+                flags.append('--grouped-attribute-supervision')
+            if '--grouped-attribute-supervision' in flags:
                 flags.append('--three-tier-scratch')
             return entry.parser().parse_args(['--semantic-checkpoint', str(slot), '--out', str(tmp_path/name),
                 '--bootstrap-steps', '2', '--render-steps', '2', '--neighbor-steps', '0' if three else '2', '--hidden', '16',
@@ -282,14 +289,15 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
         with patch.object(entry, 'assess', side_effect=assessment):
             entry.main(args('full'))
             resumed = args('resumed')
-            entry.main(resumed, max_updates=3 if joint else 5)
+            entry.main(resumed, max_updates=3 if joint or gated else 5)
             resumed.resume = True
             entry.main(resumed)
         a = torch.load(tmp_path/'full/checkpoints/latest.pt', weights_only=True)
         b = torch.load(tmp_path/'resumed/checkpoints/latest.pt', weights_only=True)
         for key in a['state']:
             torch.testing.assert_close(a['state'][key], b['state'][key], atol=0, rtol=0)
-        expected = {'eight': 34, 'three-tier-scratch': 12, 'three-tier-joint': 4, 'grouped-attribute-supervision': 12}
+        expected = {'eight': 34, 'three-tier-scratch': 12, 'three-tier-joint': 4,
+                    'grouped-attribute-supervision': 12, 'q1-content-gate': 4}
         assert a['progress'] == b['progress'] and a['progress']['step'] == expected[mode]
         assert not any(name == 'drjohnson' and scope == 'validation' for name, scope, _, _, _ in calls)
         assert any(name == 'drjohnson' and actual for name, _, actual, _, _ in calls)
@@ -309,10 +317,21 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             assert views('full') == views('frozen')
             summary = json.loads((tmp_path/'full/review_summary.json').read_text())
             assert summary['training_mode'] == 'joint_prefix_mean'
+        elif gated:
+            assert all(layers == [1] for _, _, _, _, layers in calls)
+            assert a['state']['encoders.0.gate.readout.weight'].abs().sum() > 0
+            assert json.loads((tmp_path/'full/complete.json').read_text())['rates'] == [0, 8]
+            with patch.object(entry, 'assess', side_effect=assessment):
+                entry.main(args('ungated', 'grouped-attribute-supervision'), max_updates=1)
+            # The identity gate preserves the first q1 update's data, noise and loss.
+            gated_first, ungated_first = (json.loads((tmp_path/run/'metrics/loss.jsonl').read_text().splitlines()[0])
+                                          for run in ('full', 'ungated'))
+            assert gated_first['views'] == ungated_first['views']
+            assert gated_first['loss'] == ungated_first['loss']
         elif three:
             assert ('truck', 'validation', False, 'layer_02_bootstrap_00002', [2]) in calls
             assert ('truck', 'validation', False, 'layer_03', [2, 3]) in calls
-        if mode == 'grouped-attribute-supervision':
+        if gated or mode == 'grouped-attribute-supervision':
             rows = [json.loads(line) for line in (tmp_path/'full/metrics/loss.jsonl').read_text().splitlines()]
             for row in rows:
                 attrs = sum(WEIGHTS[row['layer']][k] * row[k+'_loss'] for k in FIELDS)

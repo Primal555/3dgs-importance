@@ -10,6 +10,10 @@ INIT=()
 if [[ "${RESUME:-0}" == 1 ]]; then INIT=(--resume); fi
 echo "GPU $CUDA_VISIBLE_DEVICES | frozen semantic checkpoint $SEMANTIC | output $OUT"
 case " $* " in
+  *" --q1-content-gate "*)
+    echo 'Train only q1 with a transmitter content gate, at 8 complex symbols per Gaussian.'
+    echo 'Fresh channel weights and frozen private128 semantics. Default 8000 bootstrap + 500 render updates.'
+    ;;
   *" --three-tier-joint "*)
     echo 'Joint 8/24/48 cumulative complex symbols per Gaussian. Fresh channel weights and frozen private128 semantics.'
     echo 'Three equal-weight losses per update. Default 8000 bootstrap + 250 render updates; all three tiers supervised each time.'
@@ -25,7 +29,7 @@ case " $* " in
     echo 'Default per layer is 500 bootstrap + 250 render updates, then 200 shared neighbor-only updates. Total 6200.'
     ;;
 esac
-if [[ " $* " != *" --three-tier-joint "* ]]; then
+if [[ " $* " != *" --three-tier-joint "* && " $* " != *" --q1-content-gate "* ]]; then
   echo 'Train the current channel layer only. Earlier layers stay frozen.'
 fi
 if [[ " $* " == *" --grouped-attribute-supervision "* ]]; then
