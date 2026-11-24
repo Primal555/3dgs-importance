@@ -17,6 +17,7 @@ WEIGHTS = {
     2: dict(zip(FIELDS, (.30, .20, .25, .25))),
     3: dict(zip(FIELDS, (.25, .20, .20, .35))),
 }
+EQUAL_WEIGHTS = {tier: dict.fromkeys(FIELDS, 0.25) for tier in WEIGHTS}
 SCALE_FLOOR = 1e-4
 SAMPLE_LIMIT = 32768
 
@@ -31,15 +32,16 @@ def attribute_errors(pred, target, directions):
     return errors
 
 
-def grouped_objective(pred, target, directions, scales, tier):
+def grouped_objective(pred, target, directions, scales, tier, *, equal_weights=False):
     errors = attribute_errors(pred, target.detach(), directions)
     terms = {name: errors[name].mean() / scales[name] for name in FIELDS}
+    weights = EQUAL_WEIGHTS if equal_weights else WEIGHTS
     if isinstance(tier, int):
-        loss = sum(WEIGHTS[tier][name] * value for name, value in terms.items())
+        loss = sum(weights[tier][name] * value for name, value in terms.items())
     else:
-        table = pred.new_tensor([[0.] * len(FIELDS), *[[row[name] for name in FIELDS] for row in WEIGHTS.values()]])
-        weights = table[tier]
-        loss = sum((weights[:, i] * errors[name]).mean() / scales[name] for i, name in enumerate(FIELDS))
+        table = pred.new_tensor([[0.] * len(FIELDS), *[[row[name] for name in FIELDS] for row in weights.values()]])
+        point_weights = table[tier]
+        loss = sum((point_weights[:, i] * errors[name]).mean() / scales[name] for i, name in enumerate(FIELDS))
     return loss, terms
 
 

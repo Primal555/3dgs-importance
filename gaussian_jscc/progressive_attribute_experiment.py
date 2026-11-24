@@ -22,7 +22,7 @@ from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewR
 from .progressive_attribute_channel import (EIGHT_FAMILY, EIGHT_RATES, THREE_RATES, LayerConfig,
     LayeredAttributeCodec, load_semantic_slot, configure_stage, frozen_digest, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
-from .progressive_attribute_supervision import FIELDS, WEIGHTS, fit_color_scales, grouped_objective
+from .progressive_attribute_supervision import EQUAL_WEIGHTS, FIELDS, WEIGHTS, fit_color_scales, grouped_objective
 from .q1_content_gate import GatedQ1Encoder
 from .refinement_views import RefinementViewCycle
 from .render_validation import append_json
@@ -46,6 +46,8 @@ def parser():
                    help='8/24/48 symbols with equally weighted joint channel training and frozen private128 semantics')
     p.add_argument('--grouped-attribute-supervision', action='store_true',
                    help='use the four tier-weighted attribute losses in both training phases of --three-tier-scratch')
+    p.add_argument('--equal-attribute-weights', action='store_true',
+                   help='give each of the four normalized grouped losses weight 0.25 at every tier')
     p.add_argument('--q1-content-gate', action='store_true',
                    help='train and evaluate only q1 from scratch with a transmitter content gate')
     p.add_argument('--bootstrap-steps', type=int,
@@ -90,6 +92,8 @@ def schedule(args, layers):
 
 
 def validate_settings(args):
+    if args.equal_attribute_weights and not args.grouped_attribute_supervision:
+        raise ValueError('--equal-attribute-weights requires --grouped-attribute-supervision')
     if args.grouped_attribute_supervision and not args.three_tier_scratch:
         raise ValueError('--grouped-attribute-supervision requires --three-tier-scratch')
     if args.q1_content_gate and (not args.grouped_attribute_supervision or args.neighbor_steps):
@@ -122,7 +126,7 @@ def prepare(args):
         semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
         settings={k: v for k, v in vars(args).items()
                   if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint',
-                               'grouped_attribute_supervision', 'q1_content_gate', 'record_symbol_diagnostics')},
+                               'grouped_attribute_supervision', 'equal_attribute_weights', 'q1_content_gate', 'record_symbol_diagnostics')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -139,14 +143,19 @@ def prepare(args):
         plan['budget_reference'] = 'old 8/24/48 main had 8000 noisy minibatch updates for each prefix'
         plan['prefix_training'] = 'freeze the semantic model and all channel layers except the current increment'
     if args.grouped_attribute_supervision:
+        weights = EQUAL_WEIGHTS if args.equal_attribute_weights else WEIGHTS
         plan['settings'].update(latent_weight=0., attribute_weight=1.)
         plan['objective'] = 'source RGB MSE + ssim_weight*(1-SSIM) + the same tier-weighted normalized attribute loss as bootstrap'
         plan['bootstrap_objective'] = 'weighted normalized shape, opacity, base RGB and high-order directional RGB MSE'
         plan['attribute_supervision'] = dict(mode='grouped_attributes_v2', latent_weight=0., target='source PLY',
             attribute_weight=dict(bootstrap=1., render=1., neighbor=1.),
-            weights_by_complex_symbols={str(cfg.rates[tier]): weights for tier, weights in WEIGHTS.items()},
+            weights_by_complex_symbols={str(cfg.rates[tier]): row for tier, row in weights.items()},
             scales='fixed train-scene attribute variance; spherical SH energy for high-order RGB',
             directions='rotating training camera directions; SH degrees 1..3 only')
+        if args.equal_attribute_weights:
+            plan['attribute_supervision']['mode'] = 'grouped_attributes_equal_v2'
+            plan['bootstrap_objective'] = 'mean of normalized shape, opacity, base RGB and high-order directional RGB MSE'
+            plan['objective'] = 'source RGB MSE + ssim_weight*(1-SSIM) + the same equal-weight attribute loss as bootstrap'
     if args.q1_content_gate:
         plan['q1_content_gate'] = dict(location='q1 transmitter input', initial_multiplier=1.,
                                       symbols_per_gaussian=cfg.rates[1])
@@ -233,7 +242,8 @@ def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tie
         raw = to_raw(pred[active], scene.geometry, model)
         target = to_raw(f[active], scene.geometry, model)
         tier = q[active] if grouped_tier == 'mixed' else grouped_tier
-        loss, terms = grouped_objective(raw, target, directions, scales, tier)
+        loss, terms = grouped_objective(raw, target, directions, scales, tier,
+                                       equal_weights=getattr(args, 'equal_attribute_weights', False))
         latent = (yh[active].detach()-y[active]).square().mean()
         return raw, loss, dict(terms, attributes=loss, latent=latent, transmitted_power=wire['transmitted_power'])
     latent = (yh[active]-y[active]).square().mean()

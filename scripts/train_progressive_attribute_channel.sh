@@ -33,7 +33,11 @@ if [[ " $* " != *" --three-tier-joint "* && " $* " != *" --q1-content-gate "* ]]
   echo 'Train the current channel layer only. Earlier layers stay frozen.'
 fi
 if [[ " $* " == *" --grouped-attribute-supervision "* ]]; then
-  echo 'Both phases use the same tier-weighted shape, opacity, base RGB and high-order SH RGB losses.'
+  if [[ " $* " == *" --equal-attribute-weights "* ]]; then
+    echo 'All tiers and both phases: shape=0.25, opacity=0.25, base RGB=0.25, high-order RGB=0.25.'
+  else
+    echo 'Both phases use the same tier-weighted shape, opacity, base RGB and high-order SH RGB losses.'
+  fi
   echo 'Render fine-tuning adds multiview rendering loss. Latent MSE is reporting only in both phases.'
 fi
 echo '32 rotating training views; inherit original validation/test cameras and heldout scenes.'
