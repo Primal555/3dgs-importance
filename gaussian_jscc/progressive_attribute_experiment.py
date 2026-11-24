@@ -62,6 +62,8 @@ def parser():
     p.add_argument('--hidden', type=int, default=256)
     p.add_argument('--views-per-step', type=int, default=32)
     p.add_argument('--validate-every', type=int, default=250)
+    p.add_argument('--record-symbol-diagnostics', action='store_true',
+                   help='record per-symbol power, covariance rank and attribute errors at evaluation')
     p.add_argument('--save-every', type=int, help='latest checkpoint interval (50 eight-tier, 250 three-tier)')
     p.add_argument('--trials', type=int, default=4)
     p.add_argument('--snr', type=float, default=10.)
@@ -120,7 +122,7 @@ def prepare(args):
         semantic_slot=dict(checkpoint=args.semantic_checkpoint, accepted=['shared128', 'shared256', 'split128', 'split256', 'split_full_geometry128']),
         settings={k: v for k, v in vars(args).items()
                   if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint',
-                               'grouped_attribute_supervision', 'q1_content_gate')},
+                               'grouped_attribute_supervision', 'q1_content_gate', 'record_symbol_diagnostics')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -128,6 +130,8 @@ def prepare(args):
         selection='fixed final; validation reports only; tests never select weights',
         cost_protocol='digital_side_file_v1; actual LDPC4096/6144 + 16QAM; no ARQ',
         cache='frozen semantic latents in CPU RAM, rebuilt on resume; never cache noisy receiver outputs')
+    if args.record_symbol_diagnostics:
+        plan['record_symbol_diagnostics'] = True
     if three:
         plan['semantic_slot']['accepted'] = [PRIVATE_ONLY]
         plan['bootstrap_validation_steps'] = sorted(

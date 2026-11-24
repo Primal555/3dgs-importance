@@ -33,11 +33,15 @@ def layout_for(scene, layer, seed, *, layers=8):
 
 
 @torch.no_grad()
-def decode_cached(model, scene, cached, layouts, snr, seed, *, noiseless=False, clean=False, neighbor=True):
+def decode_cached(model, scene, cached, layouts, snr, seed, *, noiseless=False, clean=False, neighbor=True,
+                  record_symbols=False):
+    if record_symbols and (clean or not noiseless):
+        raise ValueError('symbol statistics require a uniform finite noiseless prefix')
     device = next(model.parameters()).device
     generator = torch.Generator(device=device).manual_seed(seed)
     model.eval(); model.set_scene_geometry(scene.geometry)
     rows, squared, count, energy, symbols = [], 0., 0, 0., 0
+    symbol_sum, symbol_products, symbol_points = 0., 0., 0
     rates = torch.as_tensor(model.layer_config.rates, device=device)
     for data, q in zip(cached, layouts):
         data, q = data.to(device), q.to(device)
@@ -50,10 +54,31 @@ def decode_cached(model, scene, cached, layouts, snr, seed, *, noiseless=False, 
                                                   generator=generator, neighbor=neighbor)
             n = int(rates[q].sum())
             energy += float(wire['transmitted_power'])*n; symbols += n
+            if record_symbols:
+                z = wire['received'][active].double()
+                if z.numel() != 2*n:
+                    raise ValueError('symbol statistics require a uniform finite noiseless prefix')
+                symbol_sum = symbol_sum + z.sum(dim=0)
+                symbol_products = symbol_products + z.T @ z
+                symbol_points += len(z)
         squared += float((yh[active]-y[active]).square().sum()); count += int(active.sum())*y.shape[-1]
         rows.append(to_raw(pred[active], scene.geometry, model).cpu())
-    return torch.cat(rows), dict(latent_mse=squared/max(1, count),
-                                 transmitted_power=energy/max(1, symbols))
+    diagnostics = dict(latent_mse=squared/max(1, count), transmitted_power=energy/max(1, symbols))
+    if record_symbols:
+        # Every consecutive pair belongs to one transmitted complex symbol.
+        mean = symbol_sum.cpu()/symbol_points
+        second_moment = symbol_products.cpu()/symbol_points
+        covariance = second_moment - torch.outer(mean, mean)
+        spectrum = torch.linalg.eigvalsh(covariance).clamp_min(0).flip(0)
+        fractions = spectrum/spectrum.sum().clamp_min(torch.finfo(spectrum.dtype).tiny)
+        positive = fractions[fractions > 0]
+        diagnostics['symbols'] = dict(
+            points=symbol_points,
+            mean_power_by_symbol=second_moment.diag().reshape(-1, 2).sum(1).tolist(),
+            centered_power_by_symbol=covariance.diag().clamp_min(0).reshape(-1, 2).sum(1).tolist(),
+            real_covariance_eigenvalues=spectrum.tolist(),
+            real_covariance_effective_rank=float((-(positive*positive.log()).sum()).exp()) if positive.numel() else 0.)
+    return torch.cat(rows), diagnostics
 
 
 @torch.no_grad()
@@ -88,6 +113,8 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
     cameras = scene.val_cameras if scope == 'validation' else scene.test_cameras
     rows = []
     identity = model.identity()
+    record_symbols = getattr(args, 'record_symbol_diagnostics', False)
+    record_attributes = args.grouped_attribute_supervision or record_symbols
     # The semantic reference is identical at every layer endpoint.
     clean_cache = getattr(scene, '_progressive_clean_metrics', {})
     clean_metrics = clean_cache.get(scope)
@@ -95,7 +122,7 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
         clean, _ = decode_cached(model, scene, cached, layout_for(scene, 1, args.seed), args.snr,
                                  args.seed+1000, clean=True)
         clean_metrics = render_metrics(clean, model, scene, cameras, perceptual)
-        if args.grouped_attribute_supervision:
+        if record_attributes:
             clean_metrics['attribute_errors'] = assess_attributes(clean, scene.raw, cameras, next(model.parameters()).device)
         clean_cache[scope] = clean_metrics
         scene._progressive_clean_metrics = clean_cache
@@ -118,7 +145,8 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
                     rows.append(row); continue
                 seed = args.seed+1000+trial
                 raw, diagnostics = decode_cached(model, scene, cached, layouts, args.snr,
-                    seed, noiseless=path == 'finite_noiseless')
+                    seed, noiseless=path == 'finite_noiseless',
+                    record_symbols=record_symbols and path == 'finite_noiseless' and layer != 'mixed')
                 with tempfile.TemporaryDirectory(prefix='packet-', dir=folder) as tmp:
                     sender, receiver = Path(tmp)/'sender', Path(tmp)/'receiver'
                     measured, cost = export_packet(model, scene, cached, layouts, args.snr, seed, sender,
@@ -131,7 +159,7 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
                         packet_max_error=float((packet_raw-raw).abs().max()),
                         **render_metrics(packet_raw, model, scene, cameras, perceptual,
                             folder/'images' if scope == 'test' and trial == 0 and path == 'awgn' else None))
-                    if args.grouped_attribute_supervision:
+                    if record_attributes:
                         row['attribute_errors'] = assess_attributes(packet_raw, scene.raw, cameras,
                                                                     next(model.parameters()).device)
                     if actual and path == 'awgn':

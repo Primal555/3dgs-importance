@@ -237,6 +237,12 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
     gated = entry.main(entry.parser().parse_args(grouped_flags + ['--q1-content-gate']))
     assert gated['schedule'] == grouped['schedule'][:2] and gated['total_updates'] == 8500
     assert gated['settings'] == grouped['settings'] and gated['q1_content_gate']['symbols_per_gaussian'] == 8
+    average_500 = entry.main(entry.parser().parse_args([
+        '--out', str(tmp_path/'average_500'), '--dry-run', '--three-tier-scratch',
+        '--render-steps', '500', '--record-symbol-diagnostics']))
+    assert average_500['total_updates'] == 25500 and average_500['record_symbol_diagnostics']
+    assert average_500['settings'] == dict(three['settings'], render_steps=500)
+    assert average_500['objective'] == three['objective']
     explicit = entry.main(entry.parser().parse_args(grouped_flags + ['--render-steps', '250']))
     assert explicit['schedule'] == three['schedule'] and explicit['total_updates'] == 24750
     assert grouped['attribute_supervision']['latent_weight'] == 0.
@@ -356,7 +362,7 @@ def test_evaluation_received_files_and_failed_cost(tmp_path, failed, rates, laye
     scene = SimpleNamespace(name='tiny', geometry=geometry, groups=[f], group_ids=[ids],
         raw=raw, test_cameras=views, degree=3, white_background=False, reference=Reference(raw))
     args = entry.parser().parse_args(['--out', str(tmp_path), '--device', 'cpu',
-                                     '--digital-device', 'cpu', '--trials', '1']
+                                     '--digital-device', 'cpu', '--trials', '1', '--record-symbol-diagnostics']
                                      + (['--three-tier-scratch', '--grouped-attribute-supervision'] if rates == THREE_RATES else []))
     calls = []
     def execute(python, module, arguments, log):
@@ -378,9 +384,17 @@ def test_evaluation_received_files_and_failed_cost(tmp_path, failed, rates, laye
             tmp_path/'evaluation/final/tiny', scope='test', layers=[layer], actual=True)
     assert calls == ['xyz.bin', 'metadata.bin', 'scales.bin']
     row = next(r for r in rows if r['path'] == 'awgn')
-    if rates == THREE_RATES:
-        assert row['attribute_errors']['points'] == int(active.sum())
-        assert set(row['attribute_errors']['mse']) == set(FIELDS)
+    assert row['attribute_errors']['points'] == int(active.sum())
+    assert set(row['attribute_errors']['mse']) == set(FIELDS)
+    assert 'symbols' not in row['diagnostics']
+    clean_row = next(r for r in rows if r['path'] == 'finite_noiseless')
+    stats = clean_row['diagnostics']['symbols']
+    assert stats['points'] == int(active.sum())
+    assert len(stats['mean_power_by_symbol']) == rates[layer]
+    assert sum(stats['mean_power_by_symbol'])/rates[layer] == pytest.approx(
+        clean_row['diagnostics']['transmitted_power'], rel=1e-6)
+    assert sum(stats['centered_power_by_symbol']) == pytest.approx(sum(stats['real_covariance_eigenvalues']))
+    assert 1 <= stats['real_covariance_effective_rank'] <= min(rates[layer]*2, stats['points']-1) + 1e-8
     delivered = row['actual_delivery']
     assert delivered['status'] == ('failed' if failed else 'success')
     assert (delivered['metrics'] is None) == failed
