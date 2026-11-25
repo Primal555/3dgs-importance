@@ -11,6 +11,7 @@ import torch
 from comparison_baselines.digital_link import file_channel_cost
 from gaussian_jscc import progressive_attribute_joint as joint
 from gaussian_jscc.progressive_attribute_channel import LayerConfig, LayeredAttributeCodec, THREE_RATES
+from gaussian_jscc.progressive_attribute_supervision import assess_attributes, summarize_attribute_recovery
 from gaussian_jscc.semantic_attribute_codec import PRIVATE_ONLY
 from test_semantic_attribute_controls import build_fixture, cameras, model_data, synthetic_render
 
@@ -49,9 +50,19 @@ def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path):
             record = plan['scene_records'][spec['name']]
             scene = joint.make_scene(spec, *joint.read_ply(spec['ply']), model, Namespace(**inputs['settings']),
                                      run, old=record)
-            joint.assess(model, scene, joint.cache_scene(model, scene)['batches'],
-                Namespace(**settings, grouped_attribute_supervision=False), run/'evaluation/final'/scene.name,
-                scope='test', layers=joint.LAYOUTS, actual=True)
+            cached = joint.cache_scene(model, scene)['batches']
+            evaluation = Namespace(**settings, grouped_attribute_supervision=False)
+            out = run/'evaluation/final'/scene.name
+            original_rows = joint.assess(model, scene, cached, evaluation, out, scope='test',
+                                         layers=joint.LAYOUTS, actual=True)
+            if scene.name == 'truck':
+                with patch('gaussian_jscc.progressive_attribute_evaluation.transmit_sides',
+                           side_effect=AssertionError('a completed delivery was repeated')):
+                    updated = joint.assess(model, scene, cached, evaluation, out, scope='test',
+                                           layers=joint.LAYOUTS, actual=True, detailed_attributes=True)
+                for before, after in zip(original_rows, updated):
+                    assert 'details' in after.pop('attribute_errors')
+                    assert after == before
 
         def args(name):
             return joint.parser().parse_args(['--run', str(run), '--out', str(tmp_path/name),
@@ -90,6 +101,9 @@ def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path):
         assert stage['optimizer']['state'] and all(v['step'] == 4 for v in stage['optimizer']['state'].values())
         evaluated = json.loads((output/f'evaluation/q{tier}_end/truck/summary.json').read_text())
         assert {r['layer'] for r in evaluated['rows']} == set(joint.TIERS)
+        attributes = json.loads((output/f'evaluation/q{tier}_end/truck/attribute_recovery.json').read_text())
+        assert set(attributes['tiers']) == {'1', '2', '3'}
+        assert attributes['awgn_basis'] == 'reliable side files'
         assert not (output/f'evaluation/q{tier}_end/drjohnson').exists()
         previous = state
     history = [json.loads(s) for s in (output/'metrics/loss.jsonl').read_text().splitlines()]
@@ -101,6 +115,9 @@ def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path):
     assert clean[0]['photo_psnr'] != clean[1]['photo_psnr']
     comparison = json.loads((output/'photo_comparison.json').read_text())
     assert set(comparison) == {'truck', 'playroom', 'drjohnson'}
+    attributes = json.loads((output/'evaluation/final/drjohnson/attribute_recovery.json').read_text())
+    assert attributes['awgn_basis'] == 'successful actual deliveries'
+    assert attributes['tiers']['3']['awgn_trials_used'] == 1
     assert comparison['truck']['clean']['gain_db'] != 0.
     row = comparison['drjohnson']['layouts']['3']
     assert row['paired_successes'] == 1 and row['awgn']['gain_db'] != 0.
@@ -126,3 +143,30 @@ def test_photo_gain_pairs_successful_trials_and_preserves_clean_change():
     assert row['paired_successes'] == 1 and row['attempted'] == 3
     assert row['awgn']['gain_db'] == row['noise_penalty_db']['reduction_db'] == 1.
     assert joint.photo_comparison(initial, endpoint(31., [None]*3), 3)['layouts']['1']['awgn'] is None
+
+
+def test_attribute_details_separate_sh_degrees_and_condition_on_delivery():
+    from types import SimpleNamespace
+    source = torch.zeros(4, 59)
+    source[:, 7] = 1.
+    recovered = source.clone()
+    recovered[:, 4:7] = 0.5
+    recovered[:, 7] = -1.
+    recovered[:, 14:].reshape(-1, 3, 15)[:, :, 3:8] = 2.
+    views = [SimpleNamespace(camera_center=torch.tensor([0., 0., 1.]))]
+    def measure(pred):
+        return assess_attributes(pred, source, views, 'cpu', detailed=True)
+    clean, noisy = measure(source), measure(recovered)
+    details = noisy['details']
+    assert details['sorted_log_scale_rmse'] == 0.5 and details['log_volume_bias'] == 1.5
+    assert details['rotation_angle_mean_deg'] == 0.
+    assert [details[f'sh_degree_{i}_coefficient_mse'] for i in (1, 2, 3)] == [0., 4., 0.]
+    rows = [dict(layer=1, path='finite_noiseless', attribute_errors=clean),
+            dict(layer=1, path='awgn', attribute_errors=noisy, actual_delivery={'status': 'success'}),
+            dict(layer=1, path='awgn', attribute_errors=clean, actual_delivery={'status': 'failed'})]
+    row = summarize_attribute_recovery(clean, rows, actual=True)['tiers']['1']
+    assert row['awgn_trials_used'] == 1 and row['awgn_trials_attempted'] == 2
+    assert row['awgn_minus_finite']['sh_degree_2_coefficient_mse'] == 4.
+    assert summarize_attribute_recovery(clean, rows, False)['tiers']['1']['awgn_mean']['sh_degree_2_coefficient_mse'] == 2.
+    rows[1]['actual_delivery']['status'] = 'failed'
+    assert summarize_attribute_recovery(clean, rows, True)['tiers']['1']['awgn_mean'] is None

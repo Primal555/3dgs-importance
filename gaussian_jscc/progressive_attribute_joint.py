@@ -237,7 +237,7 @@ def main(args):
                 cached = cache_scene(model, scene)['batches']
                 assess(model, scene, cached, settings, out/'evaluation'/label/scene.name,
                        scope='test' if final else 'validation', layers=LAYOUTS if final else TIERS,
-                       perceptual=perceptual, actual=final)
+                       perceptual=perceptual, actual=final, detailed_attributes=True)
                 del cached
 
     interval = len(train)*args.validate_every

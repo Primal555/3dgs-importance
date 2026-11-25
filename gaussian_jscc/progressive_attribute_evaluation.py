@@ -13,7 +13,7 @@ from .digital_side_delivery import transmit_sides
 from .modular_experiment import json_write
 from .position_delivery import delivered_positions
 from .progressive_attribute_packet import export_packet, receive_packet
-from .progressive_attribute_supervision import assess_attributes
+from .progressive_attribute_supervision import assess_attributes, summarize_attribute_recovery
 from .render_objective import image_metrics
 from .semantic_attribute_metrics import save_image
 
@@ -108,23 +108,26 @@ def render_metrics(raw, model, scene, cameras, perceptual, image_dir=None):
 
 
 def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
-           actual=False, core_comparison=False):
+           actual=False, core_comparison=False, detailed_attributes=False):
     out = Path(out); out.mkdir(parents=True, exist_ok=True)
     cameras = scene.val_cameras if scope == 'validation' else scene.test_cameras
     rows = []
     identity = model.identity()
     record_symbols = getattr(args, 'record_symbol_diagnostics', False)
-    record_attributes = args.grouped_attribute_supervision or record_symbols
+    record_attributes = args.grouped_attribute_supervision or record_symbols or detailed_attributes
+    device = next(model.parameters()).device
     # Only frozen semantics can reuse a clean render across optimizer updates.
     clean_cache = getattr(scene, '_progressive_clean_metrics', {})
     frozen_semantics = not any(p.requires_grad for p in model.semantic.parameters())
     clean_metrics = clean_cache.get(scope) if frozen_semantics else None
-    if clean_metrics is None:
+    if clean_metrics is None or (detailed_attributes and
+                                 'details' not in clean_metrics.get('attribute_errors', {})):
         clean, _ = decode_cached(model, scene, cached, layout_for(scene, 1, args.seed), args.snr,
                                  args.seed+1000, clean=True)
         clean_metrics = render_metrics(clean, model, scene, cameras, perceptual)
         if record_attributes:
-            clean_metrics['attribute_errors'] = assess_attributes(clean, scene.raw, cameras, next(model.parameters()).device)
+            clean_metrics['attribute_errors'] = assess_attributes(clean, scene.raw, cameras, device,
+                                                                  detailed=detailed_attributes)
         if frozen_semantics:
             clean_cache[scope] = clean_metrics
             scene._progressive_clean_metrics = clean_cache
@@ -139,13 +142,27 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
                 folder = out/str(layer)/path/str(trial)
                 folder.mkdir(parents=True, exist_ok=True)
                 result = folder/'result.json'
+                seed = args.seed+1000+trial
                 if result.exists():
                     import json
                     row = json.loads(result.read_text(encoding='utf8'))
                     if row['codec_id'] != identity:
                         raise ValueError('evaluation resume weights changed')
+                    if detailed_attributes and 'details' not in row.get('attribute_errors', {}):
+                        # Old checkpoints may have completed this trial before detailed logging was added.
+                        with tempfile.TemporaryDirectory(prefix='attribute-', dir=folder) as tmp:
+                            packet = Path(tmp)/'sender'
+                            export_packet(model, scene, cached, layouts, args.snr, seed, packet,
+                                          noiseless=path == 'finite_noiseless')
+                            raw = receive_packet(model, packet)
+                        measured_attrs = assess_attributes(raw, scene.raw, cameras, device, detailed=True)
+                        if 'attribute_errors' in row:
+                            row['attribute_errors']['details'] = measured_attrs['details']
+                        else:
+                            row['attribute_errors'] = measured_attrs
+                        json_write(result, row)
+                        del raw
                     rows.append(row); continue
-                seed = args.seed+1000+trial
                 raw, diagnostics = decode_cached(model, scene, cached, layouts, args.snr,
                     seed, noiseless=path == 'finite_noiseless',
                     record_symbols=record_symbols and path == 'finite_noiseless' and layer != 'mixed')
@@ -162,8 +179,8 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
                         **render_metrics(packet_raw, model, scene, cameras, perceptual,
                             folder/'images' if scope == 'test' and trial == 0 and path == 'awgn' else None))
                     if record_attributes:
-                        row['attribute_errors'] = assess_attributes(packet_raw, scene.raw, cameras,
-                                                                    next(model.parameters()).device)
+                        row['attribute_errors'] = assess_attributes(packet_raw, scene.raw, cameras, device,
+                                                                    detailed=detailed_attributes)
                     if actual and path == 'awgn':
                         config = LinkConfig(device=args.digital_device)
                         def runner(src, dst, report, link_seed):
@@ -198,4 +215,8 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
                       f'photo={row["photo_psnr"]:.4f}, cost={cost["total_channel_uses"]/1e6:.5f}M', flush=True)
     json_write(out/'summary.json', dict(rows=rows, clean=clean_metrics, scope=scope,
         quality_conditioning='main metrics assume reliable side files; actual_delivery reports successes and failures separately'))
+    if detailed_attributes:
+        recovery = summarize_attribute_recovery(clean_metrics['attribute_errors'], rows, actual)
+        json_write(out/'attribute_recovery.json', dict(scene=scene.name, scope=scope, codec_id=identity,
+                                                       snr_db=args.snr, **recovery))
     return rows
