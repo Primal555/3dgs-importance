@@ -1,4 +1,4 @@
-"""Joint B render fine-tuning from a completed private128 progressive channel."""
+"""Adapt shared private128 semantics and one progressive channel tier at a time."""
 import argparse
 import json
 import math
@@ -27,7 +27,8 @@ from .successive_multiscene_inputs import make_scene
 from .training import full_scene_step
 
 
-LAYOUTS = (1, 2, 3, 'mixed')
+TIERS = (1, 2, 3)
+LAYOUTS = (*TIERS, 'mixed')
 
 
 def parser():
@@ -35,7 +36,8 @@ def parser():
     p.add_argument('--run', type=Path, required=True, help='completed three-tier channel run')
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--manifest', help='override scene paths, retaining the checkpoint splits')
-    p.add_argument('--steps-per-scene', type=int, default=2000)
+    p.add_argument('--steps-per-scene', type=int, default=1500,
+                   help='total per training scene, divided across consecutive q1, q2 and q3 phases')
     p.add_argument('--lr', type=float, default=1e-5)
     p.add_argument('--validate-every', type=int, default=250, help='updates per training scene')
     p.add_argument('--save-every', type=int, default=100, help='global updates')
@@ -52,6 +54,8 @@ def prepare(args):
         raise ValueError('joint output must be separate from the source run')
     if min(args.steps_per_scene, args.validate_every, args.save_every) < 1 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError('positive step counts and finite positive learning rate required')
+    if args.steps_per_scene < len(TIERS):
+        raise ValueError('each scene needs at least one update per tier')
     saved = torch.load(run/'checkpoints/final.pt', map_location='cpu', weights_only=True)
     parent = saved['plan']
     complete = json.loads((run/'complete.json').read_text(encoding='utf8'))
@@ -75,11 +79,22 @@ def prepare(args):
         ('snr', 'seed', 'trials', 'lpips', 'digital_device', 'cpu_threads', 'views_per_step')},
         digital_python=args.digital_python or settings['digital_python'], grouped_attribute_supervision=False,
         record_symbol_diagnostics=parent.get('record_symbol_diagnostics', False))
-    plan = dict(version='progressive_attribute_joint_b_v1', source_run=str(run),
+    scene_count = sum(s['role'] == 'train' for s in specs)
+    per_tier, remainder = divmod(args.steps_per_scene, len(TIERS))
+    schedule = []
+    start = 0
+    for tier in TIERS:
+        visits = per_tier + int(tier <= remainder)
+        end = start + visits*scene_count
+        schedule.append(dict(tier=tier, steps_per_scene=visits, start_step=start, end_step=end))
+        start = end
+    plan = dict(version='progressive_attribute_tier_semantic_v1', source_run=str(run),
         source_step=complete['step'], source_codec_id=complete['codec_id'], channel=parent['channel'],
         semantic_slot=slot, selected_scenes=specs, scene_records=parent['scene_records'],
-        steps_per_scene=args.steps_per_scene, total_updates=args.steps_per_scene*sum(s['role']=='train' for s in specs),
-        layouts=list(LAYOUTS), lr=args.lr, validate_every_per_scene=args.validate_every, save_every=args.save_every,
+        steps_per_scene=args.steps_per_scene, total_updates=start, schedule=schedule, evaluation_layouts=list(LAYOUTS),
+        trainable='shared semantic encoder and decoder plus the active tier channel encoder and decoder',
+        optimizer='new Adam at each tier; inherit all model weights across tiers',
+        lr=args.lr, validate_every_per_scene=args.validate_every, save_every=args.save_every,
         objective='source PLY render RGB MSE + MSE(recovered latent, stop_gradient(current semantic latent))',
         evaluation=vars(evaluation), device=args.device, cost_protocol=parent['cost_protocol'])
     return model, json.loads(json.dumps(plan)), evaluation
@@ -158,8 +173,9 @@ def main(args):
     before = {s['name']: read_endpoint(run, s['name'], plan['source_codec_id'], settings, records[s['name']])
               for s in plan['selected_scenes']}
     if args.dry_run:
+        budget = ', '.join(f"q{p['tier']}={p['steps_per_scene']}" for p in plan['schedule'])
         print(f"Verified source step {plan['source_step']}, codec {plan['source_codec_id']}, "
-              f"{len(before)} paired test baselines; {plan['total_updates']} new updates.")
+              f"{len(before)} paired test baselines; {budget} per scene, {plan['total_updates']} new updates.")
         return plan
     if not Path(settings.digital_python).is_file():
         raise FileNotFoundError(settings.digital_python)
@@ -176,9 +192,7 @@ def main(args):
     torch.set_num_threads(settings.cpu_threads)
     seed_all(settings.seed)
     model.to(device)
-    optimizer = configure_stage(model, 'end_to_end', args.lr)
-    fixed = frozen_digest(model)
-    progress = dict(step=0, cycles={})
+    progress = dict(step=0, tier=1, cycles={})
     latest = out/'checkpoints/latest.pt'
     saved = None
     log = out/'metrics/loss.jsonl'
@@ -187,7 +201,6 @@ def main(args):
         if saved['plan'] != plan:
             raise ValueError('checkpoint plan mismatch')
         model.load_state_dict(saved['state'])
-        optimizer.load_state_dict(saved['optimizer'])
         progress = saved['progress']
         if log.exists():
             lines = log.read_text(encoding='utf8').splitlines()[:progress['step']]
@@ -207,14 +220,14 @@ def main(args):
         del raw
     train = [s for s in scenes if s.spec['role'] == 'train']
     cycles = {s.name: RefinementViewCycle([str(c.image_name) for c in s.cameras], settings.seed, s.name,
-              'joint_b', progress['cycles'].get(s.name)) for s in train}
+              'tier_semantic', progress['cycles'].get(s.name)) for s in train}
     perceptual = LPIPSEvaluator(device) if settings.lpips else None
     if saved:
         restore_rng(saved['rng'])
-        del saved
-    def checkpoint(label):
-        if bool(model.neighbor_enabled) or frozen_digest(model) != fixed:
-            raise RuntimeError('joint training changed fixed statistics or inactive neighbor')
+
+    def checkpoint(label, optimizer):
+        if bool(model.neighbor_enabled) or frozen_digest(model) != progress['frozen_sha256']:
+            raise RuntimeError(f"q{progress['tier']}: inactive channel layers or fixed statistics changed")
         progress['cycles'] = {k: v.state_dict() for k, v in cycles.items()}
         save(out/'checkpoints'/f'{label}.pt', model, optimizer, progress, plan, {})
 
@@ -223,35 +236,48 @@ def main(args):
             for scene in scenes_to_test:
                 cached = cache_scene(model, scene)['batches']
                 assess(model, scene, cached, settings, out/'evaluation'/label/scene.name,
-                       scope='test' if final else 'validation', layers=LAYOUTS if final else LAYOUTS[:3],
+                       scope='test' if final else 'validation', layers=LAYOUTS if final else TIERS,
                        perceptual=perceptual, actual=final)
                 del cached
 
-    if not latest.exists():
-        checkpoint('latest')
-    print(f"Joint B from step {plan['source_step']}: {args.steps_per_scene} updates per scene, "
-          f"{plan['total_updates']} total, {settings.views_per_step} views/update, resume step {progress['step']}.",
-          flush=True)
     interval = len(train)*args.validate_every
-    while progress['step'] < plan['total_updates']:
-        step = progress['step']
-        if step and step % interval == 0:
-            evaluate(f'monitor_{step:06d}', train)
-        visit, index = divmod(step, len(train))
-        scene, tier = train[index], LAYOUTS[visit % len(LAYOUTS)]
-        cameras = [scene.cameras[i] for i in cycles[scene.name].next(settings.views_per_step)]
-        optimizer.zero_grad(set_to_none=True)
-        loss, metrics = update(model, scene, tier, visit+1, cameras, settings)
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
-        optimizer.step()
-        progress['step'] = step+1
-        append_json(log, dict(step=step+1, scene=scene.name, scene_step=visit+1, layout=tier, loss=loss,
-                    grad_norm=float(norm), views=[str(c.image_name) for c in cameras], **metrics))
-        if step == 0 or (step+1) % 10 == 0:
-            print(f"Joint {step+1}/{plan['total_updates']} {scene.name} tier={tier} loss={loss:.7g}", flush=True)
-        if any((step+1) % n == 0 for n in (args.save_every, interval)) or step+1 == plan['total_updates']:
-            checkpoint('latest')
-    checkpoint('final')
+    for phase in plan['schedule'][progress['tier']-1:]:
+        tier, start, end = phase['tier'], phase['start_step'], phase['end_step']
+        optimizer = configure_stage(model, tier, args.lr, train_semantic=True)
+        fixed = frozen_digest(model)
+        if saved:
+            if not start <= progress['step'] <= end or fixed != progress['frozen_sha256']:
+                raise ValueError('resume checkpoint does not match the tier or its frozen weights')
+            optimizer.load_state_dict(saved['optimizer'])
+            saved = None
+        else:
+            progress.update(tier=tier, frozen_sha256=fixed)
+            checkpoint('latest', optimizer)
+        print(f"q{tier} semantic adaptation: train semantic endpoints and channel increment {tier}; "
+              f"global steps {start+1}..{end}, {phase['steps_per_scene']} updates per scene, "
+              f"completed {progress['step']}/{plan['total_updates']}.", flush=True)
+        for step in range(progress['step'], end):
+            phase_step = step-start
+            if phase_step and phase_step % interval == 0:
+                evaluate(f'monitor_{step:06d}', train)
+            visit, index = divmod(step, len(train))
+            scene = train[index]
+            cameras = [scene.cameras[i] for i in cycles[scene.name].next(settings.views_per_step)]
+            optimizer.zero_grad(set_to_none=True)
+            loss, metrics = update(model, scene, tier, visit+1, cameras, settings)
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
+            optimizer.step()
+            progress['step'] = step+1
+            append_json(log, dict(step=step+1, scene=scene.name, scene_step=visit+1, layout=tier,
+                        tier_step=phase_step+1, loss=loss, grad_norm=float(norm),
+                        views=[str(c.image_name) for c in cameras], **metrics))
+            if phase_step == 0 or (step+1) % 10 == 0:
+                print(f"q{tier} {phase_step+1}/{end-start} {scene.name} loss={loss:.7g}", flush=True)
+            if (step+1) % args.save_every == 0 or (phase_step+1) % interval == 0 or step+1 == end:
+                checkpoint('latest', optimizer)
+        checkpoint(f'q{tier}_end', optimizer)
+        evaluate(f'q{tier}_end', train)
+    checkpoint('final', optimizer)
     evaluate('final', scenes, final=True)
     identity = model.identity()
     comparison = {s.name: photo_comparison(before[s.name],

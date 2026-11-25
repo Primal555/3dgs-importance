@@ -1,4 +1,4 @@
-"""Four-module continuation, moving semantic references and paired photo endpoints."""
+"""Sequential semantic adaptation, frozen channel prefixes and paired photo endpoints."""
 import json
 import shutil
 import sys
@@ -24,7 +24,7 @@ def copy_sides(sender, receiver, reports, config, snr, seed, runner):
     return dict(status='success', streams={}, side_channel_uses=uses)
 
 
-def test_joint_b_restores_weights_and_compares_current_semantics(tmp_path):
+def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path):
     torch.set_num_threads(1)
     torch.manual_seed(101)
     with patch('gaussian_jscc.rendering.render', side_effect=synthetic_render), \
@@ -55,37 +55,49 @@ def test_joint_b_restores_weights_and_compares_current_semantics(tmp_path):
 
         def args(name):
             return joint.parser().parse_args(['--run', str(run), '--out', str(tmp_path/name),
-                '--steps-per-scene', '4', '--save-every', '2', '--validate-every', '1', '--device', 'cpu'])
+                '--steps-per-scene', '6', '--save-every', '2', '--validate-every', '1', '--device', 'cpu'])
 
         joint.main(args('full'))
         part = args('resumed')
         original = joint.update
-        def interrupt(net, scene, tier, visit, views, config):
-            if visit == 3:
-                raise InterruptedError
-            return original(net, scene, tier, visit, views, config)
-        with patch.object(joint, 'update', side_effect=interrupt), pytest.raises(InterruptedError):
-            joint.main(part)
-        part.resume = True
+        for stop in (3, 4):
+            def interrupt(net, scene, tier, visit, views, config):
+                if visit == stop:
+                    raise InterruptedError
+                return original(net, scene, tier, visit, views, config)
+            with patch.object(joint, 'update', side_effect=interrupt), pytest.raises(InterruptedError):
+                joint.main(part)
+            part.resume = True
         joint.main(part)
 
     checkpoints = [torch.load(tmp_path/name/'checkpoints/final.pt', weights_only=True)
                    for name in ('full', 'resumed')]
     a, b = checkpoints
-    assert a['progress'] == b['progress'] and a['progress']['step'] == 8
+    assert a['progress'] == b['progress'] and a['progress']['step'] == 12
     for name, value in a['state'].items():
         torch.testing.assert_close(b['state'][name], value, atol=0, rtol=0)
-    changed = {name for name, value in a['state'].items() if not torch.equal(model.state_dict()[name], value)}
-    for prefix in ('semantic.semantic_encoder.', 'semantic.semantic_decoder.', 'encoders.', 'decoders.'):
-        assert any(name.startswith(prefix) for name in changed)
-    assert all('neighbor' not in name and 'attr_mean' not in name and 'attr_std' not in name for name in changed)
     output = part.out
+    previous = model.state_dict()
+    for tier in joint.TIERS:
+        stage = torch.load(output/f'checkpoints/q{tier}_end.pt', weights_only=True)
+        state = stage['state']
+        changed = {k for k in state if not torch.equal(previous[k], state[k])}
+        prefixes = ('semantic.semantic_encoder.', 'semantic.semantic_decoder.',
+                    f'encoders.{tier-1}.', f'decoders.{tier-1}.')
+        assert all(any(k.startswith(prefix) for k in changed) for prefix in prefixes)
+        assert all(k.startswith(prefixes) for k in changed)
+        assert stage['progress']['tier'] == tier
+        assert stage['optimizer']['state'] and all(v['step'] == 4 for v in stage['optimizer']['state'].values())
+        evaluated = json.loads((output/f'evaluation/q{tier}_end/truck/summary.json').read_text())
+        assert {r['layer'] for r in evaluated['rows']} == set(joint.TIERS)
+        assert not (output/f'evaluation/q{tier}_end/drjohnson').exists()
+        previous = state
     history = [json.loads(s) for s in (output/'metrics/loss.jsonl').read_text().splitlines()]
     for scene in ('truck', 'playroom'):
-        assert [r['layout'] for r in history if r['scene'] == scene] == list(joint.LAYOUTS)
-    assert not (output/'evaluation/monitor_000004/drjohnson').exists()
-    clean = [json.loads((output/'evaluation'/f'monitor_{step:06d}/truck/clean.json').read_text())
-             for step in (2, 4)]
+        assert [r['layout'] for r in history if r['scene'] == scene] == [1, 1, 2, 2, 3, 3]
+    assert not (output/'evaluation/monitor_000002/drjohnson').exists()
+    clean = [json.loads((output/'evaluation'/label/'truck/clean.json').read_text())
+             for label in ('monitor_000002', 'q1_end')]
     assert clean[0]['photo_psnr'] != clean[1]['photo_psnr']
     comparison = json.loads((output/'photo_comparison.json').read_text())
     assert set(comparison) == {'truck', 'playroom', 'drjohnson'}

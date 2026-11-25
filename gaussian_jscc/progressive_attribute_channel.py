@@ -95,6 +95,7 @@ class LayeredAttributeCodec(nn.Module):
         self.neighbor = ChannelSpatialDenoiser(spatial, c.layer_count)
         self.register_buffer('neighbor_enabled', torch.tensor(False))
         self.active_stage = None
+        self.train_semantic = False
 
     @property
     def attr_mean(self):
@@ -106,7 +107,12 @@ class LayeredAttributeCodec(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.semantic.train(mode and self.active_stage == 'end_to_end')
+        self.semantic.train(mode and self.train_semantic)
+        if mode and self.train_semantic:
+            for tier, (encoder, decoder) in enumerate(zip(self.encoders, self.decoders), 1):
+                encoder.train(tier == self.active_stage)
+                decoder.train(tier == self.active_stage)
+            self.neighbor.eval()
         return self
 
     def set_scene_geometry(self, geometry):
@@ -204,17 +210,17 @@ class LayeredAttributeCodec(nn.Module):
         return pred, yh, dict(core=core, scales=scales, received=received, transmitted_power=power)
 
 
-def configure_stage(model, stage, lr):
+def configure_stage(model, stage, lr, *, train_semantic=False):
     neighbor_stage = model.layer_config.layer_count+1
-    if ((stage not in ('joint', 'end_to_end') and stage not in range(1, neighbor_stage+1)) or
+    if ((stage != 'joint' and stage not in range(1, neighbor_stage+1)) or
             not math.isfinite(lr) or lr <= 0):
         raise ValueError(f'joint or stage 1..{neighbor_stage} and positive LR required')
+    if train_semantic and stage not in range(1, neighbor_stage):
+        raise ValueError('semantic adaptation requires one active channel tier')
     model.requires_grad_(False)
     for p in model.parameters():
         p.grad = None
-    if stage == 'end_to_end':
-        modules = (model.semantic, model.encoders, model.decoders)
-    elif stage == 'joint':
+    if stage == 'joint':
         modules = (model.encoders, model.decoders)
     elif stage == neighbor_stage:
         modules = (model.neighbor,)
@@ -222,6 +228,8 @@ def configure_stage(model, stage, lr):
         modules = (model.encoders[stage-1], model.decoders[stage-1])
     for module in modules:
         module.requires_grad_(True)
+    model.semantic.requires_grad_(train_semantic)
+    model.train_semantic = train_semantic
     model.neighbor_enabled.fill_(stage == neighbor_stage)
     model.active_stage = stage
     return torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
