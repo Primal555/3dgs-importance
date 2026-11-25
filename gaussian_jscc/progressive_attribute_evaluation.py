@@ -115,17 +115,19 @@ def assess(model, scene, cached, args, out, *, scope, layers, perceptual=None,
     identity = model.identity()
     record_symbols = getattr(args, 'record_symbol_diagnostics', False)
     record_attributes = args.grouped_attribute_supervision or record_symbols
-    # The semantic reference is identical at every layer endpoint.
+    # Only frozen semantics can reuse a clean render across optimizer updates.
     clean_cache = getattr(scene, '_progressive_clean_metrics', {})
-    clean_metrics = clean_cache.get(scope)
+    frozen_semantics = not any(p.requires_grad for p in model.semantic.parameters())
+    clean_metrics = clean_cache.get(scope) if frozen_semantics else None
     if clean_metrics is None:
         clean, _ = decode_cached(model, scene, cached, layout_for(scene, 1, args.seed), args.snr,
                                  args.seed+1000, clean=True)
         clean_metrics = render_metrics(clean, model, scene, cameras, perceptual)
         if record_attributes:
             clean_metrics['attribute_errors'] = assess_attributes(clean, scene.raw, cameras, next(model.parameters()).device)
-        clean_cache[scope] = clean_metrics
-        scene._progressive_clean_metrics = clean_cache
+        if frozen_semantics:
+            clean_cache[scope] = clean_metrics
+            scene._progressive_clean_metrics = clean_cache
         del clean
     json_write(out/'clean.json', dict(scene=scene.name, scope=scope, **clean_metrics))
     for layer in layers:

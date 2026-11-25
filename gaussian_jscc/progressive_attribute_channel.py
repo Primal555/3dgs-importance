@@ -106,7 +106,7 @@ class LayeredAttributeCodec(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.semantic.eval()
+        self.semantic.train(mode and self.active_stage == 'end_to_end')
         return self
 
     def set_scene_geometry(self, geometry):
@@ -206,13 +206,15 @@ class LayeredAttributeCodec(nn.Module):
 
 def configure_stage(model, stage, lr):
     neighbor_stage = model.layer_config.layer_count+1
-    if ((stage != 'joint' and stage not in range(1, neighbor_stage+1)) or
+    if ((stage not in ('joint', 'end_to_end') and stage not in range(1, neighbor_stage+1)) or
             not math.isfinite(lr) or lr <= 0):
         raise ValueError(f'joint or stage 1..{neighbor_stage} and positive LR required')
     model.requires_grad_(False)
     for p in model.parameters():
         p.grad = None
-    if stage == 'joint':
+    if stage == 'end_to_end':
+        modules = (model.semantic, model.encoders, model.decoders)
+    elif stage == 'joint':
         modules = (model.encoders, model.decoders)
     elif stage == neighbor_stage:
         modules = (model.neighbor,)
