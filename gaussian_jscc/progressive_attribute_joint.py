@@ -1,4 +1,4 @@
-"""Adapt shared private128 semantics and one progressive channel tier at a time."""
+"""Render adaptation for a completed private128 progressive channel."""
 import argparse
 import json
 import math
@@ -16,7 +16,7 @@ from .multiscene import manifest
 from .optimization import preserved_rng
 from .perceptual_metrics import LPIPSEvaluator
 from .progressive_attribute_channel import (THREE_FAMILY, LayerConfig, LayeredAttributeCodec,
-                                           configure_stage, frozen_digest)
+                                           configure_stage, frozen_digest, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
 from .progressive_attribute_experiment import cache_scene, save, write_review
 from .refinement_views import RefinementViewCycle
@@ -31,13 +31,32 @@ TIERS = (1, 2, 3)
 LAYOUTS = (*TIERS, 'mixed')
 
 
+def rotation_channel_tiers(layout):
+    return TIERS if layout == 'mixed' else (layout,)
+
+
+def set_rotation_layout(model, layout):
+    """Keep the optimizer's parameter groups fixed along the layout cycle."""
+    model.train()
+    model.semantic.semantic_encoder.eval().requires_grad_(False)
+    model.semantic.semantic_decoder.train().requires_grad_(True)
+    active = rotation_channel_tiers(layout)
+    for tier, (encoder, decoder) in enumerate(zip(model.encoders, model.decoders), 1):
+        enabled = tier in active
+        encoder.train(enabled).requires_grad_(enabled)
+        decoder.train(enabled).requires_grad_(enabled)
+    model.neighbor.eval()
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run', type=Path, required=True, help='completed three-tier channel run')
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--manifest', help='override scene paths, retaining the checkpoint splits')
-    p.add_argument('--steps-per-scene', type=int, default=1500,
-                   help='total per training scene, divided across consecutive q1, q2 and q3 phases')
+    p.add_argument('--rotate-tiers', action='store_true',
+                   help='cycle q1/q2/q3/mixed each scene; freeze the semantic encoder')
+    p.add_argument('--steps-per-scene', type=int,
+                   help='total per training scene (default: 1000 rotating, 1500 consecutive)')
     p.add_argument('--lr', type=float, default=1e-5)
     p.add_argument('--validate-every', type=int, default=250, help='updates per training scene')
     p.add_argument('--save-every', type=int, default=100, help='global updates')
@@ -50,11 +69,13 @@ def parser():
 
 def prepare(args):
     run, out = args.run.resolve(), args.out.resolve()
+    if args.steps_per_scene is None:
+        args.steps_per_scene = 1000 if args.rotate_tiers else 1500
     if out.is_relative_to(run) or run.is_relative_to(out):
         raise ValueError('joint output must be separate from the source run')
     if min(args.steps_per_scene, args.validate_every, args.save_every) < 1 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError('positive step counts and finite positive learning rate required')
-    if args.steps_per_scene < len(TIERS):
+    if not args.rotate_tiers and args.steps_per_scene < len(TIERS):
         raise ValueError('each scene needs at least one update per tier')
     saved = torch.load(run/'checkpoints/final.pt', map_location='cpu', weights_only=True)
     parent = saved['plan']
@@ -97,11 +118,21 @@ def prepare(args):
         lr=args.lr, validate_every_per_scene=args.validate_every, save_every=args.save_every,
         objective='source PLY render RGB MSE + MSE(recovered latent, stop_gradient(current semantic latent))',
         evaluation=vars(evaluation), device=args.device, cost_protocol=parent['cost_protocol'])
+    if args.rotate_tiers:
+        cycles, partial = divmod(args.steps_per_scene, len(LAYOUTS))
+        plan.pop('schedule')
+        plan.update(version='progressive_attribute_rotating_semantic_v1',
+            rotation=[dict(layout=layout, steps_per_scene=cycles+int(index < partial),
+                           trainable_channel_tiers=list(rotation_channel_tiers(layout)))
+                      for index, layout in enumerate(LAYOUTS)],
+            trainable='shared semantic decoder and the channel layers active in the current layout',
+            optimizer='one Adam throughout rotation; skipped parameters retain their own moments and step counters',
+            mixed_layout='uniform random positive tiers per Gaussian, independently resampled each mixed update',
+            objective='source PLY render RGB MSE + MSE(recovered latent, fixed semantic encoder latent)')
     return model, json.loads(json.dumps(plan)), evaluation
 
 
 def update(model, scene, tier, visit, cameras, settings):
-    model.train()
     model.set_scene_geometry(scene.geometry)
     layouts = layout_for(scene, tier, settings.seed+1009*visit, layers=3)
     task = MultiViewRenderTask(cameras, scene.reference, scene.degree, scene.white_background)
@@ -173,7 +204,11 @@ def main(args):
     before = {s['name']: read_endpoint(run, s['name'], plan['source_codec_id'], settings, records[s['name']])
               for s in plan['selected_scenes']}
     if args.dry_run:
-        budget = ', '.join(f"q{p['tier']}={p['steps_per_scene']}" for p in plan['schedule'])
+        if args.rotate_tiers:
+            print(json.dumps(plan['rotation'], indent=2))
+            budget = f"{plan['steps_per_scene']} updates"
+        else:
+            budget = ', '.join(f"q{p['tier']}={p['steps_per_scene']}" for p in plan['schedule'])
         print(f"Verified source step {plan['source_step']}, codec {plan['source_codec_id']}, "
               f"{len(before)} paired test baselines; {budget} per scene, {plan['total_updates']} new updates.")
         return plan
@@ -192,7 +227,9 @@ def main(args):
     torch.set_num_threads(settings.cpu_threads)
     seed_all(settings.seed)
     model.to(device)
-    progress = dict(step=0, tier=1, cycles={})
+    progress = dict(step=0, cycles={})
+    if not args.rotate_tiers:
+        progress['tier'] = 1
     latest = out/'checkpoints/latest.pt'
     saved = None
     log = out/'metrics/loss.jsonl'
@@ -219,15 +256,22 @@ def main(args):
         scenes.append(make_scene(spec, raw, degree, model, scene_args, out, old=old))
         del raw
     train = [s for s in scenes if s.spec['role'] == 'train']
+    cycle_key = 'rotating_semantic' if args.rotate_tiers else 'tier_semantic'
     cycles = {s.name: RefinementViewCycle([str(c.image_name) for c in s.cameras], settings.seed, s.name,
-              'tier_semantic', progress['cycles'].get(s.name)) for s in train}
+              cycle_key, progress['cycles'].get(s.name)) for s in train}
     perceptual = LPIPSEvaluator(device) if settings.lpips else None
     if saved:
         restore_rng(saved['rng'])
 
+    def fixed_digest():
+        if args.rotate_tiers:
+            trainable = ('semantic.semantic_decoder.', 'encoders.', 'decoders.')
+            return state_digest({k: v for k, v in model.state_dict().items() if not k.startswith(trainable)})
+        return frozen_digest(model)
+
     def checkpoint(label, optimizer):
-        if bool(model.neighbor_enabled) or frozen_digest(model) != progress['frozen_sha256']:
-            raise RuntimeError(f"q{progress['tier']}: inactive channel layers or fixed statistics changed")
+        if bool(model.neighbor_enabled) or fixed_digest() != progress['frozen_sha256']:
+            raise RuntimeError('frozen model weights or statistics changed')
         progress['cycles'] = {k: v.state_dict() for k, v in cycles.items()}
         save(out/'checkpoints'/f'{label}.pt', model, optimizer, progress, plan, {})
 
@@ -236,15 +280,59 @@ def main(args):
             for scene in scenes_to_test:
                 cached = cache_scene(model, scene)['batches']
                 assess(model, scene, cached, settings, out/'evaluation'/label/scene.name,
-                       scope='test' if final else 'validation', layers=LAYOUTS if final else TIERS,
+                       scope='test' if final else 'validation',
+                       layers=LAYOUTS if final or args.rotate_tiers else TIERS,
                        perceptual=perceptual, actual=final, detailed_attributes=True)
                 del cached
 
+    def train_step(optimizer, step, layout, **phase_fields):
+        visit, index = divmod(step, len(train))
+        scene = train[index]
+        cameras = [scene.cameras[i] for i in cycles[scene.name].next(settings.views_per_step)]
+        optimizer.zero_grad(set_to_none=True)
+        if args.rotate_tiers:
+            set_rotation_layout(model, layout)
+        else:
+            model.train()
+        # Use distinct mixed draws for different scenes in the same rotation.
+        layout_visit = step+1 if layout == 'mixed' else visit+1
+        loss, metrics = update(model, scene, layout, layout_visit, cameras, settings)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
+        optimizer.step()
+        progress['step'] = step+1
+        append_json(log, dict(step=step+1, scene=scene.name, scene_step=visit+1, layout=layout,
+                    loss=loss, grad_norm=float(norm), views=[str(c.image_name) for c in cameras],
+                    **phase_fields, **metrics))
+        return scene.name, loss
+
     interval = len(train)*args.validate_every
-    for phase in plan['schedule'][progress['tier']-1:]:
+    if args.rotate_tiers:
+        set_rotation_layout(model, 'mixed')
+        optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
+        if saved:
+            if fixed_digest() != progress['frozen_sha256']:
+                raise ValueError('resume checkpoint does not match the frozen encoder and statistics')
+            optimizer.load_state_dict(saved['optimizer'])
+            saved = None
+        else:
+            progress['frozen_sha256'] = fixed_digest()
+            checkpoint('latest', optimizer)
+        print(f"Rotating q1/q2/q3/mixed from step {progress['step']}/{plan['total_updates']}; "
+              "semantic encoder frozen; mixed trains all three channel tiers.", flush=True)
+        for step in range(progress['step'], plan['total_updates']):
+            if step % interval == 0:
+                evaluate(f'monitor_{step:06d}', train)
+            layout = LAYOUTS[(step//len(train)) % len(LAYOUTS)]
+            scene, loss = train_step(optimizer, step, layout)
+            if step == 0 or (step+1) % 10 == 0:
+                print(f"step {step+1}/{plan['total_updates']} {scene} layout={layout} loss={loss:.7g}", flush=True)
+            if (step+1) % args.save_every == 0 or (step+1) % interval == 0 or step+1 == plan['total_updates']:
+                checkpoint('latest', optimizer)
+
+    for phase in plan.get('schedule', ())[progress.get('tier', 1)-1:]:
         tier, start, end = phase['tier'], phase['start_step'], phase['end_step']
         optimizer = configure_stage(model, tier, args.lr, train_semantic=True)
-        fixed = frozen_digest(model)
+        fixed = fixed_digest()
         if saved:
             if not start <= progress['step'] <= end or fixed != progress['frozen_sha256']:
                 raise ValueError('resume checkpoint does not match the tier or its frozen weights')
@@ -260,19 +348,9 @@ def main(args):
             phase_step = step-start
             if phase_step and phase_step % interval == 0:
                 evaluate(f'monitor_{step:06d}', train)
-            visit, index = divmod(step, len(train))
-            scene = train[index]
-            cameras = [scene.cameras[i] for i in cycles[scene.name].next(settings.views_per_step)]
-            optimizer.zero_grad(set_to_none=True)
-            loss, metrics = update(model, scene, tier, visit+1, cameras, settings)
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
-            optimizer.step()
-            progress['step'] = step+1
-            append_json(log, dict(step=step+1, scene=scene.name, scene_step=visit+1, layout=tier,
-                        tier_step=phase_step+1, loss=loss, grad_norm=float(norm),
-                        views=[str(c.image_name) for c in cameras], **metrics))
+            scene, loss = train_step(optimizer, step, tier, tier_step=phase_step+1)
             if phase_step == 0 or (step+1) % 10 == 0:
-                print(f"q{tier} {phase_step+1}/{end-start} {scene.name} loss={loss:.7g}", flush=True)
+                print(f"q{tier} {phase_step+1}/{end-start} {scene} loss={loss:.7g}", flush=True)
             if (step+1) % args.save_every == 0 or (phase_step+1) % interval == 0 or step+1 == end:
                 checkpoint('latest', optimizer)
         checkpoint(f'q{tier}_end', optimizer)

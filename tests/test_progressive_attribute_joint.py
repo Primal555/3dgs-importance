@@ -25,7 +25,8 @@ def copy_sides(sender, receiver, reports, config, snr, seed, runner):
     return dict(status='success', streams={}, side_channel_uses=uses)
 
 
-def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path):
+@pytest.fixture
+def joint_source(tmp_path):
     torch.set_num_threads(1)
     torch.manual_seed(101)
     with patch('gaussian_jscc.rendering.render', side_effect=synthetic_render), \
@@ -64,22 +65,28 @@ def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path):
                     assert 'details' in after.pop('attribute_errors')
                     assert after == before
 
-        def args(name):
-            return joint.parser().parse_args(['--run', str(run), '--out', str(tmp_path/name),
-                '--steps-per-scene', '6', '--save-every', '2', '--validate-every', '1', '--device', 'cpu'])
+        yield run, model
 
-        joint.main(args('full'))
-        part = args('resumed')
-        original = joint.update
-        for stop in (3, 4):
-            def interrupt(net, scene, tier, visit, views, config):
-                if visit == stop:
-                    raise InterruptedError
-                return original(net, scene, tier, visit, views, config)
-            with patch.object(joint, 'update', side_effect=interrupt), pytest.raises(InterruptedError):
-                joint.main(part)
-            part.resume = True
-        joint.main(part)
+
+def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path, joint_source):
+    run, model = joint_source
+
+    def args(name):
+        return joint.parser().parse_args(['--run', str(run), '--out', str(tmp_path/name),
+            '--steps-per-scene', '6', '--save-every', '2', '--validate-every', '1', '--device', 'cpu'])
+
+    joint.main(args('full'))
+    part = args('resumed')
+    original = joint.update
+    for stop in (3, 4):
+        def interrupt(net, scene, tier, visit, views, config):
+            if visit == stop:
+                raise InterruptedError
+            return original(net, scene, tier, visit, views, config)
+        with patch.object(joint, 'update', side_effect=interrupt), pytest.raises(InterruptedError):
+            joint.main(part)
+        part.resume = True
+    joint.main(part)
 
     checkpoints = [torch.load(tmp_path/name/'checkpoints/final.pt', weights_only=True)
                    for name in ('full', 'resumed')]
@@ -123,6 +130,65 @@ def test_tier_semantic_adaptation_freezes_other_layers_and_resumes(tmp_path):
     assert row['paired_successes'] == 1 and row['awgn']['gain_db'] != 0.
     assert row['noise_penalty_db']['reduction_db'] == pytest.approx(
         row['awgn']['gain_db']-row['finite_noiseless']['gain_db'])
+
+
+def test_rotating_adaptation_keeps_encoder_fixed_and_resumes_adam(tmp_path, joint_source):
+    run, source = joint_source
+    def args(name):
+        return joint.parser().parse_args(['--run', str(run), '--out', str(tmp_path/name),
+            '--rotate-tiers', '--steps-per-scene', '8', '--save-every', '1',
+            '--validate-every', '4', '--device', 'cpu'])
+
+    expected_tiers = {1: (1,), 2: (2,), 3: (3,), 'mixed': (1, 2, 3)}
+    previous = source.state_dict()
+    save = joint.save
+    def check_step(path, model, optimizer, progress, plan, scales):
+        nonlocal previous
+        state = model.state_dict()
+        step = progress['step']
+        if path.stem == 'latest' and step:
+            layout = joint.LAYOUTS[((step-1)//2) % 4]
+            prefixes = ['semantic.semantic_decoder.']
+            for tier in expected_tiers[layout]:
+                prefixes.extend((f'encoders.{tier-1}.', f'decoders.{tier-1}.'))
+            changed = [key for key in state if not torch.equal(state[key], previous[key])]
+            assert all(key.startswith(tuple(prefixes)) for key in changed)
+            assert all(any(key.startswith(prefix) for key in changed) for prefix in prefixes)
+            assert all(not p.requires_grad for p in model.semantic.semantic_encoder.parameters())
+            assert not model.semantic.semantic_encoder.training
+        previous = {name: value.clone() for name, value in state.items()}
+        save(path, model, optimizer, progress, plan, scales)
+
+    full = args('rotating')
+    with patch.object(joint, 'save', side_effect=check_step):
+        joint.main(full)
+    half = args('resumed_rotation')
+    original = joint.update
+    def interrupt(net, scene, tier, visit, views, config):
+        if tier == 'mixed' and visit == 8:
+            raise InterruptedError
+        return original(net, scene, tier, visit, views, config)
+    with patch.object(joint, 'update', side_effect=interrupt), pytest.raises(InterruptedError):
+        joint.main(half)
+    half.resume = True
+    joint.main(half)
+
+    a, b = [torch.load(x.out/'checkpoints/final.pt', weights_only=True) for x in (full, half)]
+    assert a['progress'] == b['progress'] and a['progress']['step'] == 16
+    torch.testing.assert_close(a['state'], b['state'], atol=0, rtol=0)
+    torch.testing.assert_close(a['optimizer'], b['optimizer'], atol=0, rtol=0)
+    optimized = [name for name, _ in source.named_parameters()
+                 if name.startswith(('semantic.semantic_decoder.', 'encoders.', 'decoders.'))]
+    for index, state in a['optimizer']['state'].items():
+        name = optimized[index]
+        assert state['step'] == (16 if name.startswith('semantic.') else 8)
+    history = [json.loads(line) for line in (half.out/'metrics/loss.jsonl').read_text().splitlines()]
+    for scene in ('truck', 'playroom'):
+        assert [r['layout'] for r in history if r['scene'] == scene] == list(joint.LAYOUTS)*2
+    final = json.loads((half.out/'photo_comparison.json').read_text())
+    assert final['drjohnson']['layouts']['mixed']['paired_successes'] == 1
+    initial = json.loads((half.out/'evaluation/monitor_000000/truck/summary.json').read_text())
+    assert {row['layer'] for row in initial['rows']} == set(joint.LAYOUTS)
 
 
 def test_photo_gain_pairs_successful_trials_and_preserves_clean_change():
