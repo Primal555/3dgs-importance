@@ -44,7 +44,9 @@ def joint_source(tmp_path):
                     channel=model.layer_config.to_dict(), settings=settings, cost_protocol='digital_side_file_v1')
         identity = model.identity()
         (run/'checkpoints').mkdir()
-        torch.save(dict(family=joint.THREE_FAMILY, plan=plan, state=model.state_dict(), progress=dict(step=12)),
+        scales = dict.fromkeys(('shape', 'opacity', 'dc', 'sh', 'direction_rgb'), 1.)
+        torch.save(dict(family=joint.THREE_FAMILY, plan=plan, state=model.state_dict(),
+                        progress=dict(step=12), loss_scales=scales),
                    run/'checkpoints/final.pt')
         joint.json_write(run/'complete.json', dict(step=12, status='complete', rates=list(THREE_RATES), codec_id=identity))
         for spec in scenes:
@@ -189,6 +191,71 @@ def test_rotating_adaptation_keeps_encoder_fixed_and_resumes_adam(tmp_path, join
     assert final['drjohnson']['layouts']['mixed']['paired_successes'] == 1
     initial = json.loads((half.out/'evaluation/monitor_000000/truck/summary.json').read_text())
     assert {row['layer'] for row in initial['rows']} == set(joint.LAYOUTS)
+
+
+def test_finite_noiseless_rotation_adds_visits_and_resumes_with_original_teacher(tmp_path, joint_source):
+    run, source = joint_source
+
+    def args(name):
+        return joint.parser().parse_args(['--run', str(run), '--out', str(tmp_path/name),
+            '--rotate-tiers', '--steps-per-scene', '20', '--finite-noiseless-every', '5',
+            '--attribute-weight', '0.02', '--semantic-anchor-weight', '0.02', '--save-every', '1',
+            '--validate-every', '24', '--device', 'cpu'])
+
+    full, resumed = args('finite'), args('finite_resumed')
+    update = joint.update
+    teacher_state = source.semantic.state_dict()
+
+    def check_update(net, scene, layout, visit, cameras, config, **options):
+        teacher = options['teacher']
+        if options['path'] == 'finite_noiseless':
+            assert not teacher.training and not any(p.requires_grad for p in teacher.parameters())
+            torch.testing.assert_close(teacher.state_dict(), teacher_state, atol=0, rtol=0)
+        else:
+            assert teacher is None
+        with patch.object(net, 'transmit', wraps=net.transmit) as transmit:
+            result = update(net, scene, layout, visit, cameras, config, **options)
+        assert transmit.call_args_list
+        assert all(call.kwargs['noiseless'] == (teacher is not None) for call in transmit.call_args_list)
+        return result
+
+    with patch.object(joint, 'update', side_effect=check_update):
+        joint.main(full)
+
+    def interrupt(net, scene, layout, visit, cameras, config, **options):
+        if options['teacher'] is not None and layout == 2:
+            raise InterruptedError
+        return check_update(net, scene, layout, visit, cameras, config, **options)
+
+    with patch.object(joint, 'update', side_effect=interrupt), pytest.raises(InterruptedError):
+        joint.main(resumed)
+    resumed.resume = True
+    with patch.object(joint, 'update', side_effect=check_update):
+        joint.main(resumed)
+
+    a, b = [torch.load(x.out/'checkpoints/final.pt', weights_only=True) for x in (full, resumed)]
+    assert a['progress'] == b['progress'] and a['progress']['step'] == 48
+    assert a['plan']['awgn_steps_per_scene'] == 20
+    assert a['plan']['finite_noiseless_steps_per_scene'] == 4
+    torch.testing.assert_close(a['state'], b['state'], atol=0, rtol=0)
+    torch.testing.assert_close(a['optimizer'], b['optimizer'], atol=0, rtol=0)
+    history = [json.loads(row) for row in (resumed.out/'metrics/loss.jsonl').read_text().splitlines()]
+    for scene in ('truck', 'playroom'):
+        rows = [r for r in history if r['scene'] == scene]
+        expected = [('awgn', layout) for layout in list(joint.LAYOUTS)*5]
+        for index, layout in reversed(list(enumerate(joint.LAYOUTS, 1))):
+            expected.insert(index*5, ('finite_noiseless', layout))
+        assert [(r['path'], r['layout']) for r in rows] == expected
+        assert a['progress']['cycles'][scene]['updates'] == 20
+        assert a['progress']['cycles'][f'{scene}:finite_noiseless']['updates'] == 4
+    for row in history:
+        expected = row['latent_loss'] + 0.02*row['attributes_loss']
+        if row['path'] == 'finite_noiseless':
+            assert row['semantic_anchor_loss'] > 0
+            expected += 0.02*row['semantic_anchor_loss']
+        else:
+            assert 'semantic_anchor_loss' not in row
+        assert row['aux_loss'] == pytest.approx(expected, abs=1e-7)
 
 
 def test_photo_gain_pairs_successful_trials_and_preserves_clean_change():
