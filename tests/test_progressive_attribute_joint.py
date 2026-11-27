@@ -258,6 +258,73 @@ def test_finite_noiseless_rotation_adds_visits_and_resumes_with_original_teacher
         assert row['aux_loss'] == pytest.approx(expected, abs=1e-7)
 
 
+def test_fixed_semantic_refinement_from_rotation_preserves_completed_layouts(tmp_path, joint_source):
+    source_run, _ = joint_source
+    rotation = joint.parser().parse_args(['--run', str(source_run), '--out', str(tmp_path/'rotation'),
+        '--rotate-tiers', '--steps-per-scene', '4', '--finite-noiseless-every', '4',
+        '--attribute-weight', '0.02', '--semantic-anchor-weight', '0.02', '--device', 'cpu'])
+    joint.main(rotation)
+
+    def args(name):
+        return joint.parser().parse_args(['--run', str(rotation.out), '--out', str(tmp_path/name),
+            '--refine-tiers', '--steps-per-scene', '8', '--attribute-weight', '0.02',
+            '--save-every', '1', '--validate-every', '1', '--device', 'cpu'])
+
+    full, resumed = args('refine'), args('resume_refine')
+    joint.main(full)
+    update = joint.update
+    mixed_updates = 0
+
+    def interrupt(net, scene, layout, visit, views, config, **options):
+        nonlocal mixed_updates
+        if layout == 'mixed':
+            mixed_updates += 1
+            if mixed_updates == 2:
+                raise InterruptedError
+        return update(net, scene, layout, visit, views, config, **options)
+
+    with patch.object(joint, 'update', side_effect=interrupt), pytest.raises(InterruptedError):
+        joint.main(resumed)
+    resumed.resume = True
+    joint.main(resumed)
+
+    def checkpoint(run, name):
+        return torch.load(run/'checkpoints'/f'{name}.pt', weights_only=True)
+
+    a, b = [checkpoint(args.out, 'final') for args in (full, resumed)]
+    assert a['family'] == joint.REFINEMENT_FAMILY
+    assert a['progress'] == b['progress'] and a['progress']['step'] == 16
+    torch.testing.assert_close(a['state'], b['state'], atol=0, rtol=0)
+    torch.testing.assert_close(a['optimizer'], b['optimizer'], atol=0, rtol=0)
+
+    previous = checkpoint(rotation.out, 'final')['state']
+    for tier, label in enumerate(('q1', 'q2', 'q3', 'mixed'), 1):
+        stage = checkpoint(full.out, f'{label}_end')
+        changed = {name for name in stage['state'] if not torch.equal(stage['state'][name], previous[name])}
+        prefixes = ('neighbor.',) if label == 'mixed' else (f'encoders.{tier-1}.', f'decoders.{tier-1}.')
+        assert all(any(k.startswith(prefix) for k in changed) for prefix in prefixes)
+        changes = changed - {'neighbor_enabled'} if label == 'mixed' else changed
+        assert all(k.startswith(prefixes) for k in changes)
+        previous = stage['state']
+
+    def evaluated(label):
+        return json.loads((full.out/'evaluation'/label/'truck'/'summary.json').read_text())
+
+    final = evaluated('final')
+    after_mixed = evaluated('mixed_end')
+    for tier in joint.TIERS:
+        fixed_stage = evaluated(f'q{tier}_end')
+        current = [r for r in after_mixed['rows'] if r['layer'] == tier]
+        previous = [r for r in fixed_stage['rows'] if r['layer'] == tier]
+        for a, b in zip(current, previous, strict=True):
+            for field in ('source_psnr', 'photo_psnr', 'photo_mse', 'diagnostics', 'attribute_errors'):
+                assert a[field] == b[field]
+    baseline = json.loads((rotation.out/'evaluation/final/truck/summary.json').read_text())
+    assert final['clean'] == baseline['clean']
+    assert all(r['actual_delivery']['status'] == 'success' for r in final['rows'] if r['path'] == 'awgn')
+    assert evaluated('q3_end')['rows'][-1]['photo_mse'] != after_mixed['rows'][-1]['photo_mse']
+
+
 def test_photo_gain_pairs_successful_trials_and_preserves_clean_change():
     def endpoint(clean, values):
         rows = {}

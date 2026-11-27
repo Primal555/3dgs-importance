@@ -29,16 +29,22 @@ class LayerConfig:
     power_floor: float = .01
     neighbor_hidden: int = 64
     neighbors: int = 16
+    neighbor_mixed_only: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, 'rates', tuple(self.rates))
         if (self.rates not in (EIGHT_RATES, THREE_RATES) or
                 any(type(x) is not int or x < 1 for x in (self.hidden, self.neighbor_hidden, self.neighbors)) or
-                not math.isfinite(self.power_floor) or self.power_floor <= 0):
+                not math.isfinite(self.power_floor) or self.power_floor <= 0 or
+                type(self.neighbor_mixed_only) is not bool):
             raise ValueError('supported progressive rate table and positive channel dimensions required')
 
     def to_dict(self):
-        return asdict(self)
+        config = asdict(self)
+        # Preserve the identity of packets and checkpoints created before this option.
+        if not self.neighbor_mixed_only:
+            del config['neighbor_mixed_only']
+        return config
 
     @property
     def layer_count(self):
@@ -180,10 +186,19 @@ class LayeredAttributeCodec(nn.Module):
             previous = self.advance(j, signal, scales, previous, q >= j, snr)
         core = previous
         if neighbor and bool(self.neighbor_enabled):
+            mixed = None
+            if self.layer_config.neighbor_mixed_only:
+                mixed = ((q > 0) & (q < q.amax(dim=1, keepdim=True))).any(dim=1)
+                # During replay, even a uniform batch needs a zero-gradient path.
+                if not self.neighbor.training and not mixed.any():
+                    return previous, core
             pad = self.prefix_widths[-1]-signal.shape[-1]
-            previous = previous + self.neighbor(previous,
+            correction = self.neighbor(previous,
                 torch.nn.functional.pad(signal, (0, pad)),
                 torch.nn.functional.pad(available, (0, pad)), xyz, q > 0, snr)
+            previous = previous + correction
+            if mixed is not None:
+                previous = torch.where(mixed[:, None, None], previous, core)
         return previous, core
 
     def symbol_mask(self, q, width):

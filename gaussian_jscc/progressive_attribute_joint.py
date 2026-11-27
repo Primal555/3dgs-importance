@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from statistics import fmean
 
@@ -32,6 +33,7 @@ from .training import full_scene_step
 
 TIERS = (1, 2, 3)
 LAYOUTS = (*TIERS, 'mixed')
+REFINEMENT_FAMILY = 'progressive_attribute_fixed_semantics_refinement_v1'
 
 
 def rotation_channel_tiers(layout):
@@ -65,14 +67,17 @@ def parser():
     p.add_argument('--run', type=Path, required=True, help='completed three-tier channel run')
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--manifest', help='override scene paths, retaining the checkpoint splits')
-    p.add_argument('--rotate-tiers', action='store_true',
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--rotate-tiers', action='store_true',
                    help='cycle q1/q2/q3/mixed each scene; freeze the semantic encoder')
+    mode.add_argument('--refine-tiers', action='store_true',
+                   help='refine q1, q2, q3 and mixed in order with both semantic endpoints frozen')
     p.add_argument('--steps-per-scene', type=int,
-                   help='AWGN updates per training scene (default: 1000 rotating, 1500 consecutive)')
+                   help='AWGN updates per scene (default: 1000 rotating/refining, 1500 adapting)')
     p.add_argument('--finite-noiseless-every', type=int, default=0, metavar='N',
                    help='add one finite noiseless rotating update per scene after every N AWGN updates')
     p.add_argument('--attribute-weight', type=float, default=0.,
-                   help='weight of equally averaged source PLY attribute errors in rotating updates')
+                   help='weight of equally averaged source PLY attribute errors in rotation or refinement')
     p.add_argument('--semantic-anchor-weight', type=float, default=0.,
                    help='weight of matching the starting clean semantic attributes on finite noiseless updates')
     p.add_argument('--lr', type=float, default=1e-5)
@@ -88,19 +93,21 @@ def parser():
 def prepare(args):
     run, out = args.run.resolve(), args.out.resolve()
     if args.steps_per_scene is None:
-        args.steps_per_scene = 1000 if args.rotate_tiers else 1500
+        args.steps_per_scene = 1000 if args.rotate_tiers or args.refine_tiers else 1500
     if out.is_relative_to(run) or run.is_relative_to(out):
         raise ValueError('joint output must be separate from the source run')
     if min(args.steps_per_scene, args.validate_every, args.save_every) < 1 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError('positive step counts and finite positive learning rate required')
-    if not args.rotate_tiers and args.steps_per_scene < len(TIERS):
-        raise ValueError('each scene needs at least one update per tier')
+    if not args.rotate_tiers and args.steps_per_scene < len(LAYOUTS if args.refine_tiers else TIERS):
+        raise ValueError('each scene needs at least one update per stage')
     weights = (args.attribute_weight, args.semantic_anchor_weight)
     if any(not math.isfinite(w) or w < 0 for w in weights) or args.finite_noiseless_every < 0:
         raise ValueError('rotation weights and finite noiseless interval must be nonnegative')
-    augmented_rotation = args.finite_noiseless_every or any(weights)
-    if augmented_rotation and not args.rotate_tiers:
-        raise ValueError('finite noiseless updates and attribute supervision require --rotate-tiers')
+    if not args.rotate_tiers and (args.finite_noiseless_every or args.semantic_anchor_weight):
+        raise ValueError('finite noiseless updates and the semantic anchor require --rotate-tiers')
+    if args.attribute_weight and not (args.rotate_tiers or args.refine_tiers):
+        raise ValueError('attribute supervision requires rotation or refinement')
+    augmented_rotation = args.rotate_tiers and (args.finite_noiseless_every or any(weights))
     finite_steps = args.steps_per_scene // args.finite_noiseless_every if args.finite_noiseless_every else 0
     if (args.finite_noiseless_every or args.semantic_anchor_weight) and not finite_steps:
         raise ValueError('the budget must include a finite noiseless update to enable it or use a semantic anchor')
@@ -108,33 +115,44 @@ def prepare(args):
     parent = saved['plan']
     complete = json.loads((run/'complete.json').read_text(encoding='utf8'))
     slot = parent['semantic_slot']
-    if (saved['family'] != THREE_FAMILY or slot['arm'] != PRIVATE_ONLY or
+    from_rotation = saved['family'] in ('progressive_attribute_rotating_semantic_v1',
+                                        'progressive_attribute_rotating_semantic_v2')
+    if ((saved['family'] != THREE_FAMILY and not (args.refine_tiers and from_rotation)) or
+            slot['arm'] != PRIVATE_ONLY or
             complete['status'] != 'complete' or saved['progress']['step'] != complete['step'] or
             complete['step'] != parent['total_updates'] or complete['rates'] != [0, 8, 24, 48] or
             saved['state']['neighbor_enabled'].item()):
-        raise ValueError('expected a completed private128 three-tier backbone with no neighbor stage')
+        raise ValueError('expected a completed private128 three-tier source with no neighbor stage')
     semantic = SemanticAttributeCodec(slot['arm'], ModularCodecConfig.from_dict(slot['config']))
     model = LayeredAttributeCodec(semantic, LayerConfig(**parent['channel']))
     model.load_state_dict(saved['state'], strict=True)
     if model.identity() != complete['codec_id']:
         raise ValueError('source final weights differ from completed evaluation')
+    if args.refine_tiers:
+        model.layer_config = replace(model.layer_config, neighbor_mixed_only=True)
     specs = parent['selected_scenes']
     if args.manifest:
         locations = {s['name']: s for s in manifest(args.manifest)}
         specs = [dict(s, **{k: locations[s['name']][k] for k in ('source', 'ply')}) for s in specs]
-    settings = parent['settings']
+    settings = parent['evaluation'] if from_rotation else parent['settings']
     evaluation = argparse.Namespace(**{k: settings[k] for k in
         ('snr', 'seed', 'trials', 'lpips', 'digital_device', 'cpu_threads', 'views_per_step')},
         digital_python=args.digital_python or settings['digital_python'], grouped_attribute_supervision=False,
-        record_symbol_diagnostics=parent.get('record_symbol_diagnostics', False))
+        record_symbol_diagnostics=settings.get('record_symbol_diagnostics',
+                                               parent.get('record_symbol_diagnostics', False)))
     scene_count = sum(s['role'] == 'train' for s in specs)
-    per_tier, remainder = divmod(args.steps_per_scene, len(TIERS))
+    phase_layouts = LAYOUTS if args.refine_tiers else TIERS
+    per_tier, remainder = divmod(args.steps_per_scene, len(phase_layouts))
     schedule = []
     start = 0
-    for tier in TIERS:
+    for tier, layout in enumerate(phase_layouts, 1):
         visits = per_tier + int(tier <= remainder)
         end = start + visits*scene_count
         schedule.append(dict(tier=tier, steps_per_scene=visits, start_step=start, end_step=end))
+        if args.refine_tiers:
+            name = 'mixed' if layout == 'mixed' else f'q{tier}'
+            trainable = 'neighbor refiner' if layout == 'mixed' else f'channel encoder and decoder layer {tier}'
+            schedule[-1].update(layout=layout, name=name, trainable=trainable)
         start = end
     plan = dict(version='progressive_attribute_tier_semantic_v1', source_run=str(run),
         source_step=complete['step'], source_codec_id=complete['codec_id'], channel=parent['channel'],
@@ -145,6 +163,12 @@ def prepare(args):
         lr=args.lr, validate_every_per_scene=args.validate_every, save_every=args.save_every,
         objective='source PLY render RGB MSE + MSE(recovered latent, stop_gradient(current semantic latent))',
         evaluation=vars(evaluation), device=args.device, cost_protocol=parent['cost_protocol'])
+    if args.refine_tiers:
+        plan.update(version=REFINEMENT_FAMILY, channel=model.layer_config.to_dict(),
+            trainable='active channel layer in fixed tier stages; receiver-only neighbor refiner in mixed',
+            optimizer='new Adam at each stage; inherit all model weights across stages',
+            mixed_layout='uniform random positive tiers per Gaussian; refine only heterogeneous blocks',
+            objective='source PLY render RGB MSE + MSE(recovered latent, fixed semantic encoder latent)')
     if args.rotate_tiers:
         cycles, partial = divmod(args.steps_per_scene, len(LAYOUTS))
         plan.pop('schedule')
@@ -167,19 +191,23 @@ def prepare(args):
                 finite = finite_cycles+int(index < finite_partial)
                 row.update(awgn_steps_per_scene=row['steps_per_scene'], finite_noiseless_steps_per_scene=finite)
                 row['steps_per_scene'] += finite
-            if any(weights):
-                scales = {key: saved.get('loss_scales', {}).get(key, 0.)
-                          for key in ('shape', 'opacity', 'dc', 'sh', 'direction_rgb')}
-                if any(not math.isfinite(scale) or scale <= 0 for scale in scales.values()):
-                    raise ValueError('attribute supervision requires valid loss scales from the source checkpoint')
-                plan['attribute_supervision'] = dict(
-                    terms=list(scales), scales=scales, reduction='equal mean of the normalized terms',
-                    attribute_weight=args.attribute_weight, target='source PLY',
-                    semantic_anchor_weight=args.semantic_anchor_weight,
-                    semantic_anchor_target='fixed starting semantic decoder at the clean semantic latent',
-                    semantic_anchor_path='current clean semantic decode on finite noiseless training steps')
-                plan['objective'] += ' + attribute_weight*source attribute loss (both channel conditions)'
-                plan['objective'] += ' + semantic_anchor_weight*clean semantic attribute loss (finite noiseless only)'
+    if any(weights):
+        scales = {key: saved.get('loss_scales', {}).get(key, 0.)
+                  for key in ('shape', 'opacity', 'dc', 'sh', 'direction_rgb')}
+        if any(not math.isfinite(scale) or scale <= 0 for scale in scales.values()):
+            raise ValueError('attribute supervision requires valid loss scales from the source checkpoint')
+        plan['attribute_supervision'] = dict(
+            terms=list(scales), scales=scales, reduction='equal mean of the normalized terms',
+            attribute_weight=args.attribute_weight, target='source PLY')
+        if args.rotate_tiers:
+            plan['attribute_supervision'].update(
+                semantic_anchor_weight=args.semantic_anchor_weight,
+                semantic_anchor_target='fixed starting semantic decoder at the clean semantic latent',
+                semantic_anchor_path='current clean semantic decode on finite noiseless training steps')
+            plan['objective'] += ' + attribute_weight*source attribute loss (both channel conditions)'
+            plan['objective'] += ' + semantic_anchor_weight*clean semantic attribute loss (finite noiseless only)'
+        else:
+            plan['objective'] += ' + attribute_weight*source attribute loss'
     return model, json.loads(json.dumps(plan)), evaluation
 
 
@@ -281,6 +309,8 @@ def main(args):
         if args.rotate_tiers:
             print(json.dumps(plan['rotation'], indent=2))
             budget = f"{plan['steps_per_scene']} updates"
+        elif args.refine_tiers:
+            budget = ', '.join(f"{p['name']}={p['steps_per_scene']}" for p in plan['schedule'])
         else:
             budget = ', '.join(f"q{p['tier']}={p['steps_per_scene']}" for p in plan['schedule'])
         print(f"Verified source step {plan['source_step']}, codec {plan['source_codec_id']}, "
@@ -303,7 +333,7 @@ def main(args):
     model.to(device)
     supervision = plan.get('attribute_supervision')
     teacher = (deepcopy(model.semantic).requires_grad_(False).eval()
-               if supervision and supervision['semantic_anchor_weight'] else None)
+               if supervision and supervision.get('semantic_anchor_weight') else None)
     progress = dict(step=0, cycles={})
     if not args.rotate_tiers:
         progress['tier'] = 1
@@ -333,7 +363,7 @@ def main(args):
         scenes.append(make_scene(spec, raw, degree, model, scene_args, out, old=old))
         del raw
     train = [s for s in scenes if s.spec['role'] == 'train']
-    cycle_key = 'rotating_semantic' if args.rotate_tiers else 'tier_semantic'
+    cycle_key = 'rotating_semantic' if args.rotate_tiers else ('tier_refine' if args.refine_tiers else 'tier_semantic')
     cycle_specs = [(s.name, s, cycle_key) for s in train]
     if args.finite_noiseless_every:
         cycle_specs += [(f'{s.name}:finite_noiseless', s, f'{cycle_key}_finite_noiseless') for s in train]
@@ -350,7 +380,8 @@ def main(args):
         return frozen_digest(model)
 
     def checkpoint(label, optimizer):
-        if bool(model.neighbor_enabled) or fixed_digest() != progress['frozen_sha256']:
+        mixed_refinement = args.refine_tiers and progress['tier'] == len(LAYOUTS)
+        if bool(model.neighbor_enabled) != mixed_refinement or fixed_digest() != progress['frozen_sha256']:
             raise RuntimeError('frozen model weights or statistics changed')
         progress['cycles'] = {k: v.state_dict() for k, v in cycles.items()}
         save(out/'checkpoints'/f'{label}.pt', model, optimizer, progress, plan,
@@ -362,7 +393,7 @@ def main(args):
                 cached = cache_scene(model, scene)['batches']
                 assess(model, scene, cached, settings, out/'evaluation'/label/scene.name,
                        scope='test' if final else 'validation',
-                       layers=LAYOUTS if final or args.rotate_tiers else TIERS,
+                       layers=LAYOUTS if final or args.rotate_tiers or args.refine_tiers else TIERS,
                        perceptual=perceptual, actual=final, detailed_attributes=True)
                 del cached
 
@@ -386,6 +417,8 @@ def main(args):
         if path is not None:
             phase_fields.update(path=path, path_scene_step=path_visit+1)
             update_options.update(path=path, supervision=supervision, teacher=teacher if noiseless else None)
+        elif args.refine_tiers and supervision is not None:
+            update_options['supervision'] = supervision
         loss, metrics = update(model, scene, layout, layout_visit, cameras, settings, **update_options)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
         optimizer.step()
@@ -430,7 +463,9 @@ def main(args):
 
     for phase in plan.get('schedule', ())[progress.get('tier', 1)-1:]:
         tier, start, end = phase['tier'], phase['start_step'], phase['end_step']
-        optimizer = configure_stage(model, tier, args.lr, train_semantic=True)
+        layout = phase.get('layout', tier)
+        stage_name = phase.get('name', f'q{tier}')
+        optimizer = configure_stage(model, tier, args.lr, train_semantic=not args.refine_tiers)
         fixed = fixed_digest()
         if saved:
             if not start <= progress['step'] <= end or fixed != progress['frozen_sha256']:
@@ -440,20 +475,22 @@ def main(args):
         else:
             progress.update(tier=tier, frozen_sha256=fixed)
             checkpoint('latest', optimizer)
-        print(f"q{tier} semantic adaptation: train semantic endpoints and channel increment {tier}; "
+        description = (f"{stage_name} refinement: train {phase['trainable']}" if args.refine_tiers else
+                       f"q{tier} semantic adaptation: train semantic endpoints and channel increment {tier}")
+        print(f"{description}; "
               f"global steps {start+1}..{end}, {phase['steps_per_scene']} updates per scene, "
               f"completed {progress['step']}/{plan['total_updates']}.", flush=True)
         for step in range(progress['step'], end):
             phase_step = step-start
             if phase_step and phase_step % interval == 0:
                 evaluate(f'monitor_{step:06d}', train)
-            scene, loss = train_step(optimizer, step, tier, tier_step=phase_step+1)
+            scene, loss = train_step(optimizer, step, layout, tier_step=phase_step+1)
             if phase_step == 0 or (step+1) % 10 == 0:
-                print(f"q{tier} {phase_step+1}/{end-start} {scene} loss={loss:.7g}", flush=True)
+                print(f"{stage_name} {phase_step+1}/{end-start} {scene} loss={loss:.7g}", flush=True)
             if (step+1) % args.save_every == 0 or (phase_step+1) % interval == 0 or step+1 == end:
                 checkpoint('latest', optimizer)
-        checkpoint(f'q{tier}_end', optimizer)
-        evaluate(f'q{tier}_end', train)
+        checkpoint(f'{stage_name}_end', optimizer)
+        evaluate(f'{stage_name}_end', train)
     checkpoint('final', optimizer)
     evaluate('final', scenes, final=True)
     identity = model.identity()
