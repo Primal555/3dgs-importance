@@ -174,6 +174,36 @@ def test_full_scene_replay_gradient_matches_direct(grouped):
     torch.testing.assert_close(gradients[0], gradients[1], atol=2e-6, rtol=2e-4)
 
 
+def test_local_response_matches_clean_decoder_and_updates_only_active_channel():
+    model, geometry, f, y, active = fixture(PRIVATE_ONLY, THREE_RATES)
+    ids = torch.arange(active.numel()).reshape_as(active).masked_fill(~active, -1)
+    scene = SimpleNamespace(geometry=geometry, groups=[f], group_ids=[ids])
+    cache = entry.cache_scene(model, scene, local_response=True)
+    torch.testing.assert_close(cache['batches'][0], torch.cat((f, y), -1))
+    configure_stage(model, 2, 1e-4)
+    q = 2*active.long()
+    args = entry.parser().parse_args(['--out', 'unused', '--local-response-weight', '0.1'])
+    scales = fit_loss_scales([to_raw(f[active], geometry, model)])
+    cameras_used = cameras('', split='train')[:2]
+    centers = torch.stack([c.camera_center for c in cameras_used])
+    probe = {}
+    torch.manual_seed(55)
+    _, _, terms = entry.batch_objective(model, scene, cache['training_batches'][0], q,
+        cameras_used, scales, args, response_centers=centers, response_seed=17, gradient_probe=probe)
+    assert probe['response_latent_grad_norm'] > 0 and probe['baseline_latent_grad_norm'] > 0
+    with torch.no_grad():
+        clean = model.semantic.decode(y, active, delivered_positions(f[..., :3], q, model.cfg))
+        torch.manual_seed(55)
+        pred, _, _ = model.forward_cached(f, y, q, args.snr)
+        views, _ = entry.color_directions(clean[active][:, :3], geometry, centers, 8, 17)
+        expected, _ = entry.local_response_loss(pred[active], clean[active], geometry, model, directions=views)
+        torch.testing.assert_close(terms['local_response'], expected)
+    terms['local_response'].backward()
+    for module in (model.encoders[1], model.decoders[1]):
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+    assert all(p.grad is None for p in model.parameters() if not p.requires_grad)
+
+
 @pytest.mark.parametrize('supervise_latent', [False, True])
 def test_grouped_supervision_decouples_rgb_and_controls_latent_loss(supervise_latent):
     model, geometry, f, y, active = fixture(PRIVATE_ONLY, THREE_RATES)
@@ -275,7 +305,7 @@ def test_slot_unfilled_plan_and_reject_unfinished(tmp_path):
 
 @pytest.mark.parametrize('mode', ['eight', 'three-tier-scratch', 'three-tier-joint',
                                   'grouped-attribute-supervision', 'equal-attribute-weights',
-                                  'grouped-latent-supervision', 'q1-content-gate'])
+                                  'grouped-latent-supervision', 'q1-content-gate', 'local-response'])
 def test_training_resume_across_layer_transition(tmp_path, mode):
     # Real source loader, semantic weights, optimizer phases and renderer VJPs.
     # Final digital delivery is tested separately; this test avoids subprocesses.
@@ -300,6 +330,8 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             return []
         def args(name, profile=mode):
             flags = [] if profile == 'eight' else ['--'+profile]
+            if profile == 'local-response':
+                flags = ['--three-tier-scratch', '--attribute-weight', '0.02', '--local-response-weight', '0.1']
             if profile in ('q1-content-gate', 'equal-attribute-weights', 'grouped-latent-supervision'):
                 flags.append('--grouped-attribute-supervision')
             if '--grouped-attribute-supervision' in flags:
@@ -326,8 +358,14 @@ def test_training_resume_across_layer_transition(tmp_path, mode):
             torch.testing.assert_close(a['state'][key], b['state'][key], atol=0, rtol=0)
         expected = {'eight': 34, 'three-tier-scratch': 12, 'three-tier-joint': 4,
                     'grouped-attribute-supervision': 12, 'equal-attribute-weights': 12,
-                    'grouped-latent-supervision': 12, 'q1-content-gate': 4}
+                    'grouped-latent-supervision': 12, 'q1-content-gate': 4, 'local-response': 12}
         assert a['progress'] == b['progress'] and a['progress']['step'] == expected[mode]
+        if mode == 'local-response':
+            rows = [json.loads(line) for line in (tmp_path/'full/metrics/loss.jsonl').read_text().splitlines()]
+            for row in rows:
+                auxiliary = row['latent_loss']+.02*row['attributes_loss']+.1*row['local_response_loss']
+                assert row['loss'] == pytest.approx(auxiliary+row.get('render_loss', 0.), rel=1e-5)
+                assert row['response_latent_grad_norm'] > 0 and row['baseline_latent_grad_norm'] > 0
         assert not any(name == 'drjohnson' and scope == 'validation' for name, scope, _, _, _ in calls)
         assert any(name == 'drjohnson' and actual for name, _, actual, _, _ in calls)
         if joint:

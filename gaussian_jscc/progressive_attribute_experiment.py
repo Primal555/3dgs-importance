@@ -11,14 +11,17 @@ import time
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from .channel_supervision_controls import color_directions
 from .cli import device_for, seed_all
 from .data import read_ply, to_raw
+from .local_response import local_response_loss
 from .modular_checkpoint import capture_rng, restore_rng
 from .modular_experiment import json_write
 from .multiscene import manifest
 from .optimization import preserved_rng
 from .perceptual_metrics import LPIPSEvaluator
 from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewRenderTask
+from .position_delivery import delivered_positions
 from .progressive_attribute_channel import (EIGHT_FAMILY, EIGHT_RATES, THREE_RATES, LayerConfig,
     LayeredAttributeCodec, load_semantic_slot, configure_stage, frozen_digest, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
@@ -62,6 +65,8 @@ def parser():
     p.add_argument('--neighbor-lr', type=float, default=1e-5)
     p.add_argument('--latent-weight', type=float, default=1.)
     p.add_argument('--attribute-weight', type=float, default=.01)
+    p.add_argument('--local-response-weight', type=float, default=0.,
+                   help='weight of isolated Gaussian RGB response MSE against the frozen clean decode')
     p.add_argument('--ssim-weight', type=float, default=1/3)
     p.add_argument('--hidden', type=int, default=256)
     p.add_argument('--views-per-step', type=int, default=32)
@@ -94,6 +99,11 @@ def schedule(args, layers):
 
 
 def validate_settings(args):
+    if not math.isfinite(args.local_response_weight) or args.local_response_weight < 0:
+        raise ValueError('local response weight must be finite and nonnegative')
+    if args.local_response_weight and (not args.three_tier_scratch or
+                                         args.grouped_attribute_supervision or args.neighbor_steps):
+        raise ValueError('local response requires the average-attribute three-tier scratch schedule')
     if args.equal_attribute_weights and not args.grouped_attribute_supervision:
         raise ValueError('--equal-attribute-weights requires --grouped-attribute-supervision')
     if args.grouped_latent_supervision and not args.grouped_attribute_supervision:
@@ -131,7 +141,7 @@ def prepare(args):
         settings={k: v for k, v in vars(args).items()
                   if k not in ('resume', 'dry_run', 'out', 'device', 'three_tier_scratch', 'three_tier_joint',
                                'grouped_attribute_supervision', 'equal_attribute_weights', 'grouped_latent_supervision',
-                               'q1_content_gate', 'record_symbol_diagnostics')},
+                               'q1_content_gate', 'record_symbol_diagnostics', 'local_response_weight')},
         initialization='fresh channel weights; frozen completed semantic checkpoint',
         objective='source RGB MSE + ssim_weight*(1-SSIM) + latent_weight*latent_MSE + attribute_weight*attribute_loss',
         bootstrap_objective='latent_weight*latent_MSE + attribute_weight*attribute_loss',
@@ -141,6 +151,14 @@ def prepare(args):
         cache='frozen semantic latents in CPU RAM, rebuilt on resume; never cache noisy receiver outputs')
     if args.record_symbol_diagnostics:
         plan['record_symbol_diagnostics'] = True
+    if args.local_response_weight:
+        plan['local_response'] = dict(weight=args.local_response_weight, phases=['bootstrap', 'render'],
+            target='frozen semantic decoder at clean y, same delivered XYZ and active block mask',
+            directions='4 sampled training camera centers + 4 uniform sphere directions per step',
+            reduction='legacy isolated Gaussian response MSE over probes and equally weighted black/white backgrounds',
+            gradient_probe='weighted response and baseline auxiliary L2 norms at recovered latent; first batch on scene visits 1, 125, 250, ... per phase')
+        for key in ('bootstrap_objective', 'objective'):
+            plan[key] += ' + local_response_weight*local_response_loss'
     if three:
         plan['semantic_slot']['accepted'] = [PRIVATE_ONLY]
         plan['bootstrap_validation_steps'] = sorted(
@@ -218,17 +236,23 @@ def prepare(args):
 
 
 @torch.no_grad()
-def cache_scene(model, scene):
+def cache_scene(model, scene, *, local_response=False):
     device = next(model.parameters()).device
     model.eval(); model.set_scene_geometry(scene.geometry)
-    batches, blocks = [], []
+    batches, blocks, training_batches = [], [], []
     for f, ids in zip(scene.groups, scene.group_ids):
         f, active = f.to(device), (ids >= 0).to(device)
         y = model.semantic.encode(f, active)
-        data = torch.cat((f, y), -1).cpu()
-        batches.append(data)
+        parts = [f, y]
+        if local_response:
+            side = delivered_positions(f[..., :3], active.long(), model.cfg)
+            parts.append(model.semantic.decode(y, active, side))
+        data = torch.cat(parts, -1).cpu()
+        training_batches.append(data)
+        # The evaluator and packet exporter consume exactly features + clean latent.
+        batches.append(data[..., :f.shape[-1]+y.shape[-1]] if local_response else data)
         blocks.extend(data[i, :int(valid.sum())] for i, valid in enumerate(ids >= 0))
-    return dict(batches=batches, blocks=blocks)
+    return dict(batches=batches, blocks=blocks, training_batches=training_batches)
 
 
 def sample_blocks(blocks, count, visit, seed):
@@ -244,9 +268,11 @@ def sample_blocks(blocks, count, visit, seed):
     return data, active
 
 
-def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tier=None):
+def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tier=None,
+                    response_centers=None, response_seed=None, gradient_probe=None):
     from .semantic_attribute_codec import attribute_objective
-    f, y, active = data[..., :59], data[..., 59:], q > 0
+    latent_end = 59 + model.cfg.latent_dim
+    f, y, active = data[..., :59], data[..., 59:latent_end], q > 0
     pred, yh, wire = model.forward_cached(f, y, q, args.snr)
     directions = directions_for(scene, f, active, cameras)
     if grouped_tier is not None:
@@ -265,31 +291,49 @@ def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tie
     attrs, terms = attribute_objective(pred[active], f[active], scene.geometry, model, directions, scales)
     auxiliary = args.latent_weight*latent+args.attribute_weight*attrs
     terms = dict(terms, latent=latent, attributes=attrs, transmitted_power=wire['transmitted_power'])
+    if getattr(args, 'local_response_weight', 0.):
+        target = data[..., latent_end:][active]
+        views, _ = color_directions(target[:, :3], scene.geometry, response_centers, 8, response_seed)
+        response, _ = local_response_loss(pred[active], target, scene.geometry, model, directions=views)
+        weighted = args.local_response_weight*response
+        if gradient_probe is not None and not gradient_probe and torch.is_grad_enabled():
+            for key, objective in [('baseline', auxiliary), ('response', weighted)]:
+                grad, = torch.autograd.grad(objective, yh, retain_graph=True)
+                gradient_probe[key+'_latent_grad_norm'] = float(grad.detach().norm())
+        auxiliary = auxiliary + weighted
+        terms['local_response'] = response
     return to_raw(pred[active], scene.geometry, model), auxiliary, terms
 
 
-def train_update(model, scene, cache, phase, visit, cameras, scales, args, index):
+def train_update(model, scene, cache, phase, visit, cameras, scales, args, index, *, global_step=None):
     device = next(model.parameters()).device
     model.train(); model.set_scene_geometry(scene.geometry)
     layer = phase['stage']
     layout = 'mixed' if phase['phase'] == 'neighbor' else layer
     grouped_tier = layout if args.grouped_attribute_supervision else None
+    options = dict(grouped_tier=grouped_tier)
+    probe = {}
+    if getattr(args, 'local_response_weight', 0.):
+        centers = torch.stack([c.camera_center for c in scene.cameras]).to(device)
+        options.update(response_centers=centers, response_seed=args.seed+900001*global_step,
+                       gradient_probe=probe if visit == 1 or visit % 125 == 0 else None)
     if phase['phase'] == 'bootstrap':
         data, active = sample_blocks(cache['blocks'], scene.record['blocks_per_batch'], visit,
                                      args.seed+index*1009+layer*100003)
         q = active.long()*layer
         _, loss, terms = batch_objective(model, scene, data.to(device), q.to(device), cameras, scales, args,
-                                        grouped_tier=grouped_tier)
+                                        **options)
         loss.backward()
-        return loss.detach(), {k+'_loss': float(v.detach()) for k, v in terms.items()}
+        return loss.detach(), {**{k+'_loss': float(v.detach()) for k, v in terms.items()}, **probe}
     layouts = layout_for(scene, layout, args.seed+visit*1009+index, layers=model.layer_config.layer_count)
     objective = PerceptualImageObjective('mse_ssim', args.ssim_weight, device)
     task = PerceptualMultiViewRenderTask(cameras, scene.reference, scene.degree, scene.white_background, objective)
     def forward(data, q):
-        return batch_objective(model, scene, data, q, cameras, scales, args, grouped_tier=grouped_tier)
+        return batch_objective(model, scene, data, q, cameras, scales, args, **options)
     # Auxiliary already contains its explicit latent/attribute weights.
-    return full_scene_step(model, list(zip(cache['batches'], layouts)), scene.geometry, args.snr,
+    loss, metrics = full_scene_step(model, list(zip(cache['training_batches'], layouts)), scene.geometry, args.snr,
         'awgn', task, attr_weight=1., mode='replay', profile=True, batch_forward=forward)
+    return loss, dict(metrics, **probe)
 
 
 def save(path, model, optimizer, progress, plan, scales):
@@ -323,6 +367,8 @@ def write_review(out):
         cost_unit='complex_channel_use_per_delivery', selection='fixed_final')
     if 'training_mode' in plan:
         review.update(training_mode=plan['training_mode'], supervision_per_tier=plan['supervision_per_tier'])
+    if 'local_response' in plan:
+        review['local_response'] = plan['local_response']
     if 'attribute_supervision' in plan:
         review['attribute_supervision'] = plan['attribute_supervision']
     json_write(out/'review_summary.json', review)
@@ -397,7 +443,8 @@ def main(args, max_updates=None):
     caches = {}
     for scene in scenes:
         print(f'Caching frozen {model.semantic.arm} latent: {scene.name}', flush=True)
-        caches[scene.name] = cache_scene(model, scene)
+        caches[scene.name] = cache_scene(model, scene,
+            local_response=bool(args.local_response_weight) and scene.spec['role'] == 'train')
     from .progressive_attribute_preflight import verify_execution
     check_layers = 1 if args.q1_content_gate else layers
     print(f'Checking {check_layers} prefixes and received-file decoding on {device}', flush=True)
@@ -472,7 +519,8 @@ def main(args, max_updates=None):
                 tier = task['stage']
                 cycle = cycles[f'{cycle_phase}/{scene.name}']
                 cameras = [scene.cameras[i] for i in cycle.next(args.views_per_step)]
-                loss, metrics = train_update(model, scene, caches[scene.name], task, visit, cameras, scales, args, index)
+                loss, metrics = train_update(model, scene, caches[scene.name], task, visit, cameras, scales,
+                                             args, index, global_step=progress['step']+1)
                 if not torch.isfinite(loss):
                     raise RuntimeError(f'nonfinite training loss at layer {tier}')
                 results[tier] = dict(loss=float(loss), views=[str(c.image_name) for c in cameras],
