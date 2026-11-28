@@ -268,6 +268,12 @@ def sample_blocks(blocks, count, visit, seed):
     return data, active
 
 
+def clean_response_loss(model, scene, pred, target, centers, seed):
+    views, _ = color_directions(target[:, :3], scene.geometry, centers, 8, seed)
+    response, _ = local_response_loss(pred, target, scene.geometry, model, directions=views)
+    return response
+
+
 def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tier=None,
                     response_centers=None, response_seed=None, gradient_probe=None):
     from .semantic_attribute_codec import attribute_objective
@@ -293,8 +299,7 @@ def batch_objective(model, scene, data, q, cameras, scales, args, *, grouped_tie
     terms = dict(terms, latent=latent, attributes=attrs, transmitted_power=wire['transmitted_power'])
     if getattr(args, 'local_response_weight', 0.):
         target = data[..., latent_end:][active]
-        views, _ = color_directions(target[:, :3], scene.geometry, response_centers, 8, response_seed)
-        response, _ = local_response_loss(pred[active], target, scene.geometry, model, directions=views)
+        response = clean_response_loss(model, scene, pred[active], target, response_centers, response_seed)
         weighted = args.local_response_weight*response
         if gradient_probe is not None and not gradient_probe and torch.is_grad_enabled():
             for key, objective in [('baseline', auxiliary), ('response', weighted)]:

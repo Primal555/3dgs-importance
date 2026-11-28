@@ -258,6 +258,47 @@ def test_finite_noiseless_rotation_adds_visits_and_resumes_with_original_teacher
         assert row['aux_loss'] == pytest.approx(expected, abs=1e-7)
 
 
+def test_local_response_continues_with_original_teacher_through_rotation_and_refinement(tmp_path, joint_source):
+    run, model = joint_source
+    source_path = run/'checkpoints/final.pt'
+    saved = torch.load(source_path, weights_only=True)
+    semantic = model.semantic
+    slot_path = tmp_path/'semantic.pt'
+    torch.save(dict(family='semantic_attribute_controls_v1', arm=semantic.arm, config=semantic.cfg.to_dict(),
+                    model=semantic.state_dict(), progress=dict(step=1),
+                    plan=dict(settings=dict(bootstrap_steps=1, render_steps=0))), slot_path)
+    teacher_hash = joint.state_digest(semantic.state_dict())
+    saved['plan']['semantic_slot'].update(checkpoint=str(slot_path), state_sha256=teacher_hash)
+    saved['plan']['settings'].update(attribute_weight=.02, latent_weight=1., ssim_weight=1/3)
+    saved['plan']['local_response'] = dict(weight=.1, target='original clean decode',
+                                          directions='4 camera + 4 sphere', reduction='response MSE')
+    torch.save(saved, source_path)
+    update = joint.update
+
+    def check_update(*args, **options):
+        assert joint.state_digest(options['teacher'].state_dict()) == teacher_hash
+        assert not any(p.requires_grad for p in options['teacher'].parameters())
+        return update(*args, **options)
+
+    for mode, extra in [('rotate', ['--finite-noiseless-every', '1', '--semantic-anchor-weight', '.02']),
+                        ('refine', [])]:
+        out = tmp_path/mode
+        args = joint.parser().parse_args(['--run', str(run), '--out', str(out), '--'+mode+'-tiers',
+                                          '--steps-per-scene', '4', '--device', 'cpu', *extra])
+        with patch.object(joint, 'update', side_effect=check_update):
+            joint.main(args)
+        plan = json.loads((out/'plan.json').read_text())
+        assert plan['local_response']['teacher_state_sha256'] == teacher_hash
+        assert plan['render_weights'] == dict(attribute_weight=.02, latent_weight=1., ssim_weight=1/3)
+        rows = [json.loads(line) for line in (out/'metrics/loss.jsonl').read_text().splitlines()]
+        for row in rows:
+            assert row['local_response_loss'] > 0
+            assert row['aux_loss'] == pytest.approx(row['latent_loss'] + .02*row['attributes_loss']
+                + .1*row['local_response_loss'] + .02*row.get('semantic_anchor_loss', 0.), abs=1e-6)
+            assert row['render_loss'] == pytest.approx(row['image_mse'] + row['image_ssim_loss']/3, abs=1e-6)
+        run = out
+
+
 def test_fixed_semantic_refinement_from_rotation_preserves_completed_layouts(tmp_path, joint_source):
     source_run, _ = joint_source
     rotation = joint.parser().parse_args(['--run', str(source_run), '--out', str(tmp_path/'rotation'),

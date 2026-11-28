@@ -17,11 +17,12 @@ from .modular_experiment import json_write
 from .multiscene import manifest
 from .optimization import preserved_rng
 from .perceptual_metrics import LPIPSEvaluator
+from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewRenderTask
 from .position_delivery import delivered_positions
 from .progressive_attribute_channel import (THREE_FAMILY, LayerConfig, LayeredAttributeCodec,
-                                           configure_stage, frozen_digest, state_digest)
+                                           configure_stage, frozen_digest, load_semantic_slot, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
-from .progressive_attribute_experiment import cache_scene, save, write_review
+from .progressive_attribute_experiment import cache_scene, clean_response_loss, save, write_review
 from .refinement_views import RefinementViewCycle
 from .render_objective import MultiViewRenderTask
 from .render_validation import append_json
@@ -76,7 +77,7 @@ def parser():
                    help='AWGN updates per scene (default: 1000 rotating/refining, 1500 adapting)')
     p.add_argument('--finite-noiseless-every', type=int, default=0, metavar='N',
                    help='add one finite noiseless rotating update per scene after every N AWGN updates')
-    p.add_argument('--attribute-weight', type=float, default=0.,
+    p.add_argument('--attribute-weight', type=float,
                    help='weight of equally averaged source PLY attribute errors in rotation or refinement')
     p.add_argument('--semantic-anchor-weight', type=float, default=0.,
                    help='weight of matching the starting clean semantic attributes on finite noiseless updates')
@@ -100,6 +101,16 @@ def prepare(args):
         raise ValueError('positive step counts and finite positive learning rate required')
     if not args.rotate_tiers and args.steps_per_scene < len(LAYOUTS if args.refine_tiers else TIERS):
         raise ValueError('each scene needs at least one update per stage')
+    saved = torch.load(run/'checkpoints/final.pt', map_location='cpu', weights_only=True)
+    parent = saved['plan']
+    response = parent.get('local_response') if args.rotate_tiers or args.refine_tiers else None
+    if response:
+        # Scratch stores the weights in settings; rotation records them for the following refinement.
+        inherited = parent.get('render_weights', parent.get('settings'))
+        if args.attribute_weight is None:
+            args.attribute_weight = inherited['attribute_weight']
+    elif args.attribute_weight is None:
+        args.attribute_weight = 0.
     weights = (args.attribute_weight, args.semantic_anchor_weight)
     if any(not math.isfinite(w) or w < 0 for w in weights) or args.finite_noiseless_every < 0:
         raise ValueError('rotation weights and finite noiseless interval must be nonnegative')
@@ -111,8 +122,6 @@ def prepare(args):
     finite_steps = args.steps_per_scene // args.finite_noiseless_every if args.finite_noiseless_every else 0
     if (args.finite_noiseless_every or args.semantic_anchor_weight) and not finite_steps:
         raise ValueError('the budget must include a finite noiseless update to enable it or use a semantic anchor')
-    saved = torch.load(run/'checkpoints/final.pt', map_location='cpu', weights_only=True)
-    parent = saved['plan']
     complete = json.loads((run/'complete.json').read_text(encoding='utf8'))
     slot = parent['semantic_slot']
     from_rotation = saved['family'] in ('progressive_attribute_rotating_semantic_v1',
@@ -191,6 +200,15 @@ def prepare(args):
                 finite = finite_cycles+int(index < finite_partial)
                 row.update(awgn_steps_per_scene=row['steps_per_scene'], finite_noiseless_steps_per_scene=finite)
                 row['steps_per_scene'] += finite
+    if response:
+        plan['render_weights'] = dict(attribute_weight=args.attribute_weight, ssim_weight=inherited['ssim_weight'],
+                                      latent_weight=inherited['latent_weight'])
+        plan['local_response'] = {k: response[k] for k in ('weight', 'target', 'directions', 'reduction')}
+        plan['local_response']['teacher_state_sha256'] = slot['state_sha256']
+        plan['local_response']['phases'] = ['awgn', 'finite_noiseless'] if finite_steps else ['awgn']
+        plan['objective'] = ('source PLY render RGB MSE + ssim_weight*(1-SSIM) + '
+                             'latent_weight*MSE(recovered latent, fixed semantic encoder latent) + '
+                             'local_response_weight*local_response_loss')
     if any(weights):
         scales = {key: saved.get('loss_scales', {}).get(key, 0.)
                   for key in ('shape', 'opacity', 'dc', 'sh', 'direction_rgb')}
@@ -211,12 +229,19 @@ def prepare(args):
     return model, json.loads(json.dumps(plan)), evaluation
 
 
-def update(model, scene, tier, visit, cameras, settings, *, path='awgn', supervision=None, teacher=None):
+def update(model, scene, tier, visit, cameras, settings, *, path='awgn', supervision=None, teacher=None,
+           render_weights=None, response_weight=0., response_seed=None):
     model.set_scene_geometry(scene.geometry)
     if teacher is not None:
         teacher.set_scene_geometry(scene.geometry)
     layouts = layout_for(scene, tier, settings.seed+1009*visit, layers=3)
-    task = MultiViewRenderTask(cameras, scene.reference, scene.degree, scene.white_background)
+    if render_weights:
+        device = next(model.parameters()).device
+        objective = PerceptualImageObjective('mse_ssim', render_weights['ssim_weight'], device)
+        task = PerceptualMultiViewRenderTask(cameras, scene.reference, scene.degree, scene.white_background, objective)
+        centers = torch.stack([camera.camera_center for camera in scene.cameras]).to(device)
+    else:
+        task = MultiViewRenderTask(cameras, scene.reference, scene.degree, scene.white_background)
 
     def forward(features, q):
         active = q > 0
@@ -225,7 +250,7 @@ def update(model, scene, tier, visit, cameras, settings, *, path='awgn', supervi
                                                   noiseless=path == 'finite_noiseless')
         target = y[active].detach()
         mse = (recovered[active]-target).square().mean()
-        aux = mse
+        aux = render_weights['latent_weight']*mse if render_weights else mse
         metrics = dict(latent=mse, target_power=target.square().mean())
         if supervision and (supervision['attribute_weight'] or teacher is not None):
             scales = supervision['scales']
@@ -235,10 +260,15 @@ def update(model, scene, tier, visit, cameras, settings, *, path='awgn', supervi
                                                     model, directions, scales)
                 aux = aux + supervision['attribute_weight']*attrs
                 metrics.update(terms, attributes=attrs)
-            if teacher is not None:
-                xyz = delivered_positions(features[..., :3], q, model.cfg)
-                with torch.no_grad():
-                    fixed = teacher.decode(y, active, xyz)
+        if teacher is not None:
+            xyz = delivered_positions(features[..., :3], q, model.cfg)
+            with torch.no_grad():
+                fixed = teacher.decode(y, active, xyz)
+            if response_weight:
+                response = clean_response_loss(model, scene, pred[active], fixed[active], centers, response_seed)
+                aux = aux + response_weight*response
+                metrics['local_response'] = response
+            if path == 'finite_noiseless' and supervision and supervision.get('semantic_anchor_weight'):
                 clean = model.semantic.decode(y, active, xyz)
                 anchor, terms = attribute_objective(clean[active], fixed[active], scene.geometry,
                                                      model, directions, scales)
@@ -249,6 +279,8 @@ def update(model, scene, tier, visit, cameras, settings, *, path='awgn', supervi
 
     loss, metrics = full_scene_step(model, list(zip(scene.groups, layouts)), scene.geometry, settings.snr,
         path, task, attr_weight=1., mode='replay', profile=True, batch_forward=forward)
+    if render_weights:
+        metrics.update({key: task.stats[key] for key in ('image_mse', 'image_ssim_loss', 'image_aux_weighted')})
     metrics['latent_target_power'] = metrics.pop('target_power_loss')
     metrics['latent_nmse'] = metrics['latent_loss']/max(metrics['latent_target_power'], 1e-12)
     return float(loss), metrics
@@ -332,8 +364,15 @@ def main(args):
     seed_all(settings.seed)
     model.to(device)
     supervision = plan.get('attribute_supervision')
-    teacher = (deepcopy(model.semantic).requires_grad_(False).eval()
-               if supervision and supervision.get('semantic_anchor_weight') else None)
+    response = plan.get('local_response')
+    teacher = None
+    if response:
+        teacher = load_semantic_slot(plan['semantic_slot']['checkpoint'])[0]
+        if state_digest(teacher.state_dict()) != response['teacher_state_sha256']:
+            raise ValueError('original clean semantic teacher weights do not match the channel experiment')
+        teacher.to(device)
+    elif supervision and supervision.get('semantic_anchor_weight'):
+        teacher = deepcopy(model.semantic).requires_grad_(False).eval()
     progress = dict(step=0, cycles={})
     if not args.rotate_tiers:
         progress['tier'] = 1
@@ -419,6 +458,9 @@ def main(args):
             update_options.update(path=path, supervision=supervision, teacher=teacher if noiseless else None)
         elif args.refine_tiers and supervision is not None:
             update_options['supervision'] = supervision
+        if response:
+            update_options.update(teacher=teacher, render_weights=plan['render_weights'],
+                                  response_weight=response['weight'], response_seed=settings.seed+900001*(step+1))
         loss, metrics = update(model, scene, layout, layout_visit, cameras, settings, **update_options)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
         optimizer.step()
