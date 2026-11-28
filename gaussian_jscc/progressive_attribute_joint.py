@@ -19,6 +19,7 @@ from .optimization import preserved_rng
 from .perceptual_metrics import LPIPSEvaluator
 from .perceptual_objective import PerceptualImageObjective, PerceptualMultiViewRenderTask
 from .position_delivery import delivered_positions
+from .progressive_attribute_alternation import alternating_schedule, refinement_noise_states, validation_response
 from .progressive_attribute_channel import (THREE_FAMILY, LayerConfig, LayeredAttributeCodec,
                                            configure_stage, frozen_digest, load_semantic_slot, state_digest)
 from .progressive_attribute_evaluation import assess, layout_for
@@ -69,17 +70,19 @@ def parser():
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--manifest', help='override scene paths, retaining the checkpoint splits')
     mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--alternate-tiers', action='store_true',
+                      help='alternate two rotation and fixed-channel refinement passes, then refine mixed')
     mode.add_argument('--rotate-tiers', action='store_true',
                    help='cycle q1/q2/q3/mixed each scene; freeze the semantic encoder')
     mode.add_argument('--refine-tiers', action='store_true',
                    help='refine q1, q2, q3 and mixed in order with both semantic endpoints frozen')
     p.add_argument('--steps-per-scene', type=int,
                    help='AWGN updates per scene (default: 1000 rotating/refining, 1500 adapting)')
-    p.add_argument('--finite-noiseless-every', type=int, default=0, metavar='N',
+    p.add_argument('--finite-noiseless-every', type=int, metavar='N',
                    help='add one finite noiseless rotating update per scene after every N AWGN updates')
     p.add_argument('--attribute-weight', type=float,
                    help='weight of equally averaged source PLY attribute errors in rotation or refinement')
-    p.add_argument('--semantic-anchor-weight', type=float, default=0.,
+    p.add_argument('--semantic-anchor-weight', type=float,
                    help='weight of matching the starting clean semantic attributes on finite noiseless updates')
     p.add_argument('--lr', type=float, default=1e-5)
     p.add_argument('--validate-every', type=int, default=250, help='updates per training scene')
@@ -93,8 +96,13 @@ def parser():
 
 def prepare(args):
     run, out = args.run.resolve(), args.out.resolve()
+    rotating = args.rotate_tiers or args.alternate_tiers
+    if args.finite_noiseless_every is None:
+        args.finite_noiseless_every = 5 if args.alternate_tiers else 0
+    if args.semantic_anchor_weight is None:
+        args.semantic_anchor_weight = .02 if args.alternate_tiers else 0.
     if args.steps_per_scene is None:
-        args.steps_per_scene = 1000 if args.rotate_tiers or args.refine_tiers else 1500
+        args.steps_per_scene = 1000 if rotating or args.refine_tiers else 1500
     if out.is_relative_to(run) or run.is_relative_to(out):
         raise ValueError('joint output must be separate from the source run')
     if min(args.steps_per_scene, args.validate_every, args.save_every) < 1 or not math.isfinite(args.lr) or args.lr <= 0:
@@ -103,7 +111,9 @@ def prepare(args):
         raise ValueError('each scene needs at least one update per stage')
     saved = torch.load(run/'checkpoints/final.pt', map_location='cpu', weights_only=True)
     parent = saved['plan']
-    response = parent.get('local_response') if args.rotate_tiers or args.refine_tiers else None
+    response = parent.get('local_response') if rotating or args.refine_tiers else None
+    if args.alternate_tiers and not response:
+        raise ValueError('alternating continuation expects the completed local-response channel')
     if response:
         # Scratch stores the weights in settings; rotation records them for the following refinement.
         inherited = parent.get('render_weights', parent.get('settings'))
@@ -114,11 +124,11 @@ def prepare(args):
     weights = (args.attribute_weight, args.semantic_anchor_weight)
     if any(not math.isfinite(w) or w < 0 for w in weights) or args.finite_noiseless_every < 0:
         raise ValueError('rotation weights and finite noiseless interval must be nonnegative')
-    if not args.rotate_tiers and (args.finite_noiseless_every or args.semantic_anchor_weight):
+    if not rotating and (args.finite_noiseless_every or args.semantic_anchor_weight):
         raise ValueError('finite noiseless updates and the semantic anchor require --rotate-tiers')
-    if args.attribute_weight and not (args.rotate_tiers or args.refine_tiers):
+    if args.attribute_weight and not (rotating or args.refine_tiers):
         raise ValueError('attribute supervision requires rotation or refinement')
-    augmented_rotation = args.rotate_tiers and (args.finite_noiseless_every or any(weights))
+    augmented_rotation = rotating and (args.finite_noiseless_every or any(weights))
     finite_steps = args.steps_per_scene // args.finite_noiseless_every if args.finite_noiseless_every else 0
     if (args.finite_noiseless_every or args.semantic_anchor_weight) and not finite_steps:
         raise ValueError('the budget must include a finite noiseless update to enable it or use a semantic anchor')
@@ -137,7 +147,7 @@ def prepare(args):
     model.load_state_dict(saved['state'], strict=True)
     if model.identity() != complete['codec_id']:
         raise ValueError('source final weights differ from completed evaluation')
-    if args.refine_tiers:
+    if args.refine_tiers or args.alternate_tiers:
         model.layer_config = replace(model.layer_config, neighbor_mixed_only=True)
     specs = parent['selected_scenes']
     if args.manifest:
@@ -178,7 +188,7 @@ def prepare(args):
             optimizer='new Adam at each stage; inherit all model weights across stages',
             mixed_layout='uniform random positive tiers per Gaussian; refine only heterogeneous blocks',
             objective='source PLY render RGB MSE + MSE(recovered latent, fixed semantic encoder latent)')
-    if args.rotate_tiers:
+    if rotating:
         cycles, partial = divmod(args.steps_per_scene, len(LAYOUTS))
         plan.pop('schedule')
         plan.update(version='progressive_attribute_rotating_semantic_v1',
@@ -217,7 +227,7 @@ def prepare(args):
         plan['attribute_supervision'] = dict(
             terms=list(scales), scales=scales, reduction='equal mean of the normalized terms',
             attribute_weight=args.attribute_weight, target='source PLY')
-        if args.rotate_tiers:
+        if rotating:
             plan['attribute_supervision'].update(
                 semantic_anchor_weight=args.semantic_anchor_weight,
                 semantic_anchor_target='fixed starting semantic decoder at the clean semantic latent',
@@ -226,6 +236,16 @@ def prepare(args):
             plan['objective'] += ' + semantic_anchor_weight*clean semantic attribute loss (finite noiseless only)'
         else:
             plan['objective'] += ' + attribute_weight*source attribute loss'
+    if args.alternate_tiers:
+        phases = alternating_schedule(args.steps_per_scene, finite_steps, scene_count)
+        plan.update(version='progressive_attribute_alternating_v1', channel=model.layer_config.to_dict(),
+                    alternating_schedule=phases, total_updates=phases[-1]['end_step'],
+                    steps_per_scene=phases[-1]['end_step']//scene_count,
+                    awgn_steps_per_scene=2*args.steps_per_scene, joint_awgn_steps_per_scene=args.steps_per_scene,
+                    refinement_awgn_steps_per_scene=args.steps_per_scene,
+                    trainable='joint: semantic decoder and active tiers; q1/q2/q3: active increment; mixed finish: neighbor only',
+                    optimizer='persistent separate Adam states for joint, q1, q2, q3 and mixed',
+                    sampling='continue joint and sequential refinement camera, AWGN, layout and response streams by reference step')
     return model, json.loads(json.dumps(plan)), evaluation
 
 
@@ -338,7 +358,10 @@ def main(args):
     before = {s['name']: read_endpoint(run, s['name'], plan['source_codec_id'], settings, records[s['name']])
               for s in plan['selected_scenes']}
     if args.dry_run:
-        if args.rotate_tiers:
+        if args.alternate_tiers:
+            print(json.dumps(plan['alternating_schedule'], indent=2))
+            budget = f"{plan['steps_per_scene']} updates"
+        elif args.rotate_tiers:
             print(json.dumps(plan['rotation'], indent=2))
             budget = f"{plan['steps_per_scene']} updates"
         elif args.refine_tiers:
@@ -402,24 +425,35 @@ def main(args):
         scenes.append(make_scene(spec, raw, degree, model, scene_args, out, old=old))
         del raw
     train = [s for s in scenes if s.spec['role'] == 'train']
-    cycle_key = 'rotating_semantic' if args.rotate_tiers else ('tier_refine' if args.refine_tiers else 'tier_semantic')
+    cycle_key = 'rotating_semantic' if args.rotate_tiers or args.alternate_tiers else ('tier_refine' if args.refine_tiers else 'tier_semantic')
     cycle_specs = [(s.name, s, cycle_key) for s in train]
     if args.finite_noiseless_every:
         cycle_specs += [(f'{s.name}:finite_noiseless', s, f'{cycle_key}_finite_noiseless') for s in train]
     cycles = {key: RefinementViewCycle([str(c.image_name) for c in s.cameras], settings.seed, s.name,
               mode, progress['cycles'].get(key)) for key, s, mode in cycle_specs}
+    if args.alternate_tiers:
+        for scene in train:
+            for index, lane in enumerate(('q1', 'q2', 'q3', 'mixed')):
+                key = f'{scene.name}:{lane}'
+                state = progress['cycles'].get(key)
+                cycle = RefinementViewCycle([str(c.image_name) for c in scene.cameras], settings.seed, scene.name,
+                                            'tier_refine', state)
+                if state is None:
+                    for _ in range(index*(args.steps_per_scene//4)):
+                        cycle.next(settings.views_per_step)
+                cycles[key] = cycle
     perceptual = LPIPSEvaluator(device) if settings.lpips else None
     if saved:
         restore_rng(saved['rng'])
 
     def fixed_digest():
-        if args.rotate_tiers:
+        if args.rotate_tiers or (args.alternate_tiers and progress.get('lane') == 'joint'):
             trainable = ('semantic.semantic_decoder.', 'encoders.', 'decoders.')
             return state_digest({k: v for k, v in model.state_dict().items() if not k.startswith(trainable)})
         return frozen_digest(model)
 
     def checkpoint(label, optimizer):
-        mixed_refinement = args.refine_tiers and progress['tier'] == len(LAYOUTS)
+        mixed_refinement = (args.refine_tiers and progress['tier'] == len(LAYOUTS)) or progress.get('lane') == 'mixed'
         if bool(model.neighbor_enabled) != mixed_refinement or fixed_digest() != progress['frozen_sha256']:
             raise RuntimeError('frozen model weights or statistics changed')
         progress['cycles'] = {k: v.state_dict() for k, v in cycles.items()}
@@ -432,18 +466,26 @@ def main(args):
                 cached = cache_scene(model, scene)['batches']
                 assess(model, scene, cached, settings, out/'evaluation'/label/scene.name,
                        scope='test' if final else 'validation',
-                       layers=LAYOUTS if final or args.rotate_tiers or args.refine_tiers else TIERS,
+                       layers=LAYOUTS if final or args.rotate_tiers or args.refine_tiers or args.alternate_tiers else TIERS,
                        perceptual=perceptual, actual=final, detailed_attributes=True)
+                if args.alternate_tiers and not final and (label.endswith('_end') or label == 'monitor_000000'):
+                    json_write(out/'evaluation'/label/scene.name/'local_response_validation.json',
+                               validation_response(model, teacher, scene, cached, settings))
                 del cached
 
-    def train_step(optimizer, step, layout, *, path=None, path_visit=None, **phase_fields):
-        visit, index = divmod(step, len(train))
+    def train_step(optimizer, step, layout, *, path=None, path_visit=None, reference_step=None, **phase_fields):
+        sample_step = step if reference_step is None else reference_step
+        visit, index = divmod(sample_step, len(train))
         scene = train[index]
         noiseless = path == 'finite_noiseless'
-        cycle = cycles[f'{scene.name}:{path}' if noiseless else scene.name]
+        key = f'{scene.name}:{path}' if noiseless else scene.name
+        lane = progress.get('lane')
+        if args.alternate_tiers and lane != 'joint':
+            key = f'{scene.name}:{lane}'
+        cycle = cycles[key]
         cameras = [scene.cameras[i] for i in cycle.next(settings.views_per_step)]
         optimizer.zero_grad(set_to_none=True)
-        if args.rotate_tiers:
+        if args.rotate_tiers or lane == 'joint':
             set_rotation_layout(model, layout)
         else:
             model.train()
@@ -456,21 +498,84 @@ def main(args):
         if path is not None:
             phase_fields.update(path=path, path_scene_step=path_visit+1)
             update_options.update(path=path, supervision=supervision, teacher=teacher if noiseless else None)
-        elif args.refine_tiers and supervision is not None:
+        elif (args.refine_tiers or args.alternate_tiers) and supervision is not None:
             update_options['supervision'] = supervision
+            if args.alternate_tiers:
+                phase_fields['path'] = 'awgn'
         if response:
             update_options.update(teacher=teacher, render_weights=plan['render_weights'],
-                                  response_weight=response['weight'], response_seed=settings.seed+900001*(step+1))
+                                  response_weight=response['weight'], response_seed=settings.seed+900001*(sample_step+1))
         loss, metrics = update(model, scene, layout, layout_visit, cameras, settings, **update_options)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
         optimizer.step()
         progress['step'] = step+1
-        append_json(log, dict(step=step+1, scene=scene.name, scene_step=visit+1, layout=layout,
+        append_json(log, dict(step=step+1, scene=scene.name, scene_step=step//len(train)+1, layout=layout,
                     loss=loss, grad_norm=float(norm), views=[str(c.image_name) for c in cameras],
                     **phase_fields, **metrics))
         return scene.name, loss
 
     interval = len(train)*args.validate_every
+    if args.alternate_tiers:
+        if not saved:
+            progress.update(phase=0, paused_adam={}, noise_states=refinement_noise_states(
+                train, args.steps_per_scene//4, device))
+        phases = plan['alternating_schedule']
+        for i in range(progress['phase'], len(phases)):
+            phase = phases[i]
+            lane, name = phase['lane'], phase['name']
+            joint = lane == 'joint'
+            if joint:
+                model.neighbor.requires_grad_(False)
+                set_rotation_layout(model, 'mixed')
+                optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)
+            else:
+                tier = 4 if lane == 'mixed' else int(lane[1:])
+                optimizer = configure_stage(model, tier, args.lr)
+            start, end = phase['start_step'], phase['end_step']
+            if saved:
+                if (progress['lane'] != lane or not start <= progress['step'] <= end
+                        or fixed_digest() != progress['frozen_sha256']):
+                    raise ValueError('alternating checkpoint phase or frozen state mismatch')
+                optimizer.load_state_dict(saved['optimizer'])
+                saved = None
+            else:
+                progress.update(phase=i, lane=lane)
+                progress['frozen_sha256'] = fixed_digest()
+                if lane in progress['paused_adam']:
+                    optimizer.load_state_dict(progress['paused_adam'].pop(lane))
+                state = progress['noise_states'][lane]
+                if device.type == 'cuda':
+                    torch.cuda.set_rng_state(state, device)
+                else:
+                    torch.set_rng_state(state)
+                checkpoint('latest', optimizer)
+            # A later joint pass changes the semantic decoder seen by frozen-stage evaluations.
+            for scene in scenes:
+                scene._progressive_clean_metrics = {}
+            print(f"{name}: {start}..{end}, completed {progress['step']}", flush=True)
+            for step in range(progress['step'], end):
+                if step == 0 or (step > start and (step-start) % interval == 0):
+                    evaluate(f'monitor_{step:06d}', train)
+                reference = phase['reference_step']+step-start
+                options = {}
+                if joint:
+                    path, visit = rotation_visit(reference//len(train), args.finite_noiseless_every)
+                    layout = LAYOUTS[visit % len(LAYOUTS)]
+                    options.update(path=path, path_visit=visit)
+                else:
+                    layout = 'mixed' if lane == 'mixed' else tier
+                scene_name, loss = train_step(optimizer, step, layout, reference_step=reference,
+                    phase=name, reference_update=reference+1, **options)
+                if step == start or (step+1) % 10 == 0:
+                    print(f"{name} {step+1}/{plan['total_updates']} {scene_name} {layout=} {loss=:.7g}", flush=True)
+                if (step+1) % args.save_every == 0 or step+1 == end:
+                    checkpoint('latest', optimizer)
+            checkpoint(name+'_end', optimizer)
+            evaluate(name+'_end', train)
+            if i < len(phases)-1:
+                progress['noise_states'][lane] = torch.cuda.get_rng_state(device) if device.type == 'cuda' else torch.get_rng_state()
+                if any(p['lane'] == lane for p in phases[i+1:]):
+                    progress['paused_adam'][lane] = optimizer.state_dict()
     if args.rotate_tiers:
         set_rotation_layout(model, 'mixed')
         optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=args.lr)

@@ -258,7 +258,8 @@ def test_finite_noiseless_rotation_adds_visits_and_resumes_with_original_teacher
         assert row['aux_loss'] == pytest.approx(expected, abs=1e-7)
 
 
-def test_local_response_continues_with_original_teacher_through_rotation_and_refinement(tmp_path, joint_source):
+@pytest.fixture
+def response_source(tmp_path, joint_source):
     run, model = joint_source
     source_path = run/'checkpoints/final.pt'
     saved = torch.load(source_path, weights_only=True)
@@ -273,6 +274,11 @@ def test_local_response_continues_with_original_teacher_through_rotation_and_ref
     saved['plan']['local_response'] = dict(weight=.1, target='original clean decode',
                                           directions='4 camera + 4 sphere', reduction='response MSE')
     torch.save(saved, source_path)
+    return run, teacher_hash
+
+
+def test_local_response_continues_with_original_teacher_through_rotation_and_refinement(tmp_path, response_source):
+    run, teacher_hash = response_source
     update = joint.update
 
     def check_update(*args, **options):
@@ -297,6 +303,82 @@ def test_local_response_continues_with_original_teacher_through_rotation_and_ref
                 + .1*row['local_response_loss'] + .02*row.get('semantic_anchor_loss', 0.), abs=1e-6)
             assert row['render_loss'] == pytest.approx(row['image_mse'] + row['image_ssim_loss']/3, abs=1e-6)
         run = out
+
+
+def test_alternation_resumes_second_joint_pass_with_separate_optimizers_and_samples(tmp_path, response_source):
+    run, _ = response_source
+    def args(name):
+        return joint.parser().parse_args(['--run', str(run), '--out', str(tmp_path/name), '--alternate-tiers',
+            '--finite-noiseless-every', '1', '--steps-per-scene', '8', '--save-every', '1', '--device', 'cpu'])
+    full, part = args('alternating'), args('resumed_alternating')
+    joint.main(full)
+    original = joint.update
+    def stop(*a, **kw):
+        if kw.get('path') == 'finite_noiseless' and kw['response_seed'] == 42+900001*20:
+            raise InterruptedError
+        return original(*a, **kw)
+    with patch.object(joint, 'update', side_effect=stop), pytest.raises(InterruptedError):
+        joint.main(part)
+    part.resume = True
+    joint.main(part)
+
+    def load(root, name):
+        return torch.load(root/'checkpoints'/f'{name}.pt', weights_only=True)
+    a, b = [load(x.out, 'final') for x in (full, part)]
+    torch.testing.assert_close(a['state'], b['state'], atol=0, rtol=0)
+    torch.testing.assert_close(a['optimizer'], b['optimizer'], atol=0, rtol=0)
+    assert a['progress']['cycles'] == b['progress']['cycles']
+    assert a['progress']['step'] == 48
+    for name, adam_steps in [('joint_2', {16, 32}), ('q1_pass_2', {4}), ('q2_pass_2', {4}),
+                             ('q3_pass_2', {4}), ('mixed', {4})]:
+        ckpt = load(part.out, name+'_end')
+        assert {int(s['step']) for s in ckpt['optimizer']['state'].values()} == adam_steps
+    previous = load(run, 'final')['state']
+    for phase in a['plan']['alternating_schedule']:
+        ckpt = load(part.out, phase['name']+'_end')
+        changed = {k for k, v in ckpt['state'].items() if not torch.equal(previous[k], v)}
+        lane = phase['lane']
+        if lane == 'joint':
+            prefixes = ('semantic.semantic_decoder.', 'encoders.', 'decoders.')
+        elif lane == 'mixed':
+            prefixes = ('neighbor.', 'neighbor_enabled')
+        else:
+            i = int(lane[1:])-1
+            prefixes = (f'encoders.{i}.', f'decoders.{i}.')
+        assert changed and all(k.startswith(prefixes) for k in changed)
+        previous = ckpt['state']
+    clean = lambda tag: json.loads((part.out/'evaluation'/tag/'truck/clean.json').read_text())['photo_psnr']
+    assert clean('joint_1_end') == clean('q3_pass_1_end')
+    assert clean('joint_2_end') == clean('mixed_end')
+    assert clean('joint_2_end') != clean('joint_1_end')
+    rows = [json.loads(line) for line in (part.out/'metrics/loss.jsonl').read_text().splitlines()]
+    for is_joint, total in [(True, 32), (False, 16)]:
+        assert sorted(r['reference_update'] for r in rows if r['phase'].startswith('joint') == is_joint) == list(range(1,total+1))
+    record = a['plan']['scene_records']['truck']
+    names = record['train_view_names']
+    cycle = joint.RefinementViewCycle(names, 42, 'truck', 'tier_refine')
+    control_views = [[names[i] for i in cycle.next(2)] for _ in range(8)]
+    for row in rows:
+        if row['scene'] == 'truck' and not row['phase'].startswith('joint'):
+            assert row['views'] == control_views[(row['reference_update']-1)//2]
+    phases = joint.alternating_schedule(1000, 200, 2)
+    assert [p['end_step'] for p in phases] == [1200,1450,1700,1950,3150,3400,3650,3900,4400]
+
+
+@pytest.mark.parametrize('device', ['cpu'] + (['cuda'] if torch.cuda.is_available() else []))
+def test_alternating_noise_offsets_match_sequential_full_slot_draws(device):
+    from gaussian_jscc.progressive_attribute_channel import EIGHT_RATES
+    scenes = [Namespace(groups=[torch.empty(2, 5, 59), torch.empty(1, n, 59)]) for n in (3, 7)]
+    device = torch.device(device)
+    states = joint.refinement_noise_states(scenes, 2, device)
+    stream = torch.Generator(device=device)
+    stream.set_state(states['joint'])
+    for lane in ('q1', 'q2', 'q3', 'mixed'):
+        assert torch.equal(stream.get_state(), states[lane])
+        for _ in range(2):
+            for scene in scenes:
+                for features in scene.groups:
+                    torch.randn(*features.shape[:-1], EIGHT_RATES[-1], 2, device=device, generator=stream)
 
 
 def test_fixed_semantic_refinement_from_rotation_preserves_completed_layouts(tmp_path, joint_source):
